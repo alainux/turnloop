@@ -44,7 +44,15 @@ class CodexWorker(Worker):
         prompt = self._build_prompt(ctx)
 
         worktree = self._prepare_worktree(ctx.node.id) if self._repo_is_git() else None
-        cwd = worktree or self.s.repo_path or os.getcwd()
+        # Safety: with a repo configured we MUST run in an isolated worktree.
+        # Refusing here is far better than letting Codex rewrite the main repo.
+        if self.s.repo_path and worktree is None:
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary="could not create an isolated git worktree; refused to run Codex in the main repository",
+                retry_recommended=False,
+            )
+        cwd = worktree or os.getcwd()
 
         schema_path = codex_schemas.write_schema(codex_schemas.RESULT_SCHEMA)
 
@@ -250,6 +258,18 @@ decision, or approval) is missing, return outcome "BLOCK" with explicit missing_
         repo = Path(self.s.repo_path)
         branch = f"turn-{node_id.hex[:8]}"
         wt = repo / ".turn" / "worktrees" / node_id.hex
+        # Clean up any prior worktree/branch for this node so re-runs isolate
+        # cleanly instead of failing and falling back to the main repo.
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", branch],
+            capture_output=True,
+            text=True,
+        )
         try:
             subprocess.run(
                 ["git", "-C", str(repo), "worktree", "add", str(wt), "-b", branch],
@@ -259,7 +279,8 @@ decision, or approval) is missing, return outcome "BLOCK" with explicit missing_
             )
             return str(wt)
         except (subprocess.CalledProcessError, OSError):
-            return str(repo)
+            # Never return the main repo: callers must refuse to run Codex here.
+            return None
 
     def _capture_worktree(self, worktree: str) -> list[ArtifactSpec]:
         def run(args):
