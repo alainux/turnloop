@@ -107,7 +107,9 @@ class CodexPlanner(Planner):
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         prompt = self._build_prompt(ctx)
         cwd = self.s.repo_path or os.getcwd()
-        text = await self._call_codex(prompt, cwd)
+        text = await self._call_codex(
+            prompt, cwd, stream=getattr(ctx, "stream", None), node_id=ctx.node.id
+        )
         plan = self._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
             return plan
@@ -123,6 +125,19 @@ THIS NODE'S OBJECTIVE:
 You are planning the DIRECT children of this node. Produce the SMALLEST useful
 set of concrete, runnable child steps that can begin executing now. Decompose
 only far enough to expose real work.
+
+SCOPE & CARDINALITY (important):
+- Honor the user's explicit scope. If the objective asks for a SINGLE step
+  (e.g. it contains "one", "a single", "just one", "next step", "the next
+  step", "first step", or "only"), produce EXACTLY ONE child node. Do NOT pad
+  the graph with investigate / implement / verify scaffolding — the requested
+  step itself is the one child.
+- When the objective already names a concrete, executable action, the smallest
+  useful graph is usually a SINGLE child that performs it. Prefer one
+  well-specified child over a generic multi-step breakdown. Only split when a
+  genuine prerequisite or dependency truly exists.
+- Give that single child a concrete objective describing the ACTION to take
+  (e.g. "Create the X"), not a restatement of this node's objective.
 
 HARD RULES:
 - Return ONLY this node's direct children. Do NOT create a child that merely
@@ -153,7 +168,7 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
 }}
 """
 
-    async def _call_codex(self, prompt: str, cwd: str) -> str:
+    async def _call_codex(self, prompt: str, cwd: str, stream=None, node_id=None) -> str:
         if shutil.which(self.s.codex_binary) is None:
             return ""
         schema_path = codex_schemas.write_schema(codex_schemas.PLAN_SCHEMA)
@@ -177,8 +192,30 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            out, err = await asyncio.wait_for(
-                proc.communicate(), timeout=self.s.default_run_timeout_seconds
+            out_buf: list[bytes] = []
+
+            async def _read_out():
+                assert proc.stdout is not None
+                while True:
+                    chunk = await proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    out_buf.append(chunk)
+                    if stream is not None:
+                        await stream(node_id, chunk.decode(errors="replace"))
+
+            async def _read_err():
+                assert proc.stderr is not None
+                while True:
+                    chunk = await proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    if stream is not None:
+                        await stream(node_id, chunk.decode(errors="replace"))
+
+            await asyncio.wait_for(
+                asyncio.gather(_read_out(), _read_err(), proc.wait()),
+                timeout=self.s.default_run_timeout_seconds,
             )
         except (asyncio.TimeoutError, FileNotFoundError, OSError):
             return ""
@@ -187,7 +224,7 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
                 os.unlink(schema_path)
             except OSError:
                 pass
-        return (out or b"").decode(errors="replace")
+        return b"".join(out_buf).decode(errors="replace")
 
     COORDINATOR_KEYS = {"coordinator", "oversee", "manage", "coordinate", "co-ordinate"}
 
@@ -224,12 +261,17 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
         ]
 
         # 1) Drop redundant "coordinator"/duplicate nodes; reparent their children.
+        # A LONE child whose objective merely echoes the parent is the intended
+        # single step (e.g. when the user asked for exactly one) — never drop it,
+        # or we'd regress to zero children. Only drop a duplicate-objective node
+        # when siblings exist (there it's redundant scaffolding).
         parent_norm = CodexPlanner._norm(parent_objective)
+        only_child = len(raw_nodes) == 1
         drop = set()
         for n in raw_nodes:
             kn = n.key.strip().lower()
             on = CodexPlanner._norm(n.objective)
-            if on and on == parent_norm:
+            if on and on == parent_norm and not only_child:
                 drop.add(n.key)
             elif kn in CodexPlanner.COORDINATOR_KEYS:
                 drop.add(n.key)

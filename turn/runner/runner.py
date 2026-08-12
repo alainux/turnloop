@@ -17,6 +17,8 @@ logger = logging.getLogger("turn.runner")
 from turn.db.store import PLANNER_EXECUTOR, Store
 from turn.domain.schemas import (
     Artifact,
+    ArtifactKind,
+    ArtifactSpec,
     Node,
     NodeStatus,
     Outcome,
@@ -29,6 +31,7 @@ from turn.domain.schemas import (
 from turn.graph.logic import build_indexes, evaluate
 from turn.runner.events import EventBus
 from turn.workers.base import NodeExecutionContext, Worker
+from turn.workers import parsing
 from turn.workers.registry import WorkerRegistry, build_registry
 
 from turn.config import settings as default_settings
@@ -183,6 +186,16 @@ class Runner:
 
     async def _plan_node(self, node: Node, project_id: uuid.UUID) -> None:
         ctx = await self._build_context(node)
+        # Collect the planner's raw Codex transcript so it can be shown in the
+        # node-detail terminal pane, exactly like a worker node's output.
+        transcript_chunks: list[str] = []
+        orig_stream = ctx.stream
+
+        async def _stream(nid, chunk):
+            await orig_stream(nid, chunk)
+            transcript_chunks.append(chunk)
+
+        ctx.stream = _stream
         run = await self.store.create_run(node, PLANNER_EXECUTOR)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
@@ -192,6 +205,14 @@ class Runner:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
             created = await self.store.apply_plan(node, plan)
+            transcript = parsing.strip_ansi("".join(transcript_chunks))
+            if transcript.strip():
+                arts = await self.store.add_artifacts(
+                    node.id,
+                    [ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)],
+                )
+                for a in arts:
+                    await self._emit("artifact.created", project_id, _dump(a))
             await self.store.update_run(
                 run.id,
                 status=RunStatus.COMPLETE,
