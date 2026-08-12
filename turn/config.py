@@ -9,6 +9,34 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _load_env_file() -> None:
+    """Best-effort load of a repo-local ``.env`` (optional, no hard dependency).
+
+    Inline process environment variables always take precedence over values
+    found in ``.env``.
+    """
+    path = Path(__file__).resolve().parent.parent / ".env"
+    try:
+        from dotenv import load_dotenv  # type: ignore
+
+        if path.exists():
+            load_dotenv(str(path))
+        return
+    except Exception:
+        pass
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
 
 
 @dataclass
@@ -81,4 +109,5 @@ class Settings:
 
 
 # A single process-wide settings instance.
+_load_env_file()
 settings = Settings()
