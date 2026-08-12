@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Turn — live workgraph</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">Turn <span class="host">turnloop.tech</span></div>
+    <form id="prompt-form">
+      <input id="prompt-input" placeholder="Describe an objective… (vague is fine)" autocomplete="off" />
+      <button type="submit">Create workgraph</button>
+    </form>
+  </header>
+
+  <div id="project-bar">
+    <label>Project:</label>
+    <select id="project-select"><option value="">— none —</option></select>
+    <span id="status-line"></span>
+  </div>
+
+  <main>
+    <section id="graph-pane">
+      <div class="pane-title">WorkGraph</div>
+      <div class="graph-legend">solid = contains · <span style="color:#d29922">dashed = depends on</span></div>
+      <div id="graph"></div>
+    </section>
+    <section id="detail-pane">
+      <div class="pane-title">Node</div>
+      <div id="detail"><p class="muted">Select a node to inspect, edit, or act on it.</p></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
