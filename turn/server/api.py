@@ -47,6 +47,10 @@ class SetMode(BaseModel):
     auto_run: bool
 
 
+class SettingsUpdate(BaseModel):
+    default_auto_run: Optional[bool] = None
+
+
 # -- helpers ---------------------------------------------------------------
 
 
@@ -77,6 +81,24 @@ async def create_project(body: CreateProject, request: Request):
     root = await store.create_project(body.prompt, name=body.name)
     runner.wake()
     return {"project_id": str(root.id), "root": _dump(root)}
+
+
+@router.get("/api/settings")
+async def get_settings(request: Request):
+    """Return cross-project preferences (e.g. the default auto-run mode)."""
+    store: Store = request.app.state.store
+    raw = await store.get_setting("default_auto_run", "1")
+    default_auto_run = str(raw) not in ("0", "false", "False", "")
+    return {"default_auto_run": default_auto_run}
+
+
+@router.post("/api/settings")
+async def update_settings(body: SettingsUpdate, request: Request):
+    """Persist a cross-project preference (e.g. the default auto-run mode)."""
+    store: Store = request.app.state.store
+    if body.default_auto_run is not None:
+        await store.set_setting("default_auto_run", "1" if body.default_auto_run else "0")
+    return {"ok": True}
 
 
 @router.get("/api/projects")

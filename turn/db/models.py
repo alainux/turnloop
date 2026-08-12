@@ -88,5 +88,21 @@ class ArtifactModel(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
+class SettingModel(Base):
+    """Key/value store for cross-project preferences (e.g. default auto-run)."""
+
+    __tablename__ = "settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text, nullable=True)
+
+
 # Re-export for convenience.
-__all__ = ["Base", "NodeModel", "EdgeModel", "RunModel", "ArtifactModel"]
+__all__ = [
+    "Base",
+    "NodeModel",
+    "EdgeModel",
+    "RunModel",
+    "ArtifactModel",
+    "SettingModel",
+]

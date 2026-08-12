@@ -21,6 +21,7 @@ from turn.db.models import (
     EdgeModel,
     NodeModel,
     RunModel,
+    SettingModel,
 )
 from turn.domain.schemas import (
     Artifact,
@@ -136,6 +137,14 @@ class Store:
     # -- projects ---------------------------------------------------------
 
     async def create_project(self, prompt: str, name: Optional[str] = None) -> Node:
+        # New projects inherit the user's last auto-run preference (persisted
+        # across projects) so manual-stepping mode survives a page reload.
+        auto_run_default = True
+        try:
+            raw = await self.get_setting("default_auto_run", "1")
+            auto_run_default = str(raw) not in ("0", "false", "False", "")
+        except Exception:
+            auto_run_default = True
         root_id = uuid.uuid4()
         node = NodeModel(
             id=root_id,
@@ -145,7 +154,7 @@ class Store:
             generated_prompt=prompt,
             executor=PLANNER_EXECUTOR,
             status=NodeStatus.PENDING.value,
-            auto_run=True,
+            auto_run=auto_run_default,
         )
         async with self.session() as s:
             s.add(node)
@@ -310,6 +319,27 @@ class Store:
             return None
         n.auto_run = auto_run
         return await self._save_node(n)
+
+    # -- settings (cross-project preferences) -----------------------------
+
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        async with self.session() as s:
+            m = (
+                await s.execute(select(SettingModel).where(SettingModel.key == key))
+            ).scalar_one_or_none()
+            return m.value if m else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with self.session() as s:
+            m = (
+                await s.execute(select(SettingModel).where(SettingModel.key == key))
+            ).scalar_one_or_none()
+            if m is None:
+                m = SettingModel(key=key, value=value)
+                s.add(m)
+            else:
+                m.value = value
+            await s.commit()
 
     async def create_node(
         self,
