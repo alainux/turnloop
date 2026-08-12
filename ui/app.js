@@ -292,7 +292,7 @@ async function renderDetail() {
     d.appendChild(box);
   }
 
-  // actions
+  // actions — only show controls that make sense for the current status
   const actions = el("div", { className: "actions" });
   const mk = (label, cls, fn) => {
     const b = document.createElement("button");
@@ -301,18 +301,32 @@ async function renderDetail() {
     b.onclick = fn;
     return b;
   };
-  if (node.status === "RUNNABLE") {
-    actions.append(mk("Run ▶", "run", async () => { await runNode(node.id); }));
+  const st = node.status;
+  const act = (label, cls, fn) => actions.append(mk(label, cls, fn));
+
+  if (st === "RUNNABLE" || st === "PAUSED" || st === "CANCELLED") {
+    act("Run ▶", "run", () => runNode(node.id));
   }
-  actions.append(
-    mk("Edit", "secondary", () => editNode(node)),
-    mk("Regenerate ↓", "secondary", async () => { await api(`/api/nodes/${node.id}/regenerate`, { method: "POST" }); await loadGraph(); }),
-    mk("Fork", "secondary", async () => { await api(`/api/nodes/${node.id}/fork`, { method: "POST" }); await loadGraph(); }),
-    mk("Retry", "secondary", async () => { await api(`/api/nodes/${node.id}/retry`, { method: "POST" }); await loadGraph(); }),
-    mk("Pause", "secondary", async () => { await api(`/api/nodes/${node.id}/pause`, { method: "POST" }); await loadGraph(); }),
-    mk("Resume", "secondary", async () => { await api(`/api/nodes/${node.id}/resume`, { method: "POST" }); await loadGraph(); }),
-    mk("Cancel", "danger", async () => { await api(`/api/nodes/${node.id}/cancel`, { method: "POST" }); await loadGraph(); }),
-  );
+  if (st === "RUNNING") {
+    act("Cancel", "danger", () => nodeAction(node.id, "cancel"));
+  }
+  if (st === "PAUSED") {
+    act("Resume", "secondary", () => nodeAction(node.id, "resume"));
+  }
+  if (st === "FAILED") {
+    act("Retry", "secondary", () => nodeAction(node.id, "retry"));
+  }
+  if (st !== "RUNNING") {
+    act("Edit", "secondary", () => editNode(node));
+    act("Regenerate ↓", "secondary", () => nodeAction(node.id, "regenerate"));
+    act("Fork", "secondary", () => nodeAction(node.id, "fork"));
+  }
+  if (st === "RUNNABLE" || st === "BLOCKED") {
+    act("Pause", "secondary", () => nodeAction(node.id, "pause"));
+  }
+  if (st !== "RUNNING" && st !== "COMPLETE") {
+    act("Cancel", "danger", () => nodeAction(node.id, "cancel"));
+  }
   d.appendChild(actions);
 
   // live transcript (raw Codex output) — terminal-styled pane
@@ -514,6 +528,7 @@ $("#project-select").addEventListener("change", async (e) => {
 
 document.getElementById("auto-run").addEventListener("change", (e) => setMode(e.target.checked));
 document.getElementById("step-btn").addEventListener("click", stepProject);
+document.getElementById("clear-btn").addEventListener("click", clearProjects);
 
 // Don't let live updates rebuild the detail pane in the middle of a scroll.
 document.getElementById("detail-pane").addEventListener("scroll", markUserScroll, { passive: true });
@@ -555,6 +570,23 @@ async function stepProject() {
 async function runNode(nid) {
   if (!nid) return;
   await api(`/api/nodes/${nid}/run`, { method: "POST" });
+  await loadGraph();
+}
+
+// Generic node action (pause/resume/cancel/retry/regenerate/fork) that
+// refreshes the graph afterwards.
+async function nodeAction(id, action) {
+  await api(`/api/nodes/${id}/${action}`, { method: "POST" });
+  await loadGraph();
+}
+
+async function clearProjects() {
+  if (!confirm("Clear all projects? This cannot be undone.")) return;
+  await api("/api/projects", { method: "DELETE" });
+  state.projectId = null;
+  state.openNodeId = null;
+  if (state.es) { state.es.close(); state.es = null; }
+  await refreshProjects();
   await loadGraph();
 }
 
