@@ -8,15 +8,12 @@ dependencies = [
     "sqlalchemy>=2.0",
     "greenlet>=3.0",
     "aiosqlite>=0.19",
-    "asyncpg>=0.29",
     "pydantic>=2.0",
     "fastapi>=0.110",
     "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
-# Postgres as the authoritative store (async driver).
-postgres = ["asyncpg>=0.29"]
 # LLM-backed planner via the OpenAI SDK (optional; Codex is used by default).
 llm = ["openai>=1.0"]
 # Optional Prefect 3 execution backend behind the thin adapter.

@@ -1,9 +1,8 @@
 """Runtime configuration for Turn.
 
-All knobs are read from environment variables so the same code runs locally
-(against SQLite) or in production (against Postgres). Postgres is the
-authoritative store; SQLite is the default only so the vertical slice runs
-with zero external services.
+All knobs are read from environment variables. SQLite is the default local
+store and requires zero external services; TURN_DATABASE_URL can point the
+same SQLAlchemy store at another database if desired.
 """
 from __future__ import annotations
 

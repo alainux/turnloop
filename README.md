@@ -75,7 +75,7 @@ adds data, not core code.
 |---------|--------|
 | Backend language | **Python** |
 | Schemas | **Pydantic** (strict Node / Edge / Run / Artifact / worker-result) |
-| Authoritative store | **Postgres** (SQLite default for local runs; schema-identical) |
+| Store | **SQLite** (local default; zero external services) |
 | Execution orchestration | **Prefect 3** behind a thin adapter (optional) |
 | Software-engineering worker | **Codex SDK / `codex exec`** |
 | Resource / tool boundary | **MCP** (optional) |
@@ -109,8 +109,8 @@ worktrees are only an execution mechanism for software branches.
 ## Run it
 
 ```bash
-pip install -e .                 # core deps (sqlite + postgres drivers)
-# optional: pip install -e ".[postgres,llm,prefect]"
+pip install -e .                 # core deps (sqlite)
+# optional: pip install -e ".[llm,prefect]"
 
 # minimal local run (SQLite, deterministic heuristic planner + echo leaves)
 TURN_DATABASE_URL="sqlite+aiosqlite:///./turnloop.db" \
@@ -130,14 +130,6 @@ Or with the helper script:
 TURN_PLANNER=codex ./scripts/run.sh   # real Codex planning/execution
 ```
 
-### Postgres (authoritative store)
-
-```bash
-./scripts/setup_postgres.sh     # starts Postgres, creates role + db, prints URL
-export TURN_DATABASE_URL="postgresql+asyncpg://turn:turn@localhost:5432/turn"
-python -m turn
-```
-
 `.env.example` lists every configurable variable.
 
 ---
@@ -147,14 +139,14 @@ python -m turn
 ```
 turn/
   domain/schemas.py   # Node, Edge, Run, Artifact, PlanResult, WorkerResult (Pydantic)
-  db/                 # async SQLAlchemy store (Postgres-ready, SQLite default)
+  db/                 # async SQLAlchemy store (SQLite)
   graph/logic.py      # runnability, ancestry, derived progress (pure)
   workers/            # base protocols, registry, planner, codex/shell/echo adapters
   runner/             # runner loop, event bus, optional Prefect adapter
   server/             # FastAPI REST + SSE, UI mount
   tests/test_slice.py # offline vertical-slice proof
 ui/                   # single-page UI (prompt, live graph, node detail)
-scripts/              # run.sh, setup_postgres.sh
+scripts/              # run.sh
 ```
 
 ## Minimal vertical slice (proven)

@@ -15,7 +15,6 @@ venv/
 # Databases / runtime state
 *.db
 *.sqlite
-.pgdata/
 .turn/
 .pi/
 

@@ -2,9 +2,8 @@
 # Start the Turn UI server.
 #
 # Defaults run fully offline: SQLite store, heuristic planner, echo leaves.
-# Override with env vars (see .env.example). Examples:
+# Override with env vars (see .env.example). Example:
 #   TURN_PLANNER=codex ./scripts/run.sh        # Codex-backed planning + workers
-#   TURN_DATABASE_URL=postgresql+asyncpg://... ./scripts/run.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
