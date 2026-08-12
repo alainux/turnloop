@@ -41,8 +41,6 @@ class CodexWorker(Worker):
     # -- public ----------------------------------------------------------
 
     async def execute(self, ctx: "NodeExecutionContext") -> WorkerResult:
-        prompt = self._build_prompt(ctx)
-
         worktree = self._prepare_worktree(ctx.node.id) if self._repo_is_git() else None
         # Safety: with a repo configured we MUST run in an isolated worktree.
         # Refusing here is far better than letting Codex rewrite the main repo.
@@ -53,6 +51,10 @@ class CodexWorker(Worker):
                 retry_recommended=False,
             )
         cwd = worktree or os.getcwd()
+        # Run inside the isolated worktree, and keep Codex pointed AT that
+        # worktree (never the main repo) so it cannot rewrite files outside
+        # the isolation boundary.
+        prompt = self._build_prompt(ctx, cwd=cwd)
 
         schema_path = codex_schemas.write_schema(codex_schemas.RESULT_SCHEMA)
 
@@ -159,13 +161,19 @@ class CodexWorker(Worker):
 
     # -- prompt ----------------------------------------------------------
 
-    def _build_prompt(self, ctx: NodeExecutionContext) -> str:
+    def _build_prompt(self, ctx: NodeExecutionContext, cwd=None) -> str:
+        gp = ctx.node.generated_prompt or "Complete the objective above using the available tools."
+        # If we execute inside an isolated worktree, rewrite any mention of the
+        # main repository path so Codex operates on the worktree, not the source
+        # tree it was cloned from.
+        if cwd and self.s.repo_path and self.s.repo_path != cwd:
+            gp = gp.replace(self.s.repo_path, cwd)
         return f"""{render_context_block(ctx)}
 OBJECTIVE:
 {ctx.node.objective}
 
 TASK:
-{ctx.node.generated_prompt or "Complete the objective above using the available tools."}
+{gp}
 
 When you finish, append a fenced code block labeled `turn-result` containing JSON:
 {{"outcome": "COMPLETE"|"BLOCK"|"FAIL", "summary": "...", "missing_inputs": [{{"id":"...","label":"...","kind":"text|decision|credential|account|approval|file"}}]}}
