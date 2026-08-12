@@ -5,6 +5,7 @@ const state = {
   graph: { nodes: [], edges: [], artifacts: [] },
   openNodeId: null,
   projectAutoRun: true,
+  editing: false,
   es: null,
 };
 
@@ -196,6 +197,7 @@ function renderGraph() {
 
 // ---------------------------------------------------------------- detail
 async function renderDetail() {
+  state.editing = false;
   const res = await api(`/api/nodes/${state.openNodeId}`);
   const node = res.node;
   const d = $("#detail");
@@ -316,12 +318,15 @@ async function renderDetail() {
 }
 
 function editNode(node) {
+  state.editing = true;
   const d = $("#detail");
   const objBox = d.querySelector(".kv div");
   const ta = document.createElement("textarea");
   ta.value = node.objective;
   ta.rows = 3;
   objBox.replaceWith(ta);
+  ta.focus();
+  ta.select();
   const save = document.createElement("button");
   save.textContent = "Save revision";
   save.onclick = async () => {
@@ -330,9 +335,19 @@ function editNode(node) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ objective: ta.value }),
     });
+    state.editing = false;
     await loadGraph();
   };
-  d.insertBefore(save, d.querySelector(".actions"));
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  cancel.className = "secondary";
+  cancel.onclick = () => {
+    state.editing = false;
+    loadGraph();
+  };
+  const actions = d.querySelector(".actions");
+  d.insertBefore(save, actions);
+  d.insertBefore(cancel, actions);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -364,7 +379,7 @@ function connectStream() {
             pane.scrollTop = pane.scrollHeight;
           }
         }
-      } else {
+      } else if (!state.editing) {
         $("#status-line").textContent = "update: " + data.type;
         loadGraph();
       }
