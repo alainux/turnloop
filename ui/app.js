@@ -60,10 +60,10 @@ function buildTree() {
 }
 
 const SVGNS = "http://www.w3.org/2000/svg";
-const G_BOX_W = 210;
-const G_BOX_H = 54;
-const G_COL = 250;
-const G_ROW = 60;
+const G_BOX_W = 232;
+const G_BOX_H = 66;
+const G_COL = 290;
+const G_ROW = 74;
 const STATUS_COLOR = {
   COMPLETE: "#3fb950",
   RUNNING: "#5b8cff",
@@ -104,14 +104,23 @@ function renderGraph() {
     return;
   }
 
-  let maxX = 0;
-  let maxY = 0;
+  // compute the bounding box of all node boxes, then shift so nothing is clipped
+  let minBX = Infinity, minBY = Infinity, maxBX = -Infinity, maxBY = -Infinity;
   for (const p of pos.values()) {
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
+    minBX = Math.min(minBX, p.x);
+    minBY = Math.min(minBY, p.y - G_BOX_H / 2);
+    maxBX = Math.max(maxBX, p.x + G_BOX_W);
+    maxBY = Math.max(maxBY, p.y + G_BOX_H / 2);
   }
-  const W = maxX + G_COL;
-  const Ht = maxY + G_ROW;
+  const PAD = 16;
+  const xOff = PAD - minBX;
+  const yOff = PAD - minBY;
+  for (const p of pos.values()) {
+    p.x += xOff;
+    p.y += yOff;
+  }
+  const W = maxBX - minBX + 2 * PAD;
+  const Ht = maxBY - minBY + 2 * PAD;
 
   const canvas = el("div", {
     className: "graph-canvas",
@@ -128,13 +137,16 @@ function renderGraph() {
     const pa = pos.get(a);
     const pb = pos.get(b);
     if (!pa || !pb) return;
-    const line = document.createElementNS(SVGNS, "line");
-    line.setAttribute("x1", pa.x + G_BOX_W / 2);
-    line.setAttribute("y1", pa.y);
-    line.setAttribute("x2", pb.x + G_BOX_W / 2);
-    line.setAttribute("y2", pb.y);
-    if (cls) line.setAttribute("class", cls);
-    svg.appendChild(line);
+    const x1 = pa.x + G_BOX_W; // parent right-center
+    const y1 = pa.y;
+    const x2 = pb.x; // child left-center
+    const y2 = pb.y;
+    const midX = (x1 + x2) / 2;
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} H ${midX} V ${y2} H ${x2}`);
+    path.setAttribute("class", cls || "edge-contains");
+    path.setAttribute("fill", "none");
+    svg.appendChild(path);
   };
 
   // CONTAINS (hierarchy) from parent_id
