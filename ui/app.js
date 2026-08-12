@@ -6,6 +6,9 @@ const state = {
   openNodeId: null,
   projectAutoRun: true,
   editing: false,
+  streaming: false,
+  streamTimer: null,
+  termFollow: true,
   es: null,
 };
 
@@ -186,6 +189,8 @@ function renderGraph() {
     }
     box.onclick = () => {
       state.openNodeId = n.id;
+      state.streaming = false;
+      if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
       renderGraph();
       renderDetail();
     };
@@ -198,6 +203,8 @@ function renderGraph() {
 // ---------------------------------------------------------------- detail
 async function renderDetail() {
   state.editing = false;
+  state.streaming = false;
+  if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
   const res = await api(`/api/nodes/${state.openNodeId}`);
   const node = res.node;
   const d = $("#detail");
@@ -283,9 +290,15 @@ async function renderDetail() {
     const termBox = el("div", { className: "kv" }, [
       el("label", {}, "Live transcript (Codex)"),
     ]);
-    termBox.appendChild(
-      el("pre", { className: "terminal", id: "terminal-pane" }, transcriptContent),
-    );
+    const pane = el("pre", { className: "terminal", id: "terminal-pane" }, transcriptContent);
+    pane.addEventListener("scroll", () => {
+      // Remember whether the user is pinned to the bottom; if they scrolled
+      // up to read history, stop auto-following so we don't yank them down.
+      const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 30;
+      state.termFollow = atBottom;
+    });
+    if (state.termFollow) pane.scrollTop = pane.scrollHeight;
+    termBox.appendChild(pane);
     d.appendChild(termBox);
   }
 
@@ -371,17 +384,50 @@ function connectStream() {
       if (data.type === "connected") {
         $("#status-line").textContent = "live";
       } else if (data.type === "node.terminal") {
-        // Append raw Codex output to the open node's terminal pane (no graph reload).
+        // Live Codex output for the open node: append in place, no graph reload.
         if (data.data && data.data.node_id === state.openNodeId) {
           const pane = document.getElementById("terminal-pane");
           if (pane) {
             pane.textContent += data.data.chunk;
-            pane.scrollTop = pane.scrollHeight;
+            // Only auto-follow to the bottom if the user is already there;
+            // if they scrolled up to read, leave their position alone.
+            if (state.termFollow) pane.scrollTop = pane.scrollHeight;
           }
+          // Mark the open node as actively streaming and arm a fallback that
+          // ends "streaming" mode shortly after output stops (in case the
+          // terminal-status event is missed).
+          state.streaming = true;
+          if (state.streamTimer) clearTimeout(state.streamTimer);
+          state.streamTimer = setTimeout(() => {
+            state.streaming = false;
+            state.streamTimer = null;
+            loadGraph();
+          }, 3000);
         }
-      } else if (!state.editing) {
-        $("#status-line").textContent = "update: " + data.type;
-        loadGraph();
+      } else {
+        // Graph-change events. Avoid rebuilding the detail pane (which
+        // recreates the terminal <pre> and resets its scroll) while the user
+        // is editing or while the open node is actively producing output.
+        const isOpenUpdate =
+          data.type === "node.updated" && data.data && data.data.id === state.openNodeId;
+        const st = isOpenUpdate ? data.data.status : null;
+        const terminalTransition =
+          st === "COMPLETE" || st === "FAILED" || st === "CANCELLED";
+
+        if (isOpenUpdate && st === "RUNNING") state.streaming = true;
+
+        if (state.editing) {
+          // never reload while editing
+        } else if (state.streaming && !terminalTransition) {
+          // actively streaming: ignore intermediate updates (don't rebuild terminal)
+        } else {
+          if (terminalTransition) {
+            state.streaming = false;
+            if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
+          }
+          $("#status-line").textContent = "update: " + data.type;
+          loadGraph();
+        }
       }
     } catch (_) {}
   };
@@ -399,6 +445,8 @@ $("#prompt-form").addEventListener("submit", async (e) => {
 $("#project-select").addEventListener("change", async (e) => {
   state.projectId = e.target.value || null;
   state.openNodeId = null;
+  state.streaming = false;
+  if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
   connectStream();
   await loadGraph();
 });
