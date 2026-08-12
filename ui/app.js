@@ -201,13 +201,50 @@ function renderGraph() {
 }
 
 // ---------------------------------------------------------------- detail
+// Remember the scroll position of every inner scrollable block so that
+// rebuilding the detail pane (on each SSE update) does not yank the user
+// back to the top of the terminal / run history / artifacts.
+function snapshotScroll(d) {
+  const s = {};
+  const pane = d.querySelector("#terminal-pane");
+  if (pane) s.terminal = pane.scrollTop;
+  d.querySelectorAll(".run").forEach((r) => {
+    const idx = r.dataset.runIdx;
+    const p = r.querySelector("pre");
+    if (idx != null && p) s["run:" + idx] = p.scrollTop;
+  });
+  d.querySelectorAll(".artifact").forEach((a) => {
+    const idx = a.dataset.artIdx;
+    const p = a.querySelector("pre");
+    if (idx != null && p) s["art:" + idx] = p.scrollTop;
+  });
+  return s;
+}
+
+function restoreScroll(d, s) {
+  if (!s) return;
+  const pane = d.querySelector("#terminal-pane");
+  if (pane && s.terminal != null) pane.scrollTop = s.terminal;
+  d.querySelectorAll(".run").forEach((r) => {
+    const idx = r.dataset.runIdx;
+    const p = r.querySelector("pre");
+    if (idx != null && p && s["run:" + idx] != null) p.scrollTop = s["run:" + idx];
+  });
+  d.querySelectorAll(".artifact").forEach((a) => {
+    const idx = a.dataset.artIdx;
+    const p = a.querySelector("pre");
+    if (idx != null && p && s["art:" + idx] != null) p.scrollTop = s["art:" + idx];
+  });
+}
+
 async function renderDetail() {
   state.editing = false;
   state.streaming = false;
   if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
+  const d = $("#detail");
+  const scroll = snapshotScroll(d);
   const res = await api(`/api/nodes/${state.openNodeId}`);
   const node = res.node;
-  const d = $("#detail");
   d.innerHTML = "";
 
   d.appendChild(el("div", { className: "kv" }, [
@@ -306,14 +343,16 @@ async function renderDetail() {
   if (res.artifacts && res.artifacts.length) {
     d.appendChild(el("hr"));
     d.appendChild(el("label", { className: "kv" }, "Artifacts"));
+    let ai = 0;
     for (const a of res.artifacts) {
       if (a.name === "transcript") continue; // shown in the terminal pane above
-      const box = el("div", { className: "artifact" });
+      const box = el("div", { className: "artifact", "data-art-idx": String(ai) });
       box.appendChild(el("strong", {}, a.name + " · " + a.kind));
       if (a.ref) box.appendChild(el("div", { className: "muted" }, a.ref));
       const content = a.content == null ? "" : (typeof a.content === "string" ? a.content : JSON.stringify(a.content, null, 2));
       if (content) box.appendChild(el("pre", {}, content.slice(0, 4000)));
       d.appendChild(box);
+      ai++;
     }
   }
 
@@ -321,13 +360,14 @@ async function renderDetail() {
   if (res.runs && res.runs.length) {
     d.appendChild(el("hr"));
     d.appendChild(el("label", { className: "kv" }, "Run history"));
-    for (const r of res.runs.slice().reverse()) {
-      const box = el("div", { className: "run" });
+    res.runs.slice().reverse().forEach((r, i) => {
+      const box = el("div", { className: "run", "data-run-idx": String(i) });
       box.appendChild(el("div", {}, `${r.worker} · ${r.status}${r.outcome ? " · " + r.outcome : ""}`));
       if (r.summary) box.appendChild(el("pre", {}, r.summary));
       d.appendChild(box);
-    }
+    });
   }
+  restoreScroll(d, scroll);
 }
 
 function editNode(node) {
