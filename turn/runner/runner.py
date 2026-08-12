@@ -163,6 +163,9 @@ class Runner:
             node = node_by_id.get(nid)
             if node is None:
                 continue
+            # Respect an explicit pause: a paused node must not be auto-launched.
+            if node.paused:
+                continue
             self._running[nid] = asyncio.create_task(self._execute_node(node, project_id))
 
     # -- execution -------------------------------------------------------
@@ -459,10 +462,14 @@ class Runner:
         if node.status in (
             NodeStatus.COMPLETE,
             NodeStatus.FAILED,
-            NodeStatus.CANCELLED,
             NodeStatus.RUNNING,
         ):
             return None
+        # Revive a cancelled or paused node so the user can run it again.
+        if node.status == NodeStatus.CANCELLED:
+            await self.store.set_status(node_id, NodeStatus.RUNNABLE)
+        if node.paused:
+            await self.store.set_paused(node_id, False)
         self._running[node.id] = asyncio.create_task(
             self._execute_node(node, node.project_id)
         )
