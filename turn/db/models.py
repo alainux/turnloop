@@ -31,6 +31,7 @@ class NodeModel(Base):
     executor = Column(String(64), nullable=True)
     status = Column(String(16), nullable=False, default="PENDING")
     paused = Column(Boolean, nullable=False, default=False)
+    auto_run = Column(Boolean, nullable=False, default=True)
 
     required_inputs = Column(JSON, nullable=False, default=list)
     resource_refs = Column(JSON, nullable=False, default=list)

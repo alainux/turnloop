@@ -128,6 +128,11 @@ class Node(BaseModel):
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
     status: NodeStatus = NodeStatus.PENDING
     paused: bool = False
+    # Project-level execution mode: True = auto-run ready nodes (default);
+    # False = manual "step" mode where the runner plans but waits for an
+    # explicit step()/run_node() before executing. Effective only on the
+    # project root node (id == project_id).
+    auto_run: bool = True
 
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)

@@ -23,7 +23,13 @@
 
   <main>
     <section id="graph-pane">
-      <div class="pane-title">WorkGraph</div>
+      <div class="pane-title">
+        WorkGraph
+        <span class="pane-controls">
+          <label class="switch"><input type="checkbox" id="auto-run" checked /> Auto-run</label>
+          <button id="step-btn" type="button" hidden>Step ▶</button>
+        </span>
+      </div>
       <div class="graph-legend">solid = contains · <span style="color:#d29922">dashed = depends on</span></div>
       <div id="graph"></div>
     </section>

@@ -4,6 +4,7 @@ const state = {
   projectId: null,
   graph: { nodes: [], edges: [], artifacts: [] },
   openNodeId: null,
+  projectAutoRun: true,
   es: null,
 };
 
@@ -39,8 +40,13 @@ async function createProject(prompt) {
 // ---------------------------------------------------------------- graph
 async function loadGraph() {
   if (!state.projectId) return;
-  state.graph = await api(`/api/projects/${state.projectId}/graph`);
+  const data = await api(`/api/projects/${state.projectId}/graph`);
+  state.graph = data;
+  // project auto-run mode comes from the root node (id === project_id)
+  const root = (data.nodes || []).find((n) => n.id === state.projectId) || (data.nodes || []).find((n) => !n.parent_id);
+  if (root) state.projectAutoRun = root.auto_run !== false;
   renderGraph();
+  syncModeControls();
   if (state.openNodeId) renderDetail();
 }
 
@@ -249,6 +255,9 @@ async function renderDetail() {
     b.onclick = fn;
     return b;
   };
+  if (node.status === "RUNNABLE") {
+    actions.append(mk("Run ▶", "run", async () => { await runNode(node.id); }));
+  }
   actions.append(
     mk("Edit", "secondary", () => editNode(node)),
     mk("Regenerate ↓", "secondary", async () => { await api(`/api/nodes/${node.id}/regenerate`, { method: "POST" }); await loadGraph(); }),
@@ -378,5 +387,38 @@ $("#project-select").addEventListener("change", async (e) => {
   connectStream();
   await loadGraph();
 });
+
+document.getElementById("auto-run").addEventListener("change", (e) => setMode(e.target.checked));
+document.getElementById("step-btn").addEventListener("click", stepProject);
+
+function syncModeControls() {
+  const cb = document.getElementById("auto-run");
+  const step = document.getElementById("step-btn");
+  if (cb) cb.checked = state.projectAutoRun;
+  if (step) step.hidden = state.projectAutoRun;
+}
+
+async function setMode(autoRun) {
+  if (!state.projectId) return;
+  await api(`/api/projects/${state.projectId}/mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_run: autoRun }),
+  });
+  state.projectAutoRun = autoRun;
+  syncModeControls();
+}
+
+async function stepProject() {
+  if (!state.projectId) return;
+  await api(`/api/projects/${state.projectId}/step`, { method: "POST" });
+  await loadGraph();
+}
+
+async function runNode(nid) {
+  if (!nid) return;
+  await api(`/api/nodes/${nid}/run`, { method: "POST" });
+  await loadGraph();
+}
 
 refreshProjects();

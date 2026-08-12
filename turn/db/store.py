@@ -10,7 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from turn.db.base import make_engine, make_session_factory
@@ -55,6 +56,7 @@ def _node_from_model(m: NodeModel) -> Node:
         executor=m.executor,
         status=NodeStatus(m.status),
         paused=m.paused,
+        auto_run=m.auto_run,
         required_inputs=[InputSpec(**d) for d in (m.required_inputs or [])],
         resource_refs=list(m.resource_refs or []),
         artifact_refs=[uuid.UUID(x) for x in (m.artifact_refs or [])],
@@ -113,6 +115,15 @@ class Store:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        # Self-heal older schemas: add the auto_run column if it is missing
+        # (e.g. a DB created before manual-stepping support existed).
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text("ALTER TABLE nodes ADD COLUMN auto_run BOOLEAN NOT NULL DEFAULT 1")
+                )
+        except OperationalError:
+            pass
 
     async def dispose(self) -> None:
         await self.engine.dispose()
@@ -134,6 +145,7 @@ class Store:
             generated_prompt=prompt,
             executor=PLANNER_EXECUTOR,
             status=NodeStatus.PENDING.value,
+            auto_run=True,
         )
         async with self.session() as s:
             s.add(node)
@@ -266,6 +278,7 @@ class Store:
             m.executor = node.executor
             m.status = node.status.value
             m.paused = node.paused
+            m.auto_run = node.auto_run
             m.required_inputs = [d.model_dump(mode="json") for d in node.required_inputs]
             m.resource_refs = list(node.resource_refs)
             m.artifact_refs = [str(x) for x in node.artifact_refs]
@@ -289,6 +302,13 @@ class Store:
         if n is None:
             return None
         n.paused = paused
+        return await self._save_node(n)
+
+    async def set_auto_run(self, project_id: uuid.UUID, auto_run: bool) -> Optional[Node]:
+        n = await self.get_node(project_id)
+        if n is None:
+            return None
+        n.auto_run = auto_run
         return await self._save_node(n)
 
     async def create_node(

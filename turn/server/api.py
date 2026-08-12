@@ -43,6 +43,10 @@ class EditNode(BaseModel):
     resource_refs: Optional[list[str]] = None
 
 
+class SetMode(BaseModel):
+    auto_run: bool
+
+
 # -- helpers ---------------------------------------------------------------
 
 
@@ -80,6 +84,22 @@ async def list_projects(request: Request):
     store: Store = request.app.state.store
     roots = await store.list_projects()
     return {"projects": [_dump(r) for r in roots]}
+
+
+@router.post("/api/projects/{project_id}/mode")
+async def set_mode(project_id: str, body: SetMode, request: Request):
+    """Toggle a project between auto-run and manual step mode."""
+    runner = await _runner(request)
+    await runner.set_mode(uuid.UUID(project_id), body.auto_run)
+    return {"ok": True}
+
+
+@router.post("/api/projects/{project_id}/step")
+async def step_project(project_id: str, request: Request):
+    """Manual mode: execute the next runnable node (one step)."""
+    runner = await _runner(request)
+    nid = await runner.step(uuid.UUID(project_id))
+    return {"ok": nid is not None, "stepped": str(nid) if nid else None}
 
 
 @router.get("/api/projects/{project_id}/graph")
@@ -202,13 +222,7 @@ async def cancel(node_id: str, request: Request):
 
 @router.post("/api/nodes/{node_id}/run")
 async def run_node(node_id: str, request: Request):
-    """Manually mark a node runnable so the runner picks it up."""
-    store: Store = request.app.state.store
-    nid = uuid.UUID(node_id)
-    node = await store.get_node(nid)
-    if node is None:
-        raise HTTPException(404, "node not found")
-    if node.status in (NodeStatus.CANCELLED, NodeStatus.COMPLETE, NodeStatus.FAILED):
-        await store.set_status(nid, NodeStatus.RUNNABLE)
-    request.app.state.runner.wake()
-    return {"ok": True}
+    """Manually execute a specific node (works in any mode)."""
+    runner = await _runner(request)
+    nid = await runner.run_node(uuid.UUID(node_id))
+    return {"ok": nid is not None, "ran": str(nid) if nid else None}

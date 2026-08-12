@@ -40,6 +40,16 @@ def _dump(obj):
     return obj
 
 
+def _depth(node_id, idx) -> int:
+    """Depth of a node in the CONTAINS hierarchy (root = 0)."""
+    d = 0
+    cur = idx.parents.get(node_id)
+    while cur is not None and cur in idx.node_by_id:
+        d += 1
+        cur = idx.parents.get(cur)
+    return d
+
+
 class Runner:
     def __init__(
         self,
@@ -130,6 +140,19 @@ class Runner:
                 await self._emit(
                     "node.updated", project_id, _dump(node_by_id[n.id])
                 )
+
+        # --- manual mode -------------------------------------------------
+        # When the project root is not auto-run, we still compute and persist
+        # effective statuses (so the UI can show what is ready) but we do NOT
+        # launch anything. The user drives execution via step()/run_node().
+        root = node_by_id.get(project_id)
+        if root is not None and not root.auto_run:
+            await self._emit(
+                "project.manual",
+                project_id,
+                {"runnable": [str(x) for x in ev.runnable]},
+            )
+            return
 
         for nid in ev.runnable:
             if nid in self._running:
@@ -378,6 +401,56 @@ class Runner:
         else:
             await self.store.set_status(node_id, NodeStatus.CANCELLED)
             await self._emit("node.updated", node.project_id, _dump(node))
+        self.wake()
+
+    # -- manual stepping --------------------------------------------------
+
+    async def step(self, project_id: uuid.UUID) -> Optional[uuid.UUID]:
+        """Manual mode: run exactly one runnable node (shallowest first).
+
+        Returns the executed node id, or None if nothing is runnable.
+        """
+        nodes, edges, _ = await self.store.get_workgraph(project_id)
+        if not nodes:
+            return None
+        ev = evaluate(nodes, edges)
+        idx = build_indexes(nodes, edges)
+        candidates = [nid for nid in ev.runnable if nid not in self._running]
+        if not candidates:
+            return None
+        # shallowest-first so planners/containers run before their leaves
+        candidates.sort(key=lambda nid: (_depth(nid, idx), str(nid)))
+        node = idx.node_by_id.get(candidates[0])
+        if node is None:
+            return None
+        self._running[node.id] = asyncio.create_task(
+            self._execute_node(node, project_id)
+        )
+        return node.id
+
+    async def run_node(self, node_id: uuid.UUID) -> Optional[uuid.UUID]:
+        """Manually execute a specific node regardless of auto-run mode."""
+        node = await self.store.get_node(node_id)
+        if node is None:
+            return None
+        if node.id in self._running:
+            return None
+        if node.status in (
+            NodeStatus.COMPLETE,
+            NodeStatus.FAILED,
+            NodeStatus.CANCELLED,
+            NodeStatus.RUNNING,
+        ):
+            return None
+        self._running[node.id] = asyncio.create_task(
+            self._execute_node(node, node.project_id)
+        )
+        return node.id
+
+    async def set_mode(self, project_id: uuid.UUID, auto_run: bool) -> None:
+        node = await self.store.set_auto_run(project_id, auto_run)
+        if node is not None:
+            await self._emit("node.updated", project_id, _dump(node))
         self.wake()
 
     # -- helpers ---------------------------------------------------------

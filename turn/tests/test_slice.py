@@ -200,5 +200,78 @@ async def main() -> None:
     print("VERTICAL SLICE TEST PASSED")
 
 
+async def test_manual_mode() -> None:
+    """Manual stepping: the runner plans but never auto-executes; each step
+    runs exactly one runnable node, and a plain tick does nothing."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    await store.init()
+    events = EventBus()
+    runner = Runner(store, registry=build_registry(), events=events, settings=settings)
+
+    root = await store.create_project("Ship a tiny landing page for turnloop.tech (manual)")
+    await store.set_auto_run(root.id, False)
+
+    # In manual mode a tick must NOT auto-run anything.
+    await runner.tick()
+    assert runner._running == {}, "manual mode must not auto-run on tick"
+    nodes, _, _ = await store.get_workgraph(root.id)
+    assert len(nodes) == 1, "planner should not have run yet"
+
+    # Step the planner -> it builds the graph.
+    nid = await runner.step(root.id)
+    assert nid == root.id, "first step should run the planner root"
+    if runner._running:
+        await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
+    assert runner._running == {}, "step task should have finished"
+    nodes, _, _ = await store.get_workgraph(root.id)
+    children = [n for n in nodes if n.parent_id == root.id]
+    assert len(children) == 3, "planner should have created 3 children"
+
+    # Still manual: a tick runs nothing; leaves are merely RUNNABLE.
+    await runner.tick()
+    assert runner._running == {}
+    a = find_node(children, "Investigate the objective")
+    a = await store.get_node(a.id)
+    assert a.status == NodeStatus.RUNNABLE
+
+    # Step one leaf at a time; shallowest (a) runs first.
+    nid = await runner.step(root.id)
+    assert nid == a.id
+    if runner._running:
+        await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
+    a = await store.get_node(a.id)
+    assert a.status == NodeStatus.COMPLETE
+
+    # b is BLOCKED until its input is supplied (re-evaluate after a completes).
+    await runner.tick()
+    b = await store.get_node(find_node(children, "Confirm the key decision").id)
+    assert b.status == NodeStatus.BLOCKED
+    await runner.provide_input(b.id, "decision_x", "single hero section")
+    nid = await runner.step(root.id)
+    assert nid == b.id
+    if runner._running:
+        await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
+    b = await store.get_node(b.id)
+    assert b.status == NodeStatus.COMPLETE
+
+    # c joins after b; step it to finish.
+    c = find_node(children, "Produce the deliverable")
+    nid = await runner.step(root.id)
+    assert nid == c.id
+    if runner._running:
+        await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
+    c = await store.get_node(c.id)
+    assert c.status == NodeStatus.COMPLETE
+
+    # a final tick derives container completion for the root
+    await runner.tick()
+    root = await store.get_node(root.id)
+    assert root.status == NodeStatus.COMPLETE
+    await store.dispose()
+    print("MANUAL MODE TEST PASSED")
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    asyncio.run(test_manual_mode())
