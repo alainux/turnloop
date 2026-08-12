@@ -108,6 +108,25 @@ async def list_projects(request: Request):
     return {"projects": [_dump(r) for r in roots]}
 
 
+@router.delete("/api/projects")
+async def clear_projects(request: Request):
+    """Remove all projects and their data (keeps cross-project settings)."""
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    await store.clear_projects()
+    runner.wake()
+    return {"ok": True}
+
+
+@router.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, request: Request):
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    await store.delete_project(uuid.UUID(project_id))
+    runner.wake()
+    return {"ok": True}
+
+
 @router.post("/api/projects/{project_id}/mode")
 async def set_mode(project_id: str, body: SetMode, request: Request):
     """Toggle a project between auto-run and manual step mode."""

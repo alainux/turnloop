@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -170,6 +170,29 @@ class Store:
                 )
             ).scalars().all()
             return [_node_from_model(m) for m in rows]
+
+    async def delete_project(self, project_id: uuid.UUID) -> None:
+        """Delete a single project and all of its nodes/edges/runs/artifacts."""
+        ids = select(NodeModel.id).where(NodeModel.project_id == project_id)
+        async with self.session() as s:
+            await s.execute(delete(ArtifactModel).where(ArtifactModel.node_id.in_(ids)))
+            await s.execute(delete(RunModel).where(RunModel.node_id.in_(ids)))
+            await s.execute(
+                delete(EdgeModel).where(
+                    (EdgeModel.src.in_(ids)) | (EdgeModel.dst.in_(ids))
+                )
+            )
+            await s.execute(delete(NodeModel).where(NodeModel.project_id == project_id))
+            await s.commit()
+
+    async def clear_projects(self) -> None:
+        """Remove every project and all associated data (keeps settings)."""
+        async with self.session() as s:
+            await s.execute(delete(ArtifactModel))
+            await s.execute(delete(RunModel))
+            await s.execute(delete(EdgeModel))
+            await s.execute(delete(NodeModel))
+            await s.commit()
 
     # -- node reads ------------------------------------------------------
 
