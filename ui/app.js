@@ -398,9 +398,11 @@ function editNode(node) {
     state.editing = false;
     loadGraph();
   };
+  const editActions = document.createElement("div");
+  editActions.className = "edit-actions";
+  editActions.append(save, cancel);
   const actions = d.querySelector(".actions");
-  d.insertBefore(save, actions);
-  d.insertBefore(cancel, actions);
+  d.insertBefore(editActions, actions);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -532,6 +534,14 @@ async function setMode(autoRun) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ auto_run: autoRun }),
   });
+  // Remember this choice as the default for future projects.
+  try {
+    await api(`/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ default_auto_run: autoRun }),
+    });
+  } catch (_) {}
   state.projectAutoRun = autoRun;
   syncModeControls();
 }

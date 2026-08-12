@@ -74,8 +74,27 @@ main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; }
 
 /* detail */
 .muted { color: var(--muted); }
-.kv { margin: 8px 0; }
+.kv { margin: 8px 0; min-width: 0; }
 .kv label { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+/* Long machine-generated prompts must wrap + scroll instead of blowing out
+   the right panel. `:not(.terminal)` keeps the live-transcript pane's own
+   (higher-specificity) styling intact. */
+.kv pre:not(.terminal) {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 4px 0 0;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+.kv form { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.kv form input[type=text] { flex: 1; }
+.edit-actions { display: flex; gap: 6px; margin: 8px 0; }
 textarea, input[type=text] {
   width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
   border-radius: 8px; padding: 8px; font: inherit; resize: vertical;
