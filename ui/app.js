@@ -413,6 +413,25 @@ function el(tag, attrs, children) {
   return e;
 }
 
+// ---------------------------------------------------------------- scroll guard
+// Rebuilding the detail pane tears down its scrollable blocks; doing that in
+// the middle of a user scroll gesture "blocks" the scroll. While the user is
+// actively scrolling we skip reloads and instead refresh once they settle.
+let userScrolling = false;
+let userScrollTimer = null;
+function markUserScroll() {
+  userScrolling = true;
+  if (userScrollTimer) clearTimeout(userScrollTimer);
+  userScrollTimer = setTimeout(() => {
+    userScrolling = false;
+    if (!state.editing && !state.streaming) loadGraph();
+  }, 450);
+}
+function scheduleReload() {
+  if (userScrolling) return;
+  loadGraph();
+}
+
 // ---------------------------------------------------------------- streaming
 function connectStream() {
   if (state.es) state.es.close();
@@ -441,7 +460,7 @@ function connectStream() {
           state.streamTimer = setTimeout(() => {
             state.streaming = false;
             state.streamTimer = null;
-            loadGraph();
+            scheduleReload();
           }, 3000);
         }
       } else {
@@ -466,7 +485,7 @@ function connectStream() {
             if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
           }
           $("#status-line").textContent = "update: " + data.type;
-          loadGraph();
+          scheduleReload();
         }
       }
     } catch (_) {}
@@ -493,6 +512,11 @@ $("#project-select").addEventListener("change", async (e) => {
 
 document.getElementById("auto-run").addEventListener("change", (e) => setMode(e.target.checked));
 document.getElementById("step-btn").addEventListener("click", stepProject);
+
+// Don't let live updates rebuild the detail pane in the middle of a scroll.
+document.getElementById("detail-pane").addEventListener("scroll", markUserScroll, { passive: true });
+document.addEventListener("wheel", markUserScroll, { passive: true });
+document.addEventListener("touchmove", markUserScroll, { passive: true });
 
 function syncModeControls() {
   const cb = document.getElementById("auto-run");
