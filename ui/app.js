@@ -9,6 +9,7 @@ const state = {
   streaming: false,
   streamTimer: null,
   termFollow: true,
+  termBuffer: "",
   es: null,
 };
 
@@ -192,6 +193,7 @@ function renderGraph() {
     box.onclick = () => {
       state.openNodeId = n.id;
       state.streaming = false;
+      state.termBuffer = "";
       if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
       renderGraph();
       renderDetail();
@@ -333,17 +335,21 @@ async function renderDetail() {
 
   // live transcript (raw Codex output) — terminal-styled pane
   const transcriptArt = (res.artifacts || []).find((a) => a.name === "transcript");
-  const transcriptContent =
+  const artifactText =
     transcriptArt && transcriptArt.content
       ? (typeof transcriptArt.content === "string"
           ? transcriptArt.content
           : JSON.stringify(transcriptArt.content, null, 2))
       : "";
-  if (transcriptContent.length > 0 || node.status === "RUNNING") {
+  // While the node is running, prefer the accumulated live buffer (the
+  // transcript artifact is only written once the run completes).
+  const liveText =
+    node.status === "RUNNING" && state.termBuffer ? state.termBuffer : artifactText;
+  if (liveText.length > 0 || node.status === "RUNNING") {
     const termBox = el("div", { className: "kv" }, [
       el("label", {}, "Live transcript (Codex)"),
     ]);
-    const pane = el("pre", { className: "terminal", id: "terminal-pane" }, transcriptContent);
+    const pane = el("pre", { className: "terminal", id: "terminal-pane" }, liveText);
     pane.addEventListener("scroll", () => {
       // Remember whether the user is pinned to the bottom; if they scrolled
       // up to read history, stop auto-following so we don't yank them down.
@@ -463,48 +469,47 @@ function connectStream() {
       } else if (data.type === "node.terminal") {
         // Live Codex output for the open node: append in place, no graph reload.
         if (data.data && data.data.node_id === state.openNodeId) {
+          // Accumulate into a persistent buffer so the transcript survives any
+          // incidental detail-pane rebuild (which would otherwise recreate the
+          // <pre> and wipe streamed output). Render the full buffer each time.
+          state.termBuffer += data.data.chunk;
           const pane = document.getElementById("terminal-pane");
           if (pane) {
-            pane.textContent += data.data.chunk;
-            // Only auto-follow to the bottom if the user is already there;
-            // if they scrolled up to read, leave their position alone.
+            pane.textContent = state.termBuffer;
             if (state.termFollow) pane.scrollTop = pane.scrollHeight;
           }
-          // Mark the open node as actively streaming and arm a fallback that
-          // ends "streaming" mode shortly after output stops (in case the
-          // terminal-status event is missed).
           state.streaming = true;
           if (state.streamTimer) clearTimeout(state.streamTimer);
           state.streamTimer = setTimeout(() => {
             state.streaming = false;
             state.streamTimer = null;
-            scheduleReload();
           }, 3000);
         }
       } else {
-        // Graph-change events. Avoid rebuilding the detail pane (which
-        // recreates the terminal <pre> and resets its scroll) while the user
-        // is editing or while the open node is actively producing output.
         const isOpenUpdate =
           data.type === "node.updated" && data.data && data.data.id === state.openNodeId;
         const st = isOpenUpdate ? data.data.status : null;
         const terminalTransition =
           st === "COMPLETE" || st === "FAILED" || st === "CANCELLED";
-
-        if (isOpenUpdate && st === "RUNNING") state.streaming = true;
-
-        if (state.editing) {
-          // never reload while editing
-        } else if (state.streaming && !terminalTransition) {
-          // actively streaming: ignore intermediate updates (don't rebuild terminal)
-        } else {
-          if (terminalTransition) {
-            state.streaming = false;
-            if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
-          }
-          $("#status-line").textContent = "update: " + data.type;
-          scheduleReload();
+        // A fresh run of the open node starts a new live transcript.
+        if (data.type === "run.created" && data.data && data.data.node_id === state.openNodeId) {
+          state.termBuffer = "";
         }
+        if (isOpenUpdate && st === "RUNNING") state.streaming = true;
+        if (terminalTransition) {
+          // Live run finished: the transcript artifact now holds the full
+          // output, so drop the accumulated live buffer.
+          state.streaming = false;
+          state.termBuffer = "";
+          if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
+        }
+        // While the open node is actively streaming (or the user is editing),
+        // never rebuild the detail pane -- that recreates the terminal <pre>
+        // and would lose scroll. The persistent termBuffer keeps the live
+        // transcript intact across any incidental reloads.
+        if (state.editing || state.streaming) return;
+        $("#status-line").textContent = "update: " + data.type;
+        scheduleReload();
       }
     } catch (_) {}
   };
