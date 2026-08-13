@@ -498,6 +498,14 @@ class Store:
             parent_id = (
                 keys_to_ids[spec.parent_key] if spec.parent_key else parent.id
             )
+            # A node flagged plan:true (or explicitly a planner) is itself a
+            # sub-planner: the runner decomposes it again on its next turn
+            # rather than executing it as a leaf worker.
+            executor = (
+                PLANNER_EXECUTOR
+                if (spec.plan or spec.executor == PLANNER_EXECUTOR)
+                else (spec.executor or "codex")
+            )
             new_models.append(
                 NodeModel(
                     id=nid,
@@ -505,7 +513,7 @@ class Store:
                     parent_id=parent_id,
                     objective=spec.objective,
                     generated_prompt=spec.generated_prompt,
-                    executor=spec.executor,
+                    executor=executor,
                     status=NodeStatus.PENDING.value,
             required_inputs=[d.model_dump(mode="json") for d in spec.required_inputs],
                     resource_refs=list(spec.resource_refs),

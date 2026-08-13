@@ -182,8 +182,15 @@ If the task is too broad to complete directly, set "outcome": "EXPAND" and ALSO 
 separate fenced block labeled `turn-plan` containing JSON:
 {{"nodes":[{{"key":"a","objective":"...","executor":"codex"}}], "edges":[]}}
 
-Never invent missing information. If something required (input, account, credential, file,
-decision, or approval) is missing, return outcome "BLOCK" with explicit missing_inputs.
+Never invent facts you do not have. However, do NOT block merely because a
+prerequisite step's output is not pasted into this prompt: a "depends_on" edge
+means that step already ran first and its artifacts are part of your available
+context (read them from the worktree or the provided context blocks).
+Only return outcome "BLOCK" with explicit missing_inputs when a genuine
+EXTERNAL gate is missing — a credential, account, approval, or a file the human
+must supply — something no automated step or your own tools can produce. If you
+can proceed using the objective, the provided context, and your tools, do so
+and return "COMPLETE".
 """
 
     # -- parsing ---------------------------------------------------------

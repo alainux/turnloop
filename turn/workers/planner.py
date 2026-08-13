@@ -122,49 +122,59 @@ class CodexPlanner(Planner):
 THIS NODE'S OBJECTIVE:
 {ctx.node.objective}
 
-You are planning the DIRECT children of this node. Produce the SMALLEST useful
-set of concrete, runnable child steps that can begin executing now. Decompose
-only far enough to expose real work.
+You are decomposing THIS node into its direct children. Produce the SMALLEST
+useful set of concrete, runnable child steps that can begin executing now.
+Decompose only far enough to expose real work.
 
-SCOPE & CARDINALITY (important):
-- Honor the user's explicit scope. If the objective asks for a SINGLE step
-  (e.g. it contains "one", "a single", "just one", "next step", "the next
-  step", "first step", or "only"), produce EXACTLY ONE child node. Do NOT pad
-  the graph with investigate / implement / verify scaffolding — the requested
-  step itself is the one child.
-- When the objective already names a concrete, executable action, the smallest
-  useful graph is usually a SINGLE child that performs it. Prefer one
-  well-specified child over a generic multi-step breakdown. Only split when a
-  genuine prerequisite or dependency truly exists.
-- Give that single child a concrete objective describing the ACTION to take
-  (e.g. "Create the X"), not a restatement of this node's objective.
+DECOMPOSITION POLICY — match the structure to the objective:
+- ATOMIC step: if the objective is a SINGLE concrete step (it says "one", "a
+single", "just one", "the next step", "first step", or names exactly one
+action), produce EXACTLY ONE child that performs it. Do NOT pad with
+investigate / plan / verify scaffolding.
+- BROAD container: if the objective is a wide effort (e.g. "build X",
+"create a game", "implement the system", "plan the project"), decompose into
+the genuinely distinct sub-tasks and express their relationships using the
+TOPOLOGY rules below.
+- Prefer one well-specified child over generic multi-step scaffolding. A child
+that merely restates this objective is never useful — drop it.
 
-HARD RULES:
-- Return ONLY this node's direct children. Do NOT create a child that merely
-  restates or summarizes this objective, and do NOT create a "coordinator",
-  "oversee", or "manage" wrapper node — this node is already the coordinator.
-- Keep it FLAT: every child's parent_key must be null (a direct child of this
-  node). Do not nest children under other children.
-- List the children IN EXECUTION ORDER: any step that is a prerequisite must
-  appear BEFORE the steps that depend on it.
-- Use dependencies (edges) only where genuinely required, and never create a
-  cycle (a step must never depend, directly or transitively, on itself).
-- Only add required_inputs when a human decision, credential, account, approval,
-  or file is genuinely required to START the step; otherwise omit them so the
-  step can run immediately via its executor.
-- Assign each child executor="codex" (it can use its own tools, including the
-  shell, to do the work). Only use executor="shell" when the task is exactly one
-  shell command, and in that case put that command alone in generated_prompt.
-  Never use executor="echo" for real work.
-- Give every child a concrete generated_prompt that includes the actual task,
-  the working directory, and any context from the objective above.
+TOPOLOGY — arrange the children to express the real workflow:
+- SEQUENTIAL: steps that must run in order. The later step lists its
+  prerequisite as a "depends_on" key.
+- PARALLEL: independent steps that can run at the same time have NO depends_on.
+- COMPLEX: freely mix sequential chains and parallel branches.
+- NESTED PLANNERS: for any sub-task that is itself a broad problem, set
+  "plan": true AND "executor": "planner". Such a node will be decomposed AGAIN
+  on its next turn — so do NOT pre-expand it here; give it a clear objective and
+  let it plan its own children. Limit the chain to at most two levels of
+  sub-planners.
+- LEAF WORK: every node that actually does work (writing code, prose, files)
+  gets "executor": "codex" and a concrete "generated_prompt". Never use
+  "executor": "echo" for real work; only use "shell" for a single shell command
+  (put that command alone in generated_prompt).
+
+ORDER & SAFETY:
+- List children IN EXECUTION ORDER (prerequisites before the steps that depend
+  on them).
+- Never create a cycle (a step must never depend, directly or transitively, on
+  itself).
+- Only add "required_inputs" for a genuinely EXTERNAL, human-supplied item — a
+  decision, credential, account, approval, or a file the user must provide.
+  NEVER use required_inputs to hand data from one step to another: a
+  "depends_on" edge already guarantees the prerequisite ran first, and its
+  outputs are available to the dependent step as context. If a step needs the
+  result of a prior step, DEPEND ON that step; do not block on an input for it.
+  Leave required_inputs empty unless a real human gate exists.
+- Do NOT create a "coordinator" / "oversee" / "manage" wrapper node — this node
+  is already the coordinator.
+- Every child is a DIRECT child of this node (parent_key must be null).
 
 Return ONLY a fenced code block labeled `turn-plan` containing JSON:
 {{
   "nodes": [
-    {{"key":"unique","objective":"...","executor":"codex","generated_prompt":"...","required_inputs":[{{"id":"x","label":"...","kind":"text|decision|credential|account|approval|file"}}],"resource_refs":[],"parent_key":null,"depends_on":["otherkey"]}}
+    {{"key":"unique","objective":"...","executor":"codex"|"planner","plan":false|true,"generated_prompt":"...","required_inputs":[{{"id":"x","label":"...","kind":"text|decision|credential|account|approval|file"}}],"resource_refs":[],"parent_key":null,"depends_on":["otherkey"]}}
   ],
-  "edges": [{{"type":"DEPENDS_ON","src":"a","dst":"b"}}]
+  "edges": []
 }}
 """
 
@@ -256,6 +266,7 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
                 resource_refs=list(n.get("resource_refs", [])),
                 parent_key=n.get("parent_key"),
                 depends_on=list(n.get("depends_on", [])),
+                plan=bool(n.get("plan", False)),
             )
             for n in data.get("nodes", [])
         ]

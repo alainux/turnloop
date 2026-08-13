@@ -247,6 +247,10 @@ class NodeSpec(BaseModel):
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
     depends_on: list[str] = Field(default_factory=list)  # prerequisite keys
+    # When True (or executor == "planner") the created node is itself a
+    # sub-planner: the runner will decompose it again on its next turn instead
+    # of executing it as a leaf. This lets plans nest planners arbitrarily.
+    plan: bool = False
 
 
 class EdgeSpec(BaseModel):

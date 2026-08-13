@@ -208,6 +208,56 @@ async def test_worker_prompt_points_at_worktree() -> None:
     print("WORKER PROMPT ISOLATION TEST PASSED")
 
 
+async def test_planner_topology() -> None:
+    """apply_plan must build sequential, parallel, and nested-planner graphs.
+
+    A broad objective decomposes into a leaf (engine), two sub-planners
+    (chapters), and a join node (assemble) that depends on all of them.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    await store.init()
+    root = await store.create_project("Build a choose-your-own-adventure game")
+
+    plan = PlanResult(
+        nodes=[
+            NodeSpec(key="engine", objective="Build the game engine", executor="codex"),
+            NodeSpec(key="ch1", objective="Write chapter 1", executor="planner", plan=True),
+            NodeSpec(key="ch2", objective="Write chapter 2", executor="planner", plan=True),
+            NodeSpec(
+                key="assemble",
+                objective="Assemble the game",
+                executor="codex",
+                depends_on=["engine", "ch1", "ch2"],
+            ),
+        ]
+    )
+    created = await store.apply_plan(root, plan)
+    assert len(created) == 4, created
+
+    by_obj = {n.objective: n for n in created}
+    engine = by_obj["Build the game engine"]
+    ch1 = by_obj["Write chapter 1"]
+    ch2 = by_obj["Write chapter 2"]
+    assemble = by_obj["Assemble the game"]
+
+    # nested planners are flagged as planner executors
+    assert ch1.executor == "planner"
+    assert ch2.executor == "planner"
+    assert engine.executor == "codex"
+    # the parent becomes a container
+    assert (await store.get_node(root.id)).status == NodeStatus.EXPANDED
+
+    # edges: ch1/ch2 are PARALLEL (no deps); assemble DEPENDS_ON all three
+    _, edges, _ = await store.get_workgraph(root.id)
+    deps = [e for e in edges if e.type == EdgeType.DEPENDS_ON]
+    assert any(e.src == engine.id and e.dst == assemble.id for e in deps)
+    assert any(e.src == ch1.id and e.dst == assemble.id for e in deps)
+    assert any(e.src == ch2.id and e.dst == assemble.id for e in deps)
+    assert not any(e.dst == ch1.id for e in deps)  # chapters have no deps -> parallel
+    print("PLANNER TOPOLOGY TEST PASSED")
+
+
 if __name__ == "__main__":
     asyncio.run(test_auto_run_default())
     asyncio.run(test_codex_worker_refuses_main_repo())
@@ -215,3 +265,4 @@ if __name__ == "__main__":
     asyncio.run(test_pause_respected())
     asyncio.run(test_cancel_then_rerun())
     asyncio.run(test_worker_prompt_points_at_worktree())
+    asyncio.run(test_planner_topology())

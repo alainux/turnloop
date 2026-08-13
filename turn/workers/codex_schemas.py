@@ -40,6 +40,7 @@ _NODE = {
         "resource_refs": {"type": "array", "items": {"type": "string"}},
         "parent_key": {"type": ["string", "null"]},
         "depends_on": {"type": "array", "items": {"type": "string"}},
+        "plan": {"type": "boolean"},
     },
     "required": [
         "key",
@@ -50,6 +51,7 @@ _NODE = {
         "resource_refs",
         "parent_key",
         "depends_on",
+        "plan",
     ],
 }
 
