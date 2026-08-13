@@ -111,16 +111,19 @@ def init_project_repo(
         if r.returncode != 0:
             raise RuntimeError("git init failed: " + r.stderr)
 
-    # Ensure at least one commit exists so we can branch off HEAD.
+    # Never let the scratch worktree tree pollute project commits. Write it
+    # BEFORE the initial commit so it is tracked from the very first tree.
+    _ensure_gitignore(repo)
+
+    # Ensure at least one commit exists so we can branch off HEAD. The initial
+    # commit carries the .gitignore so the project repo starts clean.
     if _git(["rev-parse", "HEAD"], cwd=str(repo)).returncode != 0:
-        _git(["commit", "--allow-empty", "-m", "turn: project initialized"], cwd=str(repo))
+        _git(["add", "-A"], cwd=str(repo))
+        _git(["commit", "-qm", "turn: project initialized"], cwd=str(repo))
 
     # Capture the base branch so ship_project can merge back into it.
     base_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo)).stdout.strip() or "main"
     _git(["config", "turn.baseBranch", base_branch], cwd=str(repo))
-
-    # Never let the scratch worktree tree pollute project commits.
-    _ensure_gitignore(repo)
 
     # Create + check out the working branch for this project.
     if not _branch_exists(work_branch, repo_path=str(repo)):

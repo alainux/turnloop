@@ -18,6 +18,9 @@ venv/
 .turn/
 .pi/
 
+# Per-project repos (user deliverables; each is its own git repository)
+projects/
+
 # Node / tooling
 node_modules/
 
