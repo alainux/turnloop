@@ -28,6 +28,7 @@ import asyncio
 import json
 import sys
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -37,11 +38,35 @@ _DELIVERABLE_KINDS = {"file", "code_diff", "log", "evidence"}
 _INTERNAL_NAMES = {"transcript", "worktree-path", "codex-output", "plan"}
 
 
-async def _query(db_url: str, project_id: str):
+async def _query(db_url: str, project_id: str, requester: str | None = None, query: str = "tree"):
     pid = uuid.UUID(project_id).hex
     engine = create_async_engine(db_url, connect_args={"check_same_thread": False})
     try:
-        async with engine.connect() as conn:
+        async with engine.begin() as conn:
+            if requester:
+                requester_id = uuid.UUID(requester).hex
+                # Keep this tool self-contained: an agent may run it against a
+                # database created by an older Turn build before app startup.
+                await conn.execute(text(
+                    "CREATE TABLE IF NOT EXISTS graph_inspections ("
+                    "id CHAR(32) PRIMARY KEY, project_id CHAR(32) NOT NULL, "
+                    "requester_node_id CHAR(32) NOT NULL, query TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL)"
+                ))
+                await conn.execute(
+                    text(
+                        "INSERT INTO graph_inspections "
+                        "(id, project_id, requester_node_id, query, created_at) "
+                        "VALUES (:id, :pid, :requester, :query, :created_at)"
+                    ),
+                    {
+                        "id": uuid.uuid4().hex,
+                        "pid": pid,
+                        "requester": requester_id,
+                        "query": query,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             nrows = (
                 await conn.execute(
                     text(
@@ -139,12 +164,17 @@ async def _main_async():
     ap.add_argument("--node", help="Show only this node id.")
     ap.add_argument("--children", help="Show only the direct children of this node id.")
     ap.add_argument("--ancestors", help="Show only the parent chain of this node id.")
+    ap.add_argument(
+        "--requester",
+        help="Node id performing this inspection; records durable audit evidence.",
+    )
     ap.add_argument("--format", default="tree", choices=["tree", "json"])
     ap.add_argument("--tree", action="store_const", dest="format", const="tree",
                     help="alias for --format tree (the default)")
     args = ap.parse_args()
 
-    nodes, children = await _query(args.db, args.project)
+    query = "node" if args.node else "children" if args.children else "ancestors" if args.ancestors else args.format
+    nodes, children = await _query(args.db, args.project, args.requester, query)
     by_id = {n["id"]: n for n in nodes}
 
     if args.node:
@@ -170,6 +200,8 @@ async def _main_async():
             print("- " + _summary(s))
     else:
         _print_tree(nodes, children)
+    if args.requester:
+        print(f"[turn] graph inspection recorded for {uuid.UUID(args.requester).hex}")
     return 0
 
 

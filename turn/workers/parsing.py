@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import re
 
-from turn.domain.schemas import ArtifactKind, InputKind
+from turn.domain.schemas import ArtifactKind, ArtifactSpec, InputKind
 
-_FENCE_RE = re.compile(r"```(\w+)[ \t]*\n(.*?)```", re.DOTALL)
+_FENCE_RE = re.compile(r"```([\w-]+)[ \t]*\n(.*?)```", re.DOTALL)
 
 
 def extract_fences(text: str) -> dict[str, str]:
@@ -63,6 +63,43 @@ def extract_json(text: str):
     return None
 
 
+def extract_json_objects(text: str) -> list[dict]:
+    """Return every balanced JSON object embedded in ``text`` in order."""
+    values: list[dict] = []
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if esc:
+                esc = False
+                continue
+            if c == "\\":
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        val = _safe_json(text[start : i + 1])
+                        if isinstance(val, dict):
+                            values.append(val)
+                            start = text.find("{", i + 1)
+                        else:
+                            start = text.find("{", start + 1)
+                        break
+        else:
+            break
+    return values
+
+
 def safe_input_kind(value: str) -> InputKind:
     """Coerce a free-form kind string to a valid InputKind (defaults to TEXT)."""
     try:
@@ -76,6 +113,29 @@ def safe_artifact_kind(value: str) -> ArtifactKind:
         return ArtifactKind(value)
     except ValueError:
         return ArtifactKind.TEXT
+
+
+def artifact_specs(values) -> list[ArtifactSpec]:
+    """Normalize the artifact shorthand commonly emitted by coding agents."""
+    specs: list[ArtifactSpec] = []
+    for value in values or []:
+        if isinstance(value, str):
+            specs.append(ArtifactSpec(kind=ArtifactKind.FILE, name=value.rsplit("/", 1)[-1], ref=value))
+            continue
+        if not isinstance(value, dict):
+            continue
+        ref = value.get("ref") or value.get("path")
+        name = value.get("name") or (str(ref).rsplit("/", 1)[-1] if ref else "artifact")
+        kind = safe_artifact_kind(value.get("kind") or ("file" if ref else "text"))
+        specs.append(
+            ArtifactSpec(
+                kind=kind,
+                name=name,
+                content=value.get("content") or value.get("description"),
+                ref=ref,
+            )
+        )
+    return specs
 
 
 def strip_ansi(s: str) -> str:
@@ -92,14 +152,39 @@ _ANSI_RE = re.compile(
 
 
 def first_plan_json(text: str):
-    val = extract_json(text)
-    if isinstance(val, dict) and "nodes" in val:
+    fences = extract_fences(text)
+    val = _safe_json(fences.get("turn-plan", ""))
+    if _is_plan(val):
         return val
+    # Codex --output-schema returns a bare object. Accept only the planner
+    # identity (key/objective child specs), never graph-inspector rows (id).
+    for candidate in reversed(extract_json_objects(text)):
+        if _is_plan(candidate):
+            return candidate
     return None
 
 
 def first_result_json(text: str):
-    val = extract_json(text)
-    if isinstance(val, dict) and "outcome" in val:
-        return val
+    labeled = _safe_json(extract_fences(text).get("turn-result", ""))
+    if isinstance(labeled, dict) and "outcome" in labeled:
+        return labeled
+    # Streaming harnesses can emit more than one schema-shaped progress
+    # message. Only the final structured result is authoritative.
+    for val in reversed(extract_json_objects(text)):
+        if "outcome" in val:
+            return val
     return None
+
+
+def _is_plan(value) -> bool:
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
+        return False
+    return all(
+        isinstance(node, dict)
+        and isinstance(node.get("key"), str)
+        and bool(node["key"].strip())
+        and isinstance(node.get("objective"), str)
+        and bool(node["objective"].strip())
+        and "id" not in node
+        for node in value["nodes"]
+    )

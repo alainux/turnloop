@@ -66,6 +66,21 @@ class Settings:
     default_run_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("TURN_RUN_TIMEOUT", "600"))
     )
+    stall_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TURN_STALL_TIMEOUT", "90"))
+    )
+    delay_between_jobs_ms: int = field(
+        default_factory=lambda: int(os.getenv("TURN_JOB_DELAY_MS", "0"))
+    )
+    force_sequential: bool = field(
+        default_factory=lambda: os.getenv("TURN_FORCE_SEQUENTIAL", "0").lower() in ("1", "true", "yes")
+    )
+    retry_backoff_ms: int = field(
+        default_factory=lambda: int(os.getenv("TURN_RETRY_BACKOFF_MS", "750"))
+    )
+    retry_choked_models: bool = field(
+        default_factory=lambda: os.getenv("TURN_RETRY_CHOKED", "1").lower() in ("1", "true", "yes")
+    )
 
     # --- workers ---------------------------------------------------------
     codex_binary: str = field(
@@ -73,6 +88,12 @@ class Settings:
     )
     codex_model: str | None = field(
         default_factory=lambda: os.getenv("TURN_CODEX_MODEL")
+    )
+    default_reasoning: str = field(
+        default_factory=lambda: os.getenv("TURN_REASONING", "default")
+    )
+    default_permission: str = field(
+        default_factory=lambda: os.getenv("TURN_PERMISSION", "workspace")
     )
     codex_args: list[str] = field(
         default_factory=lambda: os.getenv("TURN_CODEX_ARGS", "").split()
@@ -104,17 +125,16 @@ class Settings:
     # project repo path is recorded on the project's root node (repo_path);
     # there is no global shared repository to isolate from.
     projects_dir: str = field(
-        default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", "./projects")
+        default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", os.getcwd())
     )
 
     # Optional directory of project-local skills / instructions. Files here
     # are inherited by descendant nodes as resources.
     skills_dir: str | None = field(default_factory=lambda: os.getenv("TURN_SKILLS_DIR"))
 
-    # When True, a node whose worktree has been merged up into its parent is
-    # automatically accepted: its (now-redundant) subtree worktree is deleted
-    # without waiting for a manual review. When False (default), the user must
-    # Accept/Reject each merged node from the UI. This is a global user option.
+    # When True, completed nodes are automatically verified by their parent
+    # agent. The parent may accept or reject with same-session feedback; Turn
+    # never silently accepts an unverified merge.
     auto_accept_merges: bool = field(
         default_factory=lambda: (os.getenv("TURN_AUTO_ACCEPT_MERGES", "0").lower() in ("1", "true", "yes"))
     )

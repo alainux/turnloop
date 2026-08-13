@@ -1,65 +1,118 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Turn — live workgraph</title>
-  <link rel="stylesheet" href="/style.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Turn — an adaptive development environment for inspectable workgraphs.">
+  <title>Turn · Adaptive development environment</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/vendor/xterm/css/xterm.css">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <div class="brand">Turn <span class="host">turnloop.tech</span></div>
-  </header>
+  <div id="app-shell" class="sidebar-collapsed">
+    <header class="titlebar">
+      <button class="icon-button" id="sidebar-toggle" data-tooltip="Toggle projects" data-shortcut="⌘ B" aria-label="Toggle projects"><span class="icon" data-icon="panel-left"></span></button>
+      <button class="brand" id="home-btn" aria-label="Turn home" data-tooltip="Return to project authoring">Turn</button>
+      <span class="title-spacer"></span>
+      <button class="icon-button" id="help-btn" data-tooltip="Help and shortcuts" aria-label="Help and shortcuts"><span class="icon" data-icon="circle-help"></span></button>
+      <button class="icon-button" id="command-btn" data-tooltip="New project" data-shortcut="⌘ K" aria-label="New project"><span class="icon" data-icon="plus"></span></button>
+      <button class="icon-button" id="settings-btn" data-tooltip="Workspace settings" data-shortcut="⌘ ," aria-label="Workspace settings"><span class="icon" data-icon="settings-2"></span></button>
+    </header>
 
-  <div id="project-bar">
-    <button id="new-btn" type="button">+ New</button>
-    <label>Project:</label>
-    <select id="project-select"><option value="">— none —</option></select>
-    <span id="repo-line" class="muted"></span>
-    <span id="status-line"></span>
-    <button id="clear-btn" type="button" title="Remove all projects">Clear</button>
+    <aside class="sidebar" id="project-sidebar">
+      <div class="panel-heading"><span>Projects</span></div>
+      <label class="sidebar-search"><span class="icon" data-icon="search"></span><input id="project-filter" type="search" placeholder="Filter projects" aria-label="Filter projects"></label>
+      <div id="project-list" class="project-list" role="list" aria-label="Projects"></div>
+    </aside>
+
+    <main class="workspace">
+      <section id="empty-view" class="empty-view">
+        <p class="eyebrow">Adaptive development environment</p>
+        <h1>What should the workgraph build?</h1>
+        <p class="lede">Describe an outcome. Turn decomposes it into inspectable, independently runnable work.</p>
+        <form id="author-form" class="composer">
+          <textarea id="author-prompt" rows="5" placeholder="Build a narrative game with independent world, character, and engine branches…" aria-label="Project objective" required></textarea>
+          <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
+          <div class="composer-toolbar">
+            <input id="attachment-input" type="file" multiple hidden>
+            <button class="composer-tool" id="attachment-btn" type="button" data-tooltip="Attach files" aria-label="Attach files"><span class="icon" data-icon="paperclip"></span></button>
+            <input id="new-dir" type="hidden">
+            <button class="composer-tool" id="directory-btn" type="button" data-tooltip="Project directory: current directory" aria-label="Choose project directory"><span class="icon" data-icon="folder"></span></button>
+            <label class="compact-select harness-select"><span class="icon" data-icon="square-terminal"></span><select id="new-harness" aria-label="Harness"><option value="">Detecting harnesses…</option></select></label>
+            <label class="compact-select"><input id="new-model" list="new-model-options" aria-label="Model" placeholder="Harness default"><datalist id="new-model-options"></datalist></label>
+            <label class="compact-select"><select id="new-reasoning" aria-label="Reasoning"><option value="default">Default reasoning</option></select><small id="new-reasoning-note" hidden>Model dependent</small></label>
+            <span class="composer-spacer"></span>
+            <button class="composer-tool" id="author-config-btn" type="button" data-tooltip="Project and run configuration" aria-label="Project and run configuration"><span class="icon" data-icon="settings-2"></span></button>
+            <button class="send-button" id="project-submit" type="submit" data-tooltip="Create workgraph" aria-label="Create workgraph"><span class="icon" data-icon="arrow-up"></span></button>
+          </div>
+          <div id="author-config-panel" class="composer-config-panel" hidden>
+            <div class="form-grid">
+              <label class="field"><span>Project name</span><input id="new-name" maxlength="72" placeholder="Derived from objective"></label>
+              <label class="field"><span>Permissions <i class="help-hint" tabindex="0" data-tooltip="Filesystem and command authority passed to local harnesses."><span class="icon" data-icon="circle-help"></span></i></span><select id="new-permission"><option value="ask">Ask</option><option value="workspace" selected>Workspace</option><option value="full">Full access</option></select></label>
+            </div>
+            <div class="author-mode" aria-label="Project mode"><label><input type="radio" name="project-mode" value="create" checked><span>Create repository</span></label><label><input type="radio" name="project-mode" value="open"><span>Open repository</span></label></div>
+            <div class="run-options">
+              <label class="check"><input id="new-auto" type="checkbox" checked><span>Auto-run</span></label>
+              <label class="check"><input id="new-sequential" type="checkbox"><span>Sequential</span></label>
+              <label class="inline-field"><span>Delay</span><input id="new-delay" type="number" min="0" step="100" value="0" aria-label="Delay between jobs in milliseconds"><small>ms</small></label>
+            </div>
+          </div>
+        </form>
+        <p class="author-disclaimer">Agents run in isolated project worktrees. Review permissions before starting.</p>
+      </section>
+
+      <section id="graph-view" class="graph-view" hidden>
+        <div class="workspace-toolbar">
+          <div class="project-title"><div><strong id="project-title">Workgraph</strong><small id="repo-line">Current directory</small></div></div>
+          <div class="toolbar-actions">
+            <div class="segmented" aria-label="Execution mode"><button id="auto-mode-btn" class="selected" data-tooltip="Run ready nodes automatically">Auto</button><button id="step-mode-btn" data-tooltip="Wait for an explicit run command">Step</button></div>
+            <button id="run-step-btn" class="button accent" data-tooltip="Run the next ready node" hidden><span class="icon" data-icon="play"></span><span>Run next</span></button>
+            <button id="project-options-btn" class="icon-button" data-tooltip="Project execution policy" aria-label="Project execution policy"><span class="icon" data-icon="ellipsis"></span></button>
+          </div>
+        </div>
+        <div id="graph" class="graph" tabindex="0" aria-label="Workgraph dendrogram"></div>
+      </section>
+    </main>
+
+    <aside class="inspector" id="inspector" hidden>
+      <div class="panel-heading"><span>Inspector</span><button class="quiet-icon" id="close-inspector" data-tooltip="Close inspector" aria-label="Close inspector"><span class="icon" data-icon="panel-right-close"></span></button></div>
+      <div class="inspector-tabs" role="tablist"><button class="active" data-tab="overview" role="tab" aria-selected="true">Overview</button><button data-tab="terminal" role="tab" aria-selected="false">Terminal</button><button data-tab="history" role="tab" aria-selected="false">History</button></div>
+      <div id="detail" class="detail"></div>
+    </aside>
+
+    <footer class="statusbar">
+      <span id="status-message" aria-live="polite">Ready</span>
+      <span id="status-connection">Offline</span>
+      <div class="legend" id="graph-legend" aria-label="Graph relationships" hidden><span><i class="legend-line contains"></i>contains</span><span><i class="legend-line depends"></i>depends on</span></div>
+      <span class="status-spacer"></span>
+      <span class="graph-stats" id="graph-stats"></span>
+      <span id="status-tokens">Usage unavailable</span>
+      <div class="zoom-controls" id="graph-zoom" hidden><button id="zoom-out" data-tooltip="Zoom out" aria-label="Zoom out"><span class="icon" data-icon="zoom-out"></span></button><span id="zoom-label">100%</span><button id="zoom-in" data-tooltip="Zoom in" aria-label="Zoom in"><span class="icon" data-icon="zoom-in"></span></button><button id="zoom-fit" data-tooltip="Fit graph to viewport"><span class="icon" data-icon="scan"></span><span>Fit</span></button></div>
+    </footer>
   </div>
 
-  <div id="new-modal" class="modal" hidden>
-    <div class="modal-card">
-      <h3>New project</h3>
-      <label class="field-label" for="new-prompt">Objective</label>
-      <textarea id="new-prompt" rows="3" placeholder="Describe an objective… (vague is fine)"></textarea>
+  <aside id="settings-panel" class="side-panel" aria-label="Workspace settings" hidden><form id="settings-form">
+    <div class="panel-head"><div><p class="eyebrow">Preferences</p><h2>Workspace settings</h2></div><button type="button" class="quiet-icon panel-close" data-tooltip="Close" aria-label="Close settings"><span class="icon" data-icon="x"></span></button></div>
+    <section class="settings-section"><h3>Appearance</h3><div class="form-grid"><label class="field"><span>Theme</span><select id="setting-theme"><option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option></select></label><label class="field"><span>Density</span><select id="setting-density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label></div></section>
+    <section class="settings-section"><h3>Agent defaults</h3><div class="form-grid"><label class="field"><span>Harness <i class="help-hint" tabindex="0" data-tooltip="Only detected local harnesses can be selected."><span class="icon" data-icon="circle-help"></span></i></span><select id="setting-harness"></select></label><label class="field"><span>Model</span><input id="setting-model" list="setting-model-options" placeholder="Harness default"><datalist id="setting-model-options"></datalist></label><label class="field"><span>Reasoning</span><select id="setting-reasoning"></select><small id="setting-reasoning-note" class="field-note"></small></label><label class="field"><span>Permissions</span><select id="setting-permission"><option value="ask">Ask</option><option value="workspace">Workspace</option><option value="full">Full access</option></select></label></div></section>
+    <section class="settings-section"><h3>Execution</h3><div class="form-grid"><label class="field"><span>Run timeout (seconds)</span><input id="setting-timeout" type="number" min="1"></label><label class="field"><span>Job delay (ms)</span><input id="setting-delay" type="number" min="0"></label><label class="field"><span>Retries</span><input id="setting-retries" type="number" min="0" max="20"></label><label class="field"><span>Retry backoff (ms)</span><input id="setting-backoff" type="number" min="0"></label></div><div class="run-options stacked"><label class="check"><input id="setting-auto" type="checkbox"><span>Auto-run new projects</span></label><label class="check"><input id="setting-accept" type="checkbox"><span>Parent verification</span></label><label class="check"><input id="setting-sequential" type="checkbox"><span>Force sequential execution</span></label></div></section>
+    <section class="settings-section"><h3>Stalled generations</h3><div class="form-grid"><label class="field"><span>Silence threshold (seconds) <i class="help-hint" tabindex="0" data-tooltip="A real stream watchdog interrupts a live harness after this long with no output bytes. Whole-run timeout remains separate."><span class="icon" data-icon="circle-help"></span></i></span><input id="setting-stall-timeout" type="number" min="1" max="3600"></label></div><label class="check"><input id="setting-choked" type="checkbox"><span>Retry stalled, overloaded, or rate-limited runs</span></label></section>
+    <div class="panel-actions"><button type="submit" class="button accent"><span class="icon" data-icon="check"></span><span>Save settings</span></button></div>
+  </form></aside>
 
-      <label class="field-label" for="new-mode-create">Location</label>
-      <div class="mode-row">
-        <label class="radio"><input type="radio" id="new-mode-create" name="new-mode" value="create" checked /> New repo (or empty folder)</label>
-        <label class="radio"><input type="radio" name="new-mode" value="open" /> Open existing repo</label>
-      </div>
-      <input id="new-dir" aria-label="Working directory" placeholder="working directory — blank = ./projects/&lt;id&gt;" />
-      <span class="muted">New makes a fresh git repo that becomes the project root. Open refactors an existing repo on a side branch.</span>
+  <aside id="policy-panel" class="side-panel" aria-label="Project execution policy" hidden><form id="policy-form">
+    <div class="panel-head"><div><p class="eyebrow">Current project</p><h2>Execution policy</h2></div><button type="button" class="quiet-icon panel-close" data-tooltip="Close" aria-label="Close project policy"><span class="icon" data-icon="x"></span></button></div>
+    <section class="settings-section"><h3>Dispatch</h3><div class="run-options stacked"><label class="check"><input id="policy-auto" type="checkbox"><span>Auto-run ready nodes</span></label><label class="check"><input id="policy-sequential" type="checkbox"><span>Force sequential execution</span></label><label class="check"><input id="policy-accept" type="checkbox"><span>Parent verification</span></label></div></section>
+    <section class="settings-section"><h3>Timing and recovery</h3><div class="form-grid policy-grid"><label class="field"><span>Delay between jobs (ms)</span><input id="policy-delay" type="number" min="0" max="600000" step="1000"></label><label class="field"><span>Run timeout (seconds)</span><input id="policy-timeout" type="number" min="1" max="86400"></label><label class="field"><span>Silence threshold (seconds)</span><input id="policy-stall-timeout" type="number" min="1" max="3600"></label><label class="field"><span>Retries</span><input id="policy-retries" type="number" min="0" max="20"></label><label class="field"><span>Retry backoff (ms)</span><input id="policy-backoff" type="number" min="0" max="600000"></label></div><label class="check"><input id="policy-choked" type="checkbox"><span>Retry stalled, overloaded, or rate-limited runs</span></label></section>
+    <div class="panel-actions"><button type="submit" class="button accent"><span class="icon" data-icon="check"></span><span>Apply policy</span></button></div>
+  </form></aside>
 
-      <div class="modal-actions">
-        <button id="new-cancel" class="secondary" type="button">Cancel</button>
-        <button id="new-create" class="run" type="button">Create</button>
-      </div>
-    </div>
-  </div>
-
-  <main>
-    <section id="graph-pane">
-      <div class="pane-title">
-        WorkGraph
-        <span class="pane-controls">
-          <label class="switch"><input type="checkbox" id="auto-run" checked /> Auto-run</label>
-          <label class="switch"><input type="checkbox" id="auto-accept" /> Auto-accept merges</label>
-          <button id="step-btn" type="button" hidden>Step ▶</button>
-        </span>
-      </div>
-      <div class="graph-legend">solid = contains · <span style="color:#d29922">dashed = depends on</span></div>
-      <div id="graph"></div>
-    </section>
-    <section id="detail-pane">
-      <div class="pane-title">Node</div>
-      <div id="detail"><p class="muted">Select a node to inspect, edit, or act on it.</p></div>
-    </section>
-  </main>
-
-  <script src="/app.js"></script>
+  <div id="popover" class="popover" role="menu" hidden></div>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden><span id="tooltip-label"></span><kbd id="tooltip-shortcut" hidden></kbd></div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <dialog id="confirm-dialog" class="confirm-dialog"><form method="dialog"><div class="confirm-icon"><span class="icon" data-icon="alert-triangle"></span></div><div><h2 id="confirm-title">Confirm action</h2><p id="confirm-message"></p></div><div class="confirm-actions"><button value="cancel" class="button">Cancel</button><button id="confirm-submit" value="confirm" class="button danger">Continue</button></div></form></dialog>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

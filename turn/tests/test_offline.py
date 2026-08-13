@@ -128,7 +128,7 @@ async def test_pause_respected() -> None:
                     NodeSpec(key="a", objective="do a", executor="echo"),
                     NodeSpec(key="b", objective="do b", executor="echo", depends_on=["a"]),
                 ],
-                edges=[EdgeSpec(type=EdgeType.DEPENDS_ON, src="b", dst="a")],
+                edges=[],
             )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
@@ -395,49 +395,40 @@ async def test_deep_merge_up_ordering() -> None:
         await store.dispose()
 
 
-async def test_intermediate_integration() -> None:
-    """A nested broad planner should get an injected assembler that integrates
-    its direct children (bottom-up composition), the project root should not,
-    and we must not inject a second one when the planner already made one."""
+async def test_plan_application_is_semantically_agnostic() -> None:
+    """Persistence preserves planner intent without caps, title rewriting, or
+    hidden domain-specific assembler nodes."""
     import tempfile
-    from turn.runner.runner import Runner
-    from turn.runner.events import EventBus
-    from turn.domain.schemas import NodeSpec, PlanResult
+    from turn.domain.schemas import AgentConfig, HarnessKind, NodeSpec, PlanResult
 
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
     store = Store(f"sqlite+aiosqlite:///{tmp}")
     await store.init()
-    reg = WorkerRegistry()
-    Runner(store, registry=reg, events=EventBus(), settings=settings)
-    root = await store.create_project("write a guide")
-    created = await store.apply_plan(root, PlanResult(nodes=[
-        NodeSpec(key="A", objective="chapter one", executor="planner", plan=True),
-        NodeSpec(key="l1", objective="leaf one", executor="codex", parent_key="A"),
-        NodeSpec(key="l2", objective="leaf two", executor="codex", parent_key="A"),
-    ]))
-    A = next(c for c in created if c.objective == "chapter one")
-    created2 = await store.apply_plan(A, PlanResult(nodes=[
-        NodeSpec(key="s1", objective="section one", executor="codex"),
-        NodeSpec(key="s2", objective="section two", executor="codex"),
-    ]))
-    g = await store.get_workgraph(root.id)
-    nodes = g[0]; edges = g[1]
-    by_obj = {n.objective: n for n in nodes}
-    asm = next((n for n in nodes if n.objective.startswith("Integrate:")), None)
-    assert asm is not None, "no intermediate assembler injected for nested planner"
-    assert asm.parent_id == A.id, "assembler should be a child of the nested planner A"
-    dep_srcs = {e.src for e in edges if e.type == "DEPENDS_ON" and e.dst == asm.id}
-    assert dep_srcs == {by_obj["section one"].id, by_obj["section two"].id}, dep_srcs
-    # Root must not get an injected assembler.
-    root_kids = [n for n in nodes if n.parent_id == root.id]
-    assert not any(n.objective.startswith("Integrate:") for n in root_kids), "root got an assembler"
-    # If the planner already made an assembler, do not add a duplicate.
-    created3 = await store.apply_plan(A, PlanResult(nodes=[
-        NodeSpec(key="s3", objective="section three", executor="codex"),
-        NodeSpec(key="asm", objective="Assemble chapter one", executor="codex", depends_on=["s3"]),
-    ]))
-    assert not any(c.objective.startswith("Integrate:") for c in created3), "duplicate assembler injected"
-    print("INTERMEDIATE INTEGRATION TEST PASSED")
+    root = await store.create_project(
+        "write a guide", agent=AgentConfig(harness=HarnessKind.CLAUDE)
+    )
+    long_title = "Preserve this complete objective " + ("with detail " * 12)
+    specs = [
+        NodeSpec(key=f"leaf_{i}", objective="same valid scope", executor="echo")
+        for i in range(5)
+    ] + [
+        NodeSpec(key="long", objective=long_title, executor="echo"),
+        NodeSpec(
+            key="integrate",
+            objective="Integrate exactly when the planner requests it",
+            executor="echo",
+            depends_on=["leaf_0", "leaf_1"],
+        ),
+    ]
+    created = await store.apply_plan(root, PlanResult(nodes=specs))
+
+    assert len(created) == len(specs)
+    assert sum(node.objective == "same valid scope" for node in created) == 5
+    assert next(node.objective for node in created if node.objective == long_title) == long_title
+    assert sum(node.objective.startswith("Integrate") for node in created) == 1
+    assert all(node.executor == "echo" for node in created)
+    assert all(node.agent and node.agent.harness == HarnessKind.ECHO for node in created)
+    print("SEMANTICALLY AGNOSTIC PLAN APPLICATION TEST PASSED")
     await store.dispose()
 
 
@@ -527,5 +518,5 @@ if __name__ == "__main__":
     asyncio.run(test_planner_topology())
     asyncio.run(test_worktree_merge_up())
     asyncio.run(test_deep_merge_up_ordering())
-    asyncio.run(test_intermediate_integration())
+    asyncio.run(test_plan_application_is_semantically_agnostic())
     asyncio.run(test_accept_cleans_subtree())

@@ -289,7 +289,16 @@ def merge_into_parent(node_id, parent_id, repo_path: str | None = None) -> None:
     if parent_id is None:
         # Root is the final accumulation point; nothing to merge upward.
         return
-    parent_wt = get_or_create_worktree(parent_id, None, repo_path=repo_path)
+    # A nested parent already owns an isolated worktree created when it was
+    # planned. Use that exact workspace. Only a top-level child has the project
+    # root as its parent (for which no .turn/worktrees/<root> directory exists)
+    # and should fall back to the repository root.
+    nested_parent = worktree_path(parent_id, repo_path)
+    parent_wt = (
+        str(nested_parent)
+        if nested_parent.exists()
+        else get_or_create_worktree(parent_id, None, repo_path=repo_path)
+    )
     if parent_wt is None:
         logger.warning("cannot merge %s: parent worktree unavailable", node_id.hex)
         return

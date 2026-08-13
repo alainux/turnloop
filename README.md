@@ -1,175 +1,107 @@
 # Turn
 
-**Turn** is a live, editable workgraph. You give it a vague objective; it creates a
-root node, invokes one initial planner, shows the generated graph immediately, and
-begins executing every runnable node. The graph may contain decomposition trees,
-linear sequences, parallel branches, and dependency joins. You can inspect, pause,
-cancel, edit, retry, regenerate, or fork any node — and a blocked node tells you
-exactly what input, account, credential, file, decision, or approval it is missing.
+Turn is a local-first agentic development environment built around an adaptive
+workgraph. A prompt becomes a visible decomposition; independent branches run in
+parallel; dependencies, human inputs, reviews, artifacts, costs, and recovery
+remain inspectable throughout the project.
 
-> Hosted at `turnloop.tech`.
+The kernel is intentionally small: a versioned graph of `Node`, `Edge`, `Run`,
+and `Artifact` records, a scheduler, and replaceable planner/worker adapters. The
+IDE-like web UI and the headless CLI are clients of that same core.
 
----
+## What the MVP includes
 
-## Core interaction
+- Prompt-first project authoring and opening, a collapsible project explorer,
+  graph canvas, inspector, real PTY-backed xterm terminal, light/dark themes,
+  compact density, attachments, and responsive panels.
+- A normalized semantic design system with a quiet wordmark, professional
+  vendored Lucide icons, keyboard-aware tooltips, graph context menus, and
+  contextual help. The product deliberately ships without decorative imagery.
+- A deterministic horizontal dendrogram with orthogonal containment branches,
+  dependency overlays, and tested parent/leaf geometry.
+- Server-owned node/UI states with guarded transitions for run, step, pause,
+  resume, cancel, retry, review, accept, reject, input, branch regeneration, and
+  forks.
+- Per-project execution policy: auto/step, sequential execution, inter-job delay,
+  timeout, retry/backoff, choked-model retry, and manual/parent-verified review.
+- Parent auto-verification reads real child evidence, may reject with feedback,
+  and continues both parent and child sessions without discarding context.
+- Codex, Claude Code, OpenCode, and Pi harness adapters with automatic local
+  availability detection, editable model selectors, and model-dependent
+  reasoning options; deterministic Echo and Shell adapters for development.
+- Persistent agent session IDs so review feedback continues the same agent
+  context and worktree.
+- Agent-, branch-, and project-level token/cost reporting when a harness emits
+  usage telemetry.
+- A headless Python facade and `turn` CLI.
+- Unit, API, runner-transition, browser end-to-end, generated-screenshot, and
+  three-domain full-run persistence/log acceptance tests.
 
-```
-prompt → root node → initial planner → visible graph → execute ready leaves
-       → expand or block as necessary → accept user edits/input → continue
-```
+The exact implemented boundary and the deliberately unimplemented future scope
+are tracked in [docs/SCOPE.md](docs/SCOPE.md). Architectural decisions and
+extension points are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The visual and interaction contract is documented in
+[docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md). Reproducible full-run evidence
+is defined in [docs/ACCEPTANCE_RUNS.md](docs/ACCEPTANCE_RUNS.md).
+The independent read-only audit and closure evidence are recorded in
+[docs/INDEPENDENT_REVIEW.md](docs/INDEPENDENT_REVIEW.md).
 
-The architecture succeeds when this loop works across *unrelated* objectives while
-the kernel stays little more than **a versioned graph, a runner, and worker
-adapters**.
-
----
-
-## The four persistent primitives
-
-| Primitive | Contains |
-|-----------|----------|
-| **Node**  | objective/prompt, parent, executor, status, required inputs, resource references, artifact references, revision + lineage |
-| **Edge**  | a relationship between two nodes — only `CONTAINS` (decomposition / hierarchy / inherited context) or `DEPENDS_ON` (ordering / parallelism / joins) |
-| **Run**   | one execution attempt for one node: worker, timestamps, logs, outcome, cancellation state |
-| **Artifact** | any persistent input/output: text, structured data, user input, evidence, files, code changes, test results, links, credential references, external ids |
-
-A **WorkGraph** is versioned Nodes + Edges. A **project** is a root node and
-everything descended from it. The execution graph is kept acyclic; repeated or
-ongoing work appends new nodes rather than creating cycles.
-
-## The two operations
-
-* **Plan** — the initial planner and any later decomposition use the *same*
-  operation: *given this node, its ancestry, available artifacts, inherited
-  resources, and available executors, produce the smallest useful workgraph that
-  can begin executing now.* Decompose only far enough to expose concrete runnable
-  work; use dependencies only where required; mark missing information explicitly
-  instead of inventing it; assign each executable leaf an executor and resources.
-* **Execute** — a runnable leaf is sent to its worker. Every worker returns
-  exactly one outcome:
-  * `COMPLETE` — return output artifacts
-  * `EXPAND` — return child nodes + edges (decompose instead of pretending to finish)
-  * `BLOCK` — return explicit missing requirements
-  * `FAIL` — return an error + whether retry is appropriate
-
-## Runtime behavior
-
-A node is **runnable** when it is active, not paused, has no unsatisfied
-dependencies, and has all required inputs. The runner continuously: finds runnable
-nodes → starts their Runs → invokes workers → stores artifacts + outcomes → updates
-node state → dispatches newly runnable nodes. Expanded nodes become containers whose
-progress is derived from their descendants.
-
-## Skills & resources
-
-Resources are *context, not orchestration primitives*. A project or subtree may
-contain local skills, instructions, docs, examples, or coding standards. Resources
-attached to a parent are inherited by descendants unless overridden. Adding skills
-adds data, not core code.
-
----
-
-## Architecture / execution stack
-
-| Concern | Choice |
-|---------|--------|
-| Backend language | **Python** |
-| Schemas | **Pydantic** (strict Node / Edge / Run / Artifact / worker-result) |
-| Store | **SQLite** (local default; zero external services) |
-| Execution orchestration | **Prefect 3** behind a thin adapter (optional) |
-| Software-engineering worker | **Codex SDK / `codex exec`** |
-| Resource / tool boundary | **MCP** (optional) |
-
-**Turn owns the workgraph and node state. Prefect does not.** One node Run is one
-Prefect-managed execution, so Prefect handles retries / timeouts / cancellation /
-scheduling / worker infra without leaking Prefect concepts into Turn's data model.
-By default Turn runs workers directly (`TURN_EXECUTION_BACKEND=direct`); set
-`prefect` to wrap each Run in a flow.
-
-For a software node, the Codex worker receives the node objective, ancestor context,
-project-local skills, repository state, constraints, and acceptance criteria. It
-runs Codex in an **isolated Git worktree**, capturing its diff / commits / logs /
-generated files as artifacts. A Turn subgraph is not inherently a Git worktree —
-worktrees are only an execution mechanism for software branches.
-
-## Editing & branching
-
-* **Editing a node** creates a new revision (a snapshot artifact is stored) rather
-  than destructively rewriting history.
-* **Regenerate descendants** supersedes the existing downstream branch (old nodes
-  are marked `CANCELLED` and remain inspectable), re-plans from the revised node,
-  and begins executing the replacement branch. It does **not** pretend that
-  irreversible external side effects were undone.
-* **Fork from here** creates an alternative active branch with the same ancestral
-  context; the original branch remains inspectable and may continue, pause, or be
-  discarded.
-
----
-
-## Run it
+## Run locally
 
 ```bash
-pip install -e .                 # core deps (sqlite)
-# optional: pip install -e ".[llm,prefect]"
-
-# minimal local run (SQLite, deterministic heuristic planner + echo leaves)
-TURN_DATABASE_URL="sqlite+aiosqlite:///./turnloop.db" \
-TURN_PLANNER=heuristic \
-TURN_DEFAULT_EXECUTOR=echo \
-python -m turn
-# open http://127.0.0.1:8000
-
-# real run (Codex-backed planner + Codex workers, needs `codex` on PATH + auth)
-python -m turn
+python -m pip install -e ".[dev]"
+playwright install chromium       # once, for browser tests
+./scripts/run.sh                  # offline heuristic planner + Echo workers
 ```
 
-Or with the helper script:
+Open <http://127.0.0.1:8000>. For real coding agents, select an installed
+harness in the authoring surface or set `TURN_DEFAULT_EXECUTOR`.
+
+## Headless CLI
 
 ```bash
-./scripts/run.sh                 # sqlite, heuristic planner, echo leaves
-TURN_PLANNER=codex ./scripts/run.sh   # real Codex planning/execution
+turn doctor
+turn create "Build an adaptive narrative engine" --harness codex --run
+turn projects
+turn graph PROJECT_UUID
+turn run PROJECT_UUID
+turn serve --port 8000
 ```
 
-`.env.example` lists every configurable variable.
+`turn run` is an explicit execution request, so it temporarily drives a project
+even when it was authored in step mode. It exits when the graph settles, fails,
+or requires human input.
 
----
+## Tests
+
+```bash
+python -m pytest -q
+npm test
+```
+
+Browser tests start isolated servers and exercise onboarding, graph menus,
+inspector, real terminal transport, themes, responsive screenshots, and three
+complete software/game/book workflows. They then inspect the SQLite graph,
+runs, artifacts, and server log. In restricted sandboxes these tests skip when
+local listener sockets are prohibited; run them in a normal local shell for the
+full check.
 
 ## Project layout
 
-```
-turn/
-  domain/schemas.py   # Node, Edge, Run, Artifact, PlanResult, WorkerResult (Pydantic)
-  db/                 # async SQLAlchemy store (SQLite)
-  graph/logic.py      # runnability, ancestry, derived progress (pure)
-  workers/            # base protocols, registry, planner, codex/shell/echo adapters
-  runner/             # runner loop, event bus, optional Prefect adapter
-  server/             # FastAPI REST + SSE, UI mount
-  tests/test_slice.py # offline vertical-slice proof
-ui/                   # single-page UI (prompt, live graph, node detail)
-scripts/              # run.sh
-```
-
-## Minimal vertical slice (proven)
-
-`turn/tests/test_slice.py` proves the smallest path with **zero external services**
-(temp SQLite + deterministic workers):
-
-```
-prompt → root node → initial planner → visible graph → execute ready leaves
-       → block (missing input) → provide input → complete
-       → edit parent → regenerate descendants → execution resumes
+```text
+turn/core.py                 headless application facade
+turn/domain/                 schemas and pure UI-state projection
+turn/db/                     SQLAlchemy persistence and migrations
+turn/graph/                  pure graph evaluation
+turn/runner/                 scheduling, transitions, recovery, events
+turn/workers/                planner and harness adapters
+turn/server/                 REST, SSE, and static UI boundary
+turn/tests/                  unit, integration, API, and browser tests
+ui/                          dependency-free IDE shell and UI state reducer
 ```
 
-Run it:
+## Design constraint
 
-```bash
-PYTHONPATH=. python turn/tests/test_slice.py
-```
-
-## Hard constraints (honored)
-
-No custom workflow engine. No persistent agent organizations. No domain-specific
-workflow classes. No large policy / meta-learning framework. No separate planners
-per domain. No business / education / research / software concepts baked into the
-kernel. Domain behavior arises from the root objective, the generated graph, the
-selected workers, and the attached skills.
+The store never guesses planner intent. It validates keys, references, and graph
+acyclicity, then preserves valid objectives and topology exactly—without hidden
+child caps, semantic deduplication, title truncation, or domain-specific nodes.

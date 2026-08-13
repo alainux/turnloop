@@ -61,14 +61,26 @@ def is_runnable(node_id, idx: Indexes) -> tuple[bool, str]:
         return False, "missing"
     if node.paused:
         return False, "paused"
+    parent_id = idx.parents.get(node_id)
+    seen = set()
+    while parent_id is not None and parent_id not in seen:
+        seen.add(parent_id)
+        parent = idx.node_by_id.get(parent_id)
+        if parent is not None and parent.paused:
+            return False, "ancestor paused"
+        parent_id = idx.parents.get(parent_id)
     if node.status in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED):
         return False, "terminal"
+    if node.status == NodeStatus.RUNNING:
+        return False, "in flight"
     if node.status == NodeStatus.EXPANDED:
         return False, "container"
     for p in idx.deps.get(node_id, []):
         pn = idx.node_by_id.get(p)
         if pn is None or pn.status != NodeStatus.COMPLETE:
             return False, "dependency incomplete"
+        if pn.needs_review and not pn.merge_accepted:
+            return False, "dependency awaits review"
     for inp in node.required_inputs:
         if inp.satisfied_by is None:
             return False, f"missing input: {inp.label}"
@@ -119,7 +131,11 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
         desc = _collect_descendants(idx, n.id)
         leaves = [d for d in desc if d.id not in idx.children]
         active_leaves = [d for d in leaves if d.status != NodeStatus.CANCELLED]
-        done = [d for d in active_leaves if d.status == NodeStatus.COMPLETE]
+        done = [
+            d for d in active_leaves
+            if d.status == NodeStatus.COMPLETE
+            and not (d.needs_review and not d.merge_accepted)
+        ]
         total = len(active_leaves)
         if total == 0:
             progress[n.id] = 1.0 if all(d.status == NodeStatus.COMPLETE for d in leaves) else 0.0
@@ -127,6 +143,11 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             progress[n.id] = len(done) / total
         if total > 0 and len(done) == total:
             status[n.id] = NodeStatus.COMPLETE
+        elif n.status not in (NodeStatus.CANCELLED, NodeStatus.FAILED):
+            # Container completion is derived, never sticky. A newly forked,
+            # input-blocked, or review-blocked descendant reopens its parents
+            # until that work is genuinely settled.
+            status[n.id] = NodeStatus.EXPANDED
 
     return Evaluation(status=status, runnable=runnable, progress=progress, blocked_reason=reason)
 

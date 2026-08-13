@@ -21,15 +21,19 @@ from pathlib import Path
 from turn.config import settings
 from turn.workers import codex_schemas, parsing
 from turn.domain.schemas import (
+    AgentConfig,
     EdgeSpec,
     EdgeType,
+    HarnessKind,
     InputKind,
     InputSpec,
     NodeSpec,
     PlanResult,
     Resource,
+    Usage,
 )
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
+from turn.workers.terminal import GenerationStalled, LocalPtyTransport
 
 _FENCE_RE = re.compile(r"```(\w+)\n(.*?)```", re.DOTALL)
 
@@ -49,17 +53,22 @@ class HeuristicPlanner(Planner):
         self.default_executor = default_executor
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
-        objective = ctx.node.objective
+        # A root may have a concise project name while its complete intent is
+        # stored in generated_prompt. Keep graph-card objectives compact and
+        # put the authoritative detail in the execution prompt.
+        objective = ctx.node.generated_prompt or ctx.node.objective
         exe = self.default_executor
         nodes = [
             NodeSpec(
                 key="investigate",
-                objective=f"Investigate the context and gather what is already known about: {objective}",
+                objective="Investigate context",
+                generated_prompt=f"Gather what is already known and inspect the repository for: {objective}",
                 executor=exe,
             ),
             NodeSpec(
                 key="clarify",
-                objective=f"Confirm the key decisions and constraints for: {objective}",
+                objective="Clarify scope",
+                generated_prompt=f"Confirm the key decisions, constraints, and success criteria for: {objective}",
                 executor="echo",
                 required_inputs=[
                     InputSpec(
@@ -72,13 +81,15 @@ class HeuristicPlanner(Planner):
             ),
             NodeSpec(
                 key="produce",
-                objective=f"Produce the first concrete deliverable for: {objective}",
+                objective="Produce deliverable",
+                generated_prompt=f"Produce the first concrete deliverable for: {objective}",
                 executor=exe,
                 depends_on=["investigate", "clarify"],
             ),
             NodeSpec(
                 key="verify",
-                objective=f"Verify the deliverable against the objective: {objective}",
+                objective="Verify result",
+                generated_prompt=f"Verify the deliverable against the full objective: {objective}",
                 executor=exe,
                 depends_on=["produce"],
             ),
@@ -107,11 +118,16 @@ class CodexPlanner(Planner):
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         prompt = self._build_prompt(ctx)
         cwd = ctx.repo_path or os.getcwd()
-        text = await self._call_codex(
-            prompt, cwd, stream=getattr(ctx, "stream", None), node_id=ctx.node.id
+        text, usage, session_id = await self._call_codex(
+            prompt, cwd, agent=ctx.node.agent,
+            stream=getattr(ctx, "stream", None), node_id=ctx.node.id,
+            terminal=ctx.terminal, timeout=ctx.timeout_seconds,
+            stall_timeout=ctx.stall_timeout_seconds,
         )
-        plan = self._parse_plan(text, ctx.node.objective)
+        plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
+            plan.usage = usage
+            plan.session_id = session_id
             return plan
         if self.fallback is not None:
             return await self.fallback.plan(ctx)
@@ -121,6 +137,9 @@ class CodexPlanner(Planner):
         return f"""{render_context_block(ctx)}
 THIS NODE'S OBJECTIVE:
 {ctx.node.objective}
+
+PLANNING INSTRUCTIONS FOR THIS NODE:
+{ctx.node.generated_prompt or "No additional planning instructions."}
 
 You are decomposing THIS node into its direct children. Produce the SMALLEST
 useful set of concrete, runnable child steps that can begin executing now.
@@ -217,63 +236,169 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
 }}
 """
 
-    async def _call_codex(self, prompt: str, cwd: str, stream=None, node_id=None) -> str:
+    async def _call_codex(
+        self, prompt: str, cwd: str, *, agent: AgentConfig | None = None,
+        stream=None, node_id=None, terminal=None, timeout=None, stall_timeout=None,
+    ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
-            return ""
+            return "", Usage(), None
         schema_path = codex_schemas.write_schema(codex_schemas.PLAN_SCHEMA)
         bypass = any("bypass" in a for a in self.s.codex_args)
         sandbox_flags = [] if bypass else ["-s", "workspace-write", "--approve-for-me"]
-        model_flags = ["-m", self.s.codex_model] if self.s.codex_model else []
-        cmd = [
-            self.s.codex_binary,
-            "exec",
-            *model_flags,
-            *sandbox_flags,
-            "--ephemeral",
-            "--output-schema",
-            schema_path,
-            "-C",
-            cwd,
-            *self.s.codex_args,
-            prompt,
+        model = agent.model if agent and agent.model else self.s.codex_model
+        model_flags = ["-m", model] if model else []
+        reasoning = agent.reasoning.value if agent else "default"
+        reasoning_flags = [] if reasoning == "default" else [
+            "-c", f'model_reasoning_effort="{reasoning}"'
         ]
+        session_id = agent.session_id if agent else None
+        if session_id:
+            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else []
+            cmd = [
+                self.s.codex_binary, "exec", "resume", *model_flags,
+                *reasoning_flags, *resume_permissions, "--output-schema",
+                schema_path, "--json", session_id, prompt,
+            ]
+        else:
+            cmd = [
+                self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
+                *sandbox_flags, "--output-schema", schema_path, "--json",
+                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a],
+                prompt,
+            ]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            transport = terminal or LocalPtyTransport()
+            result = await transport.run(
+                node_id,
+                cmd,
+                cwd=cwd,
+                stream=stream,
+                timeout=timeout or self.s.default_run_timeout_seconds,
+                stall_timeout=stall_timeout,
             )
-            out_buf: list[bytes] = []
-
-            async def _read_out():
-                assert proc.stdout is not None
-                while True:
-                    chunk = await proc.stdout.read(4096)
-                    if not chunk:
-                        break
-                    out_buf.append(chunk)
-                    if stream is not None:
-                        await stream(node_id, chunk.decode(errors="replace"))
-
-            async def _read_err():
-                assert proc.stderr is not None
-                while True:
-                    chunk = await proc.stderr.read(4096)
-                    if not chunk:
-                        break
-                    if stream is not None:
-                        await stream(node_id, chunk.decode(errors="replace"))
-
-            await asyncio.wait_for(
-                asyncio.gather(_read_out(), _read_err(), proc.wait()),
-                timeout=self.s.default_run_timeout_seconds,
-            )
-        except (asyncio.TimeoutError, FileNotFoundError, OSError):
-            return ""
+            if result.stalled:
+                raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
+        except asyncio.TimeoutError as error:
+            raise GenerationStalled("planner exceeded the run timeout") from error
+        except (FileNotFoundError, OSError):
+            return "", Usage(), None
         finally:
             try:
                 os.unlink(schema_path)
             except OSError:
                 pass
-        return b"".join(out_buf).decode(errors="replace")
+        raw = result.output.decode(errors="replace")
+        messages: list[str] = []
+        usage = Usage()
+        discovered_session = None
+        parsed = False
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            parsed = True
+            if event.get("type") == "thread.started":
+                discovered_session = event.get("thread_id") or event.get("threadId")
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") in ("agent_message", "message"):
+                body = item.get("text") or item.get("content")
+                if isinstance(body, str):
+                    messages.append(body)
+            raw_usage = event.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = Usage(
+                    input_tokens=int(raw_usage.get("input_tokens") or 0),
+                    cached_input_tokens=int(raw_usage.get("cached_input_tokens") or 0),
+                    output_tokens=int(raw_usage.get("output_tokens") or 0),
+                    cost_usd=raw_usage.get("cost_usd"),
+                )
+        return ("\n".join(messages) if parsed and messages else raw), usage, discovered_session or session_id
+
+
+class AgentPlanner(Planner):
+    """Plan with the harness configured on the planner node.
+
+    The graph keeps one planner operation while this adapter owns provider CLI
+    differences. Codex retains schema-constrained output; other installed
+    harnesses receive the identical decomposition contract and are parsed by
+    the same strict ``PlanResult`` boundary.
+    """
+
+    name = "agent-planner"
+
+    def __init__(self, fallback: Planner | None = None, settings=settings):
+        self.s = settings
+        self.fallback = fallback
+        self.codex = CodexPlanner(fallback=fallback, settings=settings)
+
+    async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
+        agent = ctx.node.agent or AgentConfig(harness=HarnessKind.CODEX, type_id="planner")
+        if agent.harness == HarnessKind.CODEX:
+            return await self.codex.plan(ctx)
+        if agent.harness not in {HarnessKind.OPENCODE, HarnessKind.PI, HarnessKind.CLAUDE}:
+            return await self._fallback(ctx)
+        prompt = self.codex._build_prompt(ctx)
+        text = await self._call_harness(agent, prompt, ctx)
+        plan = AgentPlanner._parse_plan(text, ctx.node.objective)
+        if plan is not None and plan.nodes:
+            return plan
+        return await self._fallback(ctx)
+
+    async def _fallback(self, ctx: NodeExecutionContext) -> PlanResult:
+        if self.fallback is not None:
+            return await self.fallback.plan(ctx)
+        return PlanResult(nodes=[], notes="planner produced no nodes")
+
+    def _command(self, agent: AgentConfig, prompt: str) -> list[str]:
+        model = agent.model
+        reasoning = agent.reasoning.value
+        if agent.harness == HarnessKind.OPENCODE:
+            cmd = ["opencode", "run", "--format", "default", "--auto"]
+            if model:
+                cmd += ["--model", model]
+            if reasoning != "default":
+                cmd += ["--variant", reasoning]
+            return [*cmd, prompt]
+        if agent.harness == HarnessKind.PI:
+            cmd = ["pi", "--print", "--mode", "text", "--approve", "--no-session"]
+            if model:
+                cmd += ["--model", model]
+            if reasoning != "default":
+                cmd += ["--thinking", reasoning]
+            return [*cmd, prompt]
+        cmd = ["claude", "--print", "--output-format", "text", "--permission-mode", "acceptEdits"]
+        if model:
+            cmd += ["--model", model]
+        if reasoning != "default":
+            cmd += ["--effort", reasoning]
+        return [*cmd, prompt]
+
+    async def _call_harness(
+        self, agent: AgentConfig, prompt: str, ctx: NodeExecutionContext
+    ) -> str:
+        binary = {HarnessKind.OPENCODE: "opencode", HarnessKind.PI: "pi", HarnessKind.CLAUDE: "claude"}[agent.harness]
+        if shutil.which(binary) is None:
+            return ""
+        try:
+            transport = ctx.terminal or LocalPtyTransport()
+            result = await transport.run(
+                ctx.node.id,
+                self._command(agent, prompt),
+                cwd=ctx.repo_path or os.getcwd(),
+                stream=ctx.stream,
+                timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                stall_timeout=ctx.stall_timeout_seconds,
+            )
+            if result.stalled:
+                raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
+            return result.output.decode(errors="replace")
+        except asyncio.TimeoutError as error:
+            raise GenerationStalled("planner exceeded the run timeout") from error
+        except (FileNotFoundError, OSError):
+            return ""
 
     COORDINATOR_KEYS = {"coordinator", "oversee", "manage", "coordinate", "co-ordinate"}
 
@@ -315,15 +440,15 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
         # single step (e.g. when the user asked for exactly one) — never drop it,
         # or we'd regress to zero children. Only drop a duplicate-objective node
         # when siblings exist (there it's redundant scaffolding).
-        parent_norm = CodexPlanner._norm(parent_objective)
+        parent_norm = AgentPlanner._norm(parent_objective)
         only_child = len(raw_nodes) == 1
         drop = set()
         for n in raw_nodes:
             kn = n.key.strip().lower()
-            on = CodexPlanner._norm(n.objective)
+            on = AgentPlanner._norm(n.objective)
             if on and on == parent_norm and not only_child:
                 drop.add(n.key)
-            elif kn in CodexPlanner.COORDINATOR_KEYS:
+            elif kn in AgentPlanner.COORDINATOR_KEYS:
                 drop.add(n.key)
         if drop:
             for n in raw_nodes:
@@ -334,14 +459,14 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
         index = {n.key: i for i, n in enumerate(nodes)}
 
         # 2) Collect dependencies from both per-node depends_on and explicit
-        #    edges (Codex convention: edge src depends on dst). Then enforce a
+        #    edges (domain convention: src is prerequisite, dst dependent). Then enforce a
         #    DAG by keeping only a dependency whose prerequisite appears EARLIER
         #    in the node list (the prompt asks Codex to list in execution order).
         deps: dict[str, set[str]] = {n.key: set(n.depends_on) for n in nodes}
         for e in data.get("edges", []):
             s, d = e.get("src"), e.get("dst")
             if s in deps and d in deps and s != d:
-                deps[s].add(d)
+                deps[d].add(s)
         for n in nodes:
             n.depends_on = [
                 d for d in deps[n.key] if d in index and index[d] < index[n.key]

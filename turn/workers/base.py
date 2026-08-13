@@ -7,6 +7,8 @@ Neither owns Turn's data model — they only read context and emit results.
 from __future__ import annotations
 
 import os
+import shlex
+import sys
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
@@ -41,11 +43,14 @@ class NodeExecutionContext(BaseModel):
     ancestry: list[Node] = Field(default_factory=list)  # root .. immediate parent
     resources: list[Resource] = Field(default_factory=list)
     repo_path: Optional[str] = None
-    # Optional live stream for raw tool/agent output (e.g. terminal bytes).
-    # The runner wires this to the project's SSE bus. TODO(real-pty): replace
-    # this one-way mirror with a true bidirectional PTY so a human can type
-    # into the agent's terminal.
+    purpose: str = "execute"  # execute | verify
+    # Optional live stream plus provider-neutral terminal transport. Local
+    # harnesses use a true PTY; future cloud adapters can expose equivalent
+    # event/input semantics without changing the graph or worker protocol.
     stream: Any = None
+    terminal: Any = None
+    timeout_seconds: float | None = None
+    stall_timeout_seconds: float | None = None
 
 
 class Worker(ABC):
@@ -96,7 +101,11 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
     lines.append("GRAPH EXPLORATION TOOL (query the live project graph at runtime):")
     lines.append("  Before you plan or write, explore what is already planned/built so you")
     lines.append("  build on existing work instead of duplicating it. Run this EXACT command:")
-    lines.append(f'    python {ge_path} --project {ge_pid} --db "{ge_db}" --tree')
+    lines.append(
+        f'    {shlex.quote(sys.executable)} {shlex.quote(ge_path)} '
+        f'--project {ge_pid} --db "{ge_db}" '
+        f'--requester {ctx.node.id} --tree'
+    )
     lines.append("  It prints every node in this project: objective, parent, status, executor,")
     lines.append("  and the files each produced. Useful filters:")
     lines.append("    --node <id>       show one node")
@@ -107,4 +116,11 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
     lines.append("  elsewhere in the graph, reference or extend that node rather than")
     lines.append("  recreating it.")
     lines.append("")
+    objective = ctx.node.objective.lower()
+    if any(word in objective for word in ("assemble", "merge", "integrate", "combine", "stitch")):
+        lines.append("INTEGRATOR CONTRACT:")
+        lines.append("  This node is glue work. Inspect and reuse dependency outputs already in")
+        lines.append("  the working directory. Limit changes to assembly, interfaces, wiring,")
+        lines.append("  and compatibility fixes; do not recreate their domain content.")
+        lines.append("")
     return "\n".join(lines)

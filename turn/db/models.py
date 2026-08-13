@@ -27,8 +27,11 @@ class NodeModel(Base):
     parent_id = Column(Uuid(as_uuid=True), index=True, nullable=True)
 
     objective = Column(Text, nullable=False)
+    # Root-only concise navigation identity. Objective remains node intent.
+    project_name = Column(String(72), nullable=True)
     generated_prompt = Column(Text, nullable=True)
     executor = Column(String(64), nullable=True)
+    agent_config = Column(JSON, nullable=True)
 
     # Per-project working directory: the root node's own git repository path.
     # Children leave this null and inherit it from the root.
@@ -36,6 +39,7 @@ class NodeModel(Base):
     status = Column(String(16), nullable=False, default="PENDING")
     paused = Column(Boolean, nullable=False, default=False)
     auto_run = Column(Boolean, nullable=False, default=True)
+    run_policy = Column(JSON, nullable=True)
 
     required_inputs = Column(JSON, nullable=False, default=list)
     resource_refs = Column(JSON, nullable=False, default=list)
@@ -54,6 +58,10 @@ class NodeModel(Base):
     # merge into, so it is the final accumulation point).
     needs_review = Column(Boolean, nullable=False, default=False)
     merge_accepted = Column(Boolean, nullable=False, default=False)
+    verification_status = Column(String(16), nullable=True)
+    verification_summary = Column(Text, nullable=True)
+    verification_round = Column(Integer, nullable=False, default=0)
+    verification_session_id = Column(String(255), nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at = Column(
@@ -88,6 +96,17 @@ class RunModel(Base):
     error = Column(Text, nullable=True)
     retry_recommended = Column(Boolean, nullable=False, default=False)
     node_revision = Column(Integer, nullable=False, default=1)
+    attempt = Column(Integer, nullable=False, default=1)
+    usage = Column(JSON, nullable=False, default=dict)
+    session_id = Column(String(255), nullable=True)
+
+
+class SchemaVersionModel(Base):
+    """Tiny ordered migration ledger; avoids exception-driven ALTER hacks."""
+
+    __tablename__ = "schema_versions"
+    version = Column(Integer, primary_key=True)
+    applied_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class ArtifactModel(Base):
@@ -111,6 +130,18 @@ class SettingModel(Base):
     value = Column(Text, nullable=True)
 
 
+class GraphInspectionModel(Base):
+    """Durable proof that an agent queried the live workgraph."""
+
+    __tablename__ = "graph_inspections"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(Uuid(as_uuid=True), index=True, nullable=False)
+    requester_node_id = Column(Uuid(as_uuid=True), index=True, nullable=False)
+    query = Column(Text, nullable=False, default="tree")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
 # Re-export for convenience.
 __all__ = [
     "Base",
@@ -119,4 +150,6 @@ __all__ = [
     "RunModel",
     "ArtifactModel",
     "SettingModel",
+    "SchemaVersionModel",
+    "GraphInspectionModel",
 ]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -23,15 +24,20 @@ from turn.domain.schemas import (
     NodeStatus,
     Outcome,
     PlanResult,
+    ReviewMode,
     Resource,
     Run,
     RunStatus,
+    VerificationStatus,
     WorkerResult,
 )
 from turn.graph.logic import build_indexes, evaluate
 from turn.runner.events import EventBus
+from turn.runner.recovery import backoff_seconds, should_retry
 from turn.workers.base import NodeExecutionContext, Worker
 from turn.workers import parsing
+from turn.workers.harnesses import recover_session_id
+from turn.workers.terminal import GenerationStalled, LocalPtyTransport
 from turn.workers.registry import WorkerRegistry, build_registry
 from turn.workers import worktree
 
@@ -69,12 +75,15 @@ class Runner:
         self.s = settings
         self.exec_adapter = execution_adapter or DirectExecutionAdapter(settings)
         self._running: dict[uuid.UUID, asyncio.Task] = {}
+        self._verifying: dict[uuid.UUID, asyncio.Task] = {}
         self._retries: dict[uuid.UUID, int] = {}
         self._sem = asyncio.Semaphore(settings.max_concurrency)
         self._wake = asyncio.Event()
         self._stop = False
         self._task: Optional[asyncio.Task] = None
         self._merge_lock = asyncio.Lock()
+        self._last_launch_at: dict[uuid.UUID, float] = {}
+        self.terminal = LocalPtyTransport()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -84,7 +93,7 @@ class Runner:
     async def stop(self) -> None:
         self._stop = True
         self._wake.set()
-        for t in list(self._running.values()):
+        for t in [*self._running.values(), *self._verifying.values()]:
             t.cancel()
         if self._task is not None:
             try:
@@ -132,6 +141,62 @@ class Runner:
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return
+
+        # RUNNING rows survive an abrupt process exit, but tasks do not. Keep
+        # run-level usage/history honest by closing every row not owned by a
+        # live worker or verifier in this runner process.
+        active_node_ids = {
+            node_id
+            for mapping in (self._running, self._verifying)
+            for node_id, task in mapping.items()
+            if not task.done()
+        }
+        await self.store.cancel_orphaned_runs(project_id, active_node_ids)
+
+        by_id = {node.id: node for node in nodes}
+
+        # Cancellation is inherited. A verifier or worker can finish during
+        # the cancellation transaction and create a replacement child after
+        # supersede_branch() took its descendant snapshot. Reconcile that race
+        # at the scheduler boundary: no live work may survive underneath a
+        # cancelled/superseded ancestor.
+        for node in nodes:
+            ancestor = by_id.get(node.parent_id)
+            inactive_ancestor = None
+            seen: set[uuid.UUID] = set()
+            while ancestor is not None and ancestor.id not in seen:
+                seen.add(ancestor.id)
+                if ancestor.status == NodeStatus.CANCELLED or ancestor.superseded_by:
+                    inactive_ancestor = ancestor
+                    break
+                ancestor = by_id.get(ancestor.parent_id)
+            if inactive_ancestor is None or node.status == NodeStatus.CANCELLED:
+                continue
+            for task in (self._running.get(node.id), self._verifying.get(node.id)):
+                if task is not None and not task.done():
+                    task.cancel()
+            node.status = NodeStatus.CANCELLED
+            node.superseded_by = inactive_ancestor.id
+            node.needs_review = False
+            await self.store._save_node(node)
+            await self._emit("node.updated", project_id, _dump(node))
+
+        # Historical runs may finish at the same moment that their branch is
+        # cancelled or superseded. Such nodes remain useful history, but they
+        # must never keep owning an actionable review slot. Reconcile this at
+        # the scheduler boundary as well as in supersede_branch() so imported
+        # and pre-migration projects cannot leave auto-verification stuck.
+        for node in nodes:
+            if node.needs_review and (
+                node.superseded_by is not None or node.status == NodeStatus.CANCELLED
+            ):
+                verifier = self._verifying.get(node.id)
+                if verifier is not None and not verifier.done():
+                    verifier.cancel()
+                node.needs_review = False
+                await self.store._save_node(node)
+                await self._emit("node.updated", project_id, _dump(node))
+
         ev = evaluate(nodes, edges)
         idx = build_indexes(nodes, edges)
         node_by_id = idx.node_by_id
@@ -139,18 +204,28 @@ class Runner:
         # persist effective leaf statuses (RUNNABLE / BLOCKED) first
         for n in nodes:
             eff = ev.status.get(n.id)
-            if eff in (NodeStatus.RUNNABLE, NodeStatus.BLOCKED) and n.status not in (
-                NodeStatus.RUNNING,
-                NodeStatus.COMPLETE,
-                NodeStatus.FAILED,
-                NodeStatus.CANCELLED,
-                NodeStatus.EXPANDED,
-            ):
-                if n.status != eff:
-                    await self.store.set_status(n.id, eff)
-                    await self._emit(
-                        "node.updated", project_id, _dump(node_by_id[n.id])
+            if eff in (NodeStatus.RUNNABLE, NodeStatus.BLOCKED):
+                # Evaluation is a snapshot; a worker can finish while this
+                # tick is awaiting earlier writes. Re-read immediately before
+                # mutation so stale READY/BLOCKED projections never regress a
+                # newly terminal or running node.
+                fresh = await self.store.get_node(n.id)
+                if fresh is None or fresh.status in (
+                    NodeStatus.RUNNING,
+                    NodeStatus.COMPLETE,
+                    NodeStatus.FAILED,
+                    NodeStatus.CANCELLED,
+                    NodeStatus.EXPANDED,
+                ):
+                    continue
+                if fresh.status != eff:
+                    changed = await self.store.set_status_if_current(
+                        fresh.id,
+                        eff,
+                        (NodeStatus.PENDING, NodeStatus.RUNNABLE, NodeStatus.BLOCKED),
                     )
+                    if changed is not None:
+                        await self._emit("node.updated", project_id, _dump(changed))
 
         # Propagate completed planner containers up the tree. This MUST run
         # deepest-first: a parent's worktree has to already contain every
@@ -195,31 +270,43 @@ class Runner:
         # git repo of their finished work. Idempotent -- a fully-shipped
         # project is a no-op on later ticks.
         root = node_by_id.get(project_id)
-        if root is not None and root.status == NodeStatus.EXPANDED:
+        if root is not None and root.status in (NodeStatus.EXPANDED, NodeStatus.COMPLETE):
             settled = all(
                 ev.status.get(n.id)
                 in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED)
+                and not (n.needs_review and not n.merge_accepted)
                 for n in nodes
                 if n.id != project_id
             )
             if settled and len(nodes) > 1:
                 await self._maybe_finalize(root)
 
-        # --- auto-accept drain ------------------------------------------
-        # When auto-accept is on, also accept any nodes already awaiting
-        # review (reviews that piled up while it was off), not just the
-        # per-completion auto-accept in _mark_merged. Deepest-first so a
-        # container is accepted after its leaves. Independent of auto-run, so
-        # it also fires in manual/step mode. Toggling auto-accept on therefore
-        # drains the backlog immediately instead of only future completions.
-        if self.s.auto_accept_merges:
+        # --- parent-verification drain ----------------------------------
+        # Auto-verify is never a blind cleanup switch. Each pending branch is
+        # assigned to its parent agent, which inspects evidence and may accept
+        # or reject it. Rejections continue the child's existing session and
+        # worktree. This remains independent of auto-run so a user may combine
+        # manual execution with automatic parent review.
+        if self._auto_accept(root):
             pending = [
                 n for n in nodes
-                if n.parent_id and n.needs_review and not n.merge_accepted
+                if n.parent_id
+                and not n.superseded_by
+                and not n.merge_accepted
+                and n.needs_review
             ]
             pending.sort(key=lambda n: _depth(n.id), reverse=True)
             for n in pending:
-                await self.accept_merge(n.id)
+                self._queue_parent_verification(n.id)
+
+        # Reconcile old/concurrent filesystem residue in every review mode.
+        # Accepted state is a lifecycle guarantee, not an auto-review feature.
+        for n in sorted(
+            (item for item in nodes if item.parent_id and item.merge_accepted),
+            key=lambda item: _depth(item.id),
+            reverse=True,
+        ):
+            await self._cleanup_accepted(n)
 
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
@@ -227,29 +314,51 @@ class Runner:
         # launch anything. The user drives execution via step()/run_node().
         root = node_by_id.get(project_id)
         if root is not None and not root.auto_run:
-            await self._emit(
-                "project.manual",
-                project_id,
-                {"runnable": [str(x) for x in ev.runnable]},
-            )
             return
 
-        for nid in ev.runnable:
+        policy = root.run_policy if root and root.run_policy else None
+        force_sequential = policy.force_sequential if policy else self.s.force_sequential
+        delay_ms = policy.delay_between_jobs_ms if policy else self.s.delay_between_jobs_ms
+        project_running = [nid for nid in self._running if node_by_id.get(nid)]
+        if force_sequential and project_running:
+            return
+        if delay_ms and time.monotonic() - self._last_launch_at.get(project_id, 0) < delay_ms / 1000:
+            return
+        for nid in sorted(ev.runnable, key=str):
             if nid in self._running:
                 continue
-            node = node_by_id.get(nid)
-            if node is None:
+            snapshot = node_by_id.get(nid)
+            if snapshot is None:
+                continue
+            # Runnable membership is also snapshot-derived. Re-read before
+            # reserving the task so a stale tick cannot re-launch a node that
+            # completed while this scheduler pass was awaiting I/O.
+            node = await self.store.get_node(nid)
+            if node is None or node.merge_accepted or node.status in (
+                NodeStatus.RUNNING,
+                NodeStatus.COMPLETE,
+                NodeStatus.FAILED,
+                NodeStatus.CANCELLED,
+                NodeStatus.EXPANDED,
+            ):
                 continue
             # Respect an explicit pause: a paused node must not be auto-launched.
             if node.paused:
                 continue
             self._running[nid] = asyncio.create_task(self._execute_node(node, project_id))
+            self._last_launch_at[project_id] = time.monotonic()
+            if force_sequential or delay_ms:
+                break
 
     # -- execution -------------------------------------------------------
 
     async def _execute_node(self, node: Node, project_id: uuid.UUID) -> None:
         async with self._sem:
             try:
+                fresh = await self.store.get_node(node.id)
+                if fresh is None or fresh.merge_accepted:
+                    return
+                node = fresh
                 if node.executor == PLANNER_EXECUTOR and node.status != NodeStatus.EXPANDED:
                     await self._plan_node(node, project_id)
                 else:
@@ -257,6 +366,17 @@ class Runner:
             except asyncio.CancelledError:
                 await self._mark_cancelled(node)
                 raise
+            except GenerationStalled as e:
+                root = await self.store.get_node(project_id)
+                policy = root.run_policy if root else None
+                max_retries = policy.max_retries if policy else self.s.max_retries
+                retry_stalled = policy.retry_choked_models if policy else self.s.retry_choked_models
+                if retry_stalled and self._retries.get(node.id, 0) < max_retries:
+                    self._retries[node.id] = self._retries.get(node.id, 0) + 1
+                    await self.store.set_status(node.id, NodeStatus.RUNNABLE)
+                else:
+                    await self._mark_failed(node, str(e))
+                await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
             except Exception as e:
                 logger.exception("node %s failed", node.id)
                 await self._mark_failed(node, f"runner error: {e}")
@@ -264,7 +384,7 @@ class Runner:
                 self._running.pop(node.id, None)
                 self.wake()
 
-    async def _plan_node(self, node: Node, project_id: uuid.UUID) -> None:
+    async def _plan_node(self, node: Node, project_id: uuid.UUID) -> list[Node]:
         ctx = await self._build_context(node)
         # Give the planner (and its future children) a worktree branched from the
         # parent, so children inherit accumulated files and can merge back up.
@@ -279,7 +399,7 @@ class Runner:
             transcript_chunks.append(chunk)
 
         ctx.stream = _stream
-        run = await self.store.create_run(node, PLANNER_EXECUTOR)
+        run = await self.store.create_run(node, PLANNER_EXECUTOR, self._retries.get(node.id, 0) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
         try:
@@ -288,7 +408,7 @@ class Runner:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
             created = await self.store.apply_plan(node, plan)
-            transcript = parsing.strip_ansi("".join(transcript_chunks))
+            transcript = "".join(transcript_chunks)
             if transcript.strip():
                 arts = await self.store.add_artifacts(
                     node.id,
@@ -301,25 +421,58 @@ class Runner:
                 status=RunStatus.COMPLETE,
                 outcome=Outcome.COMPLETE,
                 summary=f"planned {len(created)} node(s)",
+                logs=transcript or f"Planned {len(created)} node(s). {plan.notes or ''}".strip(),
+                usage=plan.usage,
+                session_id=plan.session_id,
             )
+            await self._remember_session(node, plan.session_id)
             await self._emit("plan.applied", project_id, {"parent": _dump(node), "created": len(created)})
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
+            return created
+        except Exception as error:
+            transcript = "".join(transcript_chunks)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.FAILED,
+                outcome=Outcome.FAIL,
+                summary=str(error),
+                logs=transcript,
+                error=str(error),
+                retry_recommended=isinstance(error, GenerationStalled),
+            )
+            if transcript:
+                await self.store.add_artifacts(
+                    node.id,
+                    [ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)],
+                )
+            raise
         finally:
             self.wake()
 
     async def _run_worker(self, node: Node, project_id: uuid.UUID) -> None:
         ctx = await self._build_context(node)
-        worker = self.registry.get(node.executor) or self.registry.get(self.s.default_executor)
+        worker_key = node.agent.harness.value if node.agent and node.executor != PLANNER_EXECUTOR else node.executor
+        worker = self.registry.get(worker_key) or self.registry.get(self.s.default_executor)
         if worker is None:
             await self._mark_failed(node, f"no worker registered for executor '{node.executor}'")
             return
-        run = await self.store.create_run(node, worker.name)
+        run = await self.store.create_run(node, worker.name, self._retries.get(node.id, 0) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
         try:
+            root = await self.store.get_node(project_id)
+            timeout = (
+                root.run_policy.timeout_seconds
+                if root and root.run_policy else self.s.default_run_timeout_seconds
+            )
+            ctx.timeout_seconds = timeout
+            ctx.stall_timeout_seconds = (
+                root.run_policy.stall_timeout_seconds
+                if root and root.run_policy else self.s.stall_timeout_seconds
+            )
             result: WorkerResult = await self.exec_adapter.run(
-                worker, ctx, timeout=self.s.default_run_timeout_seconds
+                worker, ctx, timeout=timeout
             )
         except asyncio.TimeoutError:
             await self._handle_outcome(
@@ -344,26 +497,51 @@ class Runner:
     async def _handle_outcome(
         self, node: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
+        fresh = await self.store.get_node(node.id)
+        if fresh is not None and fresh.merge_accepted:
+            # Acceptance is terminal and may race an already-running worker.
+            # Preserve the late run as cancelled history without letting its
+            # result revive the accepted node or schedule another retry.
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="result arrived after branch acceptance",
+                error="superseded by accepted state",
+            )
+            if fresh.status == NodeStatus.RUNNING:
+                await self.store.set_status(fresh.id, NodeStatus.COMPLETE)
+            await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
+            return
         if result.outcome == Outcome.COMPLETE:
             arts = await self.store.add_artifacts(node.id, result.artifacts)
             for a in arts:
                 await self._emit("artifact.created", project_id, _dump(a))
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.COMPLETE,
-                summary=result.summary, logs=result.executor_notes or "",
+                summary=result.summary, logs=result.executor_notes or result.summary or "",
+                usage=result.usage, session_id=result.session_id,
             )
+            await self._remember_session(node, result.session_id)
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
             await self._mark_merged(node)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
+            arts = await self.store.add_artifacts(node.id, result.artifacts)
+            for a in arts:
+                await self._emit("artifact.created", project_id, _dump(a))
             created = await self.store.apply_plan(node, plan)
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.EXPAND,
-                summary=result.summary,
+                summary=result.summary, logs=result.executor_notes or result.summary or "",
+                usage=result.usage, session_id=result.session_id,
             )
+            await self._remember_session(node, result.session_id)
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
             await self._emit("plan.applied", project_id, {"parent": _dump(node), "created": len(created)})
+            if not created:
+                await self._mark_merged(node)
 
         elif result.outcome == Outcome.BLOCK:
             node = await self.store.get_node(node.id)
@@ -376,18 +554,29 @@ class Runner:
                 await self._save_node_state(node)
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.BLOCK,
-                summary=result.summary,
+                summary=result.summary, logs=result.executor_notes or result.summary or "",
+                usage=result.usage, session_id=result.session_id,
             )
             await self.store.set_status(node.id, NodeStatus.BLOCKED)
 
         elif result.outcome == Outcome.FAIL:
             await self.store.update_run(
                 run.id, status=RunStatus.FAILED, outcome=Outcome.FAIL,
-                summary=result.summary, error=result.error,
+                summary=result.summary, logs=result.executor_notes or result.summary or result.error or "",
+                error=result.error,
                 retry_recommended=result.retry_recommended,
             )
-            if result.retry_recommended and self._retries.get(node.id, 0) < self.s.max_retries:
+            root = await self.store.get_node(project_id)
+            policy = root.run_policy if root else None
+            max_retries = policy.max_retries if policy else self.s.max_retries
+            retry_choked = policy.retry_choked_models if policy else self.s.retry_choked_models
+            recommended = should_retry(result.error or result.summary, result.retry_recommended, retry_choked)
+            if recommended and self._retries.get(node.id, 0) < max_retries:
                 self._retries[node.id] = self._retries.get(node.id, 0) + 1
+                base_ms = policy.retry_backoff_ms if policy else self.s.retry_backoff_ms
+                delay = backoff_seconds(self._retries[node.id], base_ms)
+                if delay:
+                    await asyncio.sleep(delay)
                 await self.store.set_status(node.id, NodeStatus.RUNNABLE)
             else:
                 await self.store.set_status(node.id, NodeStatus.FAILED)
@@ -432,8 +621,9 @@ class Runner:
         for review. The root (no parent) is the final accumulation point and is
         never reviewed. Idempotent: once reviewed/accepted it is left alone.
 
-        With global auto-accept ON, the merge is accepted immediately (the
-        redundant subtree worktree is deleted) without waiting for the user.
+        With project auto-verify ON, the parent agent receives the review. It
+        may accept or reject; Turn does not delete evidence before that real
+        decision exists.
         """
         if node.parent_id is None:
             return
@@ -447,22 +637,216 @@ class Runner:
         if not worktree.worktree_path(node.id, repo).exists():
             return
         fresh.needs_review = True
+        fresh.verification_status = VerificationStatus.PENDING
+        fresh.verification_summary = "Awaiting parent verification"
         await self.store._save_node(fresh)
         await self._emit("node.updated", fresh.project_id, _dump(fresh))
-        if self.s.auto_accept_merges:
-            await self.accept_merge(node.id)
+        root = await self.store.get_node(node.project_id)
+        if self._auto_accept(root):
+            self._queue_parent_verification(node.id)
+
+    def _auto_accept(self, root: Node | None) -> bool:
+        """Compatibility name for the parent-owned auto-verification policy.
+
+        The global value is only a compatibility default for projects created
+        before per-project policies existed.
+        """
+        if root and root.run_policy:
+            return root.run_policy.review_mode in (ReviewMode.AUTO_ACCEPT, ReviewMode.PARENT)
+        return bool(self.s.auto_accept_merges)
+
+    def _queue_parent_verification(self, node_id: uuid.UUID) -> None:
+        existing = self._verifying.get(node_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._verify_with_parent(node_id))
+        self._verifying[node_id] = task
+
+        def finished(done: asyncio.Task) -> None:
+            # A completion callback may run after a replacement task has
+            # already been registered for the same node. Never let the older
+            # callback remove the newer single-flight reservation.
+            if self._verifying.get(node_id) is done:
+                self._verifying.pop(node_id, None)
+            if not done.cancelled():
+                try:
+                    done.exception()
+                except Exception:
+                    pass
+            self.wake()
+
+        task.add_done_callback(finished)
+
+    async def _verify_with_parent(self, node_id: uuid.UUID) -> None:
+        """Run a real, evidence-bearing review as the node's parent agent.
+
+        COMPLETE accepts. BLOCK is actionable rejection feedback and resumes
+        the same child session/worktree. FAIL means the verifier itself could
+        not reach a decision; evidence remains available for manual review.
+        """
+        async with self._sem:
+            child = await self.store.get_node(node_id)
+            if (
+                child is None
+                or child.parent_id is None
+                or not child.needs_review
+                or child.merge_accepted
+            ):
+                return
+            parent = await self.store.get_node(child.parent_id)
+            root = await self.store.get_node(child.project_id)
+            if parent is None:
+                return
+            policy = root.run_policy if root and root.run_policy else None
+            max_rounds = max(2, (policy.max_retries if policy else self.s.max_retries) + 1)
+            if child.verification_round >= max_rounds:
+                child.verification_status = VerificationStatus.ERROR
+                child.verification_summary = (
+                    f"Automatic verification stopped after {max_rounds} rounds; manual review required"
+                )
+                await self.store._save_node(child)
+                await self._emit("node.updated", child.project_id, _dump(child))
+                return
+
+            parent_agent = (parent.agent or (root.agent if root else None))
+            if parent_agent is None:
+                child.verification_status = VerificationStatus.ERROR
+                child.verification_summary = "Parent has no configured agent; manual review required"
+                await self.store._save_node(child)
+                return
+            worker = self.registry.get(parent_agent.harness.value)
+            if worker is None:
+                child.verification_status = VerificationStatus.ERROR
+                child.verification_summary = (
+                    f"Parent harness {parent_agent.harness.value} is unavailable; manual review required"
+                )
+                await self.store._save_node(child)
+                return
+
+            child.verification_round += 1
+            child.verification_status = VerificationStatus.RUNNING
+            child.verification_summary = (
+                f"{parent.objective} is verifying revision {child.revision}"
+            )
+            child = await self.store._save_node(child)
+            await self._emit("node.updated", child.project_id, _dump(child))
+
+            runs = await self.store.get_runs(child.id)
+            execution_runs = [r for r in runs if not r.worker.startswith("parent-verifier:")]
+            latest = execution_runs[-1] if execution_runs else None
+            artifacts = await self.store.get_artifacts(child.id)
+            evidence = "\n".join(
+                f"- {artifact.name}: {artifact.ref or artifact.kind.value}"
+                for artifact in artifacts[-30:]
+                if artifact.name != "transcript"
+            ) or "- No declared artifacts; inspect the merged worktree and git history directly."
+            verifier_node = child.model_copy(deep=True)
+            verifier_node.agent = parent_agent.model_copy(deep=True)
+            verifier_node.agent.session_id = child.verification_session_id
+            verifier_node.agent.type_id = "validator"
+            verifier_node.executor = verifier_node.agent.harness.value
+            verifier_node.objective = f"Verify {child.objective}"
+            verifier_node.generated_prompt = f"""PARENT NODE:
+{parent.objective}
+
+CHILD OBJECTIVE:
+{child.objective}
+
+CHILD INSTRUCTIONS:
+{child.generated_prompt or "No additional instructions."}
+
+LATEST CHILD RESULT:
+{latest.summary if latest and latest.summary else "No summary recorded."}
+
+DECLARED EVIDENCE:
+{evidence}
+
+Inspect the merged implementation and relevant graph context. Run focused,
+non-destructive checks where possible. Accept only when the child satisfies its
+scope and does not conflict with sibling work. If rejecting, give concise,
+actionable corrections that the same child session can apply next.
+"""
+            context = await self._build_context(verifier_node)
+            context.purpose = "verify"
+            review_run = await self.store.create_run(
+                child, f"parent-verifier:{worker.name}", child.verification_round
+            )
+            try:
+                timeout = policy.timeout_seconds if policy else self.s.default_run_timeout_seconds
+                result = await self.exec_adapter.run(worker, context, timeout=timeout)
+            except asyncio.CancelledError:
+                await self.store.update_run(review_run.id, status=RunStatus.CANCELLED, outcome=Outcome.FAIL)
+                raise
+            except Exception as error:
+                result = WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary="Parent verification could not run",
+                    error=str(error),
+                )
+
+            decision = (
+                "accepted" if result.outcome == Outcome.COMPLETE
+                else "rejected" if result.outcome == Outcome.BLOCK
+                else "error"
+            )
+            decision_artifact = ArtifactSpec(
+                kind=ArtifactKind.JSON,
+                name=f"parent-verification-{child.verification_round}",
+                content={
+                    "decision": decision,
+                    "parent_id": str(parent.id),
+                    "parent_objective": parent.objective,
+                    "child_revision": child.revision,
+                    "summary": result.summary,
+                },
+            )
+            saved_artifacts = await self.store.add_artifacts(
+                child.id, [*result.artifacts, decision_artifact]
+            )
+            for artifact in saved_artifacts:
+                await self._emit("artifact.created", child.project_id, _dump(artifact))
+            await self.store.update_run(
+                review_run.id,
+                status=(RunStatus.FAILED if result.outcome == Outcome.FAIL else RunStatus.COMPLETE),
+                outcome=result.outcome,
+                summary=result.summary,
+                logs=result.executor_notes or result.summary or result.error or "",
+                error=result.error,
+                usage=result.usage,
+                session_id=result.session_id,
+            )
+            fresh = await self.store.get_node(child.id)
+            if fresh is None or not fresh.needs_review or fresh.merge_accepted:
+                return
+            fresh.verification_summary = result.summary or result.error or "No verification summary"
+            if result.session_id:
+                fresh.verification_session_id = result.session_id
+            if result.outcome == Outcome.COMPLETE:
+                fresh.verification_status = VerificationStatus.ACCEPTED
+                await self.store._save_node(fresh)
+                await self.accept_merge(child.id)
+            elif result.outcome == Outcome.BLOCK:
+                fresh.verification_status = VerificationStatus.REJECTED
+                await self.store._save_node(fresh)
+                await self.reject_merge(
+                    child.id,
+                    f"[Parent verification round {fresh.verification_round}]\n{fresh.verification_summary}",
+                )
+            else:
+                fresh.verification_status = VerificationStatus.ERROR
+                await self.store._save_node(fresh)
+                await self._emit("node.updated", fresh.project_id, _dump(fresh))
 
     async def _maybe_finalize(self, root: Node) -> None:
         """Ship a settled project: merge its working branch into the project's
         base branch so the user keeps a real, initialized git repo, then mark
         the root container COMPLETE."""
         repo = await self._project_repo(root.project_id)
-        if not repo:
-            return
-        try:
-            await asyncio.to_thread(worktree.ship_project, root.id, repo)
-        except Exception as e:  # pragma: no cover
-            logger.warning("project ship failed for %s: %s", root.id, e)
+        if repo:
+            try:
+                await asyncio.to_thread(worktree.ship_project, root.id, repo)
+            except Exception as e:  # pragma: no cover
+                logger.warning("project ship failed for %s: %s", root.id, e)
         if root.status != NodeStatus.COMPLETE:
             await self.store.set_status(root.id, NodeStatus.COMPLETE)
             await self._emit(
@@ -476,35 +860,133 @@ class Runner:
         Cleaning the whole subtree (node + all descendants) means accepting a
         high-level container also resolves every review beneath it.
         """
+        verification = self._verifying.get(node_id)
+        if verification is not None and verification is not asyncio.current_task():
+            verification.cancel()
         node = await self.store.get_node(node_id)
         if node is None or node.parent_id is None:
             return
         repo = await self._project_repo(node.project_id)
         desc = await self.store.descendants(node_id)
         ids = [node_id] + [d.id for d in desc]
-        if repo:
-            for nid in ids:
-                try:
-                    await asyncio.to_thread(
-                        worktree.remove_worktree, nid, repo
-                    )
-                except Exception as e:  # pragma: no cover
-                    logger.warning("worktree removal failed for %s: %s", nid, e)
-            try:
-                await asyncio.to_thread(
-                    worktree.remove_branches, ids, repo
-                )
-            except Exception as e:  # pragma: no cover
-                logger.warning("branch removal failed: %s", e)
+        current = asyncio.current_task()
+        active_tasks: list[asyncio.Task] = []
+        cancelled_descendants: set[uuid.UUID] = set()
         for nid in ids:
-            n = await self.store.get_node(nid)
-            if n is None:
-                continue
-            n.needs_review = False
-            n.merge_accepted = True
-            await self.store._save_node(n)
-            await self._emit("node.updated", n.project_id, _dump(n))
+            for task in (self._running.get(nid), self._verifying.get(nid)):
+                if task is not None and task is not current and not task.done():
+                    task.cancel()
+                    active_tasks.append(task)
+                    if nid != node_id:
+                        cancelled_descendants.add(nid)
+        if active_tasks:
+            await asyncio.gather(*dict.fromkeys(active_tasks), return_exceptions=True)
+        async with self._merge_lock:
+            cleaned = await self._remove_merged_resources(ids, repo)
+            if not cleaned:
+                logger.warning("acceptance cleanup incomplete for %s; retaining review state", node_id)
+                return
+            for nid in ids:
+                n = await self.store.get_node(nid)
+                if n is None:
+                    continue
+                n.needs_review = False
+                if nid in cancelled_descendants and not n.merge_accepted:
+                    n.status = NodeStatus.CANCELLED
+                if nid != node_id and n.status == NodeStatus.CANCELLED and not n.merge_accepted:
+                    # A cancelled historical attempt is not evidence accepted
+                    # by the container decision. Keep it cancelled/unaccepted
+                    # instead of visually reviving it as completed work.
+                    await self.store._save_node(n)
+                    await self._emit("node.updated", n.project_id, _dump(n))
+                    continue
+                n.merge_accepted = True
+                # Acceptance is a terminal positive projection. A concurrent
+                # container cleanup may cancel a task, but cannot relabel work
+                # already accepted by a verifier as cancelled.
+                n.status = NodeStatus.COMPLETE
+                if nid == node_id:
+                    # Acceptance is terminal. A verifier that reached its
+                    # retry ceiling while cleanup awaited the filesystem may
+                    # have projected ERROR in the interim; canonicalize the
+                    # accepted decision as part of the same locked commit.
+                    n.verification_status = VerificationStatus.ACCEPTED
+                await self.store._save_node(n)
+                await self._emit("node.updated", n.project_id, _dump(n))
         self.wake()
+
+    async def _remove_merged_resources(self, ids: list[uuid.UUID], repo: str | None) -> bool:
+        if not repo:
+            return True
+        for nid in ids:
+            try:
+                await asyncio.to_thread(worktree.remove_worktree, nid, repo)
+            except Exception as error:  # pragma: no cover
+                logger.warning("worktree removal failed for %s: %s", nid, error)
+        try:
+            await asyncio.to_thread(worktree.remove_branches, ids, repo)
+        except Exception as error:  # pragma: no cover
+            logger.warning("branch removal failed: %s", error)
+        return all(
+            not worktree.worktree_path(nid, repo).exists()
+            and not worktree._branch_exists(worktree.branch_name(nid), repo)
+            for nid in ids
+        )
+
+    async def _cleanup_accepted(self, node: Node) -> None:
+        """Repair filesystem residue for a node already marked accepted."""
+        repo = await self._project_repo(node.project_id)
+        if not repo:
+            return
+        async with self._merge_lock:
+            # The scheduler snapshot may predate a user rejection. Never let
+            # reconciliation delete a worktree that has just become active.
+            fresh = await self.store.get_node(node.id)
+            if (
+                fresh is None
+                or not fresh.merge_accepted
+                or node.id in self._running
+            ):
+                return
+            if fresh.status != NodeStatus.COMPLETE:
+                # Acceptance is the durable positive terminal state. Process
+                # interruption or a concurrent container cancellation may
+                # leave RUNNING/CANCELLED behind, but with no in-memory owner
+                # that projection safely collapses back to COMPLETE.
+                await self.store.set_status(fresh.id, NodeStatus.COMPLETE)
+                fresh = await self.store.get_node(fresh.id)
+                if fresh is None:
+                    return
+            stale_acceptance_projection = (
+                fresh.verification_status != VerificationStatus.ACCEPTED
+                or (fresh.verification_summary or "").startswith(
+                    "Automatic verification stopped"
+                )
+            )
+            if stale_acceptance_projection:
+                fresh.verification_status = VerificationStatus.ACCEPTED
+                runs = await self.store.get_runs(fresh.id)
+                accepted_review = next(
+                    (
+                        run for run in reversed(runs)
+                        if run.worker.startswith("parent-verifier:")
+                        and run.status == RunStatus.COMPLETE
+                        and run.outcome == Outcome.COMPLETE
+                    ),
+                    None,
+                )
+                if accepted_review and accepted_review.summary:
+                    fresh.verification_summary = accepted_review.summary
+                await self.store._save_node(fresh)
+                await self._emit("node.updated", fresh.project_id, _dump(fresh))
+            ids = [node.id]
+            if not any(
+                worktree.worktree_path(nid, repo).exists()
+                or worktree._branch_exists(worktree.branch_name(nid), repo)
+                for nid in ids
+            ):
+                return
+            await self._remove_merged_resources(ids, repo)
 
     async def reject_merge(self, node_id: uuid.UUID, feedback: str) -> None:
         """Reject a merged node: send feedback into the SAME node (no new node)
@@ -515,23 +997,48 @@ class Runner:
         to its prompt. The node's (already merged) subtree worktree is preserved
         so the re-run starts from the current state.
         """
+        verification = self._verifying.get(node_id)
+        if verification is not None and verification is not asyncio.current_task():
+            verification.cancel()
         node = await self.store.get_node(node_id)
         if node is None or node.parent_id is None:
             return
+        if node.agent is not None and not node.agent.session_id:
+            # Compatibility recovery for transcripts written before a harness
+            # exposed its session id through the adapter. This keeps review
+            # feedback in the existing conversation instead of restarting it.
+            for artifact in reversed(await self.store.get_artifacts(node_id)):
+                if artifact.name != "transcript" or not isinstance(artifact.content, str):
+                    continue
+                session_id = recover_session_id(artifact.content)
+                if session_id:
+                    node.agent.session_id = session_id
+                    await self.store._save_node(node)
+                    break
         if feedback and feedback.strip():
             base = node.generated_prompt or ""
             await self.store.edit_node(
                 node_id, generated_prompt=base + f"\n\n[Reviewer feedback]\n{feedback.strip()}"
             )
-        n = await self.store.get_node(node_id)
-        n.needs_review = False
-        n.merge_accepted = False
-        await self.store._save_node(n)
-        is_planner = n.executor == PLANNER_EXECUTOR or n.status == NodeStatus.EXPANDED
+        # Serialize the accepted -> active transition with accepted-resource
+        # cleanup. If cleanup is already in flight, rejection waits and then
+        # safely recreates its worktree; if rejection wins, cleanup's refetch
+        # sees an active node and exits.
+        async with self._merge_lock:
+            n = await self.store.get_node(node_id)
+            if n is None:
+                return
+            n.needs_review = False
+            n.merge_accepted = False
+            is_planner = n.executor == PLANNER_EXECUTOR or n.status == NodeStatus.EXPANDED
+            if is_planner:
+                n.status = NodeStatus.PENDING
+            elif n.status != NodeStatus.RUNNING:
+                n.status = NodeStatus.RUNNABLE
+            await self.store._save_node(n)
         if is_planner:
             await self.regenerate_descendants(node_id)
         elif n.status != NodeStatus.RUNNING:
-            await self.store.set_status(node_id, NodeStatus.RUNNABLE)
             await self.run_node(node_id)
         await self._emit(
             "node.updated", n.project_id, _dump(await self.store.get_node(node_id))
@@ -551,26 +1058,47 @@ class Runner:
         self.wake()
 
     async def edit_node(self, node_id: uuid.UUID, **kwargs) -> None:
+        cascade_agent = bool(kwargs.pop("cascade_agent", False))
         node = await self.store.edit_node(node_id, **kwargs)
         if node is not None:
             await self._emit("node.updated", node.project_id, _dump(node))
+            if cascade_agent and node.agent is not None:
+                for child in await self.store.descendants(node_id):
+                    if child.status == NodeStatus.CANCELLED or child.superseded_by:
+                        continue
+                    inherited = node.agent.model_copy(deep=True)
+                    inherited.type_id = "planner" if child.executor == PLANNER_EXECUTOR else "general"
+                    changed = await self.store.edit_node(child.id, agent=inherited)
+                    if changed is not None:
+                        await self._emit("node.updated", changed.project_id, _dump(changed))
         self.wake()
 
-    async def regenerate_descendants(self, node_id: uuid.UUID) -> None:
+    async def regenerate_descendants(self, node_id: uuid.UUID) -> dict:
+        node = await self.store.get_node(node_id)
+        if node is None:
+            return {"created": [], "superseded": []}
+        descendants = await self.store.descendants(node_id)
+        cancelling: list[asyncio.Task] = []
+        for descendant in descendants:
+            for task in (self._running.get(descendant.id), self._verifying.get(descendant.id)):
+                if task is not None and task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+                    cancelling.append(task)
+        if cancelling:
+            await asyncio.gather(*cancelling, return_exceptions=True)
+        cancelled = await self.store.supersede_branch(node_id)
+        # Re-plan through the same execution path as an initial planner run so
+        # transcript, usage, and especially provider session continuity are
+        # preserved across parent-verifier feedback.
         node = await self.store.get_node(node_id)
         if node is None:
             return
-        cancelled = await self.store.supersede_branch(node_id)
-        # re-plan from the (possibly edited) node and build a fresh branch
-        ctx = await self._build_context(node)
-        planner = self.registry.planner
-        plan = await planner.plan(ctx) if planner else PlanResult(nodes=[])
-        created = await self.store.apply_plan(node, plan)
-        # ensure the node is once again a live container
-        if created:
-            await self.store.set_status(node_id, NodeStatus.EXPANDED)
-        else:
-            await self.store.set_status(node_id, NodeStatus.COMPLETE)
+        try:
+            created = await self._plan_node(node, node.project_id)
+        except Exception:
+            await self.store.set_status(node.id, NodeStatus.FAILED)
+            await self._emit("node.updated", node.project_id, _dump(await self.store.get_node(node.id)))
+            raise
         await self._emit(
             "graph.replaced",
             node.project_id,
@@ -580,32 +1108,40 @@ class Runner:
         for c in created:
             await self._emit("node.created", node.project_id, _dump(c))
         self.wake()
+        return {"created": [str(c.id) for c in created], "superseded": [str(c) for c in cancelled]}
 
-    async def fork(self, node_id: uuid.UUID) -> Optional[Node]:
+    async def fork(
+        self, node_id: uuid.UUID, *, objective: str | None = None,
+        generated_prompt: str | None = None,
+    ) -> Optional[Node]:
         orig = await self.store.get_node(node_id)
         if orig is None:
             return None
-        parent_id = orig.parent_id  # sibling alternative; None => new root project
+        # A fork remains visible inside the project that owns the source node.
+        # Non-root nodes get a sibling alternative. The project root has no
+        # sibling container, so its alternative becomes a top-level child.
+        # Creating a fresh unrelated project_id here produces an unreachable
+        # graph that neither project explorer nor project stream can address.
+        parent_id = orig.parent_id or orig.id
         fork = await self.store.create_node(
-            project_id=orig.project_id if parent_id else uuid.uuid4(),
+            project_id=orig.project_id,
             parent_id=parent_id,
-            objective=orig.objective,
-            generated_prompt=orig.generated_prompt,
+            objective=objective or orig.objective,
+            generated_prompt=generated_prompt if generated_prompt is not None else orig.generated_prompt,
             executor=PLANNER_EXECUTOR,
+            agent=orig.agent.model_copy(deep=True) if orig.agent else None,
             required_inputs=orig.required_inputs,
             resource_refs=orig.resource_refs,
             forked_from=orig.id,
             status=NodeStatus.PENDING,
         )
-        # planner builds an independent alternative branch from the fork
-        ctx = await self._build_context(fork)
-        planner = self.registry.planner
-        plan = await planner.plan(ctx) if planner else PlanResult(nodes=[])
-        created = await self.store.apply_plan(fork, plan)
-        if created:
-            await self.store.set_status(fork.id, NodeStatus.EXPANDED)
-        else:
-            await self.store.set_status(fork.id, NodeStatus.COMPLETE)
+        # A sibling fork gets an independent planner conversation. Editing and
+        # regenerating that fork will then resume its own session.
+        fork.agent = fork.agent or AgentConfig(type_id="planner")
+        fork.agent.session_id = None
+        fork.agent.type_id = "planner"
+        fork = await self.store._save_node(fork)
+        created = await self._plan_node(fork, fork.project_id)
         await self._emit(
             "graph.forked",
             fork.project_id,
@@ -649,6 +1185,43 @@ class Runner:
             await self.store.set_status(node_id, NodeStatus.CANCELLED)
             await self._emit("node.updated", node.project_id, _dump(node))
         self.wake()
+
+    async def branch_action(self, node_id: uuid.UUID, action: str) -> None:
+        """Apply a pause/resume/cancel action to a node and its descendants."""
+        node = await self.store.get_node(node_id)
+        if node is None:
+            return
+        descendants = await self.store.descendants(node_id)
+        targets = [node, *descendants]
+        if action == "pause":
+            for target in targets:
+                await self.store.set_paused(target.id, True)
+        elif action == "resume":
+            for target in targets:
+                await self.store.set_paused(target.id, False)
+        elif action == "cancel":
+            for target in targets:
+                task = self._running.get(target.id)
+                if task:
+                    task.cancel()
+                elif target.status not in (NodeStatus.COMPLETE, NodeStatus.CANCELLED):
+                    await self.store.set_status(target.id, NodeStatus.CANCELLED)
+        else:
+            raise ValueError(f"unsupported branch action: {action}")
+        await self._emit("graph.branch_updated", node.project_id, {"root": str(node_id), "action": action})
+        self.wake()
+
+    async def cancel_project_runs(self, project_id: uuid.UUID) -> None:
+        """Stop every in-flight task before a project is removed."""
+        nodes, _, _ = await self.store.get_workgraph(project_id)
+        tasks = [self._running[node.id] for node in nodes if node.id in self._running]
+        tasks.extend(
+            self._verifying[node.id] for node in nodes if node.id in self._verifying
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- manual stepping --------------------------------------------------
 
@@ -701,6 +1274,9 @@ class Runner:
     async def set_mode(self, project_id: uuid.UUID, auto_run: bool) -> None:
         node = await self.store.set_auto_run(project_id, auto_run)
         if node is not None:
+            if node.run_policy:
+                node.run_policy.auto_run = auto_run
+                node = await self.store._save_node(node)
             await self._emit("node.updated", project_id, _dump(node))
         self.wake()
 
@@ -715,6 +1291,8 @@ class Runner:
 
         # The project's own git repo (root node's repo_path, else fallback).
         project_repo = await self._project_repo(node.project_id)
+        root = await self.store.get_node(node.project_id)
+        policy = root.run_policy if root else None
 
         # Wire a live terminal stream: the worker emits raw output chunks and we
         # fan them out over the project SSE bus as `node.terminal` events.
@@ -729,6 +1307,9 @@ class Runner:
             resources=resources,
             repo_path=project_repo,
             stream=_stream,
+            terminal=self.terminal,
+            timeout_seconds=policy.timeout_seconds if policy else self.s.default_run_timeout_seconds,
+            stall_timeout_seconds=policy.stall_timeout_seconds if policy else self.s.stall_timeout_seconds,
         )
 
     async def _resolve_resources(self, refs: list[str]) -> list[Resource]:
@@ -756,6 +1337,20 @@ class Runner:
             return
         n.required_inputs = node.required_inputs
         await self.store._save_node(n)  # type: ignore[attr-defined]
+
+    async def _remember_session(self, node: Node, session_id: str | None) -> None:
+        if not session_id:
+            return
+        fresh = await self.store.get_node(node.id)
+        if fresh is None:
+            return
+        if fresh.agent is None:
+            from turn.domain.schemas import AgentConfig, HarnessKind
+
+            harness = fresh.executor if fresh.executor in {h.value for h in HarnessKind} else "codex"
+            fresh.agent = AgentConfig(harness=harness)
+        fresh.agent.session_id = session_id
+        await self.store._save_node(fresh)
 
     async def _mark_cancelled(self, node: Node) -> None:
         n = await self.store.get_node(node.id)
