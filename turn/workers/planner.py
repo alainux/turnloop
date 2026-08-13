@@ -136,7 +136,11 @@ investigate / plan / verify scaffolding.
 the genuinely distinct sub-tasks and express their relationships using the
 TOPOLOGY rules below.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
-that merely restates this objective is never useful — drop it.
+that merely restates this objective is never useful — drop it. Never list the
+same sub-task twice, and do NOT create parallel sub-planners that cover the
+same scope under different names (e.g. do not make both a "Kanto cities"
+planner and a "Kanto guide" planner). Each distinct scope appears exactly once
+in the plan.
 
 - CARD TITLE (HARD RULE): each child's "objective" MUST be a short
   TITLE-LIKE phrase — at most ~6 words and ~50 characters. It is rendered as
@@ -161,12 +165,19 @@ TOPOLOGY — arrange the children to express the real workflow:
 - NESTED PLANNERS: for any sub-task that is itself a broad problem, set
   "plan": true AND "executor": "planner". Such a node will be decomposed AGAIN
   on its next turn — so do NOT pre-expand it here; give it a clear objective and
-  let it plan its own children. Limit the chain to at most two levels of
-  sub-planners.
+  let it plan its own children. Nest sub-planners as deeply as the problem
+  GENUINELY requires: a sub-problem that is still broad should itself become a
+  planner, and so on, until the remaining work is concrete enough for leaf
+  workers. Do NOT add depth for show — only turn a node into a sub-planner when
+  that sub-node is truly a broad problem in its own right (a single concrete
+  step should stay a leaf).
 - LEAF WORK: every node that actually does work (writing code, prose, files)
-  gets "executor": "codex" and a concrete "generated_prompt". Never use
-  "executor": "echo" for real work; only use "shell" for a single shell command
-  (put that command alone in generated_prompt).
+  gets "executor": "codex" and a concrete "generated_prompt". The generated_prompt
+  MUST tell the worker to WRITE its deliverable to a file in the working
+  directory (e.g. create parser.py, recipe.md, or tokyo.md) — not merely return
+  text — because downstream assemblers read those files to compose the result.
+  Never use "executor": "echo" for real work; only use "shell" for a single shell
+  command (put that command alone in generated_prompt).
 - COMPOSERS / ASSEMBLERS: if a node's job is to combine or integrate its
   prerequisites (objective names 'assemble', 'merge', 'integrate', 'combine',
   'stitch'), its generated_prompt MUST tell it to READ the files those
