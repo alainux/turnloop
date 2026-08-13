@@ -30,6 +30,14 @@ async function refreshProjects(selectId) {
     sel.appendChild(o);
   }
   if (selectId) sel.value = selectId;
+  updateRepoLine();
+}
+
+// Reflect the currently-selected project's repo path in the project bar.
+function updateRepoLine() {
+  const sel = $("#project-select");
+  const opt = sel && sel.selectedOptions && sel.selectedOptions[0];
+  document.getElementById("repo-line").textContent = opt && opt.title ? opt.title : "";
 }
 
 async function createProject(prompt, mode, workingDir) {
@@ -42,6 +50,7 @@ async function createProject(prompt, mode, workingDir) {
   });
   state.projectId = res.project_id;
   await refreshProjects(state.projectId);
+  updateRepoLine();
   connectStream();
   await loadGraph();
 }
@@ -107,6 +116,14 @@ const STATUS_COLOR = {
   CANCELLED: "#8b93a3",
   EXPANDED: "#5b8cff",
 };
+
+// A node that ran and was merged up into its parent is "done" but still
+// awaits human acceptance before its subtree is cleaned. Surface that as a
+// distinct BLOCKED status so it isn't confused with a fully-accepted COMPLETE.
+function displayStatus(n) {
+  if (n.parent_id && n.needs_review && !n.merge_accepted) return "BLOCKED";
+  return n.status;
+}
 
 function layoutGraph() {
   const { byId, children, root } = buildTree();
@@ -197,13 +214,13 @@ function renderGraph() {
     const p = pos.get(n.id);
     if (!p) continue;
     const box = el("div", {
-      className: "gnode " + n.status + (state.openNodeId === n.id ? " selected" : ""),
+      className: "gnode " + displayStatus(n) + (state.openNodeId === n.id ? " selected" : ""),
       id: "gnode-" + n.id,
       title: n.objective || "",
       style: `left:${p.x}px;top:${p.y - G_BOX_H / 2}px;width:${G_BOX_W}px;`,
     });
-    box.style.borderLeftColor = STATUS_COLOR[n.status] || "#2a2f3a";
-    box.appendChild(el("span", { className: "badge " + n.status }, n.status));
+    box.style.borderLeftColor = STATUS_COLOR[displayStatus(n)] || "#2a2f3a";
+    box.appendChild(el("span", { className: "badge " + displayStatus(n) }, displayStatus(n)));
     box.appendChild(el("div", { className: "gobj" }, n.objective || "(no objective)"));
     if (n.progress != null && children.has(n.id)) {
       const pb = el("div", { className: "progress" });
@@ -283,6 +300,10 @@ async function renderDetail() {
     return b;
   };
 
+  d.appendChild(el("div", { className: "kv status-row" }, [
+    el("label", {}, "Status"),
+    el("span", { className: "badge " + displayStatus(node) }, displayStatus(node)),
+  ]));
   d.appendChild(el("div", { className: "kv" }, [
     el("label", {}, "Objective"),
     el("div", {}, node.objective || ""),
@@ -603,8 +624,7 @@ $("#project-select").addEventListener("change", async (e) => {
   state.streaming = false;
   if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
   // Show the selected project's repo path.
-  const opt = e.target.selectedOptions[0];
-  document.getElementById("repo-line").textContent = opt && opt.title ? opt.title : "";
+  updateRepoLine();
   connectStream();
   await loadGraph();
 });

@@ -55,6 +55,7 @@ button:disabled { opacity: .5; cursor: default; }
 
 /* New-project modal --------------------------------------------------- */
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal[hidden] { display: none; }
 .modal-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; width: min(520px, 92vw); box-shadow: 0 20px 60px rgba(0,0,0,.5); }
 .modal-card h3 { margin: 0 0 14px; font-size: 16px; }
 .field-label { display: block; margin: 12px 0 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
@@ -162,6 +163,11 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
 .gnode:hover { border-color: var(--accent); }
 .gnode.selected { outline: 2px solid var(--accent); }
 .gnode .badge { flex: 0 0 auto; }
+/* review-pending nodes need human action — make them stand out */
+.gnode.BLOCKED { box-shadow: 0 0 0 1px rgba(210,153,34,.55), 0 0 12px rgba(210,153,34,.28); }
+.gnode.BLOCKED.selected { outline-color: var(--amber); }
+.status-row { align-items: center; gap: 8px; }
+.status-row .badge { font-size: 11px; }
 .gnode .gobj { font-size: 12px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; word-break: break-word; flex: 1 1 auto; min-height: 0; }
 .gnode .progress { flex: 0 0 4px; margin-top: auto; }
 .graph-legend { color: var(--muted); font-size: 11px; margin: 6px 0 2px; }

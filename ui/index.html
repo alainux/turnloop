@@ -23,15 +23,15 @@
   <div id="new-modal" class="modal" hidden>
     <div class="modal-card">
       <h3>New project</h3>
-      <label class="field-label">Objective</label>
+      <label class="field-label" for="new-prompt">Objective</label>
       <textarea id="new-prompt" rows="3" placeholder="Describe an objective… (vague is fine)"></textarea>
 
-      <label class="field-label">Location</label>
+      <label class="field-label" for="new-mode-create">Location</label>
       <div class="mode-row">
-        <label class="radio"><input type="radio" name="new-mode" value="create" checked /> New repo (or empty folder)</label>
+        <label class="radio"><input type="radio" id="new-mode-create" name="new-mode" value="create" checked /> New repo (or empty folder)</label>
         <label class="radio"><input type="radio" name="new-mode" value="open" /> Open existing repo</label>
       </div>
-      <input id="new-dir" placeholder="working directory — blank = ./projects/&lt;id&gt;" />
+      <input id="new-dir" aria-label="Working directory" placeholder="working directory — blank = ./projects/&lt;id&gt;" />
       <span class="muted">New makes a fresh git repo that becomes the project root. Open refactors an existing repo on a side branch.</span>
 
       <div class="modal-actions">
