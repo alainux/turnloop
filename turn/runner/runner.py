@@ -205,6 +205,22 @@ class Runner:
             if settled and len(nodes) > 1:
                 await self._maybe_finalize(root)
 
+        # --- auto-accept drain ------------------------------------------
+        # When auto-accept is on, also accept any nodes already awaiting
+        # review (reviews that piled up while it was off), not just the
+        # per-completion auto-accept in _mark_merged. Deepest-first so a
+        # container is accepted after its leaves. Independent of auto-run, so
+        # it also fires in manual/step mode. Toggling auto-accept on therefore
+        # drains the backlog immediately instead of only future completions.
+        if self.s.auto_accept_merges:
+            pending = [
+                n for n in nodes
+                if n.parent_id and n.needs_review and not n.merge_accepted
+            ]
+            pending.sort(key=lambda n: _depth(n.id), reverse=True)
+            for n in pending:
+                await self.accept_merge(n.id)
+
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
         # effective statuses (so the UI can show what is ready) but we do NOT

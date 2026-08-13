@@ -117,11 +117,42 @@ const STATUS_COLOR = {
   EXPANDED: "#5b8cff",
 };
 
-// A node that ran and was merged up into its parent is "done" but still
-// awaits human acceptance before its subtree is cleaned. Surface that as a
-// distinct BLOCKED status so it isn't confused with a fully-accepted COMPLETE.
-function displayStatus(n) {
-  if (n.parent_id && n.needs_review && !n.merge_accepted) return "BLOCKED";
+// A node is "review-blocked" if it (or any descendant in its subtree) still
+// awaits human acceptance (needs_review && !merge_accepted). Blocking parents
+// makes it obvious the work isn't really done until the children are accepted
+// -- a container/integrator shouldn't read COMPLETE while its leaves are still
+// sitting in review.
+function computeBlockedIds() {
+  const nodes = state.graph.nodes || [];
+  const childrenOf = new Map();
+  for (const n of nodes) {
+    if (n.parent_id) {
+      if (!childrenOf.has(n.parent_id)) childrenOf.set(n.parent_id, []);
+      childrenOf.get(n.parent_id).push(n.id);
+    }
+  }
+  const blocked = new Set();
+  const seen = new Set();
+  function visit(id) {
+    if (seen.has(id)) return blocked.has(id);
+    seen.add(id);
+    const n = nodes.find((x) => x.id === id);
+    if (!n) return false;
+    let childPending = false;
+    for (const c of (childrenOf.get(id) || [])) {
+      if (visit(c)) childPending = true;
+    }
+    const selfPending = !!(n.parent_id && n.needs_review && !n.merge_accepted);
+    const isBlocked = selfPending || childPending;
+    if (isBlocked) blocked.add(id);
+    return isBlocked;
+  }
+  for (const n of nodes) if (!n.parent_id) visit(n.id);
+  return blocked;
+}
+
+function displayStatusOf(n, blocked) {
+  if (blocked && blocked.has(n.id)) return "BLOCKED";
   return n.status;
 }
 
@@ -210,17 +241,18 @@ function renderGraph() {
   }
 
   // nodes
+  const blocked = computeBlockedIds();
   for (const n of state.graph.nodes) {
     const p = pos.get(n.id);
     if (!p) continue;
     const box = el("div", {
-      className: "gnode " + displayStatus(n) + (state.openNodeId === n.id ? " selected" : ""),
+      className: "gnode " + displayStatusOf(n, blocked) + (state.openNodeId === n.id ? " selected" : ""),
       id: "gnode-" + n.id,
       title: n.objective || "",
       style: `left:${p.x}px;top:${p.y - G_BOX_H / 2}px;width:${G_BOX_W}px;`,
     });
-    box.style.borderLeftColor = STATUS_COLOR[displayStatus(n)] || "#2a2f3a";
-    box.appendChild(el("span", { className: "badge " + displayStatus(n) }, displayStatus(n)));
+    box.style.borderLeftColor = STATUS_COLOR[displayStatusOf(n, blocked)] || "#2a2f3a";
+    box.appendChild(el("span", { className: "badge " + displayStatusOf(n, blocked) }, displayStatusOf(n, blocked)));
     box.appendChild(el("div", { className: "gobj" }, n.objective || "(no objective)"));
     if (n.progress != null && children.has(n.id)) {
       const pb = el("div", { className: "progress" });
@@ -300,9 +332,10 @@ async function renderDetail() {
     return b;
   };
 
+  const blocked = computeBlockedIds();
   d.appendChild(el("div", { className: "kv status-row" }, [
     el("label", {}, "Status"),
-    el("span", { className: "badge " + displayStatus(node) }, displayStatus(node)),
+    el("span", { className: "badge " + displayStatusOf(node, blocked) }, displayStatusOf(node, blocked)),
   ]));
   d.appendChild(el("div", { className: "kv" }, [
     el("label", {}, "Objective"),
