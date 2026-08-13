@@ -302,6 +302,137 @@ async def test_worktree_merge_up() -> None:
     print("WORKTREE MERGE-UP TEST PASSED")
 
 
+async def test_deep_merge_up_ordering() -> None:
+    """Regression for the 'missing chapters' bug: a planner container must not
+    be merged into its parent until ALL of its own children have merged into it.
+    Build root -> A -> B -> leaves (3-level chain) and let the runner's
+    _schedule_project propagate completion bottom-up; every leaf file must
+    reach the root worktree. With the old shallow-first ordering, B could be
+    merged after A, so B's leaf files were dropped from the root."""
+    import tempfile
+    import subprocess
+    import os
+    from turn.workers import worktree as wtmod
+    from turn.runner.runner import Runner
+    from turn.runner.events import EventBus
+    from turn.domain.schemas import NodeSpec, PlanResult
+
+    repo = tempfile.mkdtemp(prefix="turn-order-test-")
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "--allow-empty", "-q", "-m", "init"], check=True)
+
+    saved_repo = settings.repo_path
+    settings.repo_path = repo
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    await store.init()
+    try:
+        reg = WorkerRegistry()
+        runner = Runner(store, registry=reg, events=EventBus(), settings=settings)
+        root = await store.create_project("root objective")
+        await store.set_auto_run(root.id, False)
+
+        created = await store.apply_plan(root, PlanResult(nodes=[
+            NodeSpec(key="A", objective="alpha container", executor="planner", plan=True),
+            NodeSpec(key="l1", objective="leaf one", executor="codex", parent_key="A"),
+            NodeSpec(key="l2", objective="leaf two", executor="codex", parent_key="A"),
+        ]))
+        A = next(c for c in created if c.objective == "alpha container")
+        created2 = await store.apply_plan(A, PlanResult(nodes=[
+            NodeSpec(key="B", objective="beta container", executor="planner", plan=True),
+            NodeSpec(key="l3", objective="leaf three", executor="codex", parent_key="B"),
+            NodeSpec(key="l4", objective="leaf four", executor="codex", parent_key="B"),
+        ]))
+        B = next(c for c in created2 if c.objective == "beta container")
+        leaf_ids = {"l1": None, "l2": None, "l3": None, "l4": None}
+        obj_to_key = {"leaf one": "l1", "leaf two": "l2", "leaf three": "l3", "leaf four": "l4"}
+        for c in created + created2:
+            if c.objective in obj_to_key:
+                leaf_ids[obj_to_key[c.objective]] = c.id
+
+        # Worktrees + leaf files, then simulate the worker merging leaves up.
+        root_wt = wtmod.get_or_create_worktree(root.id, None, force=True, repo_path=repo)
+        A_wt = wtmod.get_or_create_worktree(A.id, root.id, force=True, repo_path=repo)
+        B_wt = wtmod.get_or_create_worktree(B.id, A.id, force=True, repo_path=repo)
+        for k, nid in leaf_ids.items():
+            wt = wtmod.get_or_create_worktree(nid, A.id if k in ("l1", "l2") else B.id,
+                                             force=True, repo_path=repo)
+            open(os.path.join(wt, f"{k}.md"), "w").write(f"CONTENT-{k}")
+            wtmod.commit_worktree(nid, repo_path=repo)
+        wtmod.merge_into_parent(leaf_ids["l1"], A.id, repo_path=repo)
+        wtmod.merge_into_parent(leaf_ids["l2"], A.id, repo_path=repo)
+        wtmod.merge_into_parent(leaf_ids["l3"], B.id, repo_path=repo)
+        wtmod.merge_into_parent(leaf_ids["l4"], B.id, repo_path=repo)
+
+        # Simulate every worker/assembler having run: leaves and injected
+        # assemblers are COMPLETE; planner containers are EXPANDED so the runner
+        # will propagate them upward. (The merge-ordering logic is what we test.)
+        gwk = await store.get_workgraph(root.id)
+        for n in gwk[0]:
+            if n.executor == "planner":
+                await store.set_status(n.id, NodeStatus.EXPANDED)
+            else:
+                await store.set_status(n.id, NodeStatus.COMPLETE)
+
+        await runner._schedule_project(root.id)
+
+        files = sorted(os.listdir(root_wt))
+        for k in ("l1", "l2", "l3", "l4"):
+            assert f"{k}.md" in files, f"leaf {k} missing from root (merge-order bug): {files}"
+        print("DEEP MERGE-UP ORDERING TEST PASSED")
+    finally:
+        settings.repo_path = saved_repo
+        await store.dispose()
+
+
+async def test_intermediate_integration() -> None:
+    """A nested broad planner should get an injected assembler that integrates
+    its direct children (bottom-up composition), the project root should not,
+    and we must not inject a second one when the planner already made one."""
+    import tempfile
+    from turn.runner.runner import Runner
+    from turn.runner.events import EventBus
+    from turn.domain.schemas import NodeSpec, PlanResult
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    await store.init()
+    reg = WorkerRegistry()
+    Runner(store, registry=reg, events=EventBus(), settings=settings)
+    root = await store.create_project("write a guide")
+    created = await store.apply_plan(root, PlanResult(nodes=[
+        NodeSpec(key="A", objective="chapter one", executor="planner", plan=True),
+        NodeSpec(key="l1", objective="leaf one", executor="codex", parent_key="A"),
+        NodeSpec(key="l2", objective="leaf two", executor="codex", parent_key="A"),
+    ]))
+    A = next(c for c in created if c.objective == "chapter one")
+    created2 = await store.apply_plan(A, PlanResult(nodes=[
+        NodeSpec(key="s1", objective="section one", executor="codex"),
+        NodeSpec(key="s2", objective="section two", executor="codex"),
+    ]))
+    g = await store.get_workgraph(root.id)
+    nodes = g[0]; edges = g[1]
+    by_obj = {n.objective: n for n in nodes}
+    asm = next((n for n in nodes if n.objective.startswith("Integrate:")), None)
+    assert asm is not None, "no intermediate assembler injected for nested planner"
+    assert asm.parent_id == A.id, "assembler should be a child of the nested planner A"
+    dep_srcs = {e.src for e in edges if e.type == "DEPENDS_ON" and e.dst == asm.id}
+    assert dep_srcs == {by_obj["section one"].id, by_obj["section two"].id}, dep_srcs
+    # Root must not get an injected assembler.
+    root_kids = [n for n in nodes if n.parent_id == root.id]
+    assert not any(n.objective.startswith("Integrate:") for n in root_kids), "root got an assembler"
+    # If the planner already made an assembler, do not add a duplicate.
+    created3 = await store.apply_plan(A, PlanResult(nodes=[
+        NodeSpec(key="s3", objective="section three", executor="codex"),
+        NodeSpec(key="asm", objective="Assemble chapter one", executor="codex", depends_on=["s3"]),
+    ]))
+    assert not any(c.objective.startswith("Integrate:") for c in created3), "duplicate assembler injected"
+    print("INTERMEDIATE INTEGRATION TEST PASSED")
+    await store.dispose()
+
+
 if __name__ == "__main__":
     asyncio.run(test_auto_run_default())
     asyncio.run(test_codex_worker_refuses_main_repo())
@@ -311,3 +442,5 @@ if __name__ == "__main__":
     asyncio.run(test_worker_prompt_points_at_worktree())
     asyncio.run(test_planner_topology())
     asyncio.run(test_worktree_merge_up())
+    asyncio.run(test_deep_merge_up_ordering())
+    asyncio.run(test_intermediate_integration())
