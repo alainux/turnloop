@@ -31,6 +31,7 @@ from turn.domain.schemas import (
     EdgeType,
     InputSpec,
     Node,
+    NodeSpec,
     NodeStatus,
     Outcome,
     PlanResult,
@@ -105,6 +106,21 @@ def _artifact_from_model(m: ArtifactModel) -> Artifact:
 # --------------------------------------------------------------------------
 # Store
 # --------------------------------------------------------------------------
+
+
+def _slug(objective: str, limit: int = 48) -> str:
+    if not objective:
+        return "integrated"
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in objective.lower())
+    s = "_".join(cleaned.split()[:6]).strip("_")[:limit]
+    return s or "integrated"
+
+
+def _looks_like_assembler(objective: str) -> bool:
+    if not objective:
+        return False
+    low = objective.lower()
+    return any(w in low for w in ("assembl", "integrat", "merge", "combin", "stitch", "compose"))
 
 
 class Store:
@@ -504,7 +520,67 @@ class Store:
         new_edges: list[EdgeModel] = []
 
         project_id = parent.project_id
+        # Guard against planner over-decomposition: drop any child whose
+        # normalized objective already appears ANYWHERE in this plan (so a
+        # planner that lists the same child twice, or spins up parallel
+        # framings of the same scope, cannot explode the tree with redundant,
+        # competing work), and cap how many children any single parent may get.
+        MAX_CHILDREN = 4
+        seen_keys: set[str] = set()
+        seen_obj: set[str] = set()
+        child_count: dict[str, int] = {}
+        kept: list[NodeSpec] = []
         for spec in plan.nodes:
+            grp = spec.parent_key or "__root__"
+            norm = " ".join((spec.objective or "").lower().split())
+            if spec.key in seen_keys or norm in seen_obj:
+                continue
+            if child_count.get(grp, 0) >= MAX_CHILDREN:
+                continue
+            seen_keys.add(spec.key)
+            seen_obj.add(norm)
+            child_count[grp] = child_count.get(grp, 0) + 1
+            kept.append(spec)
+
+        # Intermediate integration: for any nested, broad planner, add an assembler
+        # that integrates this node's direct children into one artifact -- so
+        # composition happens bottom-up (region -> city -> section) instead of
+        # one giant top-level merge that must read every file at once. This is
+        # what makes deep trees integrable without a single all-seeing assembler.
+        # We skip the project root (it keeps its own explicit assembler) and we
+        # don't add a second one if the planner already produced an assembler.
+        if (
+            parent.parent_id is not None
+            and getattr(parent, "executor", None) == PLANNER_EXECUTOR
+            and len(kept) >= 2
+            and not any(_looks_like_assembler(s.objective) for s in kept)
+        ):
+            asm_key = "integrate"
+            i = 1
+            while asm_key in seen_keys:
+                asm_key = f"integrate_{i}"
+                i += 1
+            kept.append(
+                NodeSpec(
+                    key=asm_key,
+                    objective=f"Integrate: {parent.objective}",
+                    executor="codex",
+                    parent_key=None,
+                    depends_on=[s.key for s in kept],
+                    generated_prompt=(
+                        "You are integrating the outputs of this node's direct children "
+                        "into a single cohesive artifact. The files those children produced "
+                        "are already present in your working directory (merged up from their "
+                        "worktrees). READ every file your dependencies created and MERGE/INTEGRATE "
+                        "them into one document named '" + _slug(parent.objective) + ".md' (or the "
+                        "appropriate extension). Preserve the children's actual content; do NOT "
+                        "regenerate it from memory. Produce a clean, unified result with a short "
+                        "intro and the integrated sections in order."
+                    ),
+                )
+            )
+
+        for spec in kept:
             nid = uuid.uuid4()
             keys_to_ids[spec.key] = nid
             parent_id = (
@@ -543,7 +619,7 @@ class Store:
                 )
 
         # explicit CONTAINS edges for nested specs
-        for spec in plan.nodes:
+        for spec in kept:
             if spec.parent_key:
                 new_edges.append(
                     EdgeModel(
@@ -554,7 +630,7 @@ class Store:
                     )
                 )
         # DEPENDS_ON edges (both from specs and explicit plan edges)
-        for spec in plan.nodes:
+        for spec in kept:
             for dep in spec.depends_on:
                 new_edges.append(
                     EdgeModel(
