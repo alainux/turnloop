@@ -176,6 +176,7 @@ function renderGraph() {
     const box = el("div", {
       className: "gnode " + n.status + (state.openNodeId === n.id ? " selected" : ""),
       id: "gnode-" + n.id,
+      title: n.objective || "",
       style: `left:${p.x}px;top:${p.y - G_BOX_H / 2}px;width:${G_BOX_W}px;`,
     });
     box.style.borderLeftColor = STATUS_COLOR[n.status] || "#2a2f3a";

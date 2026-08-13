@@ -138,6 +138,11 @@ TOPOLOGY rules below.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it.
 
+- CARD TITLE: keep each child's "objective" to a short, title-like phrase (a few
+  words, e.g. "Write chapter 1", "Build the parser", "Style the theme"). The
+  objective is rendered as the graph-card title, so do NOT paste a paragraph or
+  long description into it — put the fuller task detail in "generated_prompt".
+
 TOPOLOGY — arrange the children to express the real workflow:
 - SEQUENTIAL: steps that must run in order. The later step lists its
   prerequisite as a "depends_on" key.

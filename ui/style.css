@@ -147,7 +147,9 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
 }
 .gnode:hover { border-color: var(--accent); }
 .gnode.selected { outline: 2px solid var(--accent); }
-.gnode .gobj { font-size: 12px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.gnode .badge { flex: 0 0 auto; }
+.gnode .gobj { font-size: 12px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; word-break: break-word; flex: 1 1 auto; min-height: 0; }
+.gnode .progress { flex: 0 0 4px; margin-top: auto; }
 .graph-legend { color: var(--muted); font-size: 11px; margin: 6px 0 2px; }
 .pane-controls { float: right; display: flex; align-items: center; gap: 10px; font-weight: 400; font-size: 12px; }
 .pane-controls .switch { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
