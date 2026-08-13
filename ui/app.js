@@ -92,9 +92,10 @@ function layoutGraph() {
   function walk(id, depth) {
     const kids = children.get(id) || [];
     if (!kids.length) {
-      pos.set(id, { x: depth * G_COL, y: yc * G_ROW });
+      const y = yc * G_ROW;
+      pos.set(id, { x: depth * G_COL, y });
       yc += 1;
-      return yc - 1;
+      return y;
     }
     const ys = kids.map((k) => walk(k, depth + 1));
     const myY = (Math.min(...ys) + Math.max(...ys)) / 2;
