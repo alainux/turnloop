@@ -479,6 +479,18 @@ class Store:
 
     # -- plan application ------------------------------------------------
 
+    def _cap_objective(self, text: str, limit: int = 60) -> str:
+        """Keep graph-card titles scannable. The planner is asked to keep
+        objectives short, but enforce a hard backstop: collapse whitespace and
+        truncate anything over `limit` characters (the fuller task detail lives in
+        generated_prompt, not in the title)."""
+        if not text:
+            return text
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1].rstrip() + "…"
+
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
         """Create child nodes + edges described by a plan under `parent`."""
         if not plan.nodes:
@@ -511,7 +523,7 @@ class Store:
                     id=nid,
                     project_id=project_id,
                     parent_id=parent_id,
-                    objective=spec.objective,
+                    objective=self._cap_objective(spec.objective),
                     generated_prompt=spec.generated_prompt,
                     executor=executor,
                     status=NodeStatus.PENDING.value,

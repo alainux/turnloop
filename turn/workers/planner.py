@@ -138,10 +138,20 @@ TOPOLOGY rules below.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it.
 
-- CARD TITLE: keep each child's "objective" to a short, title-like phrase (a few
-  words, e.g. "Write chapter 1", "Build the parser", "Style the theme"). The
-  objective is rendered as the graph-card title, so do NOT paste a paragraph or
-  long description into it — put the fuller task detail in "generated_prompt".
+- CARD TITLE (HARD RULE): each child's "objective" MUST be a short
+  TITLE-LIKE phrase — at most ~6 words and ~50 characters. It is rendered as
+  the graph-card title, so it must be scannable at a glance. Do NOT put a
+  sentence, paragraph, or long description in "objective"; put all task detail,
+  rationale, file names, and instructions in "generated_prompt".
+  GOOD:  "Write chapter 1", "Build the parser", "Style the theme",
+         "Assemble the package", "Add the code renderer".
+  BAD:   "Design and implement the page-renderer feature area with 2-3
+         renderer modules" (too long — move the detail to generated_prompt),
+         "Create a comprehensive Markdown->HTML engine and supporting
+         renderers for headings, paragraphs, lists and fenced code blocks"
+         (paragraph — not a title).
+  If you catch yourself writing more than a short title, STOP and move the
+  rest into "generated_prompt".
 
 TOPOLOGY — arrange the children to express the real workflow:
 - SEQUENTIAL: steps that must run in order. The later step lists its
