@@ -32,18 +32,36 @@ async function refreshProjects(selectId) {
   if (selectId) sel.value = selectId;
 }
 
-async function createProject(prompt) {
-  const mode = document.getElementById("project-mode")?.value || "create";
-  const wd = (document.getElementById("working-dir")?.value || "").trim() || null;
+async function createProject(prompt, mode, workingDir) {
+  const m = mode || "create";
+  const wd = workingDir && workingDir.trim() ? workingDir.trim() : null;
   const res = await api("/api/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, mode, working_dir: wd }),
+    body: JSON.stringify({ prompt, mode: m, working_dir: wd }),
   });
   state.projectId = res.project_id;
   await refreshProjects(state.projectId);
   connectStream();
   await loadGraph();
+}
+
+function openNewModal() {
+  const modal = document.getElementById("new-modal");
+  document.getElementById("new-prompt").value = "";
+  document.getElementById("new-dir").value = "";
+  const create = document.getElementById("new-create");
+  create.onclick = async () => {
+    const prompt = document.getElementById("new-prompt").value.trim();
+    if (!prompt) return;
+    const mode = document.querySelector('input[name="new-mode"]:checked').value;
+    const wd = document.getElementById("new-dir").value;
+    modal.hidden = true;
+    await createProject(prompt, mode, wd);
+  };
+  document.getElementById("new-cancel").onclick = () => { modal.hidden = true; };
+  modal.hidden = false;
+  document.getElementById("new-prompt").focus();
 }
 
 // ---------------------------------------------------------------- graph
@@ -255,6 +273,16 @@ async function renderDetail() {
   const node = res.node;
   d.innerHTML = "";
 
+  // Small button factory, used by both the merge-review block and the actions
+  // row below. Defined up front so it is available before any early return.
+  const mk = (label, cls, fn) => {
+    const b = document.createElement("button");
+    b.className = cls || "";
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  };
+
   d.appendChild(el("div", { className: "kv" }, [
     el("label", {}, "Objective"),
     el("div", {}, node.objective || ""),
@@ -325,13 +353,6 @@ async function renderDetail() {
 
   // actions — only show controls that make sense for the current status
   const actions = el("div", { className: "actions" });
-  const mk = (label, cls, fn) => {
-    const b = document.createElement("button");
-    b.className = cls || "";
-    b.textContent = label;
-    b.onclick = fn;
-    return b;
-  };
   const st = node.status;
   const act = (label, cls, fn) => actions.append(mk(label, cls, fn));
 
@@ -570,17 +591,10 @@ function connectStream() {
 }
 
 // ---------------------------------------------------------------- wire up
-$("#prompt-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const v = $("#prompt-input").value.trim();
-  if (!v) return;
-  await createProject(v);
-  $("#prompt-input").value = "";
-});
+document.getElementById("new-btn").addEventListener("click", openNewModal);
 
-document.getElementById("advanced-toggle").addEventListener("click", () => {
-  const adv = document.getElementById("advanced");
-  adv.hidden = !adv.hidden;
+document.getElementById("new-modal").addEventListener("click", (e) => {
+  if (e.target.id === "new-modal") e.target.hidden = true;
 });
 
 $("#project-select").addEventListener("change", async (e) => {
@@ -588,6 +602,9 @@ $("#project-select").addEventListener("change", async (e) => {
   state.openNodeId = null;
   state.streaming = false;
   if (state.streamTimer) { clearTimeout(state.streamTimer); state.streamTimer = null; }
+  // Show the selected project's repo path.
+  const opt = e.target.selectedOptions[0];
+  document.getElementById("repo-line").textContent = opt && opt.title ? opt.title : "";
   connectStream();
   await loadGraph();
 });

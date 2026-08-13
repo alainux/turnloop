@@ -9,28 +9,36 @@
 <body>
   <header>
     <div class="brand">Turn <span class="host">turnloop.tech</span></div>
-    <form id="prompt-form">
-      <input id="prompt-input" placeholder="Describe an objective… (vague is fine)" autocomplete="off" />
-      <button type="submit">Create workgraph</button>
-      <button type="button" id="advanced-toggle">Folder ▾</button>
-    </form>
-    <div id="advanced" hidden>
-      <label>Location:
-        <select id="project-mode">
-          <option value="create">New repo (or empty dir)</option>
-          <option value="open">Open existing repo</option>
-        </select>
-      </label>
-      <input id="working-dir" placeholder="working directory — blank = ./projects/&lt;slug&gt;" />
-      <span class="muted">Create makes a fresh git repo that becomes the project root; Open refactors an existing one on a branch.</span>
-    </div>
   </header>
 
   <div id="project-bar">
+    <button id="new-btn" type="button">+ New</button>
     <label>Project:</label>
     <select id="project-select"><option value="">— none —</option></select>
+    <span id="repo-line" class="muted"></span>
     <span id="status-line"></span>
     <button id="clear-btn" type="button" title="Remove all projects">Clear</button>
+  </div>
+
+  <div id="new-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h3>New project</h3>
+      <label class="field-label">Objective</label>
+      <textarea id="new-prompt" rows="3" placeholder="Describe an objective… (vague is fine)"></textarea>
+
+      <label class="field-label">Location</label>
+      <div class="mode-row">
+        <label class="radio"><input type="radio" name="new-mode" value="create" checked /> New repo (or empty folder)</label>
+        <label class="radio"><input type="radio" name="new-mode" value="open" /> Open existing repo</label>
+      </div>
+      <input id="new-dir" placeholder="working directory — blank = ./projects/&lt;id&gt;" />
+      <span class="muted">New makes a fresh git repo that becomes the project root. Open refactors an existing repo on a side branch.</span>
+
+      <div class="modal-actions">
+        <button id="new-cancel" class="secondary" type="button">Cancel</button>
+        <button id="new-create" class="run" type="button">Create</button>
+      </div>
+    </div>
   </div>
 
   <main>
