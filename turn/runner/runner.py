@@ -125,11 +125,9 @@ class Runner:
         idx = build_indexes(nodes, edges)
         node_by_id = idx.node_by_id
 
-        # persist effective leaf statuses (RUNNABLE / BLOCKED) and derived
-        # container completion, without touching RUNNING or terminal states
+        # persist effective leaf statuses (RUNNABLE / BLOCKED) first
         for n in nodes:
             eff = ev.status.get(n.id)
-            persist = False
             if eff in (NodeStatus.RUNNABLE, NodeStatus.BLOCKED) and n.status not in (
                 NodeStatus.RUNNING,
                 NodeStatus.COMPLETE,
@@ -137,18 +135,44 @@ class Runner:
                 NodeStatus.CANCELLED,
                 NodeStatus.EXPANDED,
             ):
-                persist = True
-            elif eff == NodeStatus.COMPLETE and n.status == NodeStatus.EXPANDED:
-                persist = True  # all leaf descendants finished
-            if persist and n.status != eff:
-                await self.store.set_status(n.id, eff)
-                await self._emit(
-                    "node.updated", project_id, _dump(node_by_id[n.id])
-                )
-                # A planner container that just finished must propagate its
-                # accumulated children's files up into its parent's worktree.
-                if eff == NodeStatus.COMPLETE and n.status == NodeStatus.EXPANDED:
-                    await self._merge_up(n)
+                if n.status != eff:
+                    await self.store.set_status(n.id, eff)
+                    await self._emit(
+                        "node.updated", project_id, _dump(node_by_id[n.id])
+                    )
+
+        # Propagate completed planner containers up the tree. This MUST run
+        # deepest-first: a parent's worktree has to already contain every
+        # child's files before it is merged into its own parent, otherwise a
+        # shallow-first merge snapshots the branch before the child merges land
+        # and silently drops those files (the "missing chapters" bug).
+        parent_of = {n.id: n.parent_id for n in nodes}
+
+        def _depth(nid):
+            d = 0
+            seen = set()
+            cur = parent_of.get(nid)
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                d += 1
+                cur = parent_of.get(cur)
+            return d
+
+        merge_nodes = [
+            n
+            for n in nodes
+            if ev.status.get(n.id) == NodeStatus.COMPLETE
+            and n.status == NodeStatus.EXPANDED
+            and n.parent_id is not None
+        ]
+        merge_nodes.sort(key=lambda n: _depth(n.id), reverse=True)
+        for n in merge_nodes:
+            if n.status != NodeStatus.COMPLETE:
+                await self.store.set_status(n.id, NodeStatus.COMPLETE)
+                await self._emit("node.updated", project_id, _dump(node_by_id[n.id]))
+            # A planner container that just finished must propagate its
+            # accumulated children's files up into its parent's worktree.
+            await self._merge_up(n)
 
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
