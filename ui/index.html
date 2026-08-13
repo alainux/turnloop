@@ -12,7 +12,18 @@
     <form id="prompt-form">
       <input id="prompt-input" placeholder="Describe an objective… (vague is fine)" autocomplete="off" />
       <button type="submit">Create workgraph</button>
+      <button type="button" id="advanced-toggle">Folder ▾</button>
     </form>
+    <div id="advanced" hidden>
+      <label>Location:
+        <select id="project-mode">
+          <option value="create">New repo (or empty dir)</option>
+          <option value="open">Open existing repo</option>
+        </select>
+      </label>
+      <input id="working-dir" placeholder="working directory — blank = ./projects/&lt;slug&gt;" />
+      <span class="muted">Create makes a fresh git repo that becomes the project root; Open refactors an existing one on a branch.</span>
+    </div>
   </header>
 
   <div id="project-bar">
@@ -33,7 +44,6 @@
         </span>
       </div>
       <div class="graph-legend">solid = contains · <span style="color:#d29922">dashed = depends on</span></div>
-      <div id="graph"></div>
       <div id="graph"></div>
     </section>
     <section id="detail-pane">

@@ -80,8 +80,12 @@ async def test_codex_worker_refuses_main_repo() -> None:
 
 
 async def test_worktree_isolation_happy_path() -> None:
-    """A real git repo yields an isolated worktree, and a re-run cleans up and
-    re-isolates instead of ever returning the main repo path."""
+    """A real git repo yields an isolated worktree for child nodes, and a
+    re-run cleans up and re-isolates instead of ever returning the main repo.
+    The root node's worktree IS the project repo root itself."""
+    import os as _os
+    from turn.workers import worktree as wtmod
+
     repo = tempfile.mkdtemp(prefix="turn-wt-test-")
     subprocess.run(["git", "init", "-q", repo], check=True)
     subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"], check=True)
@@ -90,15 +94,21 @@ async def test_worktree_isolation_happy_path() -> None:
 
     cfg = Settings(repo_path=repo)
     worker = CodexWorker(cfg)
-    nid = uuid.uuid4()
+    root_id = uuid.uuid4()
+    child_id = uuid.uuid4()
 
-    wt1 = worker._prepare_worktree(nid)
+    # Root node's worktree IS the project repo root (not a separate worktree).
+    root_wt = worker._prepare_worktree(root_id)
+    assert root_wt == repo, "root worktree should be the project repo root"
+
+    # A child node gets a real isolated worktree, never the main repo.
+    wt1 = wtmod.get_or_create_worktree(child_id, root_id, force=True, repo_path=repo)
     assert wt1 is not None, "should create a worktree"
     assert wt1 != repo, "must not fall back to the main repo"
-    assert os.path.isdir(wt1), "worktree dir should exist"
+    assert _os.path.isdir(wt1), "worktree dir should exist"
 
     # Second call (a node re-run) must clean up + re-isolate, still not main repo.
-    wt2 = worker._prepare_worktree(nid)
+    wt2 = wtmod.get_or_create_worktree(child_id, root_id, force=True, repo_path=repo)
     assert wt2 is not None and wt2 != repo
 
     subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", wt2], check=True)
@@ -499,8 +509,12 @@ async def test_accept_cleans_subtree() -> None:
         assert a3.needs_review is False
         for nid in (l1.id, l2.id):
             assert (await store.get_node(nid)).merge_accepted is True, "descendant not accepted"
-        # Root is the accumulation point and must never be cleaned.
-        assert wtmod.worktree_path(root.id, str(repo)).exists(), "root worktree was deleted!"
+        # Root is the accumulation point and must never be cleaned: its repo
+        # still holds the seed file and its working branch is intact.
+        assert (repo / "seed.txt").exists(), "project repo was damaged"
+        assert wtmod._branch_exists(
+            wtmod.branch_name(root.id), str(repo)
+        ), "root working branch was deleted"
         print("ACCEPT CLEANS SUBTREE TEST PASSED")
         await store.dispose()
     finally:

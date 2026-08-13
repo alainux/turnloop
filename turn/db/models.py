@@ -29,6 +29,10 @@ class NodeModel(Base):
     objective = Column(Text, nullable=False)
     generated_prompt = Column(Text, nullable=True)
     executor = Column(String(64), nullable=True)
+
+    # Per-project working directory: the root node's own git repository path.
+    # Children leave this null and inherit it from the root.
+    repo_path = Column(Text, nullable=True)
     status = Column(String(16), nullable=False, default="PENDING")
     paused = Column(Boolean, nullable=False, default=False)
     auto_run = Column(Boolean, nullable=False, default=True)

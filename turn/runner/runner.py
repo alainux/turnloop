@@ -117,6 +117,17 @@ class Runner:
             except Exception as e:  # pragma: no cover
                 print(f"[runner] schedule error for {p.id}: {e}")
 
+    async def _project_repo(self, project_id: uuid.UUID) -> str | None:
+        """Resolve the project's own git repo path from its root node.
+
+        Falls back to the global settings repo_path for projects created before
+        per-project repos existed.
+        """
+        root = await self.store.get_node(project_id)
+        if root is None:
+            return self.s.repo_path
+        return root.repo_path or self.s.repo_path
+
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
@@ -176,6 +187,23 @@ class Runner:
             # Its subtree is now redundant on disk; flag it for review so the
             # user can accept (clean) or reject (feedback) it.
             await self._mark_merged(n)
+
+        # --- finalize ---------------------------------------------------
+        # When the whole project has settled (the root is a container and every
+        # descendant is terminal), ship the accumulated working branch into the
+        # project's base branch so the user is left with a real, initialized
+        # git repo of their finished work. Idempotent -- a fully-shipped
+        # project is a no-op on later ticks.
+        root = node_by_id.get(project_id)
+        if root is not None and root.status == NodeStatus.EXPANDED:
+            settled = all(
+                ev.status.get(n.id)
+                in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED)
+                for n in nodes
+                if n.id != project_id
+            )
+            if settled and len(nodes) > 1:
+                await self._maybe_finalize(root)
 
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
@@ -356,24 +384,28 @@ class Runner:
     def _ensure_worktree(self, node: Node) -> None:
         """Best-effort: create the node's worktree (branched from its parent).
 
-        No-op when no repo is configured. Failures are logged, never fatal.
+        No-op when no repo is configured. Failures are logged, never fatal. The
+        root node's worktree IS the project repo root, so this also ensures the
+        project's working branch is checked out there.
         """
         try:
-            if self.s.repo_path:
+            repo = node.repo_path or self.s.repo_path
+            if repo:
                 worktree.get_or_create_worktree(
-                    node.id, node.parent_id, force=True, repo_path=self.s.repo_path
+                    node.id, node.parent_id, force=True, repo_path=repo
                 )
         except Exception as e:  # pragma: no cover
             logger.warning("worktree ensure failed for %s: %s", node.id, e)
 
     async def _merge_up(self, node: Node) -> None:
         """Merge a completed container's worktree up into its parent's."""
-        if not self.s.repo_path or node.merge_accepted:
+        repo = node.repo_path or self.s.repo_path
+        if not repo or node.merge_accepted:
             return
         async with self._merge_lock:
             try:
                 await asyncio.to_thread(
-                    worktree.merge_into_parent, node.id, node.parent_id, self.s.repo_path
+                    worktree.merge_into_parent, node.id, node.parent_id, repo
                 )
             except Exception as e:  # pragma: no cover
                 logger.warning("worktree merge-up failed for %s: %s", node.id, e)
@@ -388,19 +420,37 @@ class Runner:
         With global auto-accept ON, the merge is accepted immediately (the
         redundant subtree worktree is deleted) without waiting for the user.
         """
-        if node.parent_id is None or not self.s.repo_path:
+        if node.parent_id is None or not (node.repo_path or self.s.repo_path):
             return
+        repo = node.repo_path or self.s.repo_path
         fresh = await self.store.get_node(node.id)
         if fresh is None or fresh.needs_review or fresh.merge_accepted:
             return
         # Only nodes that actually produced a worktree can be cleaned.
-        if not worktree.worktree_path(node.id, self.s.repo_path).exists():
+        if not worktree.worktree_path(node.id, repo).exists():
             return
         fresh.needs_review = True
         await self.store._save_node(fresh)
         await self._emit("node.updated", fresh.project_id, _dump(fresh))
         if self.s.auto_accept_merges:
             await self.accept_merge(node.id)
+
+    async def _maybe_finalize(self, root: Node) -> None:
+        """Ship a settled project: merge its working branch into the project's
+        base branch so the user keeps a real, initialized git repo, then mark
+        the root container COMPLETE."""
+        repo = root.repo_path or self.s.repo_path
+        if not repo:
+            return
+        try:
+            await asyncio.to_thread(worktree.ship_project, root.id, repo)
+        except Exception as e:  # pragma: no cover
+            logger.warning("project ship failed for %s: %s", root.id, e)
+        if root.status != NodeStatus.COMPLETE:
+            await self.store.set_status(root.id, NodeStatus.COMPLETE)
+            await self._emit(
+                "node.updated", root.project_id, _dump(await self.store.get_node(root.id))
+            )
 
     async def accept_merge(self, node_id: uuid.UUID) -> None:
         """Accept a merged node: keep the merged result (already in the parent)
@@ -412,19 +462,20 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None or node.parent_id is None:
             return
+        repo = node.repo_path or self.s.repo_path
         desc = await self.store.descendants(node_id)
         ids = [node_id] + [d.id for d in desc]
-        if self.s.repo_path:
+        if repo:
             for nid in ids:
                 try:
                     await asyncio.to_thread(
-                        worktree.remove_worktree, nid, self.s.repo_path
+                        worktree.remove_worktree, nid, repo
                     )
                 except Exception as e:  # pragma: no cover
                     logger.warning("worktree removal failed for %s: %s", nid, e)
             try:
                 await asyncio.to_thread(
-                    worktree.remove_branches, ids, self.s.repo_path
+                    worktree.remove_branches, ids, repo
                 )
             except Exception as e:  # pragma: no cover
                 logger.warning("branch removal failed: %s", e)
@@ -645,6 +696,9 @@ class Runner:
             resource_refs.extend(a.resource_refs)
         resources = await self._resolve_resources(resource_refs)
 
+        # The project's own git repo (root node's repo_path, else fallback).
+        project_repo = await self._project_repo(node.project_id)
+
         # Wire a live terminal stream: the worker emits raw output chunks and we
         # fan them out over the project SSE bus as `node.terminal` events.
         pid = node.project_id
@@ -656,7 +710,7 @@ class Runner:
             node=node,
             ancestry=ancestry,
             resources=resources,
-            repo_path=self.s.repo_path,
+            repo_path=project_repo,
             stream=_stream,
         )
 

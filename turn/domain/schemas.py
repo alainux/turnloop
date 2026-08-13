@@ -125,6 +125,13 @@ class Node(BaseModel):
     objective: str
     generated_prompt: Optional[str] = None  # prompt handed to the worker
 
+    # --- repo (per-project working directory) ---------------------------
+    # The absolute path of THIS project's own git repository (the directory
+    # the user chose / Turn created). The root node's worktree IS this path, so
+    # by the time work completes the directory holds the finished files plus a
+    # merge log. Non-root nodes leave this null and inherit it from the root.
+    repo_path: Optional[str] = None
+
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
     status: NodeStatus = NodeStatus.PENDING
     paused: bool = False

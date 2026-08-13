@@ -26,16 +26,19 @@ async function refreshProjects(selectId) {
     const o = document.createElement("option");
     o.value = p.id;
     o.textContent = (p.objective || "").slice(0, 60);
+    o.title = p.repo_path ? `repo: ${p.repo_path}` : "";
     sel.appendChild(o);
   }
   if (selectId) sel.value = selectId;
 }
 
 async function createProject(prompt) {
+  const mode = document.getElementById("project-mode")?.value || "create";
+  const wd = (document.getElementById("working-dir")?.value || "").trim() || null;
   const res = await api("/api/projects", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({ prompt, mode, working_dir: wd }),
   });
   state.projectId = res.project_id;
   await refreshProjects(state.projectId);
@@ -573,6 +576,11 @@ $("#prompt-form").addEventListener("submit", async (e) => {
   if (!v) return;
   await createProject(v);
   $("#prompt-input").value = "";
+});
+
+document.getElementById("advanced-toggle").addEventListener("click", () => {
+  const adv = document.getElementById("advanced");
+  adv.hidden = !adv.hidden;
 });
 
 $("#project-select").addEventListener("change", async (e) => {

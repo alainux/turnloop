@@ -45,6 +45,127 @@ def _git(args, cwd=None):
     )
 
 
+def _is_git(repo: Path) -> bool:
+    return (repo / ".git").exists()
+
+
+def _ensure_gitignore(repo: Path) -> None:
+    """Make sure the scratch worktree tree (.turn/) is never committed into a
+    project's deliverable history."""
+    gi = repo / ".gitignore"
+    need = ".turn/"
+    if gi.exists():
+        lines = gi.read_text().splitlines()
+        if need not in lines:
+            with gi.open("a") as f:
+                f.write("\n# Turn scratch worktrees\n" + need + "\n")
+    else:
+        gi.write_text("# Turn scratch worktrees\n" + need + "\n")
+
+
+def init_project_repo(
+    root_id,
+    working_dir: str | None = None,
+    open_existing: bool = False,
+    projects_dir: str | None = None,
+) -> str:
+    """Create (or open) the per-project git repository that accumulates this
+    project's work, and return its absolute path (the project repo root).
+
+    The directory the user picks becomes a real, initialized git repo. By the
+    time the project finishes, the repo holds the finished files plus a merge
+    log, so the user can keep it, open it in an editor, or delete it.
+
+    Create mode
+    ----------
+    * ``working_dir`` defaults to ``<projects_dir>/<slug>``.
+    * The directory is created if needed.
+    * If it is not yet a git repo: ``git init`` + an empty initial commit +
+      a ``.gitignore`` that ignores ``.turn/`` (the scratch worktree tree).
+    * An existing git repo at the path is reused (behaves like open).
+
+    Open mode (refactoring an existing repo)
+    ----------------------------------------
+    * ``working_dir`` MUST be an existing git repo. We branch off its current
+      HEAD so all of Turn's work lands on a side branch and is only merged back
+      when the project is shipped.
+
+    In both modes we create a working branch ``turn-<roothex8>`` off the repo's
+    base branch and check the repo root out onto it. All work merges up onto
+    that branch; :func:`ship_project` merges it into the base branch at the end.
+    """
+    root_hex = root_id.hex[:8]
+    work_branch = f"turn-{root_hex}"
+    if working_dir:
+        repo = Path(working_dir).resolve()
+    else:
+        base = Path(projects_dir or "./projects").resolve()
+        repo = base / f"proj-{root_hex}"
+    repo.mkdir(parents=True, exist_ok=True)
+
+    if open_existing and not _is_git(repo):
+        raise ValueError(f"Open mode requires an existing git repo: {repo}")
+
+    if not _is_git(repo):
+        r = _git(["init"], cwd=str(repo))
+        if r.returncode != 0:
+            raise RuntimeError("git init failed: " + r.stderr)
+
+    # Ensure at least one commit exists so we can branch off HEAD.
+    if _git(["rev-parse", "HEAD"], cwd=str(repo)).returncode != 0:
+        _git(["commit", "--allow-empty", "-m", "turn: project initialized"], cwd=str(repo))
+
+    # Capture the base branch so ship_project can merge back into it.
+    base_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo)).stdout.strip() or "main"
+    _git(["config", "turn.baseBranch", base_branch], cwd=str(repo))
+
+    # Never let the scratch worktree tree pollute project commits.
+    _ensure_gitignore(repo)
+
+    # Create + check out the working branch for this project.
+    if not _branch_exists(work_branch, repo_path=str(repo)):
+        _git(["branch", work_branch], cwd=str(repo))
+    _git(["checkout", work_branch], cwd=str(repo))
+
+    return str(repo)
+
+
+def ship_project(root_id, repo_path: str | None = None) -> None:
+    """Merge the project's accumulated working branch into its base branch and
+    check the repo root out onto the base branch, leaving the user with a real,
+    initialized git repo of their finished work. Idempotent."""
+    if not repo_path:
+        return
+    repo = _repo(repo_path)
+    if not _is_git(repo):
+        return
+    work_branch = branch_name(root_id)
+    base_branch = _git(["config", "turn.baseBranch"], cwd=str(repo)).stdout.strip()
+    if not base_branch:
+        base_branch = _default_branch(repo_path)
+    if not _branch_exists(base_branch, repo_path):
+        if _branch_exists(work_branch, repo_path):
+            _git(["branch", base_branch, work_branch], cwd=str(repo))
+        else:
+            return
+    if _branch_exists(work_branch, repo_path) and _branch_exists(base_branch, repo_path):
+        # Already shipped: nothing to do but land back on the base branch.
+        if _git(["merge-base", "--is-ancestor", work_branch, base_branch], cwd=str(repo)).returncode == 0:
+            _git(["checkout", base_branch], cwd=str(repo))
+            return
+        _git(["checkout", base_branch], cwd=str(repo))
+        r = _git(
+            ["merge", work_branch, "--no-ff", "-m", f"turn: ship project {root_id.hex[:8]}"],
+            cwd=str(repo),
+        )
+        if r.returncode != 0:
+            logger.warning("ship merge failed for %s: %s", root_id.hex, r.stderr)
+            _git(["merge", "--abort"], cwd=str(repo))
+            shutil.rmtree(str(worktree_path(root_id, repo_path)), ignore_errors=True)
+    else:
+        _git(["checkout", base_branch], cwd=str(repo))
+
+
 def _default_branch(repo_path: str | None = None) -> str:
     r = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(_repo(repo_path)))
     return r.stdout.strip() or "main"
@@ -79,6 +200,31 @@ def get_or_create_worktree(
     if not (repo_path or settings.repo_path):
         return None
     repo = _repo(repo_path)
+
+    # --- Root node ---------------------------------------------------
+    # The root node's worktree IS the project repo root itself (not a sub-
+    # worktree under .turn/worktrees). So the finished files accumulate in the
+    # directory the user picked/created, and they are left with a real repo.
+    # We just ensure the project's working branch exists and is checked out.
+    if parent_id is None:
+        if not _is_git(repo):
+            return None
+        work_branch = branch_name(node_id)
+        if not _branch_exists(work_branch, repo_path):
+            base = (
+                _git(["config", "turn.baseBranch"], cwd=str(repo)).stdout.strip()
+                or _default_branch(repo_path)
+            )
+            _git(["checkout", base], cwd=str(repo))
+            _git(["branch", work_branch], cwd=str(repo))
+        # Only switch the repo root onto the working branch when the tree is
+        # clean, so we never clobber manual edits the user has made in the repo.
+        if _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo)).stdout.strip() != work_branch:
+            if _git(["status", "--porcelain"], cwd=str(repo)).stdout.strip() == "":
+                _git(["checkout", work_branch], cwd=str(repo))
+        return str(repo)
+
+    # --- Non-root node: a normal isolated worktree -------------------
     wt = worktree_path(node_id, repo_path)
     branch = branch_name(node_id)
 
@@ -174,10 +320,16 @@ def _copy_files(src: Path, dst: Path) -> None:
 def remove_worktree(node_id, repo_path: str | None = None) -> None:
     """Delete a single node's git worktree directory (its accumulated files
     have already been merged up into the parent, so this is safe). Idempotent:
-    no-ops if the worktree is already gone."""
+    no-ops if the worktree is already gone. Never deletes the project repo root
+    itself (a node whose worktree IS the repo root has no .turn/worktrees dir)."""
     wt = worktree_path(node_id, repo_path)
+    repo = _repo(repo_path)
+    # Safety: the root node's worktree is the project repo root -- never remove
+    # the user's finished repository.
+    if wt.resolve() == repo.resolve():
+        return
     if wt.exists():
-        _git(["worktree", "remove", "--force", str(wt)], cwd=str(_repo(repo_path)))
+        _git(["worktree", "remove", "--force", str(wt)], cwd=str(repo))
         shutil.rmtree(str(wt), ignore_errors=True)
 
 

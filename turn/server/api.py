@@ -29,6 +29,12 @@ router = APIRouter()
 class CreateProject(BaseModel):
     prompt: str
     name: Optional[str] = None
+    # "create" -> new empty project repo (or reuse the dir if it is already a
+    # git repo); "open" -> use an EXISTING git repo (e.g. to refactor it).
+    mode: Optional[str] = "create"
+    # Working directory that becomes (or already is) the project's git root.
+    # When omitted in create mode, a repo is made under TURN_PROJECTS_DIR.
+    working_dir: Optional[str] = None
 
 
 class ProvideInput(BaseModel):
@@ -79,9 +85,38 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID) -> dict:
 async def create_project(body: CreateProject, request: Request):
     store: Store = request.app.state.store
     runner: Runner = request.app.state.runner
-    root = await store.create_project(body.prompt, name=body.name)
+    from turn.workers import worktree as wtmod
+
+    mode = (body.mode or "create").lower()
+    open_existing = mode == "open"
+    if open_existing and not body.working_dir:
+        raise HTTPException(400, "open mode requires a working_dir (an existing git repo)")
+
+    # Each project gets its OWN git repo so the user is left with a real,
+    # initialized repository of their finished work (not a sub-worktree of the
+    # Turn app). The repo path is recorded on the root node.
+    root_id = uuid.uuid4()
+    repo_path = None
+    try:
+        repo_path = wtmod.init_project_repo(
+            root_id,
+            working_dir=body.working_dir,
+            open_existing=open_existing,
+            projects_dir=runner.s.projects_dir,
+        )
+    except Exception as e:
+        raise HTTPException(400, f"could not initialize project repo: {e}")
+
+    root = await store.create_project(
+        body.prompt, name=body.name, repo_path=repo_path, id=root_id
+    )
     runner.wake()
-    return {"project_id": str(root.id), "root": _dump(root)}
+    return {
+        "project_id": str(root.id),
+        "root": _dump(root),
+        "repo_path": repo_path,
+        "mode": mode,
+    }
 
 
 @router.get("/api/settings")

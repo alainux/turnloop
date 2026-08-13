@@ -56,6 +56,7 @@ def _node_from_model(m: NodeModel) -> Node:
         objective=m.objective,
         generated_prompt=m.generated_prompt,
         executor=m.executor,
+        repo_path=m.repo_path,
         status=NodeStatus(m.status),
         paused=m.paused,
         auto_run=m.auto_run,
@@ -152,6 +153,14 @@ class Store:
                     )
             except OperationalError:
                 pass
+        # Per-project repo path (added when per-project repos landed).
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text("ALTER TABLE nodes ADD COLUMN repo_path TEXT")
+                )
+        except OperationalError:
+            pass
 
     async def dispose(self) -> None:
         await self.engine.dispose()
@@ -163,7 +172,9 @@ class Store:
 
     # -- projects ---------------------------------------------------------
 
-    async def create_project(self, prompt: str, name: Optional[str] = None) -> Node:
+    async def create_project(
+        self, prompt: str, name: Optional[str] = None, repo_path: Optional[str] = None, id=None
+    ) -> Node:
         # New projects inherit the user's last auto-run preference (persisted
         # across projects) so manual-stepping mode survives a page reload.
         auto_run_default = True
@@ -172,7 +183,7 @@ class Store:
             auto_run_default = str(raw) not in ("0", "false", "False", "")
         except Exception:
             auto_run_default = True
-        root_id = uuid.uuid4()
+        root_id = id or uuid.uuid4()
         node = NodeModel(
             id=root_id,
             project_id=root_id,  # a project IS its root node
@@ -182,6 +193,7 @@ class Store:
             executor=PLANNER_EXECUTOR,
             status=NodeStatus.PENDING.value,
             auto_run=auto_run_default,
+            repo_path=repo_path,
         )
         async with self.session() as s:
             s.add(node)
@@ -335,6 +347,7 @@ class Store:
             m.objective = node.objective
             m.generated_prompt = node.generated_prompt
             m.executor = node.executor
+            m.repo_path = node.repo_path
             m.status = node.status.value
             m.paused = node.paused
             m.auto_run = node.auto_run
