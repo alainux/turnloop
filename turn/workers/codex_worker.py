@@ -42,8 +42,11 @@ class CodexWorker(Worker):
     # -- public ----------------------------------------------------------
 
     async def execute(self, ctx: "NodeExecutionContext") -> WorkerResult:
-        # The project's own git repo (root node's repo_path, else global fallback).
-        repo = ctx.repo_path or self.s.repo_path
+        # Every node runs inside its project's own git repository: the root
+        # node's worktree IS the project repo root, and non-root nodes get an
+        # isolated worktree branched from their parent. There is no shared
+        # "main" repository to fall back to.
+        repo = ctx.repo_path
         is_git = bool(repo) and (Path(repo) / ".git").exists()
         worktree_path = (
             worktree.get_or_create_worktree(
@@ -52,14 +55,13 @@ class CodexWorker(Worker):
             if is_git
             else None
         )
-        # Safety: with a repo configured we MUST run in an isolated worktree.
-        # Refusing here is far better than letting Codex rewrite the main repo.
-        # The root node's worktree is the project repo root itself, so a worktree
-        # is still expected for every non-root node.
-        if repo and worktree_path is None:
+        # Safety: we MUST run in the project's own isolated repo/worktree.
+        # Refusing here is far better than letting Codex run somewhere undefined
+        # (e.g. the Turn app directory).
+        if not repo or worktree_path is None:
             return WorkerResult(
                 outcome=Outcome.FAIL,
-                summary="could not create an isolated git worktree; refused to run Codex in the main repository",
+                summary="no project repository configured; refusing to run Codex",
                 retry_recommended=False,
             )
         cwd = worktree_path or os.getcwd()
@@ -185,17 +187,11 @@ class CodexWorker(Worker):
     def _build_prompt(self, ctx: NodeExecutionContext, cwd=None) -> str:
         gp = ctx.node.generated_prompt or "Complete the objective above using the available tools."
         # If we execute inside an isolated worktree, rewrite any mention of the
-        # repository path so Codex operates on the worktree, not the source tree
-        # it was cloned from. This covers both the project repo and the global
-        # fallback repo.
-        repo = ctx.repo_path or self.s.repo_path
+        # project repository path so Codex operates on the worktree, not the
+        # source tree it was branched from.
+        repo = ctx.repo_path
         if cwd and repo and repo != cwd:
             gp = gp.replace(repo, cwd)
-        # Also rewrite the global fallback repo, but only when it differs from
-        # the project repo (otherwise the previous replace already covered it
-        # and re-running it would corrupt the just-written cwd path).
-        if cwd and self.s.repo_path and self.s.repo_path != repo and self.s.repo_path != cwd:
-            gp = gp.replace(self.s.repo_path, cwd)
         return f"""{render_context_block(ctx)}
 OBJECTIVE:
 {ctx.node.objective}
@@ -291,16 +287,6 @@ and return "COMPLETE".
         return PlanResult(nodes=nodes, edges=edges, notes=plan_json.get("notes"))
 
     # -- git worktree ----------------------------------------------------
-
-    def _repo_is_git(self) -> bool:
-        if not self.s.repo_path:
-            return False
-        return (Path(self.s.repo_path) / ".git").exists()
-
-    def _prepare_worktree(self, node_id) -> str | None:
-        # Kept for backward compatibility / direct tests: a node with no parent
-        # branches from the default branch.
-        return worktree.get_or_create_worktree(node_id, None, force=True, repo_path=self.s.repo_path)
 
     def _capture_worktree(self, worktree: str) -> list[ArtifactSpec]:
         def run(args):

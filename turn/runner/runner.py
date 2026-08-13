@@ -120,13 +120,13 @@ class Runner:
     async def _project_repo(self, project_id: uuid.UUID) -> str | None:
         """Resolve the project's own git repo path from its root node.
 
-        Falls back to the global settings repo_path for projects created before
-        per-project repos existed.
+        Every project gets its own repository (recorded on the root node), so
+        there is no shared/global repository to fall back to.
         """
         root = await self.store.get_node(project_id)
         if root is None:
-            return self.s.repo_path
-        return root.repo_path or self.s.repo_path
+            return None
+        return root.repo_path
 
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         nodes, edges, _ = await self.store.get_workgraph(project_id)
@@ -252,7 +252,7 @@ class Runner:
         ctx = await self._build_context(node)
         # Give the planner (and its future children) a worktree branched from the
         # parent, so children inherit accumulated files and can merge back up.
-        self._ensure_worktree(node)
+        self._ensure_worktree(node, ctx.repo_path)
         # Collect the planner's raw Codex transcript so it can be shown in the
         # node-detail terminal pane, exactly like a worker node's output.
         transcript_chunks: list[str] = []
@@ -381,7 +381,7 @@ class Runner:
 
     # -- worktree housekeeping ---------------------------------------------
 
-    def _ensure_worktree(self, node: Node) -> None:
+    def _ensure_worktree(self, node: Node, repo_path: str | None = None) -> None:
         """Best-effort: create the node's worktree (branched from its parent).
 
         No-op when no repo is configured. Failures are logged, never fatal. The
@@ -389,17 +389,16 @@ class Runner:
         project's working branch is checked out there.
         """
         try:
-            repo = node.repo_path or self.s.repo_path
-            if repo:
+            if repo_path:
                 worktree.get_or_create_worktree(
-                    node.id, node.parent_id, force=True, repo_path=repo
+                    node.id, node.parent_id, force=True, repo_path=repo_path
                 )
         except Exception as e:  # pragma: no cover
             logger.warning("worktree ensure failed for %s: %s", node.id, e)
 
     async def _merge_up(self, node: Node) -> None:
         """Merge a completed container's worktree up into its parent's."""
-        repo = node.repo_path or self.s.repo_path
+        repo = await self._project_repo(node.project_id)
         if not repo or node.merge_accepted:
             return
         async with self._merge_lock:
@@ -420,9 +419,11 @@ class Runner:
         With global auto-accept ON, the merge is accepted immediately (the
         redundant subtree worktree is deleted) without waiting for the user.
         """
-        if node.parent_id is None or not (node.repo_path or self.s.repo_path):
+        if node.parent_id is None:
             return
-        repo = node.repo_path or self.s.repo_path
+        repo = await self._project_repo(node.project_id)
+        if not repo:
+            return
         fresh = await self.store.get_node(node.id)
         if fresh is None or fresh.needs_review or fresh.merge_accepted:
             return
@@ -439,7 +440,7 @@ class Runner:
         """Ship a settled project: merge its working branch into the project's
         base branch so the user keeps a real, initialized git repo, then mark
         the root container COMPLETE."""
-        repo = root.repo_path or self.s.repo_path
+        repo = await self._project_repo(root.project_id)
         if not repo:
             return
         try:
@@ -462,7 +463,7 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None or node.parent_id is None:
             return
-        repo = node.repo_path or self.s.repo_path
+        repo = await self._project_repo(node.project_id)
         desc = await self.store.descendants(node_id)
         ids = [node_id] + [d.id for d in desc]
         if repo:

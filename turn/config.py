@@ -98,16 +98,11 @@ class Settings:
     )
 
     # --- repo / resources ------------------------------------------------
-    # Optional FALLBACK path to a software repository used by the codex worker
-    # for software branches. Each project normally carries its OWN repo_path
-    # (a per-project git repo under projects_dir) recorded on its root node,
-    # so this only applies to projects that were created before per-project
-    # repos existed. Leave it unset to run projects in stand-alone temp trees.
-    repo_path: str | None = field(default_factory=lambda: os.getenv("TURN_REPO_PATH"))
-
     # Where NEW projects are created by default. Each project becomes its own
     # git repository under this directory (e.g. ./projects/<id>/), so the
-    # user is left with a real, initialized repo they can keep or delete.
+    # user is left with a real, initialized repo they can keep or delete. The
+    # project repo path is recorded on the project's root node (repo_path);
+    # there is no global shared repository to isolate from.
     projects_dir: str = field(
         default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", "./projects")
     )

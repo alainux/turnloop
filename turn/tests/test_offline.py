@@ -60,9 +60,10 @@ async def test_auto_run_default() -> None:
 
 
 async def test_codex_worker_refuses_main_repo() -> None:
-    """With no isolated worktree possible, the worker must REFUSE to run Codex
-    in the main repository rather than falling back to it."""
-    cfg = Settings(repo_path="/tmp/this-path-is-not-a-git-repo-xyz")
+    """With no project repository configured, the worker must REFUSE to run
+    Codex rather than falling back to an undefined location (e.g. the Turn app
+    directory)."""
+    cfg = Settings()
     worker = CodexWorker(cfg)
     node = Node(
         id=uuid.uuid4(),
@@ -75,7 +76,7 @@ async def test_codex_worker_refuses_main_repo() -> None:
     # The guard returns before any subprocess is spawned, so this is offline.
     res = await worker.execute(ctx)
     assert res.outcome == Outcome.FAIL, res
-    assert "main repository" in res.summary, res.summary
+    assert "project repository" in res.summary, res.summary
     print("CODEX WORKER SAFETY TEST PASSED")
 
 
@@ -92,13 +93,13 @@ async def test_worktree_isolation_happy_path() -> None:
     subprocess.run(["git", "-C", repo, "config", "user.name", "t"], check=True)
     subprocess.run(["git", "-C", repo, "commit", "--allow-empty", "-q", "-m", "init"], check=True)
 
-    cfg = Settings(repo_path=repo)
+    cfg = Settings()
     worker = CodexWorker(cfg)
     root_id = uuid.uuid4()
     child_id = uuid.uuid4()
 
     # Root node's worktree IS the project repo root (not a separate worktree).
-    root_wt = worker._prepare_worktree(root_id)
+    root_wt = wtmod.get_or_create_worktree(root_id, None, force=True, repo_path=repo)
     assert root_wt == repo, "root worktree should be the project repo root"
 
     # A child node gets a real isolated worktree, never the main repo.
@@ -200,7 +201,7 @@ async def test_cancel_then_rerun() -> None:
 async def test_worker_prompt_points_at_worktree() -> None:
     """The worker must rewrite the main-repo path in a node's prompt to the
     isolated worktree, so Codex never operates on the source tree."""
-    cfg = Settings(repo_path="/tmp/fake-repo")
+    cfg = Settings()
     worker = CodexWorker(cfg)
     node = Node(
         id=uuid.uuid4(),
@@ -210,7 +211,7 @@ async def test_worker_prompt_points_at_worktree() -> None:
         generated_prompt="Edit the file at /tmp/fake-repo/README.md",
         status=NodeStatus.RUNNABLE,
     )
-    ctx = NodeExecutionContext(node=node, repo_path=None)
+    ctx = NodeExecutionContext(node=node, repo_path="/tmp/fake-repo")
     prompt = worker._build_prompt(ctx, cwd="/tmp/fake-repo/.turn/worktrees/abc")
     assert "/tmp/fake-repo/.turn/worktrees/abc/README.md" in prompt
     # No bare main-repo reference should remain.
@@ -333,15 +334,13 @@ async def test_deep_merge_up_ordering() -> None:
     subprocess.run(["git", "-C", repo, "config", "user.name", "t"], check=True)
     subprocess.run(["git", "-C", repo, "commit", "--allow-empty", "-q", "-m", "init"], check=True)
 
-    saved_repo = settings.repo_path
-    settings.repo_path = repo
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
     store = Store(f"sqlite+aiosqlite:///{tmp}")
     await store.init()
     try:
         reg = WorkerRegistry()
         runner = Runner(store, registry=reg, events=EventBus(), settings=settings)
-        root = await store.create_project("root objective")
+        root = await store.create_project("root objective", repo_path=repo)
         await store.set_auto_run(root.id, False)
 
         created = await store.apply_plan(root, PlanResult(nodes=[
@@ -393,7 +392,6 @@ async def test_deep_merge_up_ordering() -> None:
             assert f"{k}.md" in files, f"leaf {k} missing from root (merge-order bug): {files}"
         print("DEEP MERGE-UP ORDERING TEST PASSED")
     finally:
-        settings.repo_path = saved_repo
         await store.dispose()
 
 
@@ -454,7 +452,6 @@ async def test_accept_cleans_subtree() -> None:
     from turn.workers import worktree as wtmod
     from turn.domain.schemas import NodeSpec, PlanResult
 
-    saved_repo = settings.repo_path
     tmp = tempfile.mkdtemp()
     repo = _Path(tmp) / "repo"
     repo.mkdir()
@@ -465,7 +462,6 @@ async def test_accept_cleans_subtree() -> None:
     (repo / "seed.txt").write_text("seed")
     subprocess.run(["git", "add", "-A"], cwd=str(repo))
     subprocess.run(["git", "commit", "-qm", "seed"], cwd=str(repo))
-    settings.repo_path = str(repo)
     settings.auto_accept_merges = False
     try:
         store = Store(f"sqlite+aiosqlite:///{tempfile.NamedTemporaryFile(suffix='.db', delete=False).name}")
@@ -473,7 +469,7 @@ async def test_accept_cleans_subtree() -> None:
         reg = WorkerRegistry()
         runner = Runner(store, registry=reg, events=EventBus(), settings=settings)
 
-        root = await store.create_project("write a guide")
+        root = await store.create_project("write a guide", repo_path=str(repo))
         created = await store.apply_plan(root, PlanResult(nodes=[
             NodeSpec(key="A", objective="chapter one", executor="planner", plan=True),
             NodeSpec(key="l1", objective="leaf one", executor="codex", parent_key="A"),
@@ -518,7 +514,6 @@ async def test_accept_cleans_subtree() -> None:
         print("ACCEPT CLEANS SUBTREE TEST PASSED")
         await store.dispose()
     finally:
-        settings.repo_path = saved_repo
         settings.auto_accept_merges = False
 
 

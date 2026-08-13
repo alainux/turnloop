@@ -106,7 +106,7 @@ class CodexPlanner(Planner):
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         prompt = self._build_prompt(ctx)
-        cwd = self.s.repo_path or os.getcwd()
+        cwd = ctx.repo_path or os.getcwd()
         text = await self._call_codex(
             prompt, cwd, stream=getattr(ctx, "stream", None), node_id=ctx.node.id
         )
