@@ -140,7 +140,11 @@ that merely restates this objective is never useful — drop it. Never list the
 same sub-task twice, and do NOT create parallel sub-planners that cover the
 same scope under different names (e.g. do not make both a "Kanto cities"
 planner and a "Kanto guide" planner). Each distinct scope appears exactly once
-in the plan.
+in the plan. BEFORE you finalize the plan, use the GRAPH EXPLORATION TOOL in
+  the context block (python -m turn.tools.graph_explorer --tree) to confirm no
+  existing or already-planned node elsewhere in the graph already covers a scope
+  you were about to add; if it does, reference or extend that node instead of
+  recreating it.
 
 - CARD TITLE (HARD RULE): each child's "objective" MUST be a short
   TITLE-LIKE phrase — at most ~6 words and ~50 characters. It is rendered as
