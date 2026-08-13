@@ -6,11 +6,13 @@ Neither owns Turn's data model — they only read context and emit results.
 """
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from turn.config import settings
 from turn.domain.schemas import (
     ArtifactSpec,
     Node,
@@ -18,6 +20,16 @@ from turn.domain.schemas import (
     Resource,
     WorkerResult,
 )
+from turn.tools import graph_explorer as _graph_explorer
+
+
+def _abs_db_url(url: str) -> str:
+    # Make a sqlite DB url absolute so the tool resolves the Turn app's DB
+    # file even when the agent runs inside a worktree (different cwd).
+    if not url or "///" not in url:
+        return url
+    path_part = url.split("///", 1)[1]
+    return "sqlite+aiosqlite:///" + os.path.abspath(path_part)
 
 
 class NodeExecutionContext(BaseModel):
@@ -76,18 +88,23 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             else:
                 lines.append(f"# {r.ref} (ref only)")
         lines.append("")
+    # GRAPH EXPLORATION TOOL — baked with absolute, copy-pasteable values so
+    # the agent needs no environment variables or PYTHONPATH to use it.
+    ge_path = os.path.abspath(_graph_explorer.__file__)
+    ge_db = _abs_db_url(settings.database_url)
+    ge_pid = ctx.node.project_id
     lines.append("GRAPH EXPLORATION TOOL (query the live project graph at runtime):")
     lines.append("  Before you plan or write, explore what is already planned/built so you")
-    lines.append("  build on existing work instead of duplicating it. Run from the shell:")
-    lines.append("    python -m turn.tools.graph_explorer --tree")
+    lines.append("  build on existing work instead of duplicating it. Run this EXACT command:")
+    lines.append(f'    python {ge_path} --project {ge_pid} --db "{ge_db}" --tree')
     lines.append("  It prints every node in this project: objective, parent, status, executor,")
     lines.append("  and the files each produced. Useful filters:")
     lines.append("    --node <id>       show one node")
     lines.append("    --children <id>   show a node's direct children")
     lines.append("    --ancestors <id>  show a node's parent chain")
     lines.append("    --format json     machine-readable")
-    lines.append("  The current project id is in the TURN_PROJECT_ID env var. If a scope")
-    lines.append("  (e.g. 'audio', 'engine', 'HUD') already exists or is planned elsewhere")
-    lines.append("  in the graph, reference or extend that node rather than recreating it.")
+    lines.append("  If a scope (e.g. 'audio', 'engine', 'HUD') already exists or is planned")
+    lines.append("  elsewhere in the graph, reference or extend that node rather than")
+    lines.append("  recreating it.")
     lines.append("")
     return "\n".join(lines)

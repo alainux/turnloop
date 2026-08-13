@@ -33,16 +33,6 @@ from turn.workers import parsing
 from turn.workers import worktree
 
 
-def _abs_db_url(url: str) -> str:
-    # Make a sqlite DB url absolute so a tool run from a worktree cwd still
-    # resolves the Turn app's database file.
-    if not url or "///" not in url:
-        return url
-    path_part = url.split("///", 1)[1]
-    abs_path = os.path.abspath(path_part)
-    return "sqlite+aiosqlite:///" + abs_path  # 3 slashes + /abs => 4 slashes
-
-
 class CodexWorker(Worker):
     name = "codex"
 
@@ -103,16 +93,8 @@ class CodexWorker(Worker):
         ]
 
         try:
-            agent_env = dict(os.environ, TURN_PROJECT_ID=str(ctx.node.project_id))
-            # Point the graph-explorer tool at the same live DB, with an absolute
-            # path so it resolves correctly even though the agent runs inside the
-            # worktree (whose cwd differs from the Turn app dir).
-            agent_env["TURN_DATABASE_URL"] = _abs_db_url(self.s.database_url)
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=agent_env,
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
             out_buf: list[bytes] = []
