@@ -33,6 +33,7 @@ from turn.runner.events import EventBus
 from turn.workers.base import NodeExecutionContext, Worker
 from turn.workers import parsing
 from turn.workers.registry import WorkerRegistry, build_registry
+from turn.workers import worktree
 
 from turn.config import settings as default_settings
 
@@ -73,6 +74,7 @@ class Runner:
         self._wake = asyncio.Event()
         self._stop = False
         self._task: Optional[asyncio.Task] = None
+        self._merge_lock = asyncio.Lock()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -143,6 +145,10 @@ class Runner:
                 await self._emit(
                     "node.updated", project_id, _dump(node_by_id[n.id])
                 )
+                # A planner container that just finished must propagate its
+                # accumulated children's files up into its parent's worktree.
+                if eff == NodeStatus.COMPLETE and n.status == NodeStatus.EXPANDED:
+                    await self._merge_up(n)
 
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
@@ -189,6 +195,9 @@ class Runner:
 
     async def _plan_node(self, node: Node, project_id: uuid.UUID) -> None:
         ctx = await self._build_context(node)
+        # Give the planner (and its future children) a worktree branched from the
+        # parent, so children inherit accumulated files and can merge back up.
+        self._ensure_worktree(node)
         # Collect the planner's raw Codex transcript so it can be shown in the
         # node-detail terminal pane, exactly like a worker node's output.
         transcript_chunks: list[str] = []
@@ -314,6 +323,33 @@ class Runner:
 
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
         self.wake()
+
+    # -- worktree housekeeping ---------------------------------------------
+
+    def _ensure_worktree(self, node: Node) -> None:
+        """Best-effort: create the node's worktree (branched from its parent).
+
+        No-op when no repo is configured. Failures are logged, never fatal.
+        """
+        try:
+            if self.s.repo_path:
+                worktree.get_or_create_worktree(
+                    node.id, node.parent_id, force=True, repo_path=self.s.repo_path
+                )
+        except Exception as e:  # pragma: no cover
+            logger.warning("worktree ensure failed for %s: %s", node.id, e)
+
+    async def _merge_up(self, node: Node) -> None:
+        """Merge a completed container's worktree up into its parent's."""
+        if not self.s.repo_path:
+            return
+        async with self._merge_lock:
+            try:
+                await asyncio.to_thread(
+                    worktree.merge_into_parent, node.id, node.parent_id, self.s.repo_path
+                )
+            except Exception as e:  # pragma: no cover
+                logger.warning("worktree merge-up failed for %s: %s", node.id, e)
 
     # -- user actions ----------------------------------------------------
 

@@ -258,6 +258,50 @@ async def test_planner_topology() -> None:
     print("PLANNER TOPOLOGY TEST PASSED")
 
 
+async def test_worktree_merge_up() -> None:
+    """A leaf's files must merge up into its parent, and a nested planner's
+    files must propagate through it to the root -- so a downstream assembler
+    finds real files on disk instead of regenerating from context."""
+    import tempfile
+    import uuid as _uuid
+
+    from turn.workers import worktree as wtmod
+
+    repo = tempfile.mkdtemp(prefix="turn-merge-test-")
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "--allow-empty", "-q", "-m", "init"], check=True)
+
+    root = _uuid.uuid4()
+    leaf = _uuid.uuid4()
+    chapter = _uuid.uuid4()
+    scene = _uuid.uuid4()
+    rp = repo
+
+    root_wt = wtmod.get_or_create_worktree(root, None, force=True, repo_path=rp)
+    leaf_wt = wtmod.get_or_create_worktree(leaf, root, force=True, repo_path=rp)
+    chapter_wt = wtmod.get_or_create_worktree(chapter, root, force=True, repo_path=rp)
+    scene_wt = wtmod.get_or_create_worktree(scene, chapter, force=True, repo_path=rp)
+    assert all([root_wt, leaf_wt, chapter_wt, scene_wt])
+
+    # leaf -> root
+    open(os.path.join(leaf_wt, "engine.py"), "w").write("ENGINE")
+    wtmod.commit_worktree(leaf, rp)
+    wtmod.merge_into_parent(leaf, root, rp)
+
+    # scene -> chapter -> root (nested planner chain)
+    open(os.path.join(scene_wt, "scene1.py"), "w").write("SCENE")
+    wtmod.commit_worktree(scene, rp)
+    wtmod.merge_into_parent(scene, chapter, rp)
+    wtmod.merge_into_parent(chapter, root, rp)
+
+    files = sorted(os.listdir(root_wt))
+    assert "engine.py" in files, "leaf file did not merge into root"
+    assert "scene1.py" in files, "nested planner file did not reach root"
+    print("WORKTREE MERGE-UP TEST PASSED")
+
+
 if __name__ == "__main__":
     asyncio.run(test_auto_run_default())
     asyncio.run(test_codex_worker_refuses_main_repo())
@@ -266,3 +310,4 @@ if __name__ == "__main__":
     asyncio.run(test_cancel_then_rerun())
     asyncio.run(test_worker_prompt_points_at_worktree())
     asyncio.run(test_planner_topology())
+    asyncio.run(test_worktree_merge_up())

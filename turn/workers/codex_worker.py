@@ -30,6 +30,7 @@ from turn.domain.schemas import (
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers import codex_schemas
 from turn.workers import parsing
+from turn.workers import worktree
 
 
 class CodexWorker(Worker):
@@ -41,16 +42,22 @@ class CodexWorker(Worker):
     # -- public ----------------------------------------------------------
 
     async def execute(self, ctx: "NodeExecutionContext") -> WorkerResult:
-        worktree = self._prepare_worktree(ctx.node.id) if self._repo_is_git() else None
+        worktree_path = (
+            worktree.get_or_create_worktree(
+                ctx.node.id, ctx.node.parent_id, force=True, repo_path=self.s.repo_path
+            )
+            if self._repo_is_git()
+            else None
+        )
         # Safety: with a repo configured we MUST run in an isolated worktree.
         # Refusing here is far better than letting Codex rewrite the main repo.
-        if self.s.repo_path and worktree is None:
+        if self.s.repo_path and worktree_path is None:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary="could not create an isolated git worktree; refused to run Codex in the main repository",
                 retry_recommended=False,
             )
-        cwd = worktree or os.getcwd()
+        cwd = worktree_path or os.getcwd()
         # Run inside the isolated worktree, and keep Codex pointed AT that
         # worktree (never the main repo) so it cannot rewrite files outside
         # the isolation boundary.
@@ -144,8 +151,17 @@ class CodexWorker(Worker):
             pass
 
         result = self._parse_result(text)
-        if worktree:
-            result.artifacts.extend(self._capture_worktree(worktree))
+        if worktree_path:
+            result.artifacts.extend(self._capture_worktree(worktree_path))
+            # Merge this node's produced files up into its parent's worktree so
+            # downstream nodes (e.g. an assembler) find them on disk instead of
+            # having to regenerate them from context.
+            try:
+                worktree.merge_into_parent(
+                    ctx.node.id, ctx.node.parent_id, repo_path=self.s.repo_path
+                )
+            except Exception as e:  # never let housekeeping fail a node
+                logger.warning("worktree merge-up failed for %s: %s", ctx.node.id, e)
         # One-way mirror of the unaltered Codex output for the node-detail
         # terminal pane. TODO(real-pty): replace with a real bidirectional PTY.
         transcript = parsing.strip_ansi(stderr_text + "\n" + text)
@@ -270,32 +286,9 @@ and return "COMPLETE".
         return (Path(self.s.repo_path) / ".git").exists()
 
     def _prepare_worktree(self, node_id) -> str | None:
-        repo = Path(self.s.repo_path)
-        branch = f"turn-{node_id.hex[:8]}"
-        wt = repo / ".turn" / "worktrees" / node_id.hex
-        # Clean up any prior worktree/branch for this node so re-runs isolate
-        # cleanly instead of failing and falling back to the main repo.
-        subprocess.run(
-            ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)],
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "branch", "-D", branch],
-            capture_output=True,
-            text=True,
-        )
-        try:
-            subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", str(wt), "-b", branch],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return str(wt)
-        except (subprocess.CalledProcessError, OSError):
-            # Never return the main repo: callers must refuse to run Codex here.
-            return None
+        # Kept for backward compatibility / direct tests: a node with no parent
+        # branches from the default branch.
+        return worktree.get_or_create_worktree(node_id, None, force=True, repo_path=self.s.repo_path)
 
     def _capture_worktree(self, worktree: str) -> list[ArtifactSpec]:
         def run(args):

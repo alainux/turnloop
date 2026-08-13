@@ -152,6 +152,15 @@ TOPOLOGY — arrange the children to express the real workflow:
   gets "executor": "codex" and a concrete "generated_prompt". Never use
   "executor": "echo" for real work; only use "shell" for a single shell command
   (put that command alone in generated_prompt).
+- COMPOSERS / ASSEMBLERS: if a node's job is to combine or integrate its
+  prerequisites (objective names 'assemble', 'merge', 'integrate', 'combine',
+  'stitch'), its generated_prompt MUST tell it to READ the files those
+  prerequisites already produced in the working directory and merge/stitch them.
+  A "depends_on" edge merges each prerequisite's output files up into this
+  node's working directory BEFORE it runs, so the node should load and integrate
+  those existing files — never regenerate their content from the prompt text.
+  Give the node the file names to read (or tell it to read all files produced by
+  its dependencies).
 
 ORDER & SAFETY:
 - List children IN EXECUTION ORDER (prerequisites before the steps that depend
