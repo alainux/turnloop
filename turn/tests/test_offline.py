@@ -433,6 +433,81 @@ async def test_intermediate_integration() -> None:
     await store.dispose()
 
 
+async def test_accept_cleans_subtree() -> None:
+    """Accepting a merged container deletes its redundant subtree worktrees
+    and marks the container + descendants as accepted; the root is never
+    touched. Rejecting (feedback) is exercised live, but the FS-cleaning path
+    is what risks data, so it is covered here deterministically."""
+    import tempfile, subprocess
+    from pathlib import Path as _Path
+
+    from turn.workers import worktree as wtmod
+    from turn.domain.schemas import NodeSpec, PlanResult
+
+    saved_repo = settings.repo_path
+    tmp = tempfile.mkdtemp()
+    repo = _Path(tmp) / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo))
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo))
+    subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=str(repo))
+    (repo / "seed.txt").write_text("seed")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo))
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=str(repo))
+    settings.repo_path = str(repo)
+    settings.auto_accept_merges = False
+    try:
+        store = Store(f"sqlite+aiosqlite:///{tempfile.NamedTemporaryFile(suffix='.db', delete=False).name}")
+        await store.init()
+        reg = WorkerRegistry()
+        runner = Runner(store, registry=reg, events=EventBus(), settings=settings)
+
+        root = await store.create_project("write a guide")
+        created = await store.apply_plan(root, PlanResult(nodes=[
+            NodeSpec(key="A", objective="chapter one", executor="planner", plan=True),
+            NodeSpec(key="l1", objective="leaf one", executor="codex", parent_key="A"),
+            NodeSpec(key="l2", objective="leaf two", executor="codex", parent_key="A"),
+        ]))
+        A = next(c for c in created if c.objective == "chapter one")
+        l1 = next(c for c in created if c.objective == "leaf one")
+        l2 = next(c for c in created if c.objective == "leaf two")
+
+        # Materialise the worktrees and merge the leaves up into A, then A up
+        # into the root (exactly what the real flow does).
+        for nid, pid in ((root.id, None), (A.id, root.id), (l1.id, A.id), (l2.id, A.id)):
+            wtmod.get_or_create_worktree(nid, pid, repo_path=str(repo))
+        wtmod.merge_into_parent(l1.id, A.id, repo_path=str(repo))
+        wtmod.merge_into_parent(l2.id, A.id, repo_path=str(repo))
+        wtmod.merge_into_parent(A.id, root.id, repo_path=str(repo))
+        for nid in (l1.id, l2.id, A.id):
+            await store.set_status(nid, NodeStatus.COMPLETE)
+        await store.set_status(A.id, NodeStatus.EXPANDED)
+
+        # Marking merged flags the container for review (no auto-accept).
+        await runner._mark_merged(A)
+        a2 = await store.get_node(A.id)
+        assert a2.needs_review is True, "container not flagged for review"
+        assert a2.merge_accepted is False
+
+        # Accept: subtree worktrees removed, container + descendants accepted.
+        await runner.accept_merge(A.id)
+        for nid in (A.id, l1.id, l2.id):
+            assert not wtmod.worktree_path(nid, str(repo)).exists(), f"worktree not cleaned for {nid}"
+        a3 = await store.get_node(A.id)
+        assert a3.merge_accepted is True, "container not marked accepted"
+        assert a3.needs_review is False
+        for nid in (l1.id, l2.id):
+            assert (await store.get_node(nid)).merge_accepted is True, "descendant not accepted"
+        # Root is the accumulation point and must never be cleaned.
+        assert wtmod.worktree_path(root.id, str(repo)).exists(), "root worktree was deleted!"
+        print("ACCEPT CLEANS SUBTREE TEST PASSED")
+        await store.dispose()
+    finally:
+        settings.repo_path = saved_repo
+        settings.auto_accept_merges = False
+
+
 if __name__ == "__main__":
     asyncio.run(test_auto_run_default())
     asyncio.run(test_codex_worker_refuses_main_repo())
@@ -444,3 +519,4 @@ if __name__ == "__main__":
     asyncio.run(test_worktree_merge_up())
     asyncio.run(test_deep_merge_up_ordering())
     asyncio.run(test_intermediate_integration())
+    asyncio.run(test_accept_cleans_subtree())

@@ -10,6 +10,7 @@ const state = {
   streamTimer: null,
   termFollow: true,
   termBuffer: "",
+  autoAccept: false,
   es: null,
 };
 
@@ -296,6 +297,29 @@ async function renderDetail() {
     d.appendChild(box);
   }
 
+  // --- merge review ---------------------------------------------------
+  // A node whose worktree was merged up into its parent is now redundant on
+  // disk. Offer Accept (clean the subtree) or Reject (feedback into the same
+  // node so it re-runs in place). The root has no parent, so it is never
+  // reviewed.
+  if (node.parent_id && node.needs_review && !node.merge_accepted) {
+    const review = el("div", { className: "review" });
+    review.appendChild(el("div", { className: "kv" }, [
+      el("label", {}, "Merged up — review result"),
+    ]));
+    const rb = el("div", { className: "actions" });
+    rb.appendChild(mk("Accept ✓", "run", async () => {
+      await api(`/api/nodes/${node.id}/accept`, { method: "POST" });
+      await loadGraph();
+    }));
+    rb.appendChild(mk("Reject ↺", "secondary", () => showRejectForm(review, node)));
+    review.appendChild(rb);
+    d.appendChild(review);
+  } else if (node.merge_accepted) {
+    d.appendChild(el("div", { className: "kv accepted-note" },
+      "✓ Merged & cleaned — subtree removed from disk"));
+  }
+
   // actions — only show controls that make sense for the current status
   const actions = el("div", { className: "actions" });
   const mk = (label, cls, fn) => {
@@ -425,6 +449,33 @@ function editNode(node) {
   editActions.append(save, cancel);
   const actions = d.querySelector(".actions");
   d.insertBefore(editActions, actions);
+}
+
+function showRejectForm(container, node) {
+  const rb = container.querySelector(".actions");
+  if (rb) rb.remove();
+  const ta = document.createElement("textarea");
+  ta.rows = 3;
+  ta.placeholder = "Feedback for this node (re-run in place)…";
+  const send = document.createElement("button");
+  send.textContent = "Send feedback ↺";
+  send.onclick = async () => {
+    if (!ta.value.trim()) return;
+    await api(`/api/nodes/${node.id}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feedback: ta.value }),
+    });
+    await loadGraph();
+  };
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  cancel.className = "secondary";
+  cancel.onclick = () => loadGraph();
+  const form = document.createElement("div");
+  form.className = "actions";
+  form.append(send, cancel);
+  container.append(ta, form);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -597,4 +648,27 @@ async function clearProjects() {
   await loadGraph();
 }
 
+document.getElementById("auto-accept").addEventListener("change", (e) => setAutoAccept(e.target.checked));
+
+async function loadSettings() {
+  try {
+    const s = await api("/api/settings");
+    state.autoAccept = !!s.auto_accept_merges;
+    const cb = document.getElementById("auto-accept");
+    if (cb) cb.checked = state.autoAccept;
+  } catch (_) {}
+}
+
+async function setAutoAccept(v) {
+  state.autoAccept = !!v;
+  try {
+    await api(`/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_accept_merges: !!v }),
+    });
+  } catch (_) {}
+}
+
 refreshProjects();
+loadSettings();

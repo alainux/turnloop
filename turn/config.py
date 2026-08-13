@@ -106,6 +106,14 @@ class Settings:
     # are inherited by descendant nodes as resources.
     skills_dir: str | None = field(default_factory=lambda: os.getenv("TURN_SKILLS_DIR"))
 
+    # When True, a node whose worktree has been merged up into its parent is
+    # automatically accepted: its (now-redundant) subtree worktree is deleted
+    # without waiting for a manual review. When False (default), the user must
+    # Accept/Reject each merged node from the UI. This is a global user option.
+    auto_accept_merges: bool = field(
+        default_factory=lambda: (os.getenv("TURN_AUTO_ACCEPT_MERGES", "0").lower() in ("1", "true", "yes"))
+    )
+
 
 # A single process-wide settings instance.
 _load_env_file()

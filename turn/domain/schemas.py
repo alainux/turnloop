@@ -143,6 +143,14 @@ class Node(BaseModel):
     superseded_by: Optional[uuid.UUID] = None
     forked_from: Optional[uuid.UUID] = None
 
+    # --- merge review (set by the runner, surfaced to the UI) ----------
+    # A node whose worktree has been merged up into its parent is redundant
+    # on disk. The runner asks the user to review the merged result:
+    #   needs_review   -> merged up, awaiting accept (clean subtree) / reject
+    #   merge_accepted -> reviewed & accepted; subtree filesystem cleaned
+    needs_review: bool = False
+    merge_accepted: bool = False
+
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

@@ -41,6 +41,16 @@ class NodeModel(Base):
     superseded_by = Column(Uuid(as_uuid=True), nullable=True)
     forked_from = Column(Uuid(as_uuid=True), nullable=True)
 
+    # --- merge review ---------------------------------------------------
+    # Once a node's worktree has been merged up into its parent it is
+    # redundant on disk. We then ask the user to review the merged result:
+    #   needs_review   -> merged up, awaiting Accept (clean subtree) / Reject
+    #   merge_accepted -> reviewed & accepted; subtree filesystem cleaned
+    # Only non-root nodes ever enter this state (the root has no parent to
+    # merge into, so it is the final accumulation point).
+    needs_review = Column(Boolean, nullable=False, default=False)
+    merge_accepted = Column(Boolean, nullable=False, default=False)
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at = Column(
         DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow

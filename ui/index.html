@@ -28,10 +28,12 @@
         WorkGraph
         <span class="pane-controls">
           <label class="switch"><input type="checkbox" id="auto-run" checked /> Auto-run</label>
+          <label class="switch"><input type="checkbox" id="auto-accept" /> Auto-accept merges</label>
           <button id="step-btn" type="button" hidden>Step ▶</button>
         </span>
       </div>
       <div class="graph-legend">solid = contains · <span style="color:#d29922">dashed = depends on</span></div>
+      <div id="graph"></div>
       <div id="graph"></div>
     </section>
     <section id="detail-pane">

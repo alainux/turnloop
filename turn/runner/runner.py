@@ -173,6 +173,9 @@ class Runner:
             # A planner container that just finished must propagate its
             # accumulated children's files up into its parent's worktree.
             await self._merge_up(n)
+            # Its subtree is now redundant on disk; flag it for review so the
+            # user can accept (clean) or reject (feedback) it.
+            await self._mark_merged(n)
 
         # --- manual mode -------------------------------------------------
         # When the project root is not auto-run, we still compute and persist
@@ -306,7 +309,7 @@ class Runner:
                 summary=result.summary, logs=result.executor_notes or "",
             )
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
-
+            await self._mark_merged(node)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
             created = await self.store.apply_plan(node, plan)
@@ -365,7 +368,7 @@ class Runner:
 
     async def _merge_up(self, node: Node) -> None:
         """Merge a completed container's worktree up into its parent's."""
-        if not self.s.repo_path:
+        if not self.s.repo_path or node.merge_accepted:
             return
         async with self._merge_lock:
             try:
@@ -374,6 +377,98 @@ class Runner:
                 )
             except Exception as e:  # pragma: no cover
                 logger.warning("worktree merge-up failed for %s: %s", node.id, e)
+
+    # -- merge review ----------------------------------------------------
+
+    async def _mark_merged(self, node: Node) -> None:
+        """After a node's worktree has been merged up into its parent, flag it
+        for review. The root (no parent) is the final accumulation point and is
+        never reviewed. Idempotent: once reviewed/accepted it is left alone.
+
+        With global auto-accept ON, the merge is accepted immediately (the
+        redundant subtree worktree is deleted) without waiting for the user.
+        """
+        if node.parent_id is None or not self.s.repo_path:
+            return
+        fresh = await self.store.get_node(node.id)
+        if fresh is None or fresh.needs_review or fresh.merge_accepted:
+            return
+        # Only nodes that actually produced a worktree can be cleaned.
+        if not worktree.worktree_path(node.id, self.s.repo_path).exists():
+            return
+        fresh.needs_review = True
+        await self.store._save_node(fresh)
+        await self._emit("node.updated", fresh.project_id, _dump(fresh))
+        if self.s.auto_accept_merges:
+            await self.accept_merge(node.id)
+
+    async def accept_merge(self, node_id: uuid.UUID) -> None:
+        """Accept a merged node: keep the merged result (already in the parent)
+        and delete this node's now-redundant subtree worktree to reclaim space.
+
+        Cleaning the whole subtree (node + all descendants) means accepting a
+        high-level container also resolves every review beneath it.
+        """
+        node = await self.store.get_node(node_id)
+        if node is None or node.parent_id is None:
+            return
+        desc = await self.store.descendants(node_id)
+        ids = [node_id] + [d.id for d in desc]
+        if self.s.repo_path:
+            for nid in ids:
+                try:
+                    await asyncio.to_thread(
+                        worktree.remove_worktree, nid, self.s.repo_path
+                    )
+                except Exception as e:  # pragma: no cover
+                    logger.warning("worktree removal failed for %s: %s", nid, e)
+            try:
+                await asyncio.to_thread(
+                    worktree.remove_branches, ids, self.s.repo_path
+                )
+            except Exception as e:  # pragma: no cover
+                logger.warning("branch removal failed: %s", e)
+        for nid in ids:
+            n = await self.store.get_node(nid)
+            if n is None:
+                continue
+            n.needs_review = False
+            n.merge_accepted = True
+            await self.store._save_node(n)
+            await self._emit("node.updated", n.project_id, _dump(n))
+        self.wake()
+
+    async def reject_merge(self, node_id: uuid.UUID, feedback: str) -> None:
+        """Reject a merged node: send feedback into the SAME node (no new node)
+        and re-run it in place so it can correct its output.
+
+        For a planner/container this supersedes its descendants and re-plans the
+        same node; for a leaf it re-runs the same node with the feedback appended
+        to its prompt. The node's (already merged) subtree worktree is preserved
+        so the re-run starts from the current state.
+        """
+        node = await self.store.get_node(node_id)
+        if node is None or node.parent_id is None:
+            return
+        if feedback and feedback.strip():
+            base = node.generated_prompt or ""
+            await self.store.edit_node(
+                node_id, generated_prompt=base + f"\n\n[Reviewer feedback]\n{feedback.strip()}"
+            )
+        n = await self.store.get_node(node_id)
+        n.needs_review = False
+        n.merge_accepted = False
+        await self.store._save_node(n)
+        is_planner = n.executor == PLANNER_EXECUTOR or n.status == NodeStatus.EXPANDED
+        if is_planner:
+            await self.regenerate_descendants(node_id)
+        elif n.status != NodeStatus.RUNNING:
+            await self.store.set_status(node_id, NodeStatus.RUNNABLE)
+            await self.run_node(node_id)
+        await self._emit(
+            "node.updated", n.project_id, _dump(await self.store.get_node(node_id))
+        )
+        self.wake()
 
     # -- user actions ----------------------------------------------------
 

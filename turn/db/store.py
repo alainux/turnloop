@@ -65,6 +65,8 @@ def _node_from_model(m: NodeModel) -> Node:
         revision=m.revision,
         superseded_by=m.superseded_by,
         forked_from=m.forked_from,
+        needs_review=bool(m.needs_review),
+        merge_accepted=bool(m.merge_accepted),
         created_at=m.created_at,
         updated_at=m.updated_at,
     )
@@ -141,6 +143,15 @@ class Store:
                 )
         except OperationalError:
             pass
+        # Same for the merge-review columns (added later).
+        for col in ("needs_review", "merge_accepted"):
+            try:
+                async with self.engine.begin() as conn:
+                    await conn.execute(
+                        text(f"ALTER TABLE nodes ADD COLUMN {col} BOOLEAN NOT NULL DEFAULT 0")
+                    )
+            except OperationalError:
+                pass
 
     async def dispose(self) -> None:
         await self.engine.dispose()
@@ -333,6 +344,8 @@ class Store:
             m.revision = node.revision
             m.superseded_by = node.superseded_by
             m.forked_from = node.forked_from
+            m.needs_review = bool(node.needs_review)
+            m.merge_accepted = bool(node.merge_accepted)
             m.updated_at = datetime.now(timezone.utc)
             await s.commit()
             await s.refresh(m)

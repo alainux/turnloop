@@ -49,6 +49,7 @@ class SetMode(BaseModel):
 
 class SettingsUpdate(BaseModel):
     default_auto_run: Optional[bool] = None
+    auto_accept_merges: Optional[bool] = None
 
 
 # -- helpers ---------------------------------------------------------------
@@ -89,7 +90,11 @@ async def get_settings(request: Request):
     store: Store = request.app.state.store
     raw = await store.get_setting("default_auto_run", "1")
     default_auto_run = str(raw) not in ("0", "false", "False", "")
-    return {"default_auto_run": default_auto_run}
+    from turn.config import settings as app_settings
+    return {
+        "default_auto_run": default_auto_run,
+        "auto_accept_merges": bool(app_settings.auto_accept_merges),
+    }
 
 
 @router.post("/api/settings")
@@ -98,6 +103,11 @@ async def update_settings(body: SettingsUpdate, request: Request):
     store: Store = request.app.state.store
     if body.default_auto_run is not None:
         await store.set_setting("default_auto_run", "1" if body.default_auto_run else "0")
+    if body.auto_accept_merges is not None:
+        await store.set_setting("auto_accept_merges", "1" if body.auto_accept_merges else "0")
+        # Keep the runner's live view of the option in sync with the persisted value.
+        from turn.config import settings as app_settings
+        app_settings.auto_accept_merges = bool(body.auto_accept_merges)
     return {"ok": True}
 
 
@@ -267,3 +277,25 @@ async def run_node(node_id: str, request: Request):
     runner = await _runner(request)
     nid = await runner.run_node(uuid.UUID(node_id))
     return {"ok": nid is not None, "ran": str(nid) if nid else None}
+
+
+class RejectBody(BaseModel):
+    feedback: Optional[str] = None
+
+
+@router.post("/api/nodes/{node_id}/accept")
+async def accept_merge(node_id: str, request: Request):
+    """Accept a merged node: keep the merged result (already in the parent)
+    and delete this node's redundant subtree worktree to reclaim space."""
+    runner = await _runner(request)
+    await runner.accept_merge(uuid.UUID(node_id))
+    return {"ok": True}
+
+
+@router.post("/api/nodes/{node_id}/reject")
+async def reject_merge(node_id: str, body: RejectBody, request: Request):
+    """Reject a merged node: send feedback into the SAME node (no new node)
+    and re-run it in place so it can correct its output."""
+    runner = await _runner(request)
+    await runner.reject_merge(uuid.UUID(node_id), body.feedback or "")
+    return {"ok": True}

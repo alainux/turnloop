@@ -169,3 +169,24 @@ def _copy_files(src: Path, dst: Path) -> None:
             shutil.copytree(item, target, dirs_exist_ok=True)
         else:
             shutil.copy2(item, target)
+
+
+def remove_worktree(node_id, repo_path: str | None = None) -> None:
+    """Delete a single node's git worktree directory (its accumulated files
+    have already been merged up into the parent, so this is safe). Idempotent:
+    no-ops if the worktree is already gone."""
+    wt = worktree_path(node_id, repo_path)
+    if wt.exists():
+        _git(["worktree", "remove", "--force", str(wt)], cwd=str(_repo(repo_path)))
+        shutil.rmtree(str(wt), ignore_errors=True)
+
+
+def remove_branches(ids, repo_path: str | None = None) -> None:
+    """Delete the turn-* branches for the given node ids and prune dangling
+    worktree metadata. Called after every worktree dir in a subtree is gone."""
+    repo = str(_repo(repo_path))
+    for nid in ids:
+        b = branch_name(nid)
+        if _branch_exists(b, repo_path):
+            _git(["branch", "-D", b], cwd=repo)
+    _git(["worktree", "prune"], cwd=repo)
