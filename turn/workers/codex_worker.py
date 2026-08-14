@@ -94,6 +94,9 @@ class CodexWorker(Worker):
         prompt = self._build_prompt(ctx, cwd=cwd)
 
         schema_path = codex_schemas.write_schema(codex_schemas.RESULT_SCHEMA)
+        result_file = tempfile.NamedTemporaryFile(prefix="turn-result-", suffix=".json", delete=False)
+        result_path = result_file.name
+        result_file.close()
 
         agent = ctx.node.agent
         permission = agent.permission if agent else PermissionMode.WORKSPACE
@@ -119,15 +122,17 @@ class CodexWorker(Worker):
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
                 *resume_permissions, "--output-schema", schema_path, "--json",
-                session_id, prompt,
+                "--output-last-message", result_path, session_id, prompt,
             ]
         else:
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags, *permission_flags,
-                "--output-schema", schema_path, "--json", "-C", cwd,
+                "--output-schema", schema_path, "--output-last-message", result_path,
+                "--json", "-C", cwd,
                 *[a for a in self.s.codex_args if "bypass" not in a], prompt,
             ]
 
+        structured_text = ""
         try:
             terminal = await (ctx.terminal or LocalPtyTransport()).run(
                 ctx.node.id,
@@ -143,8 +148,12 @@ class CodexWorker(Worker):
                     summary=f"Codex stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                     error="stalled terminal output",
                     retry_recommended=True,
-                    artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.output.decode(errors="replace"))],
+                    artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace"))],
                 )
+            try:
+                structured_text = Path(result_path).read_text().strip()
+            except OSError:
+                pass
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -161,15 +170,17 @@ class CodexWorker(Worker):
                 error=f"codex binary '{self.s.codex_binary}' is not available",
                 retry_recommended=False,
             )
+        finally:
+            for temporary_path in (schema_path, result_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
         raw_stdout = terminal.output.decode(errors="replace")
-        try:
-            os.unlink(schema_path)
-        except OSError:
-            pass
 
         text, discovered_session, usage = self._decode_json_stream(raw_stdout)
-        result = self._parse_result(text)
+        result = self._parse_result(structured_text or text)
         result.session_id = discovered_session or session_id
         result.usage = usage
         if worktree_path:
@@ -204,7 +215,7 @@ class CodexWorker(Worker):
                     logger.warning("worktree merge-up failed for %s: %s", ctx.node.id, e)
         # Preserve the unaltered PTY stream as a durable artifact after the
         # live terminal transport has closed.
-        transcript = raw_stdout
+        transcript = terminal.display_output.decode(errors="replace")
         if transcript.strip():
             result.artifacts.append(
                 ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)

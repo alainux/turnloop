@@ -69,7 +69,7 @@ class HeuristicPlanner(Planner):
                 key="clarify",
                 objective="Clarify scope",
                 generated_prompt=f"Confirm the key decisions, constraints, and success criteria for: {objective}",
-                executor="echo",
+                executor=exe,
                 required_inputs=[
                     InputSpec(
                         id="scope",
@@ -243,6 +243,9 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
         schema_path = codex_schemas.write_schema(codex_schemas.PLAN_SCHEMA)
+        result_file = tempfile.NamedTemporaryFile(prefix="turn-plan-", suffix=".json", delete=False)
+        result_path = result_file.name
+        result_file.close()
         bypass = any("bypass" in a for a in self.s.codex_args)
         sandbox_flags = [] if bypass else ["-s", "workspace-write", "--approve-for-me"]
         model = agent.model if agent and agent.model else self.s.codex_model
@@ -257,15 +260,17 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
                 *reasoning_flags, *resume_permissions, "--output-schema",
-                schema_path, "--json", session_id, prompt,
+                schema_path, "--output-last-message", result_path, "--json", session_id, prompt,
             ]
         else:
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *sandbox_flags, "--output-schema", schema_path, "--json",
+                *sandbox_flags, "--output-schema", schema_path,
+                "--output-last-message", result_path, "--json",
                 "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a],
                 prompt,
             ]
+        structured = ""
         try:
             transport = terminal or LocalPtyTransport()
             result = await transport.run(
@@ -278,15 +283,20 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
             )
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
+            try:
+                structured = Path(result_path).read_text().strip()
+            except OSError:
+                pass
         except asyncio.TimeoutError as error:
             raise GenerationStalled("planner exceeded the run timeout") from error
         except (FileNotFoundError, OSError):
             return "", Usage(), None
         finally:
-            try:
-                os.unlink(schema_path)
-            except OSError:
-                pass
+            for temporary_path in (schema_path, result_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
         raw = result.output.decode(errors="replace")
         messages: list[str] = []
         usage = Usage()
@@ -315,7 +325,7 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
                     output_tokens=int(raw_usage.get("output_tokens") or 0),
                     cost_usd=raw_usage.get("cost_usd"),
                 )
-        return ("\n".join(messages) if parsed and messages else raw), usage, discovered_session or session_id
+        return (structured or ("\n".join(messages) if parsed and messages else raw)), usage, discovered_session or session_id
 
 
 class AgentPlanner(Planner):

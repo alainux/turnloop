@@ -47,6 +47,15 @@ from turn.domain.schemas import (
 PLANNER_EXECUTOR = "planner"
 
 
+def _concise_title(prompt: str, limit: int = 72) -> str:
+    """Derive navigation copy while preserving the full authored prompt."""
+    clean = " ".join(prompt.split())
+    if len(clean) <= limit:
+        return clean
+    shortened = clean[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return f"{shortened}…"
+
+
 # --------------------------------------------------------------------------
 # Mapping
 # --------------------------------------------------------------------------
@@ -226,12 +235,13 @@ class Store:
         root_agent = agent.model_copy(deep=True) if agent else AgentConfig()
         root_agent.type_id = "planner"
         root_agent.session_id = None
+        display_name = name or _concise_title(prompt)
         node = NodeModel(
             id=root_id,
             project_id=root_id,  # a project IS its root node
             parent_id=None,
-            objective=name or prompt,
-            project_name=name,
+            objective=display_name,
+            project_name=display_name,
             generated_prompt=prompt,
             executor=PLANNER_EXECUTOR,
             status=NodeStatus.PENDING.value,
@@ -690,6 +700,11 @@ class Store:
             elif generic_leaf and inherited_agent:
                 # Preserve the complete selected configuration, not only its
                 # harness: custom model, reasoning and permission all inherit.
+                agent = inherited_agent
+            elif inherited_agent and executor == inherited_agent.harness.value:
+                # A planner may spell out the already-selected harness. That
+                # is not an instruction to discard its model, effort,
+                # permission or resources; inherit the complete assignment.
                 agent = inherited_agent
             elif executor in {"codex", "claude", "opencode", "pi", "echo", "shell"}:
                 # An explicit executor is an adapter choice. Inherit project

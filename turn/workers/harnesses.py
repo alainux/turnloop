@@ -9,8 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import re
 import shutil
+import subprocess
+import threading
+import time
+from functools import lru_cache
 from pathlib import Path
 
 from turn.domain.schemas import (
@@ -67,6 +72,13 @@ HARNESS_CATALOG = {
     },
 }
 
+MODEL_DISCOVERY_COMMANDS = {
+    "opencode": ["opencode", "models"],
+    "pi": ["pi", "--offline", "--list-models"],
+}
+
+_CODEX_REASONING: dict[str, list[str]] = {}
+
 # Ordered model-family refinements. Unknown model IDs inherit the harness
 # contract so new provider releases do not require a Turn deployment.
 MODEL_REASONING_PROFILES = [
@@ -88,6 +100,11 @@ def reasoning_levels_for(harness: str | HarnessKind, model: str | None = None) -
     key = harness.value if isinstance(harness, HarnessKind) else str(harness)
     base = list(HARNESS_CATALOG.get(key, {}).get("reasoning", ["default"]))
     normalized = (model or "").strip().lower()
+    if key == "codex" and normalized in _CODEX_REASONING:
+        return [
+            level for level in _CODEX_REASONING[normalized]
+            if level in base
+        ] or ["default"]
     if normalized:
         for profile in MODEL_REASONING_PROFILES:
             # Model-family names are delimited identifiers (for example,
@@ -111,20 +128,127 @@ def validate_agent_capabilities(agent: AgentConfig) -> None:
         )
 
 
-def harness_capabilities() -> list[dict]:
-    return [
-        {
-            "id": key,
-            **meta,
-            "models": [],
-            "accepts_custom_models": True,
-            "reasoning_profiles": MODEL_REASONING_PROFILES,
-            "available": shutil.which(meta["binary"]) is not None,
-        }
-        for key, meta in HARNESS_CATALOG.items()
+def _codex_models() -> list[str]:
+    command = ["codex", "app-server", "--listen", "stdio://"]
+    requests = [
+        {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "turn", "title": "Turn", "version": "0.1.0"}, "capabilities": {}}},
+        {"method": "initialized", "params": {}},
+        {"id": 2, "method": "model/list", "params": {}},
     ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    messages: queue.Queue[str] = queue.Queue()
+
+    def read_messages() -> None:
+        for line in process.stdout:
+            messages.put(line)
+
+    response: dict | None = None
+    try:
+        for request in requests:
+            process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        threading.Thread(target=read_messages, daemon=True).start()
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            try:
+                line = messages.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == 2:
+                response = message
+                break
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+    models: list[str] = []
+    if response and isinstance(response.get("result"), dict):
+        records = response["result"].get("data") or response["result"].get("models") or []
+        for record in records:
+            if isinstance(record, dict):
+                value = record.get("id") or record.get("model") or record.get("slug")
+                if isinstance(value, str):
+                    models.append(value)
+                    efforts = record.get("supportedReasoningEfforts") or []
+                    levels = ["default"] + [
+                        effort.get("reasoningEffort")
+                        for effort in efforts
+                        if isinstance(effort, dict)
+                        and isinstance(effort.get("reasoningEffort"), str)
+                    ]
+                    _CODEX_REASONING[value.lower()] = list(dict.fromkeys(levels))
+    return list(dict.fromkeys(models))
 
 
+@lru_cache(maxsize=8)
+def _discover_models(harness: str) -> list[str]:
+    """Best-effort local catalog discovery; never contacts a cloud API here."""
+    if harness == "codex" and shutil.which("codex") is not None:
+        try:
+            return _codex_models()
+        except OSError:
+            return []
+    command = MODEL_DISCOVERY_COMMANDS.get(harness)
+    if not command or shutil.which(command[0]) is None:
+        return []
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    models: list[str] = []
+    for line in completed.stdout.splitlines():
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        if not clean or clean.lower().startswith(("provider", "model", "available")):
+            continue
+        candidate = clean.split()[0]
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{1,160}", candidate):
+            models.append(candidate)
+    return list(dict.fromkeys(models))[:250]
+
+
+def harness_capabilities(configured_models: dict[str, str] | None = None) -> list[dict]:
+    configured_models = configured_models or {}
+    results: list[dict] = []
+    for key, meta in HARNESS_CATALOG.items():
+        discovered = _discover_models(key)
+        configured = configured_models.get(key)
+        if configured and configured not in discovered:
+            discovered.insert(0, configured)
+        models = [
+            {
+                "id": model,
+                "label": model,
+                "reasoning": reasoning_levels_for(key, model),
+                "source": "configured" if model == configured else "harness",
+            }
+            for model in discovered
+        ]
+        results.append(
+            {
+                "id": key,
+                **meta,
+                "models": models,
+                "accepts_custom_models": True,
+                "reasoning_profiles": MODEL_REASONING_PROFILES,
+                "available": shutil.which(meta["binary"]) is not None,
+            }
+        )
+    return results
 def _structured_prompt(ctx: NodeExecutionContext) -> str:
     task = ctx.node.generated_prompt or "Complete the objective using the available tools."
     if ctx.purpose == "verify":
@@ -316,7 +440,7 @@ class CLIHarnessWorker(Worker):
                 summary=f"{self.name} stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                 error="stalled terminal output",
                 retry_recommended=True,
-                artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=raw_out)],
+                artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace") or raw_out)],
             )
         text, session, usage = _json_text_and_session(raw_out)
         data = parsing.first_result_json(text) or {}
@@ -365,7 +489,14 @@ class CLIHarnessWorker(Worker):
             result.summary = f"{self.name} reported missing file outputs: {', '.join(missing_files)}"
             result.error = result.summary
             result.retry_recommended = True
-        result.artifacts.append(ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=raw_out))
+        display_out = terminal.display_output.decode(errors="replace")
+        result.artifacts.append(
+            ArtifactSpec(
+                kind=ArtifactKind.TEXT,
+                name="transcript",
+                content=display_out or text,
+            )
+        )
         captured = capture_worktree(cwd)
         result.artifacts.extend(captured)
         missing_material = (

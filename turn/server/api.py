@@ -110,7 +110,7 @@ def _dump(n: Node):
     return n.model_dump(mode="json")
 
 
-async def _serialize_graph(store: Store, project_id: uuid.UUID) -> dict:
+async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner | None = None) -> dict:
     nodes, edges, artifacts = await store.get_workgraph(project_id)
     ev = evaluate(nodes, edges)
     for n in nodes:
@@ -151,6 +151,11 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID) -> dict:
         item["allowed_actions"] = [a.value for a in p.actions]
         item["state_reason"] = p.reason
         item["review_owner"] = node_review_owner
+        terminal = runner.terminal.snapshot(n.id) if runner is not None else {"active": False}
+        # Database RUNNING covers startup, provider generation, parsing and
+        # merge housekeeping. Only a live provider terminal is presented as
+        # generative activity in the graph.
+        item["generation_active"] = bool(terminal.get("active"))
         serialized.append(item)
     return {
         "project_id": str(project_id),
@@ -370,11 +375,17 @@ async def capabilities():
     from turn.config import settings as app_settings
     from turn.workers.harnesses import harness_capabilities
 
-    harnesses = harness_capabilities()
-    if app_settings.codex_model:
-        codex = next((item for item in harnesses if item["id"] == "codex"), None)
-        if codex is not None:
-            codex["models"] = [{"id": app_settings.codex_model, "label": app_settings.codex_model}]
+    harnesses = await asyncio.to_thread(
+        harness_capabilities,
+        {"codex": app_settings.codex_model or ""},
+    )
+    if app_settings.default_executor == "echo":
+        harnesses.append({
+            "id": "echo", "label": "Echo · offline", "binary": "internal",
+            "reasoning": ["default"], "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "internal"}],
+            "supports_sessions": False, "supports_tools": False,
+            "accepts_custom_models": False, "reasoning_profiles": [], "available": True,
+        })
     return {
         "harnesses": harnesses,
         "agent_types": [
@@ -529,7 +540,7 @@ async def step_project(project_id: str, request: Request):
 async def get_graph(project_id: str, request: Request):
     store: Store = request.app.state.store
     pid = uuid.UUID(project_id)
-    return await _serialize_graph(store, pid)
+    return await _serialize_graph(store, pid, request.app.state.runner)
 
 
 @router.get("/api/projects/{project_id}/stream")
@@ -612,7 +623,7 @@ async def get_node(node_id: str, request: Request):
         raise HTTPException(404, "node not found")
     runs = await store.get_runs(nid)
     arts = await store.get_artifacts(nid)
-    graph = await _serialize_graph(store, node.project_id)
+    graph = await _serialize_graph(store, node.project_id, request.app.state.runner)
     enriched = next((n for n in graph["nodes"] if n["id"] == str(node.id)), _dump(node))
     return {
         "node": enriched,

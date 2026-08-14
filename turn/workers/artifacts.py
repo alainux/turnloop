@@ -64,8 +64,19 @@ def capture_worktree(path: str) -> list[ArtifactSpec]:
             return ""
 
     artifacts: list[ArtifactSpec] = []
-    diff = git("diff", "HEAD")
     status = git("status", "--porcelain")
+    diff_parts = [git("diff", "HEAD")]
+    # Plain `git diff` omits untracked files, which made the review panel say
+    # there was no diff for a newly created deliverable. Present them as
+    # normal additions without mutating the index.
+    for line in status.splitlines():
+        if not line.startswith("?? "):
+            continue
+        relative = line[3:].strip().strip('"')
+        target = Path(path, relative)
+        if target.is_file():
+            diff_parts.append(git("diff", "--no-index", "--", "/dev/null", relative))
+    diff = "".join(diff_parts)[:2_000_000]
     if diff.strip():
         artifacts.append(
             ArtifactSpec(kind=ArtifactKind.CODE_DIFF, name="git-diff", content=diff)

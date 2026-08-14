@@ -28,7 +28,7 @@ node context menu. There are no self-labels, redundant dots, or “future” bad
 - UI base: 13px/1.45; labels 9–10px; titles 13–16px; editable values 12px.
 - Title bar: 36px. Status bar: 24px. Sidebar: 236px. Inspector: 360px.
 - Controls: 24px compact, 28px normal, 32px prominent.
-- Graph nodes: 224×58px. Objectives are one ellipsized line; the inspector owns
+- Graph nodes: 224×64px. Objectives are one ellipsized line; the inspector owns
   long intent and prompts.
 - Buttons never wrap. Secondary actions move to menus before forming a second
   toolbar row.
@@ -52,11 +52,27 @@ removable chips and become immutable root resource references.
 
 ### Graph node
 
-Each node shows one semantic avatar, state text, harness, model, reasoning,
-nonzero resource counts, and available token usage. Node avatars may remain
-code-native masks. Running/verifying nodes use a restrained halo and their
-active edges flow. Completed nodes never animate. Reduced motion collapses all
-animation.
+Each node shows one semantic avatar, state text, harness, model, reasoning, and
+available token usage. A subtle circular play action manually starts a runnable
+node. That exact control becomes a spinner only while the provider terminal is
+live. Database startup/finalization, queued verification, completed nodes, and
+edges never animate. This is the interface's truthfulness rule, not decoration.
+
+### Terminal and results
+
+The terminal is a Shadow DOM xterm backed by the provider-neutral PTY contract.
+Harness machine events and final structured output never appear as raw JSON in
+the terminal: adapters retain byte-perfect machine output for validation while
+publishing a separate ANSI presentation stream. Schema-constrained final output
+uses a dedicated result file where supported. The inspector renders durable
+unified diffs per file with additions/deletions and keeps artifacts as compact
+single-line disclosures.
+
+Agent instructions are the first inspector section below identity and status.
+They render as Markdown and switch to one in-place editor. Harness, model, and
+reasoning controls consume the same capability records in authoring, settings,
+and node configuration; model-specific reasoning options replace generic
+guesswork whenever the harness exposes them.
 
 ### Inspector
 

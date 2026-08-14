@@ -17,6 +17,7 @@ from turn.server.security import LocalOnlyMiddleware
 from turn.workers.registry import build_registry
 
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
+UI_DIST_DIR = UI_DIR / "dist"
 ROOT_DIR = UI_DIR.parent
 XTERM_DIR = ROOT_DIR / "node_modules" / "@xterm" / "xterm"
 XTERM_FIT_DIR = ROOT_DIR / "node_modules" / "@xterm" / "addon-fit"
@@ -89,5 +90,7 @@ if XTERM_DIR.exists():
     app.mount("/vendor/xterm", StaticFiles(directory=str(XTERM_DIR)), name="xterm")
 if XTERM_FIT_DIR.exists():
     app.mount("/vendor/xterm-fit", StaticFiles(directory=str(XTERM_FIT_DIR)), name="xterm-fit")
-if UI_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
+if (UI_DIR / "icons").exists():
+    app.mount("/icons", StaticFiles(directory=str(UI_DIR / "icons")), name="icons")
+if UI_DIST_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(UI_DIST_DIR), html=True), name="ui")

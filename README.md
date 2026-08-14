@@ -37,25 +37,65 @@ IDE-like web UI and the headless CLI are clients of that same core.
 - Unit, API, runner-transition, browser end-to-end, generated-screenshot, and
   three-domain full-run persistence/log acceptance tests.
 
-The exact implemented boundary and the deliberately unimplemented future scope
-are tracked in [docs/SCOPE.md](docs/SCOPE.md). Architectural decisions and
-extension points are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-The visual and interaction contract is documented in
-[docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md). Reproducible full-run evidence
-is defined in [docs/ACCEPTANCE_RUNS.md](docs/ACCEPTANCE_RUNS.md).
-The independent read-only audit and closure evidence are recorded in
-[docs/INDEPENDENT_REVIEW.md](docs/INDEPENDENT_REVIEW.md).
+The visual and interaction contract is in [DESIGN.md](DESIGN.md). This README
+is the sole product, architecture, scope, operation, and verification guide.
+
+## Architecture and current boundary
+
+The graph is the source of truth. `PlanResult` and `WorkerResult` are strict
+domain contracts; the runner owns transitions; the store owns durable SQLite
+state; UI and CLI are clients. A node owns intent and an `AgentConfig`, while
+harness-specific flags remain inside replaceable planner/worker adapters:
+`graph → node → agent → type/harness`.
+
+The React client is strict TypeScript and mirrors the Python domain vocabulary.
+It consumes server-projected `ui_state`, `allowed_actions`, review ownership,
+and `generation_active`; it does not guess workflow state. A provider-neutral
+terminal transport separates raw machine events used for schema parsing from
+the ANSI presentation stream used by a Shadow DOM xterm. Codex final structured
+results use the CLI's schema-constrained output file instead of leaking JSONL
+into the human terminal. Code diffs are durable artifacts rendered in the
+inspector.
+
+Current scope includes local POSIX PTYs, local harness discovery, provider
+sessions, parent verification with bounded correction rounds, model-dependent
+reasoning controls, attachments, isolated git worktrees, recovery policies,
+usage accounting, CLI/headless execution, and the tested web UI.
+
+Future-ready seams—not implemented product claims—include remote/cloud terminal
+transports, Windows ConPTY, authenticated remote service mode, custom type and
+output registries, shared chats/A2A, composable validation/optimization loops,
+promoted decomposition specs, and signed native bundles. The open graph,
+artifact, registry, transport, and policy contracts are intentionally placed
+for that work.
 
 ## Run locally
 
 ```bash
 python -m pip install -e ".[dev]"
+npm install
+npm run build
 playwright install chromium       # once, for browser tests
 ./scripts/run.sh                  # offline heuristic planner + Echo workers
 ```
 
 Open <http://127.0.0.1:8000>. For real coding agents, select an installed
 harness in the authoring surface or set `TURN_DEFAULT_EXECUTOR`.
+
+## Verification
+
+```bash
+npm run typecheck
+npm test
+npm run build
+pytest -q
+```
+
+The acceptance suite covers deterministic offline software/story/book runs,
+browser authoring and inspection, PTY ANSI/input/resize/stall behavior,
+state/review transitions, persisted logs/artifacts/diffs, and server security.
+Model-backed demonstrations are intentionally separate from offline CI: they
+prove installed-harness integration but are not deterministic quality scores.
 
 ## Headless CLI
 

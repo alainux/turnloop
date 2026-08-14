@@ -27,6 +27,7 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.workers.base import NodeExecutionContext, Planner
 from turn.workers.codex_worker import CodexWorker
+from turn.workers.artifacts import capture_worktree
 from turn.workers.echo_worker import EchoWorker
 from turn.workers.registry import WorkerRegistry
 
@@ -57,6 +58,34 @@ async def test_auto_run_default() -> None:
 
     await store.dispose()
     print("AUTO-RUN DEFAULT TEST PASSED")
+
+
+async def test_long_prompt_keeps_full_intent_and_derives_concise_title(tmp_path) -> None:
+    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'titles.db'}")
+    await store.init()
+    prompt = (
+        "Build a compact offline release-notes generator with parsing, "
+        "formatting, validation, integration, and deterministic regression checks."
+    )
+    root = await store.create_project(prompt)
+    assert root.generated_prompt == prompt
+    assert root.project_name == root.objective
+    assert len(root.objective) <= 72 and root.objective.endswith("…")
+    await store.dispose()
+
+
+def test_capture_worktree_includes_untracked_file_as_reviewable_diff(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "turn@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Turn"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text(".turn/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    (tmp_path / "PLAN.md").write_text("# Plan\n\nVerify the graph.\n")
+    captured = capture_worktree(str(tmp_path))
+    patch = next(item.content for item in captured if item.kind.value == "code_diff")
+    assert "diff --git" in patch and "+++ b/PLAN.md" in patch
+    assert "+# Plan" in patch
 
 
 async def test_codex_worker_refuses_main_repo() -> None:

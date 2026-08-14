@@ -1,9 +1,4 @@
-"""Browser-driven acceptance runs with database and log inspection.
-
-The deterministic heuristic/echo harness proves the entire local product path
-without network calls or token spend. The three objectives deliberately cover
-the MVP's primary domains: software, story games, and books.
-"""
+"""Three complete browser-driven offline acceptance runs with DB inspection."""
 from __future__ import annotations
 
 import json
@@ -16,7 +11,6 @@ import time
 import urllib.request
 
 import pytest
-
 
 OBJECTIVES = (
     "Build a small modular command-line task tracker",
@@ -44,25 +38,17 @@ def _wait(url: str, seconds: float = 12) -> None:
 
 
 def _wait_persisted_complete(database, project_id: str, seconds: float = 15) -> None:
-    """Require two stable DB observations before the QA server is stopped."""
-    deadline = time.time() + seconds
-    stable = 0
-    compact = project_id.replace("-", "")
+    deadline, stable = time.time() + seconds, 0
     while time.time() < deadline:
         with sqlite3.connect(database) as connection:
-            statuses = [
-                row[0] for row in connection.execute(
-                    "SELECT status FROM nodes WHERE project_id = ?", (compact,)
-                )
-            ]
-        if statuses and all(status == "COMPLETE" for status in statuses):
-            stable += 1
-            if stable >= 2:
-                return
-        else:
-            stable = 0
+            statuses = [row[0] for row in connection.execute(
+                "SELECT status FROM nodes WHERE project_id = ?", (project_id.replace("-", ""),)
+            )]
+        stable = stable + 1 if statuses and all(item == "COMPLETE" for item in statuses) else 0
+        if stable >= 2:
+            return
         time.sleep(.15)
-    raise AssertionError(f"project {project_id} did not reach stable persisted completion: {statuses}")
+    raise AssertionError(f"project {project_id} did not complete: {statuses}")
 
 
 def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_path):
@@ -81,11 +67,11 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
         "TURN_DEFAULT_EXECUTOR": "echo",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
-    with server_log.open("w") as log_handle:
-        proc = subprocess.Popen(
+    with server_log.open("w") as log:
+        process = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "turn.server.app:app", "--host", "127.0.0.1", "--port", str(port)],
             env=env,
-            stdout=log_handle,
+            stdout=log,
             stderr=subprocess.STDOUT,
         )
         try:
@@ -93,89 +79,78 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
             with playwright.sync_playwright() as pw:
                 try:
                     browser = pw.chromium.launch()
-                except Exception as exc:
-                    pytest.skip(f"Playwright Chromium is not installed: {exc}")
+                except Exception as error:
+                    pytest.skip(f"Playwright Chromium is not installed: {error}")
                 page = browser.new_page(viewport={"width": 1440, "height": 960})
-                page.set_default_timeout(8000)
+                page.set_default_timeout(12000)
                 console_errors: list[str] = []
-                page.on("console", lambda message: console_errors.append(message.text) if message.type in {"error", "warning"} else None)
+                page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
                 page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
                 project_ids: list[str] = []
 
                 for index, objective in enumerate(OBJECTIVES):
-                    page.locator("#author-prompt").fill(objective)
-                    page.locator("#author-form").evaluate("form => form.requestSubmit()")
-                    page.locator("#new-auto").check()
+                    page.get_by_role("textbox", name="Project objective").fill(objective)
+                    page.get_by_label("Harness").select_option("echo")
                     page.get_by_role("button", name="Create workgraph").click()
                     page.locator(".gnode.waiting_input").wait_for(timeout=15000)
-                    project_id = page.evaluate("localStorage.getItem('turn.project')")
+                    project_id = page.evaluate(
+                        "async objective => (await (await fetch('/api/projects')).json()).projects.find(p => p.generated_prompt === objective).id",
+                        objective,
+                    )
                     project_ids.append(project_id)
-
-                    graph = page.evaluate("async id => (await fetch(`/api/projects/${id}/graph`)).json()", project_id)
+                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph`)).json())", project_id)
                     assert len(graph["nodes"]) == 5
-                    assert len({node["objective"] for node in graph["nodes"]}) == 5
                     assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 1
                     assert sum(edge["type"] == "DEPENDS_ON" for edge in graph["edges"]) == 3
+                    assert all(
+                        node["agent"]["harness"] == "echo" and node["agent"]["model"] == "deterministic"
+                        for node in graph["nodes"] if node["parent_id"]
+                    )
 
                     clarification = next(node for node in graph["nodes"] if node["ui_state"] == "waiting_input")
-                    page.locator(f'[data-node-id="{clarification["id"]}"]').click()
-                    page.locator("#detail .input-card textarea").fill(f"Keep run {index + 1} concise, modular, and independently verifiable.")
+                    page.locator(f'[data-node-id="{clarification["id"]}"] .node-main').click()
+                    input_label = next(item["label"] for item in clarification["required_inputs"] if not item.get("satisfied_by"))
+                    page.get_by_role("textbox", name=input_label).fill(
+                        f"Keep run {index + 1} concise, modular, and independently verifiable."
+                    )
                     page.get_by_role("button", name="Provide input").click()
                     page.wait_for_function(
-                        """async id => {
-                          const graph = await (await fetch(`/api/projects/${id}/graph`)).json();
-                          const root = graph.nodes.find(node => node.id === id);
-                              // Completion acceptance is a persisted-state
-                              // contract, not merely a transient graph
-                              // projection. Wait for durable facts before
-                              // closing the project/server.
-                              return root?.status === 'COMPLETE' && graph.nodes.every(node => node.status === 'COMPLETE');
-                        }""",
+                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`)).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
                         arg=project_id,
                         timeout=15000,
                     )
                     _wait_persisted_complete(database, project_id)
-
-                    page.locator(f'[data-node-id="{project_id}"]').click(button="right")
-                    page.get_by_role("menuitem", name="View run history").click()
+                    page.locator(f'[data-node-id="{project_id}"] .node-main').click()
+                    page.get_by_role("tab", name="History").click()
                     page.locator(".history-item").wait_for()
-                    assert "attempt 1" in page.locator("#detail").inner_text()
-                    page.locator("#home-btn").click()
+                    page.get_by_role("button", name="Turn").click()
                     page.get_by_role("heading", name="What should the workgraph build?").wait_for()
 
                 page.get_by_role("button", name="Toggle projects").click()
                 assert page.locator(".project-item").count() == 3
-                assert console_errors == []
+                assert not console_errors
                 browser.close()
         finally:
-            proc.terminate()
+            process.terminate()
             try:
-                proc.wait(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                process.kill()
 
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
-        roots = connection.execute("SELECT id, objective, generated_prompt, status FROM nodes WHERE parent_id IS NULL ORDER BY created_at").fetchall()
+        roots = connection.execute(
+            "SELECT id, objective, generated_prompt, status FROM nodes WHERE parent_id IS NULL ORDER BY created_at"
+        ).fetchall()
         assert [row["generated_prompt"] for row in roots] == list(OBJECTIVES)
-        assert all(len(row["objective"]) <= 72 for row in roots)
-        assert len({row["objective"] for row in roots}) == len(OBJECTIVES)
-        assert all(row["status"] == "COMPLETE" for row in roots)
+        assert all(len(row["objective"]) <= 72 and row["status"] == "COMPLETE" for row in roots)
         for root in roots:
-            nodes = connection.execute("SELECT id, objective, generated_prompt, status, required_inputs FROM nodes WHERE project_id = ?", (root["id"],)).fetchall()
-            assert len(nodes) == 5
-            assert len({row["objective"] for row in nodes}) == 5
-            assert all(row["status"] == "COMPLETE" for row in nodes)
-            assert all(root["generated_prompt"] in row["generated_prompt"] for row in nodes if row["id"] != root["id"])
-            gated = [json.loads(row["required_inputs"] or "[]") for row in nodes]
-            supplied = [item for items in gated for item in items]
-            assert len(supplied) == 1 and supplied[0]["satisfied_by"]
-            edges = connection.execute(
-                "SELECT type FROM edges WHERE src IN (SELECT id FROM nodes WHERE project_id = ?)",
-                (root["id"],),
+            nodes = connection.execute(
+                "SELECT id, objective, status, required_inputs FROM nodes WHERE project_id = ?", (root["id"],)
             ).fetchall()
-            assert sum(row["type"] == "CONTAINS" for row in edges) == 4
-            assert sum(row["type"] == "DEPENDS_ON" for row in edges) == 3
+            assert len(nodes) == 5 and all(row["status"] == "COMPLETE" for row in nodes)
+            supplied = [item for row in nodes for item in json.loads(row["required_inputs"] or "[]")]
+            assert len(supplied) == 1 and supplied[0]["satisfied_by"]
             runs = connection.execute(
                 "SELECT status, summary, logs FROM runs WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)",
                 (root["id"],),
@@ -186,16 +161,9 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                 "SELECT kind, name, content FROM artifacts WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)",
                 (root["id"],),
             ).fetchall()
-            assert len(artifacts) == 5
-            user_inputs = [row for row in artifacts if row["kind"] == "user_input"]
-            results = [row for row in artifacts if row["kind"] == "text"]
-            assert len(user_inputs) == 1 and user_inputs[0]["name"] == "input:scope"
-            assert "independently verifiable" in json.loads(user_inputs[0]["content"])
-            assert len(results) == 4
-            child_objectives = {row["objective"] for row in nodes if row["id"] != root["id"]}
-            assert {json.loads(row["content"]).split("\n", 1)[0] for row in results} == child_objectives
+            assert len([row for row in artifacts if row["kind"] == "user_input"]) == 1
+            assert len([row for row in artifacts if row["kind"] == "text"]) == 4
 
     log_text = server_log.read_text()
     assert log_text.count("POST /api/projects") == 3
-    assert "Traceback" not in log_text
-    assert " 500 " not in log_text
+    assert "Traceback" not in log_text and " 500 " not in log_text

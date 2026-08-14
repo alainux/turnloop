@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -36,6 +37,7 @@ from turn.tools import graph_explorer
 from turn.workers.base import NodeExecutionContext, Planner, Worker, render_context_block
 from turn.workers.echo_worker import EchoWorker
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
+import turn.workers.harnesses as harness_module
 from turn.workers import parsing
 from turn.workers.artifacts import has_material_change, missing_declared_files, requires_material_change
 from turn.workers.registry import WorkerRegistry
@@ -43,6 +45,34 @@ from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
 from turn.workers import worktree
 import turn.workers.planner as planner_module
 from turn.workers.terminal import TerminalResult
+
+
+def test_codex_model_discovery_handles_long_lived_server_bytes(monkeypatch):
+    payload = '{"id":2,"result":{"data":[{"id":"gpt-test","supportedReasoningEfforts":[{"reasoningEffort":"high"}]}]}}\n'
+
+    class Process:
+        def __init__(self, *args, **kwargs):
+            self.stdin = self
+            self.stdout = iter([payload])
+
+        def write(self, value):
+            return len(value)
+
+        def flush(self):
+            pass
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(harness_module.subprocess, "Popen", Process)
+    assert harness_module._codex_models() == ["gpt-test"]
+    assert harness_module.reasoning_levels_for("codex", "gpt-test") == ["default", "high"]
 
 
 class StubTerminal:
@@ -332,6 +362,28 @@ async def test_new_plan_children_inherit_config_but_not_parent_session(tmp_path)
     assert child.agent.model == "gpt-5.6-luna"
     assert child.agent.reasoning == ReasoningLevel.HIGH
     assert child.agent.session_id is None
+    await store.dispose()
+
+
+async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
+    _, store, _ = await _runtime(tmp_path, EchoWorker())
+    parent = await store.create_project(
+        "explicit adapter",
+        agent=AgentConfig(
+            harness=HarnessKind.ECHO,
+            model="deterministic",
+            reasoning=ReasoningLevel.DEFAULT,
+            session_id="planner-thread",
+        ),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    created = await store.apply_plan(
+        parent,
+        PlanResult(nodes=[NodeSpec(key="child", objective="Implement leaf", executor="echo")]),
+    )
+    assert created[0].agent.harness == HarnessKind.ECHO
+    assert created[0].agent.model == "deterministic"
+    assert created[0].agent.session_id is None
     await store.dispose()
 
 

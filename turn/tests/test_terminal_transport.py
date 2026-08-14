@@ -4,7 +4,29 @@ import asyncio
 import sys
 import uuid
 
-from turn.workers.terminal import LocalPtyTransport
+from turn.workers.terminal import HarnessOutputPresenter, LocalPtyTransport
+
+
+def test_machine_json_is_rendered_as_human_terminal_output():
+    presenter = HarnessOutputPresenter("codex")
+    raw = (
+        '{"type":"thread.started","thread_id":"123456789"}\n'
+        '{"type":"item.completed","item":{"type":"command_execution","command":"pytest -q","aggregated_output":"3 passed"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"Implemented and verified."}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    rendered = presenter.feed(raw, final=True)
+    assert "pytest -q" in rendered and "3 passed" in rendered
+    assert "Implemented and verified." in rendered
+    assert '"type"' not in rendered and "completed" in rendered
+
+
+def test_result_envelopes_stay_out_of_human_terminal():
+    presenter = HarnessOutputPresenter("codex")
+    raw = '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"outcome\\":\\"COMPLETE\\",\\"summary\\":\\"done\\"}"}}\n'
+    rendered = presenter.feed(raw, final=True)
+    assert "done" in rendered
+    assert '"outcome"' not in rendered
 
 
 async def test_local_pty_preserves_ansi_accepts_input_and_resizes(tmp_path):
