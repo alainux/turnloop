@@ -5,9 +5,9 @@ node Run to one Prefect-managed execution so Prefect can provide retries,
 timeouts, scheduling, and worker infrastructure without leaking Prefect concepts
 into Turn's data model.
 
-Prefect is an OPTIONAL dependency. The adapter is only selected when
-``TURN_EXECUTION_BACKEND=prefect`` and Prefect is importable. Otherwise the
-runner uses `DirectExecutionAdapter`.
+Prefect is an optional dependency. It is selected only when
+``TURN_EXECUTION_BACKEND=prefect``; a missing dependency is an explicit
+configuration error rather than a silent change of execution semantics.
 """
 from __future__ import annotations
 
@@ -47,18 +47,15 @@ class PrefectExecutionAdapter:
 
 
 def get_execution_adapter(settings: Settings):
-    """Return the configured execution adapter.
-
-    Falls back to the direct adapter if Prefect is requested but unavailable, so
-    the system always has a working backend.
-    """
+    """Return the explicitly configured execution adapter."""
     if settings.execution_backend == "prefect":
         try:
             import prefect  # noqa: F401
-
-            return PrefectExecutionAdapter(settings)
-        except ImportError:
-            print("[turn] Prefect backend requested but not installed; using direct backend.")
+        except ImportError as error:
+            raise RuntimeError(
+                "TURN_EXECUTION_BACKEND=prefect requires the Prefect dependency"
+            ) from error
+        return PrefectExecutionAdapter(settings)
     from turn.runner.runner import DirectExecutionAdapter
 
     return DirectExecutionAdapter(settings)

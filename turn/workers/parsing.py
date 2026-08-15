@@ -19,6 +19,23 @@ def extract_fences(text: str) -> dict[str, str]:
     return {m.group(1).lower(): m.group(2).strip() for m in _FENCE_RE.finditer(text)}
 
 
+def clean_summary(value: object) -> str:
+    """Return the human summary without an echoed turn-result protocol block."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    marker = re.search(r"```turn-result\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if not marker:
+        return text
+    prefix = text[: marker.start()].strip()
+    payload = _safe_json(marker.group(1).strip())
+    if prefix:
+        return prefix
+    if isinstance(payload, dict) and isinstance(payload.get("summary"), str):
+        return payload["summary"].strip()
+    return text[marker.end() :].strip() or text
+
+
 def _safe_json(s: str):
     try:
         return json.loads(s)
@@ -156,8 +173,8 @@ def first_plan_json(text: str):
     val = _safe_json(fences.get("turn-plan", ""))
     if _is_plan(val):
         return val
-    # Codex --output-schema returns a bare object. Accept only the planner
-    # identity (key/objective child specs), never graph-inspector rows (id).
+    # Accept only the planner identity (key/objective child specs), never
+    # graph-inspector rows (id).
     for candidate in reversed(extract_json_objects(text)):
         if _is_plan(candidate):
             return candidate

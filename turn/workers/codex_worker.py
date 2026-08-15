@@ -1,17 +1,10 @@
-"""Codex worker — the software-engineering / general agent worker.
-
-Shells out to `codex exec`, isolates software work in a Git worktree, and parses
-the agent's structured result. This adapter is the *only* place Codex concepts
-enter Turn; the data model stays clean.
-"""
+"""Codex worker — the software-engineering / general agent worker."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
-import re
-import tempfile
 from pathlib import Path
 
 from turn.config import settings
@@ -28,18 +21,23 @@ from turn.domain.schemas import (
     PermissionMode,
     ReasoningLevel,
     WorkerResult,
-    Usage,
 )
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers.artifacts import (
-    capture_worktree,
+    capture_filesystem,
     has_material_change,
     missing_declared_files,
     requires_material_change,
+    snapshot_filesystem,
 )
-from turn.workers import codex_schemas
+from turn.workers.interactive import (
+    agent_environment,
+    prepare_result_file,
+    read_result_file,
+    result_handoff,
+    run_until_result,
+)
 from turn.workers import parsing
-from turn.workers import worktree
 from turn.workers.terminal import LocalPtyTransport
 
 logger = logging.getLogger("turn.worker.codex")
@@ -54,51 +52,23 @@ class CodexWorker(Worker):
     # -- public ----------------------------------------------------------
 
     async def execute(self, ctx: "NodeExecutionContext") -> WorkerResult:
-        # Every node runs inside its project's own git repository: the root
-        # node's worktree IS the project repo root, and non-root nodes get an
-        # isolated worktree branched from their parent. There is no shared
-        # "main" repository to fall back to.
         repo = ctx.repo_path
-        is_verification = (
-            ctx.purpose == "verify"
-            or bool(ctx.node.agent and ctx.node.agent.type_id == "validator")
-        )
-        is_git = bool(repo) and (Path(repo) / ".git").exists()
-        worktree_path = (
-            worktree.get_or_create_worktree(
-                ctx.node.id,
-                ctx.node.parent_id,
-                # Execution retries intentionally restart from the parent's
-                # current branch. Parent verification is read-only and must
-                # inspect the exact committed child worktree; forcing here
-                # would delete the evidence immediately before reviewing it.
-                force=not is_verification,
-                repo_path=repo,
-            )
-            if is_git
-            else None
-        )
-        # Safety: we MUST run in the project's own isolated repo/worktree.
-        # Refusing here is far better than letting Codex run somewhere undefined
-        # (e.g. the Turn app directory).
-        if not repo or worktree_path is None:
+        if not repo or not Path(repo).is_dir():
             return WorkerResult(
                 outcome=Outcome.FAIL,
-                summary="no project repository configured; refusing to run Codex",
+                summary="assigned project directory is unavailable; refusing to run Codex",
                 retry_recommended=False,
             )
-        cwd = worktree_path or os.getcwd()
-        # Run inside the isolated worktree, and keep Codex pointed AT that
-        # worktree (never the main repo) so it cannot rewrite files outside
-        # the isolation boundary.
-        prompt = self._build_prompt(ctx, cwd=cwd)
-
-        schema_path = codex_schemas.write_schema(codex_schemas.RESULT_SCHEMA)
-        result_file = tempfile.NamedTemporaryFile(prefix="turn-result-", suffix=".json", delete=False)
-        result_path = result_file.name
-        result_file.close()
-
+        cwd = repo
+        before = snapshot_filesystem(cwd)
+        transport = ctx.terminal or LocalPtyTransport()
+        native = isinstance(transport, LocalPtyTransport)
         agent = ctx.node.agent
+        result_path = prepare_result_file(cwd, ctx.node.id, "result")
+        environment = agent_environment(cwd, ctx.node.id, "result", result_path, agent)
+        environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
+        prompt = self._build_prompt(ctx, cwd=cwd, result_path=result_path)
+
         permission = agent.permission if agent else PermissionMode.WORKSPACE
         configured_bypass = any("bypass" in a for a in self.s.codex_args)
         bypass = configured_bypass or permission == PermissionMode.FULL
@@ -107,7 +77,9 @@ class CodexWorker(Worker):
         elif permission == PermissionMode.ASK:
             permission_flags = ["-s", "workspace-write"]
         else:
-            permission_flags = ["-s", "workspace-write", "--approve-for-me"]
+            # The current Codex CLI treats --approve-for-me as the
+            # workspace-write approval mode; combining it with -s is rejected.
+            permission_flags = ["--approve-for-me"]
 
         model = agent.model if agent and agent.model else self.s.codex_model
         model_flags = ["-m", model] if model else []
@@ -115,45 +87,102 @@ class CodexWorker(Worker):
         if agent and agent.reasoning != ReasoningLevel.DEFAULT:
             reasoning_flags = ["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
         session_id = ctx.node.agent.session_id if ctx.node.agent else None
-        if session_id:
+        discovered_session = session_id
+
+        async def remember_session(session: str) -> None:
+            nonlocal discovered_session
+            discovered_session = session
+            if ctx.session_callback is not None:
+                await ctx.session_callback(session)
+        if native:
+            # `codex` without a subcommand is the native interactive TUI. The
+            # JSONL `exec` subcommand is intentionally kept only for injected
+            # test transports and non-interactive compatibility adapters.
+            native_args = [
+                a for a in self.s.codex_args
+                if a not in {
+                    "--skip-git-repo-check", "exec", "resume",
+                } and "bypass" not in a
+            ]
+            if session_id:
+                cmd = [
+                    self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
+                    *permission_flags, "--no-alt-screen", "-C", cwd,
+                    *native_args, session_id,
+                ]
+            else:
+                cmd = [
+                    self.s.codex_binary, *model_flags, *reasoning_flags,
+                    *permission_flags, "--no-alt-screen", "-C", cwd,
+                    *native_args,
+                ]
+        elif session_id:
             # Continue the same conversation after review feedback. Resume has
             # a deliberately smaller flag surface than a fresh exec.
-            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else []
+            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else permission_flags
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
-                *resume_permissions, "--output-schema", schema_path, "--json",
-                "--output-last-message", result_path, session_id, prompt,
+                *resume_permissions, "-C", cwd, session_id, prompt,
             ]
         else:
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags, *permission_flags,
-                "--output-schema", schema_path, "--output-last-message", result_path,
-                "--json", "-C", cwd,
-                *[a for a in self.s.codex_args if "bypass" not in a], prompt,
+                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt,
             ]
 
         structured_text = ""
         try:
-            terminal = await (ctx.terminal or LocalPtyTransport()).run(
-                ctx.node.id,
-                cmd,
-                cwd=cwd,
-                stream=ctx.stream,
-                timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
-                stall_timeout=ctx.stall_timeout_seconds,
-            )
+            if native:
+                terminal = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    initial_input=prompt,
+                    environment=environment,
+                )
+            else:
+                terminal = await transport.run(
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    environment=environment,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    stall_timeout=ctx.stall_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                )
+            if terminal.idle_reaped:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary="Codex terminal was reaped after being idle while detached",
+                    error="detached idle terminal",
+                    retry_recommended=False,
+                    session_id=discovered_session,
+                    artifacts=[ArtifactSpec(
+                        kind=ArtifactKind.TEXT,
+                        name="transcript",
+                        content=terminal.display_output.decode(errors="replace"),
+                    )],
+                )
             if terminal.stalled:
                 return WorkerResult(
                     outcome=Outcome.FAIL,
                     summary=f"Codex stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                     error="stalled terminal output",
-                    retry_recommended=True,
+                    retry_recommended=False,
                     artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace"))],
                 )
-            try:
-                structured_text = Path(result_path).read_text().strip()
-            except OSError:
-                pass
+            submitted = read_result_file(result_path)
+            if submitted is not None:
+                structured_text = json.dumps(submitted)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -171,51 +200,45 @@ class CodexWorker(Worker):
                 retry_recommended=False,
             )
         finally:
-            for temporary_path in (schema_path, result_path):
+            for temporary_path in (result_path,):
+                if temporary_path is None:
+                    continue
                 try:
-                    os.unlink(temporary_path)
+                    os.unlink(str(temporary_path))
                 except OSError:
                     pass
 
-        raw_stdout = terminal.output.decode(errors="replace")
-
-        text, discovered_session, usage = self._decode_json_stream(raw_stdout)
-        result = self._parse_result(structured_text or text)
+        text = structured_text
+        result = self._parse_result(text)
         result.session_id = discovered_session or session_id
-        result.usage = usage
-        if worktree_path:
-            missing_files = missing_declared_files(result.artifacts, worktree_path)
+        if cwd:
+            missing_files = missing_declared_files(result.artifacts, cwd)
             if missing_files:
                 result.outcome = Outcome.FAIL
                 result.summary = f"codex reported missing file outputs: {', '.join(missing_files)}"
                 result.error = result.summary
                 result.retry_recommended = True
-            captured = self._capture_worktree(worktree_path)
-            result.artifacts.extend(captured)
+            # Filesystem inspection remains an execution invariant, but it is
+            # never an artifact source. The agent's CLI submission is the
+            # single authority for the small artifact list shown in Turn.
+            captured = self._capture_filesystem(cwd, before)
             missing_material = (
                 result.outcome == Outcome.COMPLETE
-                and not is_verification
                 and requires_material_change(ctx.node.objective, ctx.node.generated_prompt)
                 and not has_material_change(captured)
             )
             if missing_material:
                 result.outcome = Outcome.FAIL
-                result.summary = "codex completed a file-writing objective without a material worktree change"
+                result.summary = "codex completed a file-writing objective without a material filesystem change"
                 result.error = result.summary
                 result.retry_recommended = True
-            # Merge this node's produced files up into its parent's worktree so
-            # downstream nodes (e.g. an assembler) find them on disk instead of
-            # having to regenerate them from context.
-            if not is_verification and not missing_files and not missing_material:
-                try:
-                    worktree.merge_into_parent(
-                        ctx.node.id, ctx.node.parent_id, repo_path=repo
-                    )
-                except Exception as e:  # never let housekeeping fail a node
-                    logger.warning("worktree merge-up failed for %s: %s", ctx.node.id, e)
         # Preserve the unaltered PTY stream as a durable artifact after the
         # live terminal transport has closed.
-        transcript = terminal.display_output.decode(errors="replace")
+        transcript = (
+            terminal.output.decode(errors="replace")
+            if native
+            else terminal.display_output.decode(errors="replace")
+        )
         if transcript.strip():
             result.artifacts.append(
                 ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)
@@ -226,92 +249,46 @@ class CodexWorker(Worker):
             )
         return result
 
-    @staticmethod
-    def _decode_json_stream(raw: str) -> tuple[str, str | None, Usage]:
-        """Extract final agent text, resumable thread id, and token usage.
-
-        Older Codex builds may still print plain text; that remains a supported
-        fallback so the adapter is version-tolerant.
-        """
-        messages: list[str] = []
-        session_id = None
-        usage = Usage()
-        parsed_any = False
-        for line in raw.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            parsed_any = True
-            if event.get("type") == "thread.started":
-                session_id = event.get("thread_id") or event.get("threadId")
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") in ("agent_message", "message"):
-                body = item.get("text") or item.get("content")
-                if isinstance(body, str):
-                    messages.append(body)
-            raw_usage = event.get("usage")
-            if isinstance(raw_usage, dict):
-                usage = Usage(
-                    input_tokens=int(raw_usage.get("input_tokens") or 0),
-                    cached_input_tokens=int(raw_usage.get("cached_input_tokens") or 0),
-                    output_tokens=int(raw_usage.get("output_tokens") or 0),
-                    cost_usd=raw_usage.get("cost_usd"),
-                )
-        return ("\n".join(messages) if parsed_any and messages else raw), session_id, usage
-
     # -- prompt ----------------------------------------------------------
 
-    def _build_prompt(self, ctx: NodeExecutionContext, cwd=None) -> str:
+    def _build_prompt(
+        self,
+        ctx: NodeExecutionContext,
+        cwd=None,
+        result_path: Path | None = None,
+    ) -> str:
         gp = ctx.node.generated_prompt or "Complete the objective above using the available tools."
-        # If we execute inside an isolated worktree, rewrite any mention of the
-        # project repository path so Codex operates on the worktree, not the
-        # source tree it was branched from.
+        # The prompt and worker both point at the same assigned project path.
         repo = ctx.repo_path
         if cwd and repo and repo != cwd:
             gp = gp.replace(repo, cwd)
-        if ctx.purpose == "verify":
-            return f"""{render_context_block(ctx)}
-PARENT VERIFICATION TASK:
-{gp}
-
-Act as the parent agent responsible for this child result. Inspect the actual
-merged files, run focused checks where possible, and compare the result with
-the child's objective and acceptance constraints. Do not edit files.
-
-Return exactly one fenced `turn-result` JSON block:
-- COMPLETE means the evidence is sufficient and the parent accepts the child.
-- BLOCK means the parent rejects it; `summary` MUST be actionable feedback for
-  the same child agent to correct in its existing session and worktree.
-- FAIL is reserved for an inability to perform verification itself.
-{{"outcome":"COMPLETE"|"BLOCK"|"FAIL","summary":"evidence or feedback","missing_inputs":[]}}
-"""
-        return f"""{render_context_block(ctx)}
+        prompt = f"""{render_context_block(ctx)}
 OBJECTIVE:
 {ctx.node.objective}
 
 TASK:
 {gp}
 
-When you finish, append a fenced code block labeled `turn-result` containing JSON:
-{{"outcome": "COMPLETE"|"BLOCK"|"FAIL", "summary": "...", "missing_inputs": [{{"id":"...","label":"...","kind":"text|decision|credential|account|approval|file"}}]}}
-
-If the task is too broad to complete directly, set "outcome": "EXPAND" and ALSO append a
-separate fenced block labeled `turn-plan` containing JSON:
-{{"nodes":[{{"key":"a","objective":"...","executor":"codex"}}], "edges":[]}}
+When you finish, submit the result through `TURN_CLI agent submit --payload '<JSON_OBJECT>'`,
+replacing the placeholder with the actual single-line JSON object. The CLI is
+the only submission interface; do not use filesystem output as a protocol.
+Include a small `artifacts` array containing repo-relative files or directories
+that represent the work.
+If the task is too broad to complete directly, use outcome `EXPAND` and put
+the child plan in that same submitted document. Do not print a fenced result
+block and do not use provider JSON-output mode.
 
 Never invent facts you do not have. However, do NOT block merely because a
-prerequisite step's output is not pasted into this prompt: a "depends_on" edge
-means that step already ran first and its artifacts are part of your available
-context (read them from the worktree or the provided context blocks).
+prior stage's output is not pasted into this prompt: a "depends_on" edge means
+that stage already ran first and its artifacts are part of your available
+context (read them from the project directory or the provided context blocks).
 Only return outcome "BLOCK" with explicit missing_inputs when a genuine
 EXTERNAL gate is missing — a credential, account, approval, or a file the human
 must supply — something no automated step or your own tools can produce. If you
 can proceed using the objective, the provided context, and your tools, do so
 and return "COMPLETE".
 """
+        return f"{prompt}\n\n{result_handoff()}" if result_path else prompt
 
     # -- parsing ---------------------------------------------------------
 
@@ -328,7 +305,7 @@ and return "COMPLETE".
                 outcome=Outcome.FAIL,
                 summary="codex stopped without a structured result",
                 error=text[-2000:] or "Codex returned no turn-result block",
-                retry_recommended=True,
+                retry_recommended=False,
             )
 
         data = result_json
@@ -337,7 +314,7 @@ and return "COMPLETE".
 
         return WorkerResult(
             outcome=outcome,
-            summary=data.get("summary", text[:500]),
+            summary=parsing.clean_summary(data.get("summary", text[:500])),
             artifacts=parsing.artifact_specs(data.get("artifacts", [])),
             children=children,
             missing_inputs=[
@@ -382,7 +359,5 @@ and return "COMPLETE".
         ]
         return PlanResult(nodes=nodes, edges=edges, notes=plan_json.get("notes"))
 
-    # -- git worktree ----------------------------------------------------
-
-    def _capture_worktree(self, worktree: str) -> list[ArtifactSpec]:
-        return capture_worktree(worktree)
+    def _capture_filesystem(self, path: str, before: dict[str, str]) -> list[ArtifactSpec]:
+        return capture_filesystem(path, before)

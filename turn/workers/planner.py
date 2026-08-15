@@ -3,23 +3,21 @@
 The initial planner and any later decomposition use the *same* operation:
 produce the smallest useful workgraph that can begin executing now.
 
-`CodexPlanner` asks Codex to emit a `turn-plan` JSON block. If Codex is
-unavailable or returns nothing usable, it falls back to `HeuristicPlanner` so
-the graph always appears and execution can start.
+`CodexPlanner` asks Codex to submit a plan through Turn's CLI. If it submits
+nothing usable, the run fails visibly. ``HeuristicPlanner``
+is a deterministic test fixture and is never selected by the served application.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import re
 import shutil
-import subprocess
-import tempfile
+import uuid
 from pathlib import Path
 
 from turn.config import settings
-from turn.workers import codex_schemas, parsing
+from turn.workers import parsing
 from turn.domain.schemas import (
     AgentConfig,
     EdgeSpec,
@@ -29,22 +27,29 @@ from turn.domain.schemas import (
     InputSpec,
     NodeSpec,
     PlanResult,
+    PermissionMode,
     Resource,
     Usage,
 )
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
+from turn.workers.harnesses import recover_session_id
+from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.workers.interactive import (
+    agent_environment,
+    opencode_session_ids,
+    prepare_result_file,
+    read_result_file,
+    result_handoff,
+    run_until_result,
+)
 from turn.workers.terminal import GenerationStalled, LocalPtyTransport
 
-_FENCE_RE = re.compile(r"```(\w+)\n(.*?)```", re.DOTALL)
-
-
 class HeuristicPlanner(Planner):
-    """Generic fallback decomposition — domain-agnostic scaffolding.
+    """Deterministic test-only decomposition — domain-agnostic scaffolding.
 
-    Produces: an investigation leaf (runs immediately), a clarification node
-    that BLOCKS on a required decision, a produce leaf that joins on both, and
-    a verify leaf. This exercises run / block / dependency-join / complete in
-    one graph and is only used when no LLM planner is available.
+    Produces a few independent domain lanes and an ordinary executor that
+    recomposes their outputs. This keeps the offline fallback representative
+    of Turn's architectural model instead of manufacturing a checklist.
     """
 
     name = "heuristic"
@@ -57,63 +62,81 @@ class HeuristicPlanner(Planner):
         # stored in generated_prompt. Keep graph-card objectives compact and
         # put the authoritative detail in the execution prompt.
         objective = ctx.node.generated_prompt or ctx.node.objective
-        exe = self.default_executor
+        # The project/node agent is the user's explicit worker choice.  The
+        # registry's default only applies when a plan is created without an
+        # agent (for example, a headless legacy project).  Freezing the
+        # registry default here caused a project visibly configured for Codex
+        # to silently fan out Echo children after workspace preferences had
+        # changed at runtime.
+        exe = (
+            ctx.node.agent.harness.value
+            if ctx.node.agent is not None
+            else self.default_executor
+        )
         nodes = [
             NodeSpec(
-                key="investigate",
-                objective="Investigate context",
-                generated_prompt=f"Gather what is already known and inspect the repository for: {objective}",
+                key="core",
+                objective="Define core structure",
+                generated_prompt=(
+                    f"Own the core concepts, constraints, and invariants for: {objective}. "
+                    "Work independently in a domain-appropriate scope directory or output namespace. "
+                    "Write the resulting contract and concrete deliverables to files for a later integrator."
+                ),
                 executor=exe,
             ),
             NodeSpec(
-                key="clarify",
-                objective="Clarify scope",
-                generated_prompt=f"Confirm the key decisions, constraints, and success criteria for: {objective}",
+                key="inputs",
+                objective="Handle inputs and storage",
+                generated_prompt=(
+                    f"Own the input, persistence, or source-material boundary for: {objective}. "
+                    "Choose a domain-appropriate scope directory or output namespace, document its contract, "
+                    "and write the deliverables there so another worker can consume them."
+                ),
                 executor=exe,
-                required_inputs=[
-                    InputSpec(
-                        id="scope",
-                        label="Scope, constraints, and success criteria",
-                        kind=InputKind.DECISION,
-                        description="The exact decisions/limits needed before producing the deliverable.",
-                    )
-                ],
             ),
             NodeSpec(
-                key="produce",
-                objective="Produce deliverable",
-                generated_prompt=f"Produce the first concrete deliverable for: {objective}",
+                key="outputs",
+                objective="Create output surface",
+                generated_prompt=(
+                    f"Own the user-facing, presentation, publishing, or delivery surface for: {objective}. "
+                    "Work in a domain-appropriate scope directory or output namespace, state the assumptions "
+                    "and invariants you honor, and write concrete deliverables for a later integrator."
+                ),
                 executor=exe,
-                depends_on=["investigate", "clarify"],
             ),
             NodeSpec(
-                key="verify",
-                objective="Verify result",
-                generated_prompt=f"Verify the deliverable against the full objective: {objective}",
+                key="integrate",
+                objective="Integrate the deliverable",
+                generated_prompt=(
+                    f"Read the outputs produced by the core, inputs, and outputs lanes and integrate them into "
+                    f"one coherent result for: {objective}. Preserve each lane's contracts, resolve conflicts "
+                    "explicitly, run an appropriate end-to-end check, and write the integrated result to the "
+                    "assigned project directory or final output namespace. This is ordinary executor work, "
+                    "not a planning task."
+                ),
                 executor=exe,
-                depends_on=["produce"],
+                depends_on=["core", "inputs", "outputs"],
             ),
         ]
         edges = [
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="investigate", dst="produce"),
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="clarify", dst="produce"),
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="produce", dst="verify"),
+            EdgeSpec(type=EdgeType.DEPENDS_ON, src="core", dst="integrate"),
+            EdgeSpec(type=EdgeType.DEPENDS_ON, src="inputs", dst="integrate"),
+            EdgeSpec(type=EdgeType.DEPENDS_ON, src="outputs", dst="integrate"),
         ]
         return PlanResult(
             nodes=nodes,
             edges=edges,
-            notes="Heuristic fallback decomposition (no LLM planner available).",
+            notes="Heuristic architectural decomposition (no LLM planner available).",
         )
 
 
 class CodexPlanner(Planner):
-    """Asks Codex to produce a workgraph as a `turn-plan` JSON block."""
+    """Asks Codex to submit a workgraph through the Turn CLI."""
 
     name = "codex-planner"
 
-    def __init__(self, fallback: Planner | None = None, settings=settings):
+    def __init__(self, settings=settings):
         self.s = settings
-        self.fallback = fallback
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         prompt = self._build_prompt(ctx)
@@ -121,17 +144,17 @@ class CodexPlanner(Planner):
         text, usage, session_id = await self._call_codex(
             prompt, cwd, agent=ctx.node.agent,
             stream=getattr(ctx, "stream", None), node_id=ctx.node.id,
+            project_id=ctx.node.project_id,
             terminal=ctx.terminal, timeout=ctx.timeout_seconds,
             stall_timeout=ctx.stall_timeout_seconds,
+            session_callback=ctx.session_callback,
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
             plan.usage = usage
             plan.session_id = session_id
             return plan
-        if self.fallback is not None:
-            return await self.fallback.plan(ctx)
-        return PlanResult(nodes=[], notes="planner produced no nodes")
+        raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
         return f"""{render_context_block(ctx)}
@@ -141,9 +164,10 @@ THIS NODE'S OBJECTIVE:
 PLANNING INSTRUCTIONS FOR THIS NODE:
 {ctx.node.generated_prompt or "No additional planning instructions."}
 
-You are decomposing THIS node into its direct children. Produce the SMALLEST
-useful set of concrete, runnable child steps that can begin executing now.
-Decompose only far enough to expose real work.
+You are the architect decomposing THIS node into its direct children. Produce
+the smallest useful workgraph that exposes the real domains of work and lets
+independent work begin in parallel. This is decomposition of a system,
+workflow, or body of work — not a chronological checklist.
 
 DECOMPOSITION POLICY — match the structure to the objective:
 - ATOMIC step: if the objective is a SINGLE concrete step (it says "one", "a
@@ -151,9 +175,11 @@ single", "just one", "the next step", "first step", or names exactly one
 action), produce EXACTLY ONE child that performs it. Do NOT pad with
 investigate / plan / verify scaffolding.
 - BROAD container: if the objective is a wide effort (e.g. "build X",
-"create a game", "implement the system", "plan the project"), decompose into
-the genuinely distinct sub-tasks and express their relationships using the
-TOPOLOGY rules below.
+"create a game", "implement the system", "plan the project"), identify the
+genuinely distinct domains, modules, capabilities, or output sections that
+make up the result. Prefer 2–5 orthogonal direct children that can proceed in
+parallel. Name them in the vocabulary of the domain; do not turn milestones,
+tests, or generic review steps into fake domains.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it. Never list the
 same sub-task twice, and do NOT create parallel sub-planners that cover the
@@ -180,40 +206,59 @@ in the plan. BEFORE you finalize the plan, use the GRAPH EXPLORATION TOOL in
   If you catch yourself writing more than a short title, STOP and move the
   rest into "generated_prompt".
 
-TOPOLOGY — arrange the children to express the real workflow:
-- SEQUENTIAL: steps that must run in order. The later step lists its
-  prerequisite as a "depends_on" key.
-- PARALLEL: independent steps that can run at the same time have NO depends_on.
-- COMPLEX: freely mix sequential chains and parallel branches.
-- NESTED PLANNERS: for any sub-task that is itself a broad problem, set
-  "plan": true AND "executor": "planner". Such a node will be decomposed AGAIN
-  on its next turn — so do NOT pre-expand it here; give it a clear objective and
-  let it plan its own children. Nest sub-planners as deeply as the problem
-  GENUINELY requires: a sub-problem that is still broad should itself become a
-  planner, and so on, until the remaining work is concrete enough for leaf
-  workers. Do NOT add depth for show — only turn a node into a sub-planner when
-  that sub-node is truly a broad problem in its own right (a single concrete
-  step should stay a leaf).
+TOPOLOGY — arrange the children to express a left-to-right architectural flow:
+- PARALLEL ONLY WHEN INDEPENDENT: children may omit depends_on only when they
+  can create their deliverables without reading another child's files or
+  contracts. Parallelism is useful, but it is never a substitute for a real
+  prerequisite.
+- SEQUENCE CONTRACTS: if a child consumes a sibling's domain model, API,
+  schema, fixtures, or files, add that sibling to depends_on. In software
+  projects, tests that exercise implementation work depend on the relevant
+  implementation branches; they must not be parallel merely because they are
+  called "tests".
+- INTEGRATION: when several sibling outputs must be recombined, add an
+  ordinary executor child whose objective says integrate, assemble, merge, or
+  otherwise recombine. It lists all of those sibling keys in depends_on and
+  reads their outputs. Integrators are not a special agent type.
+- FINAL INTEGRATION: if there are several branch integrators or major outputs,
+  add one final ordinary executor to recombine them into the parent result.
+- SEQUENTIAL: use a dependency whenever later work truly cannot begin before
+  earlier output. Such edges are left-to-right workflow stages and should be
+  explicit; never use them just to make a checklist or to order unrelated
+  work.
+- NESTED PLANNERS: for a sub-domain that is itself broad, set "plan": true
+  and "executor": "planner". Do not add a planner at every bifurcation: a
+  broad parent may directly create concrete executors and integrators. Nest
+  only when the sub-domain genuinely needs another architectural decision.
 - LEAF WORK: every node that actually does work (writing code, prose, files)
   gets "executor": "codex" and a concrete "generated_prompt". The generated_prompt
-  MUST tell the worker to WRITE its deliverable to a file in the working
-  directory (e.g. create parser.py, recipe.md, or tokyo.md) — not merely return
-  text — because downstream assemblers read those files to compose the result.
+  MUST tell the worker to WRITE its deliverable to a domain-appropriate file,
+  directory, section, or other durable output in the assigned working area —
+  not merely return text — because downstream integrators read those outputs.
+  When separate directories, namespaces, chapters, or collections reduce
+  collisions, assign one to each domain child and name it in the prompt. Keep
+  this guidance agnostic: a directory may mean a real folder, an output
+  namespace, a chapter, or another natural unit for the domain.
   Never use "executor": "echo" for real work; only use "shell" for a single shell
   command (put that command alone in generated_prompt).
-- COMPOSERS / ASSEMBLERS: if a node's job is to combine or integrate its
+- CONTRACTS & INVARIANTS: every child prompt must state the boundary it owns,
+  expected inputs and outputs, contracts or invariants, and where its durable
+  result lives. An integrator must preserve or reconcile those contracts. Do
+  not assume every objective is software; use equivalent concepts for books,
+  research, operations, design, or other kinds of generation.
+- INTEGRATORS: if a node's job is to combine or integrate its
   prerequisites (objective names 'assemble', 'merge', 'integrate', 'combine',
   'stitch'), its generated_prompt MUST tell it to READ the files those
   prerequisites already produced in the working directory and merge/stitch them.
-  A "depends_on" edge merges each prerequisite's output files up into this
-  node's working directory BEFORE it runs, so the node should load and integrate
-  those existing files — never regenerate their content from the prompt text.
-  Give the node the file names to read (or tell it to read all files produced by
-  its dependencies).
+  A "depends_on" edge means each prerequisite has already run in this same
+  assigned project area, so the node should load and integrate those existing
+  outputs — never regenerate their content from the prompt text.
 
 ORDER & SAFETY:
-- List children IN EXECUTION ORDER (prerequisites before the steps that depend
-  on them).
+- List children in architectural order from left to right: domain branches,
+  then their integrators, then any final integration. Prerequisites should
+  appear before dependent nodes, but unrelated parallel branches need not be
+  artificially serialized.
 - Never create a cycle (a step must never depend, directly or transitively, on
   itself).
 - Only add "required_inputs" for a genuinely EXTERNAL, human-supplied item — a
@@ -225,9 +270,15 @@ ORDER & SAFETY:
   Leave required_inputs empty unless a real human gate exists.
 - Do NOT create a "coordinator" / "oversee" / "manage" wrapper node — this node
   is already the coordinator.
-- Every child is a DIRECT child of this node (parent_key must be null).
+- Every child is a DIRECT child of this node (parent_key must be null). A
+  later planning turn can give a nested planner its own direct children.
 
-Return ONLY a fenced code block labeled `turn-plan` containing JSON:
+Before finishing, submit the plan object through the Turn CLI. The CLI is the
+only submission interface and writes Turn's internal handoff record. Do not
+use filesystem output as a protocol. Use `TURN_CLI agent submit --kind plan --payload '<JSON_OBJECT>'`,
+replacing the placeholder with the actual single-line JSON object. Do not
+return a fenced `turn-plan` block or use provider JSON output mode. The CLI
+submission is the only valid plan handoff:
 {{
   "nodes": [
     {{"key":"unique","objective":"...","executor":"codex"|"planner","plan":false|true,"generated_prompt":"...","required_inputs":[{{"id":"x","label":"...","kind":"text|decision|credential|account|approval|file"}}],"resource_refs":[],"parent_key":null,"depends_on":["otherkey"]}}
@@ -239,15 +290,25 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
     async def _call_codex(
         self, prompt: str, cwd: str, *, agent: AgentConfig | None = None,
         stream=None, node_id=None, terminal=None, timeout=None, stall_timeout=None,
+        session_callback=None, project_id=None,
     ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
-        schema_path = codex_schemas.write_schema(codex_schemas.PLAN_SCHEMA)
-        result_file = tempfile.NamedTemporaryFile(prefix="turn-plan-", suffix=".json", delete=False)
-        result_path = result_file.name
-        result_file.close()
+        transport = terminal or LocalPtyTransport()
+        native = isinstance(transport, LocalPtyTransport)
+        result_path = prepare_result_file(cwd, node_id, "plan")
+        environment = agent_environment(cwd, node_id, "plan", result_path, agent)
+        if project_id is not None:
+            environment["TURN_PROJECT_ID"] = str(project_id)
+        prompt = f"{prompt}\n\n{result_handoff(plan=True)}"
         bypass = any("bypass" in a for a in self.s.codex_args)
-        sandbox_flags = [] if bypass else ["-s", "workspace-write", "--approve-for-me"]
+        permission = agent.permission if agent else PermissionMode.WORKSPACE
+        if bypass or permission == PermissionMode.FULL:
+            sandbox_flags = ["--dangerously-bypass-approvals-and-sandbox"]
+        elif permission == PermissionMode.ASK:
+            sandbox_flags = ["-s", "workspace-write"]
+        else:
+            sandbox_flags = ["--approve-for-me"]
         model = agent.model if agent and agent.model else self.s.codex_model
         model_flags = ["-m", model] if model else []
         reasoning = agent.reasoning.value if agent else "default"
@@ -255,77 +316,85 @@ Return ONLY a fenced code block labeled `turn-plan` containing JSON:
             "-c", f'model_reasoning_effort="{reasoning}"'
         ]
         session_id = agent.session_id if agent else None
-        if session_id:
-            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else []
+        observed_session = session_id
+
+        async def remember_session(session: str) -> None:
+            nonlocal observed_session
+            observed_session = session
+            if session_callback is not None:
+                await session_callback(session)
+        if native:
+            native_args = [
+                a for a in self.s.codex_args
+                if a not in {
+                    "--skip-git-repo-check", "exec", "resume",
+                } and "bypass" not in a
+            ]
+            if session_id:
+                cmd = [
+                    self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
+                    *sandbox_flags, "--no-alt-screen", "-C", cwd,
+                    *native_args, session_id,
+                ]
+            else:
+                cmd = [
+                    self.s.codex_binary, *model_flags, *reasoning_flags,
+                    *sandbox_flags, "--no-alt-screen", "-C", cwd,
+                    *native_args,
+                ]
+        elif session_id:
+            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else sandbox_flags
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
-                *reasoning_flags, *resume_permissions, "--output-schema",
-                schema_path, "--output-last-message", result_path, "--json", session_id, prompt,
+                *reasoning_flags, *resume_permissions, "-C", cwd, session_id, prompt,
             ]
         else:
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *sandbox_flags, "--output-schema", schema_path,
-                "--output-last-message", result_path, "--json",
-                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a],
+                *sandbox_flags, "-C", cwd,
+                *[a for a in self.s.codex_args if "bypass" not in a],
                 prompt,
             ]
         structured = ""
         try:
-            transport = terminal or LocalPtyTransport()
-            result = await transport.run(
+            result = await run_until_result(
+                transport,
                 node_id,
                 cmd,
                 cwd=cwd,
+                result_path=result_path,
                 stream=stream,
                 timeout=timeout or self.s.default_run_timeout_seconds,
-                stall_timeout=stall_timeout,
+                idle_warning=self.s.terminal_idle_warning_seconds,
+                idle_reap=self.s.terminal_idle_reap_seconds,
+                session_callback=remember_session,
+                initial_input=prompt if native else None,
+                environment=environment,
             )
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
-            try:
-                structured = Path(result_path).read_text().strip()
-            except OSError:
-                pass
+            submitted = read_result_file(result_path)
+            if submitted is not None:
+                structured = json.dumps(submitted)
         except asyncio.TimeoutError as error:
             raise GenerationStalled("planner exceeded the run timeout") from error
         except (FileNotFoundError, OSError):
             return "", Usage(), None
         finally:
-            for temporary_path in (schema_path, result_path):
+            for temporary_path in (result_path,):
+                if temporary_path is None:
+                    continue
                 try:
-                    os.unlink(temporary_path)
+                    os.unlink(str(temporary_path))
                 except OSError:
                     pass
-        raw = result.output.decode(errors="replace")
-        messages: list[str] = []
-        usage = Usage()
-        discovered_session = None
-        parsed = False
-        for line in raw.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            parsed = True
-            if event.get("type") == "thread.started":
-                discovered_session = event.get("thread_id") or event.get("threadId")
-            item = event.get("item")
-            if isinstance(item, dict) and item.get("type") in ("agent_message", "message"):
-                body = item.get("text") or item.get("content")
-                if isinstance(body, str):
-                    messages.append(body)
-            raw_usage = event.get("usage")
-            if isinstance(raw_usage, dict):
-                usage = Usage(
-                    input_tokens=int(raw_usage.get("input_tokens") or 0),
-                    cached_input_tokens=int(raw_usage.get("cached_input_tokens") or 0),
-                    output_tokens=int(raw_usage.get("output_tokens") or 0),
-                    cost_usd=raw_usage.get("cost_usd"),
-                )
-        return (structured or ("\n".join(messages) if parsed and messages else raw)), usage, discovered_session or session_id
+        # Native sessions communicate their plan through the atomic Turn
+        # handoff file. Their PTY bytes are deliberately never scanned for
+        # JSON; the browser terminal is the only consumer of that stream.
+        if native:
+            return structured, Usage(), observed_session or session_id
+
+        return structured, Usage(), observed_session or session_id
 
 
 class AgentPlanner(Planner):
@@ -339,52 +408,44 @@ class AgentPlanner(Planner):
 
     name = "agent-planner"
 
-    def __init__(self, fallback: Planner | None = None, settings=settings):
+    def __init__(self, settings=settings):
         self.s = settings
-        self.fallback = fallback
-        self.codex = CodexPlanner(fallback=fallback, settings=settings)
+        self.codex = CodexPlanner(settings=settings)
+        self.commands = HarnessCommandFactory(
+            codex_binary=settings.codex_binary,
+            codex_args=settings.codex_args,
+        )
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         agent = ctx.node.agent or AgentConfig(harness=HarnessKind.CODEX, type_id="planner")
         if agent.harness == HarnessKind.CODEX:
             return await self.codex.plan(ctx)
         if agent.harness not in {HarnessKind.OPENCODE, HarnessKind.PI, HarnessKind.CLAUDE}:
-            return await self._fallback(ctx)
+            raise RuntimeError(f"planner harness '{agent.harness.value}' is unsupported")
         prompt = self.codex._build_prompt(ctx)
         text = await self._call_harness(agent, prompt, ctx)
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
+            plan.session_id = agent.session_id
             return plan
-        return await self._fallback(ctx)
+        raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
 
-    async def _fallback(self, ctx: NodeExecutionContext) -> PlanResult:
-        if self.fallback is not None:
-            return await self.fallback.plan(ctx)
-        return PlanResult(nodes=[], notes="planner produced no nodes")
-
-    def _command(self, agent: AgentConfig, prompt: str) -> list[str]:
-        model = agent.model
-        reasoning = agent.reasoning.value
-        if agent.harness == HarnessKind.OPENCODE:
-            cmd = ["opencode", "run", "--format", "default", "--auto"]
-            if model:
-                cmd += ["--model", model]
-            if reasoning != "default":
-                cmd += ["--variant", reasoning]
-            return [*cmd, prompt]
-        if agent.harness == HarnessKind.PI:
-            cmd = ["pi", "--print", "--mode", "text", "--approve", "--no-session"]
-            if model:
-                cmd += ["--model", model]
-            if reasoning != "default":
-                cmd += ["--thinking", reasoning]
-            return [*cmd, prompt]
-        cmd = ["claude", "--print", "--output-format", "text", "--permission-mode", "acceptEdits"]
-        if model:
-            cmd += ["--model", model]
-        if reasoning != "default":
-            cmd += ["--effort", reasoning]
-        return [*cmd, prompt]
+    def _command(
+        self,
+        agent: AgentConfig,
+        prompt: str,
+        *,
+        cwd: str | None = None,
+        native: bool = False,
+        resume: bool = False,
+    ) -> list[str]:
+        return self.commands.planner_command(
+            agent,
+            prompt,
+            cwd=cwd or os.getcwd(),
+            native=native,
+            resume=resume,
+        )
 
     async def _call_harness(
         self, agent: AgentConfig, prompt: str, ctx: NodeExecutionContext
@@ -392,19 +453,84 @@ class AgentPlanner(Planner):
         binary = {HarnessKind.OPENCODE: "opencode", HarnessKind.PI: "pi", HarnessKind.CLAUDE: "claude"}[agent.harness]
         if shutil.which(binary) is None:
             return ""
+        resume = agent.session_id is not None
+        if agent.session_id is None:
+            # Pi supports an exact project session id. Generate it only for a
+            # new planner conversation; a Re-Run clears this field first and
+            # therefore receives a genuinely fresh session.
+            if agent.harness == HarnessKind.PI:
+                agent.session_id = str(uuid.uuid4())
+                ctx.node.agent = agent
         try:
             transport = ctx.terminal or LocalPtyTransport()
-            result = await transport.run(
-                ctx.node.id,
-                self._command(agent, prompt),
-                cwd=ctx.repo_path or os.getcwd(),
-                stream=ctx.stream,
-                timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
-                stall_timeout=ctx.stall_timeout_seconds,
+            native = isinstance(transport, LocalPtyTransport)
+            cwd = ctx.repo_path or os.getcwd()
+            known_opencode_sessions = (
+                set(opencode_session_ids())
+                if native and agent.harness == HarnessKind.OPENCODE
+                else set()
             )
+
+            async def remember_session(session: str) -> None:
+                agent.session_id = session
+                ctx.node.agent = agent
+
+            async def probe_session() -> str | None:
+                if agent.harness != HarnessKind.OPENCODE:
+                    return None
+                current = await asyncio.to_thread(opencode_session_ids)
+                return next(
+                    (item for item in current if item not in known_opencode_sessions),
+                    None,
+                )
+
+            result_path = prepare_result_file(cwd, ctx.node.id, "plan")
+            environment = agent_environment(cwd, ctx.node.id, "plan", result_path, agent)
+            environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
+            native_prompt = f"{prompt}\n\n{result_handoff(plan=True)}"
+            if native:
+                result = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    self._command(
+                        agent,
+                        native_prompt,
+                        cwd=cwd,
+                        native=True,
+                        resume=resume,
+                    ),
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    session_probe=probe_session if agent.harness == HarnessKind.OPENCODE else None,
+                    initial_input=native_prompt,
+                    environment=environment,
+                )
+            else:
+                result = await transport.run(
+                    ctx.node.id,
+                    self._command(agent, native_prompt),
+                    cwd=cwd,
+                    environment=environment,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    stall_timeout=ctx.stall_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                )
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
-            return result.output.decode(errors="replace")
+            submitted = read_result_file(result_path)
+            text = json.dumps(submitted) if submitted is not None else ""
+            if agent.harness == HarnessKind.OPENCODE and not agent.session_id:
+                agent.session_id = recover_session_id(text)
+                if agent.session_id:
+                    ctx.node.agent = agent
+            return text
         except asyncio.TimeoutError as error:
             raise GenerationStalled("planner exceeded the run timeout") from error
         except (FileNotFoundError, OSError):

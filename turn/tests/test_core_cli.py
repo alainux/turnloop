@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+
 from turn.__main__ import parser
 from turn.config import Settings
 from turn.core import TurnCore
@@ -19,12 +22,12 @@ def test_cli_exposes_headless_commands_and_policy_flags():
 
 async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
     cfg = Settings()
-    cfg.database_url = f"sqlite+aiosqlite:///{tmp_path / 'core.db'}"
+    cfg.data_dir = str(tmp_path / "turn")
     cfg.projects_dir = str(tmp_path / "projects")
     cfg.planner = "heuristic"
     cfg.default_executor = "echo"
     cfg.runner_tick_seconds = 0.001
-    async with TurnCore(cfg) as core:
+    async with TurnCore(cfg, test_mode=True) as core:
         project = await core.create_project(
             "Create a compact deterministic demo",
             agent=AgentConfig(harness=HarnessKind.ECHO),
@@ -34,4 +37,33 @@ async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
         root = next(node for node in nodes if node.id == project.id)
         assert root.auto_run is True
         assert not any(node.status.value in {"PENDING", "RUNNABLE", "RUNNING"} for node in nodes)
-        assert any(node.status.value == "BLOCKED" for node in nodes)
+        assert all(node.status.value == "COMPLETE" for node in nodes)
+
+
+def test_agent_cli_writes_atomic_status_and_result_handoffs(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.result.json"
+    status = tmp_path / "node.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", "node-1")
+
+    args = parser().parse_args([
+        "agent", "status", "--state", "working", "--message", "editing files"
+    ])
+    assert agent_command(args) == 0
+    assert json.loads(status.read_text()) == {
+        "node_id": "node-1", "state": "working", "message": "editing files"
+    }
+
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "result",
+        "--stdin",
+    ])
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"outcome":"COMPLETE","summary":"done","artifacts":["src"]}'))
+    assert agent_command(args) == 0
+    assert json.loads(handoff.read_text()) == {
+        "outcome": "COMPLETE", "summary": "done", "artifacts": ["src"]
+    }
+    assert json.loads(status.read_text())["state"] == "complete"

@@ -17,7 +17,8 @@ def test_runtime_is_strict_typed_react_without_legacy_parallel_ui():
     assert '"strict": true' in tsconfig and '"allowJs": false' in tsconfig
     assert not (UI / "app.js").exists()
     assert "createRoot" in source("main.tsx")
-    assert "GraphResponse" in source("domain.ts")
+    assert "GraphView" in source("domain.ts")
+    assert "./generated/domain" in source("domain.ts")
 
 
 def test_professional_icons_and_accessible_icon_controls_are_componentized():
@@ -36,55 +37,100 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     css = (UI / "style.css").read_text()
     api = (ROOT / "turn" / "server" / "api.py").read_text()
     assert 'node.allowed_actions.includes("run")' in graph
-    assert "node.generation_active" in graph and 'className="run-spinner"' in graph
+    assert "node.generation_active" in graph and 'name={running ? "square-stop" : "play"}' in graph
     assert 'item["generation_active"]' in api
     assert ".edge-active" not in css and "@keyframes flow" not in css
     assert "node-breathe" not in css
+    assert "displayEdges" in graph and "visibleEdges" in graph
+    assert "GRAPH_PADDING" in graph
+    assert "pathBetween(a, b, edge.type)" in graph
+    assert "<g transform=" not in graph
+    assert "align-items: safe center" in css
 
 
-def test_terminal_separates_machine_result_from_shadow_dom_presentation():
+def test_terminal_is_a_raw_dom_pty_view():
     terminal = source("components", "TerminalView.tsx")
     transport = (ROOT / "turn" / "workers" / "terminal.py").read_text()
     worker = (ROOT / "turn" / "workers" / "codex_worker.py").read_text()
-    assert "attachShadow" in terminal and "Terminal(" in terminal
-    assert "HarnessOutputPresenter" in transport and "display_output" in transport
-    assert '"--output-last-message", result_path' in worker
-    assert "raw_stdout" in worker and "terminal.display_output" in worker
+    assert "attachShadow" not in terminal and "Terminal(" in terminal
+    assert "terminal.open(mount)" in terminal
+    assert 'message.type === "output"' in terminal and "activate(true)" in terminal
+    assert "socket.onopen = () =>" in terminal and "setConnection(\"connected\")" in terminal
+    assert "terminal.onBinary((value) => sendTerminalInput(value, true))" in terminal
+    assert 'encoding: "base64"' in terminal
+    assert "Show output" not in terminal and "Hide output" not in terminal
+    assert "persistent Herdr shell" in terminal
+    assert "Connection interrupted; reconnecting" in terminal
+    assert ":host{" not in terminal
+    assert "convertEol: true" in terminal
+    assert "line-height:1!important" in terminal
+    assert "lineHeight: 1" in terminal
+    assert "HarnessOutputPresenter" not in transport
+    assert "is_native_command" not in transport
+    assert "display_output" in transport and "raw stream" in transport
+    assert "--output-last-message" not in worker
+    assert "--output-schema" not in worker
+    assert "\"--json\"" not in worker
+    assert "terminal.output" in worker and "terminal.display_output" in worker
 
 
-def test_inspector_prioritizes_markdown_instructions_and_human_diffs():
+def test_inspector_prioritizes_markdown_instructions_without_legacy_review_surfaces():
     inspector = source("components", "Inspector.tsx")
-    diff = source("components", "DiffView.tsx")
     assert inspector.index("Agent instructions") < inspector.index("Agent configuration")
-    assert "ReactMarkdown" in inspector and 'tab === "diff"' in inspector
-    assert "diff-add" in diff and "diff-del" in diff
+    assert "ReactMarkdown" in inspector
+    assert 'tab === "diff"' not in inspector
+    assert 'tab === "history"' not in inspector
+    assert 'Fork alternative' not in inspector
+    assert 'Revision {node.revision}' not in inspector
     assert "Save instructions" in inspector and "disabled={!scopeDirty}" in inspector
     assert "disabled={!agentDirty}" in inspector
 
 
 def test_model_and_reasoning_controls_share_dynamic_capabilities():
     control = source("components", "ModelControl.tsx")
+    app = source("App.tsx")
     harnesses = (ROOT / "turn" / "workers" / "harnesses.py").read_text()
     assert "capability?.models" in control
     assert "selected?.reasoning ?? capability?.reasoning" in control
     assert "<datalist" not in control
-    assert "value={model}" in control and "Harness default" in control
+    assert "role=\"combobox\"" in control
+    assert "searchable-select-menu" in control
+    assert 'value={loading ? "" : model}' in control and "Harness default" in control
     assert "MODEL_DISCOVERY_COMMANDS" in harnesses
-    assert '"--offline", "--list-models"' in harnesses
+    catalog = (ROOT / "turn" / "workers" / "harness_catalog.py").read_text()
+    assert '"--offline"' in catalog and '"--list-models"' in catalog
+    assert 'Loading harnesses…' in control
+    assert "capabilitiesLoading" in app
 
 
-def test_parent_review_copy_has_mutually_exclusive_terminal_states():
+def test_composer_submit_states_and_review_copy_use_design_tokens():
+    css = (UI / "style.css").read_text()
+    assert ".send-button:disabled" in css
+    assert "background: var(--accent);" in css
+    assert "background: var(--surface-3);" in css
+    assert ".review-card p" in css and "color: var(--text-2);" in css
+
+
+def test_inspector_always_cascades_agent_configuration():
     inspector = source("components", "Inspector.tsx")
-    assert 'status === "accepted"' in inspector
-    assert "Accepted by parent" in inspector
-    assert "Awaiting parent verification" in inspector
-    assert "parent && status === \"accepted\"" in inspector
-    assert "!parent && node.merge_accepted" in inspector
-    assert "!/\\b(awaiting|waiting)\\b/i" in inspector
+    runner = (ROOT / "turn" / "runner" / "runner.py").read_text()
+    assert "Cascade options" not in inspector
+    assert "if node.agent is not None:" in runner
+
+
+def test_review_copy_has_one_explicit_user_controlled_state():
+    inspector = source("components", "Inspector.tsx")
+    assert '<span>Review</span>' in inspector
+    assert "Accept result" in inspector
+    assert "Request changes" in inspector
+    assert "Auto verification" not in inspector
+    assert "Awaiting parent verification" not in inspector
 
 
 def test_only_readme_and_design_are_product_markdown_documents():
-    product_docs = sorted(path.name for path in ROOT.glob("*.md"))
+    product_docs = sorted(
+        path.name for path in ROOT.glob("*.md") if path.name != "AGENTS.md"
+    )
     assert product_docs == ["DESIGN.md", "README.md"]
     assert not list((ROOT / "docs").glob("*.md"))
     readme = (ROOT / "README.md").read_text()
@@ -109,6 +155,7 @@ def test_object_context_menus_edges_and_theme_are_wired_to_real_actions():
     layout = source("layout.ts")
     assert 'role="menu"' in app and "Delete project" in app
     assert "onContextMenu" in graph and "node-menu-trigger" in graph
-    assert "GRAPH_PADDING" in layout and 'type === "DEPENDS_ON"' in layout
+    assert "GRAPH_PADDING" in layout and "edge-workflow" in graph
+    assert "displayEdges" in layout and "hasAlternativePath" in layout
     assert "applyAppearance(settings)" in app
-    assert "Next turn" in app and "Auto verify" in app
+    assert "Next turn" in app and "Auto-run" in app

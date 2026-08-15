@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from turn.domain.schemas import Edge, EdgeType, Node, NodeStatus
+from turn.domain.schemas import Edge, EdgeType, Graph, Node, NodeStatus
 
 
 @dataclass
@@ -54,7 +54,11 @@ def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
     return out
 
 
-def is_runnable(node_id, idx: Indexes) -> tuple[bool, str]:
+def is_runnable(
+    node_id,
+    idx: Indexes,
+    effective_status: dict | None = None,
+) -> tuple[bool, str]:
     """A node is runnable when active, not paused, deps satisfied, inputs present."""
     node = idx.node_by_id.get(node_id)
     if node is None:
@@ -77,7 +81,12 @@ def is_runnable(node_id, idx: Indexes) -> tuple[bool, str]:
         return False, "container"
     for p in idx.deps.get(node_id, []):
         pn = idx.node_by_id.get(p)
-        if pn is None or pn.status != NodeStatus.COMPLETE:
+        prerequisite_status = (
+            effective_status.get(p, pn.status)
+            if effective_status is not None and pn is not None
+            else pn.status if pn is not None else None
+        )
+        if pn is None or prerequisite_status != NodeStatus.COMPLETE:
             return False, "dependency incomplete"
         if pn.needs_review and not pn.merge_accepted:
             return False, "dependency awaits review"
@@ -97,6 +106,50 @@ class Evaluation:
     blocked_reason: dict  # node_id -> reason when not runnable
 
 
+class GraphWalker:
+    """Read-only graph traversal service.
+
+    The store owns persistence and the runner owns scheduling, but neither
+    should reimplement CONTAINS/DEPENDS_ON traversal.  This object is pure and
+    therefore can be used unchanged by the server, CLI, and deterministic
+    tests.
+    """
+
+    def __init__(self, graph: Graph | list[Node], edges: list[Edge] | None = None):
+        if isinstance(graph, Graph):
+            nodes = graph.nodes
+            edges = graph.edges
+        else:
+            nodes = graph
+            if edges is None:
+                raise ValueError("GraphWalker requires graph edges")
+        self.nodes = tuple(nodes)
+        self.edges = tuple(edges)
+        self.indexes = build_indexes(list(self.nodes), list(self.edges))
+
+    def evaluate(self) -> Evaluation:
+        return evaluate(list(self.nodes), list(self.edges))
+
+    def ancestors(self, node_id) -> list[Node]:
+        return ancestry_path(self.indexes, node_id)
+
+    def descendants(self, node_id) -> list[Node]:
+        return _collect_descendants(self.indexes, node_id)
+
+    def prerequisites(self, node_id) -> list[Node]:
+        return [
+            self.indexes.node_by_id[dependency]
+            for dependency in self.indexes.deps.get(node_id, [])
+            if dependency in self.indexes.node_by_id
+        ]
+
+    def depth(self, node_id) -> int:
+        return len(self.ancestors(node_id))
+
+    def topological(self) -> list[Node]:
+        return topo_order(list(self.nodes), list(self.edges))
+
+
 def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
     idx = build_indexes(nodes, edges)
     status: dict = {}
@@ -104,8 +157,31 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
     progress: dict = {}
     reason: dict = {}
 
+    # A planner/subplanner remains EXPANDED in persisted state because it is a
+    # container, but its completion is derived from its descendant leaves.
+    # Compute that projection before checking dependency joins so an ordinary
+    # integrator can depend on a completed architectural branch.
+    container_ids = set(idx.children)
     for n in nodes:
-        ok, why = is_runnable(n.id, idx)
+        if n.id not in container_ids:
+            status[n.id] = n.status
+            continue
+        desc = _collect_descendants(idx, n.id)
+        leaves = [d for d in desc if d.id not in idx.children]
+        active_leaves = [d for d in leaves if d.status != NodeStatus.CANCELLED]
+        done = [
+            d for d in active_leaves
+            if d.status == NodeStatus.COMPLETE
+            and not (d.needs_review and not d.merge_accepted)
+        ]
+        status[n.id] = (
+            NodeStatus.COMPLETE
+            if active_leaves and len(done) == len(active_leaves)
+            else n.status
+        )
+
+    for n in nodes:
+        ok, why = is_runnable(n.id, idx, status)
         if ok:
             runnable.add(n.id)
             status[n.id] = NodeStatus.RUNNABLE
@@ -119,7 +195,13 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             ):
                 status[n.id] = n.status
             elif n.status == NodeStatus.EXPANDED:
-                status[n.id] = NodeStatus.EXPANDED
+                # Preserve a derived COMPLETE projection for containers. The
+                # persisted node stays EXPANDED so it can retain descendants.
+                status[n.id] = (
+                    NodeStatus.COMPLETE
+                    if status.get(n.id) == NodeStatus.COMPLETE
+                    else NodeStatus.EXPANDED
+                )
             else:
                 status[n.id] = NodeStatus.BLOCKED
             reason[n.id] = why

@@ -3,7 +3,7 @@
 Primitives
 ----------
 * Node      — a unit of intent (objective, parent, executor, status, inputs, resources, artifacts, lineage)
-* Edge      — CONTAINS (decomposition) or DEPENDS_ON (ordering/joins)
+* Edge      — CONTAINS (decomposition) or DEPENDS_ON (rare left-to-right stages/joins)
 * Run       — one execution attempt for one node
 * Artifact  — any persistent input/output
 
@@ -20,9 +20,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _new_id() -> uuid.UUID:
+    return uuid.uuid4()
 
 # --------------------------------------------------------------------------
 # Enums
@@ -42,11 +51,43 @@ class NodeStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class NodeUIState(str, Enum):
+    """Server-projected state presented by the web client."""
+
+    QUEUED = "queued"
+    READY = "ready"
+    RUNNING = "running"
+    PAUSED = "paused"
+    WAITING_INPUT = "waiting_input"
+    WAITING_DEPENDENCY = "waiting_dependency"
+    REVIEW = "review"
+    ACCEPTED = "accepted"
+    COMPLETE = "complete"
+    CONTAINER = "container"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NodeAction(str, Enum):
+    """Action authorized by the server for a projected node."""
+
+    RUN = "run"
+    PAUSE = "pause"
+    RESUME = "resume"
+    CANCEL = "cancel"
+    RETRY = "retry"
+    EDIT = "edit"
+    REGENERATE = "regenerate"
+    ACCEPT = "accept"
+    REJECT = "reject"
+    PROVIDE_INPUT = "provide_input"
+
+
 class EdgeType(str, Enum):
     """The only two relationships in a WorkGraph."""
 
     CONTAINS = "CONTAINS"      # decomposition / visual hierarchy / inherited context
-    DEPENDS_ON = "DEPENDS_ON"  # execution order / parallelism / joins
+    DEPENDS_ON = "DEPENDS_ON"  # genuine left-to-right stage / integration join
 
 
 class Outcome(str, Enum):
@@ -118,29 +159,35 @@ class PermissionMode(str, Enum):
 
 class ReviewMode(str, Enum):
     MANUAL = "manual"
-    # Legacy persisted value. It now follows the same parent-verification
-    # semantics as PARENT; Turn never silently accepts unverified work.
-    AUTO_ACCEPT = "auto_accept"
-    PARENT = "parent"
 
 
-class VerificationStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    ERROR = "error"
+class AgentType(str, Enum):
+    PLANNER = "planner"
+    EXECUTOR = "executor"
 
 
-class AgentConfig(BaseModel):
-    """Runtime-neutral agent assignment for a node.
+def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
+    """Return the filesystem skills required by a built-in agent type."""
+    key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
+    root = Path(__file__).resolve().parent.parent / "agents" / "skills"
+    paths = {
+        AgentType.PLANNER.value: [root / "planner" / "turn-planning.md"],
+        AgentType.EXECUTOR.value: [root / "executor" / "turn-executing.md"],
+    }
+    return [str(path) for path in paths.get(key, [])]
 
-    ``type_id`` is deliberately an open string. Today it is usually
-    ``planner`` or ``general``; later custom agent types can be registered
-    without changing the graph schema.
+
+class Agent(BaseModel):
+    """Top-level domain object describing one executable agent.
+
+    ``type_id`` names the agent specialization. Planner and executor are the
+    built-in types; each receives its filesystem skill contract automatically.
     """
 
-    type_id: str = "general"
+    model_config = ConfigDict(validate_assignment=True)
+
+    id: uuid.UUID = Field(default_factory=_new_id)
+    type_id: AgentType = AgentType.EXECUTOR
     harness: HarnessKind = HarnessKind.CODEX
     model: Optional[str] = None
     reasoning: ReasoningLevel = ReasoningLevel.DEFAULT
@@ -150,12 +197,51 @@ class AgentConfig(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)
     session_id: Optional[str] = None
 
+    @model_validator(mode="after")
+    def attach_type_skills(self) -> "Agent":
+        required = skill_paths_for_agent_type(self.type_id)
+        object.__setattr__(self, "skills", list(dict.fromkeys([*required, *self.skills])))
+        return self
+
+    def as_type(self, agent_type: AgentType | str) -> "Agent":
+        """Return this agent as a new specialization with exact skills."""
+        target = AgentType(agent_type)
+        built_in = {
+            path
+            for kind in AgentType
+            for path in skill_paths_for_agent_type(kind)
+        }
+        custom_skills = [skill for skill in self.skills if skill not in built_in]
+        agent_model = Planner if target is AgentType.PLANNER else Executor
+        return agent_model.model_validate(
+            {
+                **self.model_dump(mode="python"),
+                "type_id": target,
+                "skills": [*skill_paths_for_agent_type(target), *custom_skills],
+            }
+        )
+
+
+class AgentConfig(Agent):
+    """Request boundary for creating or updating an :class:`Agent`."""
+
+
+class Planner(Agent):
+    """Specialized agent type carrying the turn-planning skill."""
+
+    type_id: AgentType = AgentType.PLANNER
+
+
+class Executor(Agent):
+    """Specialized agent type carrying the turn-executing skill."""
+
+    type_id: AgentType = AgentType.EXECUTOR
+
 
 class RunPolicy(BaseModel):
     """Project execution and recovery policy."""
 
     auto_run: bool = True
-    force_sequential: bool = False
     delay_between_jobs_ms: int = Field(default=0, ge=0, le=600_000)
     timeout_seconds: float = Field(default=600, gt=0, le=86_400)
     # Inter-output watchdog. Unlike the whole-run timeout this detects a
@@ -167,25 +253,11 @@ class RunPolicy(BaseModel):
     compact_on_context_pressure: bool = True
     review_mode: ReviewMode = ReviewMode.MANUAL
 
-
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cost_usd: Optional[float] = Field(default=None, ge=0)
-
-
-# --------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _new_id() -> uuid.UUID:
-    return uuid.uuid4()
 
 
 # --------------------------------------------------------------------------
@@ -216,14 +288,13 @@ class Node(BaseModel):
     generated_prompt: Optional[str] = None  # prompt handed to the worker
 
     # --- repo (per-project working directory) ---------------------------
-    # The absolute path of THIS project's own git repository (the directory
-    # the user chose / Turn created). The root node's worktree IS this path, so
-    # by the time work completes the directory holds the finished files plus a
-    # merge log. Non-root nodes leave this null and inherit it from the root.
+    # The absolute path assigned to every worker in THIS project (the directory
+    # the user chose or Turn created). Non-root nodes leave this null and
+    # inherit it from the root.
     repo_path: Optional[str] = None
 
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
-    agent: Optional[AgentConfig] = None
+    agent: Optional[Agent] = None
     status: NodeStatus = NodeStatus.PENDING
     paused: bool = False
     # Project-level execution mode: True = auto-run ready nodes (default);
@@ -238,32 +309,24 @@ class Node(BaseModel):
     resource_refs: list[str] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
 
-    # revision & lineage metadata (edits create new revisions, not rewrites)
-    revision: int = 1
-    superseded_by: Optional[uuid.UUID] = None
-    forked_from: Optional[uuid.UUID] = None
-
-    # --- merge review (set by the runner, surfaced to the UI) ----------
-    # A node whose worktree has been merged up into its parent is redundant
-    # on disk. The runner asks the user to review the merged result:
-    #   needs_review   -> merged up, awaiting accept (clean subtree) / reject
-    #   merge_accepted -> reviewed & accepted; subtree filesystem cleaned
+    # --- review metadata (set by the runner, surfaced to the UI) ----------
+    # Retained as graph metadata for existing state files. Files are already
+    # written to the assigned project directory; no merge or cleanup is done.
     needs_review: bool = False
     merge_accepted: bool = False
-    # Parent-owned automatic review lifecycle. Evidence is retained on the
-    # child even after acceptance/rejection so the decision remains auditable.
-    verification_status: Optional[VerificationStatus] = None
-    verification_summary: Optional[str] = None
-    verification_round: int = 0
-    # The parent-review conversation is distinct from both the parent's own
-    # planning/execution session and the child's correction session.
-    verification_session_id: Optional[str] = None
 
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
     # --- derived, never persisted -------------------------------------
     progress: Optional[float] = None  # 0..1 for containers, set by graph logic
+
+    # Live agent protocol status. The agent publishes these through
+    # `turn agent status`; the runner mirrors them onto the graph so every
+    # surface can present the same working message without parsing terminal
+    # output.
+    agent_state: Optional[str] = None
+    agent_message: Optional[str] = None
 
 
 # --------------------------------------------------------------------------
@@ -305,7 +368,6 @@ class Run(BaseModel):
     error: Optional[str] = None
     retry_recommended: bool = False
 
-    node_revision: int = 1  # node.revision captured when the Run started
     attempt: int = 1
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
@@ -336,6 +398,33 @@ class ArtifactRef(BaseModel):
     ref: Optional[str] = None
 
 
+class Graph(BaseModel):
+    """The extensible workgraph aggregate owned by the server."""
+
+    project_id: uuid.UUID
+    nodes: list[Node] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+    artifacts: list[Artifact] = Field(default_factory=list)
+
+
+class GraphNodeView(Node):
+    """A node enriched with the server-owned UI projection."""
+
+    ui_state: NodeUIState
+    allowed_actions: list[NodeAction]
+    state_reason: Optional[str] = None
+    generation_active: bool = False
+
+
+class GraphView(BaseModel):
+    """Serialized graph returned to the web client."""
+
+    project_id: uuid.UUID
+    nodes: list[GraphNodeView] = Field(default_factory=list)
+    edges: list[Edge] = Field(default_factory=list)
+    artifacts: list[Artifact] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Resources / skills (context, not orchestration)
 # --------------------------------------------------------------------------
@@ -360,13 +449,13 @@ class NodeSpec(BaseModel):
     objective: str
     generated_prompt: Optional[str] = None
     executor: Optional[str] = None
-    agent: Optional[AgentConfig] = None
+    agent: Optional[Agent] = None
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
-    depends_on: list[str] = Field(default_factory=list)  # prerequisite keys
+    depends_on: list[str] = Field(default_factory=list)  # prior left-to-right stage keys
     # When True (or executor == "planner") the created node is itself a
     # sub-planner: the runner will decompose it again on its next turn instead
     # of executing it as a leaf. This lets plans nest planners arbitrarily.

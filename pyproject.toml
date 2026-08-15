@@ -5,9 +5,6 @@ description = "Turn — a live, editable workgraph that turns a vague prompt int
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "sqlalchemy>=2.0",
-    "greenlet>=3.0",
-    "aiosqlite>=0.19",
     "pydantic>=2.0",
     "fastapi>=0.110",
     "uvicorn>=0.27",
@@ -17,8 +14,6 @@ dependencies = [
 [project.optional-dependencies]
 # LLM-backed planner via the OpenAI SDK (optional; Codex is used by default).
 llm = ["openai>=1.0"]
-# Optional Prefect 3 execution backend behind the thin adapter.
-prefect = ["prefect>=3.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -41,3 +36,6 @@ build-backend = "setuptools.build_meta"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["turn/tests"]
+markers = [
+    "integration: exercises the installed Herdr service directly",
+]

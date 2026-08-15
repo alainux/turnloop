@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "generate:contract": "python scripts/generate_ui_contract.py",
+    "check:contract": "python scripts/generate_ui_contract.py --check",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

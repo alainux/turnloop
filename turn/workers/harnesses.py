@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,54 +30,35 @@ from turn.domain.schemas import (
     Usage,
     WorkerResult,
 )
-from turn.workers import parsing, worktree
+from turn.config import settings
+from turn.workers import parsing
 from turn.workers.artifacts import (
-    capture_worktree,
+    capture_filesystem,
     has_material_change,
     missing_declared_files,
     requires_material_change,
+    snapshot_filesystem,
 )
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers.terminal import LocalPtyTransport
+from turn.workers.harness_catalog import (
+    MODEL_DISCOVERY_COMMANDS,
+    HarnessCommandFactory,
+    REAL_HARNESS_CATALOG,
+)
+from turn.workers.interactive import (
+    agent_environment,
+    opencode_session_ids,
+    prepare_result_file,
+    read_result_file,
+    result_handoff,
+    run_until_result,
+)
 
 logger = logging.getLogger("turn.harnesses")
 
 
-HARNESS_CATALOG = {
-    "codex": {
-        "label": "Codex",
-        "binary": "codex",
-        "reasoning": ["default", "low", "medium", "high", "xhigh", "max"],
-        "supports_sessions": True,
-        "supports_tools": True,
-    },
-    "claude": {
-        "label": "Claude Code",
-        "binary": "claude",
-        "reasoning": ["default", "low", "medium", "high", "xhigh", "max"],
-        "supports_sessions": True,
-        "supports_tools": True,
-    },
-    "opencode": {
-        "label": "OpenCode",
-        "binary": "opencode",
-        "reasoning": ["default", "low", "medium", "high", "max"],
-        "supports_sessions": True,
-        "supports_tools": True,
-    },
-    "pi": {
-        "label": "Pi",
-        "binary": "pi",
-        "reasoning": ["default", "low", "medium", "high", "xhigh", "max"],
-        "supports_sessions": True,
-        "supports_tools": True,
-    },
-}
-
-MODEL_DISCOVERY_COMMANDS = {
-    "opencode": ["opencode", "models"],
-    "pi": ["pi", "--offline", "--list-models"],
-}
+HARNESS_CATALOG = REAL_HARNESS_CATALOG.as_dict()
 
 _CODEX_REASONING: dict[str, list[str]] = {}
 
@@ -128,8 +111,8 @@ def validate_agent_capabilities(agent: AgentConfig) -> None:
         )
 
 
-def _codex_models() -> list[str]:
-    command = ["codex", "app-server", "--listen", "stdio://"]
+def _codex_models(binary: str = "codex") -> list[str]:
+    command = [binary, "app-server", "--listen", "stdio://"]
     requests = [
         {"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "turn", "title": "Turn", "version": "0.1.0"}, "capabilities": {}}},
         {"method": "initialized", "params": {}},
@@ -195,17 +178,49 @@ def _codex_models() -> list[str]:
     return list(dict.fromkeys(models))
 
 
-@lru_cache(maxsize=8)
-def _discover_models(harness: str) -> list[str]:
+def _resolve_binary(binary: str) -> str | None:
+    """Resolve a CLI even when the server was launched without the user's PATH."""
+    explicit = Path(binary).expanduser()
+    if explicit.is_file() and os.access(explicit, os.X_OK):
+        return str(explicit)
+    resolved = shutil.which(binary)
+    if resolved:
+        return resolved
+
+    # Desktop-launched processes on macOS often omit user-local bin folders
+    # from PATH. These are the standard install locations for the supported
+    # agent CLIs, so discovery still works without requiring a shell restart.
+    for directory in (
+        Path.home() / ".local" / "bin",
+        Path.home() / ".opencode" / "bin",
+        Path.home() / ".cargo" / "bin",
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+    ):
+        candidate = directory / binary
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+@lru_cache(maxsize=16)
+def _discover_models(harness: str, binary: str | None = None) -> list[str]:
     """Best-effort local catalog discovery; never contacts a cloud API here."""
-    if harness == "codex" and shutil.which("codex") is not None:
+    configured_binary = binary or HARNESS_CATALOG.get(harness, {}).get("binary")
+    if not isinstance(configured_binary, str):
+        return []
+    resolved_binary = _resolve_binary(configured_binary)
+    if resolved_binary is None:
+        return []
+    if harness == "codex":
         try:
-            return _codex_models()
+            return _codex_models(resolved_binary)
         except OSError:
             return []
     command = MODEL_DISCOVERY_COMMANDS.get(harness)
-    if not command or shutil.which(command[0]) is None:
+    if not command:
         return []
+    command = [resolved_binary, *command[1:]]
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=4)
     except (OSError, subprocess.TimeoutExpired):
@@ -215,17 +230,33 @@ def _discover_models(harness: str) -> list[str]:
         clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
         if not clean or clean.lower().startswith(("provider", "model", "available")):
             continue
-        candidate = clean.split()[0]
+        columns = clean.split()
+        if harness in {"pi", "opencode"}:
+            # Pi and OpenCode print fixed-width tables: provider, model, then
+            # context metadata. Model IDs are provider-qualified, and the
+            # model column may itself contain additional slash-separated
+            # segments.
+            if len(columns) < 2:
+                continue
+            candidate = f"{columns[0]}/{columns[1]}"
+        else:
+            candidate = columns[0]
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{1,160}", candidate):
             models.append(candidate)
     return list(dict.fromkeys(models))[:250]
 
 
-def harness_capabilities(configured_models: dict[str, str] | None = None) -> list[dict]:
+def harness_capabilities(
+    configured_models: dict[str, str] | None = None,
+    configured_binaries: dict[str, str] | None = None,
+) -> list[dict]:
     configured_models = configured_models or {}
+    configured_binaries = configured_binaries or {}
     results: list[dict] = []
     for key, meta in HARNESS_CATALOG.items():
-        discovered = _discover_models(key)
+        binary = configured_binaries.get(key)
+        discovered = _discover_models(key, binary)
+        discovered = list(dict.fromkeys(discovered))
         configured = configured_models.get(key)
         if configured and configured not in discovered:
             discovered.insert(0, configured)
@@ -245,39 +276,23 @@ def harness_capabilities(configured_models: dict[str, str] | None = None) -> lis
                 "models": models,
                 "accepts_custom_models": True,
                 "reasoning_profiles": MODEL_REASONING_PROFILES,
-                "available": shutil.which(meta["binary"]) is not None,
+                "available": _resolve_binary(binary or meta["binary"]) is not None,
             }
         )
     return results
-def _structured_prompt(ctx: NodeExecutionContext) -> str:
+def _structured_prompt(ctx: NodeExecutionContext, result_path: Path) -> str:
     task = ctx.node.generated_prompt or "Complete the objective using the available tools."
-    if ctx.purpose == "verify":
-        return f"""{render_context_block(ctx)}
-PARENT VERIFICATION TASK:
-{task}
-
-Act as the parent agent responsible for this child result. Inspect the actual
-files and git history and run focused, non-destructive checks where possible.
-Do not edit files.
-
-Finish with exactly one fenced `turn-result` JSON block:
-- COMPLETE accepts the child based on concrete evidence.
-- BLOCK rejects it with actionable feedback for the same child session.
-- FAIL means verification itself could not be completed.
-{{"outcome":"COMPLETE"|"BLOCK"|"FAIL","summary":"evidence or feedback","missing_inputs":[],"artifacts":[]}}
-"""
-    return f"""{render_context_block(ctx)}
+    prompt = f"""{render_context_block(ctx)}
 OBJECTIVE:
 {ctx.node.objective}
 
 TASK:
 {task}
 
-Finish with a fenced `turn-result` JSON block:
-{{"outcome":"COMPLETE"|"BLOCK"|"FAIL","summary":"...","missing_inputs":[],"artifacts":[]}}
 Use BLOCK only for genuinely external human input. Continue the existing
 session when reviewer feedback is supplied; preserve prior context and files.
 """
+    return f"{prompt}\n\n{result_handoff()}"
 
 
 def _json_text_and_session(raw: str) -> tuple[str, str | None, Usage]:
@@ -295,12 +310,17 @@ def _json_text_and_session(raw: str) -> tuple[str, str | None, Usage]:
         if item.get("type") == "session":
             session = session or item.get("id")
         candidate = item.get("result") or item.get("text") or item.get("content")
+        part = item.get("part")
+        if isinstance(part, dict):
+            candidate = candidate or part.get("text") or part.get("content")
         nested = item.get("item")
         if isinstance(nested, dict):
             candidate = candidate or nested.get("text") or nested.get("content")
         if isinstance(candidate, str):
             texts.append(candidate)
         raw_usage = item.get("usage")
+        if raw_usage is None and isinstance(part, dict):
+            raw_usage = part.get("tokens")
         message = item.get("message")
         if isinstance(message, dict):
             content = message.get("content")
@@ -314,9 +334,10 @@ def _json_text_and_session(raw: str) -> tuple[str, str | None, Usage]:
             raw_cost = raw_usage.get("cost_usd") or raw_usage.get("cost")
             if isinstance(raw_cost, dict):
                 raw_cost = raw_cost.get("total")
+            cache = raw_usage.get("cache") if isinstance(raw_usage.get("cache"), dict) else {}
             usage = Usage(
                 input_tokens=int(raw_usage.get("input_tokens") or raw_usage.get("inputTokens") or raw_usage.get("input") or usage.input_tokens),
-                cached_input_tokens=int(raw_usage.get("cached_input_tokens") or raw_usage.get("cache_read_input_tokens") or raw_usage.get("cacheRead") or usage.cached_input_tokens),
+                cached_input_tokens=int(raw_usage.get("cached_input_tokens") or raw_usage.get("cache_read_input_tokens") or raw_usage.get("cacheRead") or cache.get("read") or usage.cached_input_tokens),
                 output_tokens=int(raw_usage.get("output_tokens") or raw_usage.get("outputTokens") or raw_usage.get("output") or usage.output_tokens),
                 cost_usd=raw_cost,
             )
@@ -341,115 +362,171 @@ def recover_session_id(raw: str) -> str | None:
 
 
 class CLIHarnessWorker(Worker):
-    def __init__(self, harness: HarnessKind):
+    def __init__(self, harness: HarnessKind, settings=settings):
         self.harness = harness
         self.name = harness.value
+        self.s = settings
+        self.commands = HarnessCommandFactory()
 
     def _command(
-        self, agent: AgentConfig, prompt: str, cwd: str, *, resume: bool = False
+        self,
+        agent: AgentConfig,
+        prompt: str,
+        cwd: str,
+        *,
+        resume: bool = False,
+        native: bool = False,
     ) -> list[str]:
-        model = agent.model
-        reasoning = agent.reasoning.value
-        session = agent.session_id
-        if self.harness == HarnessKind.CLAUDE:
-            cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
-            if not session:
-                raise ValueError("Claude requires a session id")
-            cmd += ["--resume", session] if resume else ["--session-id", session]
-            if model:
-                cmd += ["--model", model]
-            if reasoning != "default":
-                cmd += ["--effort", reasoning]
-            if agent.permission.value == "full":
-                cmd.append("--dangerously-skip-permissions")
-            elif agent.permission.value == "workspace":
-                cmd += ["--permission-mode", "acceptEdits"]
-            if agent.tools:
-                cmd += ["--allowedTools", *agent.tools]
-            cmd.append(prompt)
-            return cmd
-        if self.harness == HarnessKind.OPENCODE:
-            cmd = ["opencode", "run", "--format", "json", "--dir", cwd]
-            if session:
-                cmd += ["--session", session]
-            if model:
-                cmd += ["--model", model]
-            if reasoning != "default":
-                cmd += ["--variant", reasoning]
-            if agent.permission.value != "ask":
-                cmd.append("--auto")
-            return [*cmd, prompt]
-        if self.harness == HarnessKind.PI:
-            cmd = ["pi", "-p", "--mode", "json"]
-            if session:
-                cmd += ["--session", session]
-            if model:
-                cmd += ["--model", model]
-            if reasoning != "default":
-                cmd += ["--thinking", reasoning]
-            if agent.tools:
-                cmd += ["--tools", ",".join(agent.tools)]
-            return [*cmd, prompt]
-        raise ValueError(f"unsupported generic harness: {self.harness}")
+        return self.commands.worker_command(
+            self.harness, agent, prompt, cwd, resume=resume, native=native
+        )
 
     async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
         repo = ctx.repo_path
-        if not repo or not (Path(repo) / ".git").exists():
-            return WorkerResult(outcome=Outcome.FAIL, summary="project repository unavailable")
-        is_verification = (
-            ctx.purpose == "verify"
-            or bool(ctx.node.agent and ctx.node.agent.type_id == "validator")
-        )
-        cwd = worktree.get_or_create_worktree(
-            ctx.node.id,
-            ctx.node.parent_id,
-            # Verification must inspect the exact child evidence. Recreating
-            # the worktree here would erase it before the parent can review.
-            force=not is_verification,
-            repo_path=repo,
-        )
-        if cwd is None:
-            return WorkerResult(outcome=Outcome.FAIL, summary="could not create isolated worktree")
+        if not repo or not Path(repo).is_dir():
+            return WorkerResult(outcome=Outcome.FAIL, summary="assigned project directory unavailable")
+        binary = HARNESS_CATALOG[self.harness.value]["binary"]
+        if _resolve_binary(binary) is None:
+            # Do not start a generic shell and hope an unavailable selected
+            # harness turns into something else. The selected harness is the
+            # contract, so fail before allocating a terminal.
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary=f"{self.harness.value} is not installed",
+                error=f"selected harness '{self.harness.value}' is unavailable",
+            )
+        cwd = repo
+        before = snapshot_filesystem(cwd)
         agent = (ctx.node.agent or AgentConfig(harness=self.harness)).model_copy(deep=True)
         try:
             validate_agent_capabilities(agent)
         except ValueError as error:
             return WorkerResult(outcome=Outcome.FAIL, summary=str(error), error=str(error))
-        resume = bool(agent.session_id)
+        transport = ctx.terminal or LocalPtyTransport()
+        native = isinstance(transport, LocalPtyTransport)
+        result_path: Path
+        environment: dict[str, str]
+        had_session = bool(agent.session_id)
+        if native:
+            # Pi supports an exact caller-provided id. OpenCode persists its
+            # own id, which can still be recovered from a machine stream or
+            # supplied by a later reconnect implementation.
+            if self.harness == HarnessKind.PI and not agent.session_id:
+                agent.session_id = str(uuid.uuid4())
+        result_path = prepare_result_file(cwd, ctx.node.id, "result")
+        environment = agent_environment(cwd, ctx.node.id, "result", result_path, agent)
+        environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
+        resume = had_session
         if not agent.session_id and self.harness == HarnessKind.CLAUDE:
             agent.session_id = str(ctx.node.id)
-        cmd = self._command(agent, _structured_prompt(ctx), cwd, resume=resume)
+        observed_session = agent.session_id
+        live_buffer = ""
+
+        async def stream_live(nid, chunk):
+            nonlocal observed_session, live_buffer
+            if not native:
+                live_buffer = (live_buffer + chunk)[-128_000:]
+                _, discovered, _ = _json_text_and_session(live_buffer)
+                if discovered and discovered != observed_session:
+                    observed_session = discovered
+                    if ctx.session_callback is not None:
+                        await ctx.session_callback(discovered)
+            if ctx.stream is not None:
+                await ctx.stream(nid, chunk)
+
+        async def remember_session(session: str) -> None:
+            nonlocal observed_session
+            observed_session = session
+            agent.session_id = session
+            ctx.node.agent = agent
+            if ctx.session_callback is not None:
+                await ctx.session_callback(session)
+
+        if ctx.session_callback is not None and observed_session:
+            await ctx.session_callback(observed_session)
+        known_opencode_sessions = (
+            set(opencode_session_ids())
+            if native and self.harness == HarnessKind.OPENCODE
+            else set()
+        )
+
+        async def probe_session() -> str | None:
+            if self.harness != HarnessKind.OPENCODE:
+                return None
+            current = await asyncio.to_thread(opencode_session_ids)
+            return next((item for item in current if item not in known_opencode_sessions), None)
+
+        prompt = _structured_prompt(ctx, result_path)
+        cmd = self._command(
+            agent, prompt, cwd, resume=resume, native=native
+        )
         try:
-            terminal = await (ctx.terminal or LocalPtyTransport()).run(
-                ctx.node.id,
-                cmd,
-                cwd=cwd,
-                stream=ctx.stream,
-                timeout=ctx.timeout_seconds,
-                stall_timeout=ctx.stall_timeout_seconds,
-            )
+            if native:
+                terminal = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=stream_live,
+                    timeout=ctx.timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
+                    initial_input=prompt,
+                    environment=environment,
+                )
+            else:
+                terminal = await transport.run(
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    environment=environment,
+                    stream=stream_live,
+                    timeout=ctx.timeout_seconds,
+                    stall_timeout=ctx.stall_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                )
         except FileNotFoundError:
             return WorkerResult(outcome=Outcome.FAIL, summary=f"{self.name} is not installed")
         except asyncio.TimeoutError:
             return WorkerResult(outcome=Outcome.FAIL, summary=f"{self.name} exceeded the run timeout", error="execution timeout")
         raw_out = terminal.output.decode(errors="replace")
         raw_err = ""
+        if terminal.idle_reaped:
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary=f"{self.name} terminal was reaped after being idle while detached",
+                error="detached idle terminal",
+                retry_recommended=False,
+                session_id=observed_session or agent.session_id,
+                artifacts=[ArtifactSpec(
+                    kind=ArtifactKind.TEXT,
+                    name="transcript",
+                    content=terminal.display_output.decode(errors="replace") or raw_out,
+                )],
+            )
         if terminal.stalled:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                 error="stalled terminal output",
-                retry_recommended=True,
+                retry_recommended=False,
                 artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace") or raw_out)],
             )
-        text, session, usage = _json_text_and_session(raw_out)
+        submitted = read_result_file(result_path)
+        text = json.dumps(submitted) if submitted is not None else ""
+        session = observed_session or agent.session_id
+        usage = Usage()
         data = parsing.first_result_json(text) or {}
         if terminal.returncode != 0 and not data:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} exited {terminal.returncode}",
                 error=raw_err or text,
-                retry_recommended=True,
+                retry_recommended=False,
                 session_id=session or agent.session_id,
                 usage=usage,
             )
@@ -458,7 +535,7 @@ class CLIHarnessWorker(Worker):
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} stopped without a structured result",
                 error=text[-2000:] or raw_err,
-                retry_recommended=True,
+                retry_recommended=False,
                 session_id=session or agent.session_id,
                 usage=usage,
                 artifacts=[
@@ -475,7 +552,9 @@ class CLIHarnessWorker(Worker):
             outcome = Outcome.COMPLETE
         result = WorkerResult(
             outcome=outcome,
-            summary=data.get("summary", text[-2000:] or f"{self.name} completed"),
+            summary=parsing.clean_summary(
+                data.get("summary", text[-2000:] or f"{self.name} completed")
+            ),
             missing_inputs=[InputSpec(**i) for i in data.get("missing_inputs", [])],
             artifacts=parsing.artifact_specs(data.get("artifacts", [])),
             error=data.get("error"),
@@ -489,7 +568,11 @@ class CLIHarnessWorker(Worker):
             result.summary = f"{self.name} reported missing file outputs: {', '.join(missing_files)}"
             result.error = result.summary
             result.retry_recommended = True
-        display_out = terminal.display_output.decode(errors="replace")
+        display_out = (
+            terminal.output.decode(errors="replace")
+            if native
+            else terminal.display_output.decode(errors="replace")
+        )
         result.artifacts.append(
             ArtifactSpec(
                 kind=ArtifactKind.TEXT,
@@ -497,24 +580,18 @@ class CLIHarnessWorker(Worker):
                 content=display_out or text,
             )
         )
-        captured = capture_worktree(cwd)
-        result.artifacts.extend(captured)
+        # Keep this comparison as a correctness invariant, but do not derive
+        # UI artifacts from the filesystem. Artifact reporting belongs to the
+        # agent's explicit CLI submission.
+        captured = capture_filesystem(cwd, before)
         missing_material = (
             result.outcome == Outcome.COMPLETE
-            and not is_verification
             and requires_material_change(ctx.node.objective, ctx.node.generated_prompt)
             and not has_material_change(captured)
         )
         if missing_material:
             result.outcome = Outcome.FAIL
-            result.summary = f"{self.name} completed a file-writing objective without a material worktree change"
+            result.summary = f"{self.name} completed a file-writing objective without a material filesystem change"
             result.error = result.summary
             result.retry_recommended = True
-        # A parent verifier reports a decision only. It must never publish
-        # incidental changes into the parent branch, regardless of provider.
-        if not is_verification and not missing_files and not missing_material:
-            try:
-                worktree.merge_into_parent(ctx.node.id, ctx.node.parent_id, repo_path=repo)
-            except Exception as exc:  # housekeeping must not erase useful output
-                logger.warning("merge-up failed for %s: %s", ctx.node.id, exc)
         return result

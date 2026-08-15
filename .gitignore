@@ -16,6 +16,10 @@ venv/
 *.db
 *.sqlite
 .turn/
+turn/config.json
+turn/herdr-workspaces.json
+turn/server.lock
+turn-demo-state/
 .pi/
 
 # Per-project repos (user deliverables; each is its own git repository)

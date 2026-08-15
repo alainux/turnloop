@@ -26,6 +26,12 @@ def classify_failure(error: str | None) -> DamageKind:
 
 
 def should_retry(error: str | None, recommended: bool, retry_choked: bool) -> bool:
+    # The worker/harness is the authority on whether a run should be retried.
+    # Automatic respawn is disabled by design: a node is only re-run on an
+    # explicit user action (re-run / retry). Transient "retry_choked" retries
+    # are therefore only honored when the worker also recommends a retry.
+    if not recommended:
+        return False
     kind = classify_failure(error)
     if kind in {
         DamageKind.CONTEXT_PRESSURE,
@@ -33,7 +39,7 @@ def should_retry(error: str | None, recommended: bool, retry_choked: bool) -> bo
         DamageKind.RATE_LIMIT,
     }:
         return retry_choked
-    return recommended
+    return True
 
 
 def backoff_seconds(attempt: int, base_ms: int) -> float:

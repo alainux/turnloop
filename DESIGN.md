@@ -45,7 +45,7 @@ preserve semantic contrast rather than merely invert colors.
 
 The full objective is the only large field. Attachments, directory, harness,
 model, reasoning, configuration, and submit are one compact toolbar. Project
-name, permission, create/open, auto-run, sequential, and delay live in one
+name, permission, create/open, auto-run, and delay live in one
 configurator. Directory selection crosses a replaceable native-platform
 boundary and defaults to the process working directory. Attached files show as
 removable chips and become immutable root resource references.
@@ -55,7 +55,7 @@ removable chips and become immutable root resource references.
 Each node shows one semantic avatar, state text, harness, model, reasoning, and
 available token usage. A subtle circular play action manually starts a runnable
 node. That exact control becomes a spinner only while the provider terminal is
-live. Database startup/finalization, queued verification, completed nodes, and
+live. Store startup/finalization, queued verification, completed nodes, and
 edges never animate. This is the interface's truthfulness rule, not decoration.
 
 ### Terminal and results
@@ -64,7 +64,7 @@ The terminal is a Shadow DOM xterm backed by the provider-neutral PTY contract.
 Harness machine events and final structured output never appear as raw JSON in
 the terminal: adapters retain byte-perfect machine output for validation while
 publishing a separate ANSI presentation stream. Schema-constrained final output
-uses a dedicated result file where supported. The inspector renders durable
+is submitted through the Turn CLI. The inspector renders durable
 unified diffs per file with additions/deletions and keeps artifacts as compact
 single-line disclosures.
 
@@ -102,8 +102,7 @@ custom tooltip. Shortcuts and the product safety disclaimer have one standard
 Implemented now: prompt-first authoring, attachments, native directory-picker
 boundary, detected local harnesses, model-aware reasoning, IDE panels/themes,
 dendrogram, compact node cards, in-place configuration/scope editing, graph
-menus, human gates, manual review, bounded parent verification with same-session
-rejection, PTY+xterm, stream-stall recovery, usage, CLI/headless core, visual
+menus, human gates, explicit user review, PTY+xterm, stream-stall recovery, usage, CLI/headless core, visual
 tests, and responsive desktop/compact layouts.
 
 Future-ready only: provider API/cloud terminal transports, portable explicit

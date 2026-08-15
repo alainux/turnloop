@@ -1,7 +1,7 @@
 """Worker registry — maps executor names to Worker instances and holds the planner."""
 from __future__ import annotations
 
-from turn.config import Settings
+from turn.config import REAL_HARNESSES, Settings
 from turn.workers.base import Planner, Worker
 from turn.workers.codex_worker import CodexWorker
 from turn.workers.echo_worker import EchoWorker
@@ -28,25 +28,39 @@ class WorkerRegistry:
         self.planner = planner
 
 
-def build_registry(settings: Settings, default_executor: str | None = None) -> WorkerRegistry:
+def build_registry(
+    settings: Settings,
+    default_executor: str | None = None,
+    *,
+    test_mode: bool = False,
+) -> WorkerRegistry:
     """Construct the default registry.
 
-    `default_executor` lets callers (e.g. tests) swap Codex for a deterministic
-    worker without touching the data model.
+    ``test_mode`` is the only path that registers deterministic workers or the
+    heuristic planner. The served application never enables it.
     """
     reg = WorkerRegistry()
-    reg.register(EchoWorker())
     reg.register(ShellWorker())
     reg.register(CodexWorker(settings))
-    reg.register(CLIHarnessWorker(HarnessKind.CLAUDE))
-    reg.register(CLIHarnessWorker(HarnessKind.OPENCODE))
-    reg.register(CLIHarnessWorker(HarnessKind.PI))
+    reg.register(CLIHarnessWorker(HarnessKind.CLAUDE, settings))
+    reg.register(CLIHarnessWorker(HarnessKind.OPENCODE, settings))
+    reg.register(CLIHarnessWorker(HarnessKind.PI, settings))
 
     executor = default_executor or settings.default_executor
-    heuristic = HeuristicPlanner(default_executor=executor)
-    if settings.planner == "heuristic":
-        planner: Planner = heuristic
+    if test_mode:
+        reg.register(EchoWorker())
+    elif settings.planner != "codex":
+        raise RuntimeError(
+            "non-Codex planners are test-only; construct the registry with test_mode=True"
+        )
+    elif executor not in REAL_HARNESSES:
+        raise RuntimeError(
+            f"non-real executor '{executor}' is test-only; choose a real harness"
+        )
+
+    if test_mode and settings.planner == "heuristic":
+        planner: Planner = HeuristicPlanner(default_executor=executor)
     else:
-        planner = AgentPlanner(fallback=heuristic, settings=settings)
+        planner = AgentPlanner(settings=settings)
     reg.register_planner(planner)
     return reg

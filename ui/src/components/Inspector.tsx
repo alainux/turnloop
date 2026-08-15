@@ -2,22 +2,22 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
-  AgentConfig,
+  Agent,
   GraphNode,
   HarnessCapability,
   NodeDetail as Detail,
   Permission,
   Reasoning,
 } from "../domain";
+import { primaryNodeAction, primaryNodeActionLabel } from "../domain";
 import { api, json } from "../api";
-import { DiffView } from "./DiffView";
 import { Icon } from "./Icon";
 import { ModelControl } from "./ModelControl";
 const TerminalView = lazy(() =>
   import("./TerminalView").then((module) => ({ default: module.TerminalView })),
 );
 
-type Tab = "overview" | "diff" | "terminal" | "history";
+type Tab = "overview" | "terminal";
 interface Props {
   nodeId: string;
   refreshKey: string;
@@ -36,6 +36,7 @@ export function Inspector({
 }: Props) {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [tab, setTab] = useState<Tab>("overview");
+  const [terminalVisited, setTerminalVisited] = useState(false);
   const [error, setError] = useState("");
   const dirty = useRef(false);
   const loadVersion = useRef(0);
@@ -82,38 +83,27 @@ export function Inspector({
         </button>
       </div>
       <div className="inspector-tabs" role="tablist">
-        {(["overview", "diff", "terminal", "history"] as Tab[]).map((item) => (
+        {(["overview", "terminal"] as Tab[]).map((item) => (
           <button
             key={item}
             role="tab"
             aria-selected={tab === item}
             className={tab === item ? "active" : ""}
-            onClick={() => setTab(item)}
+            onClick={() => {
+              if (item === "terminal") setTerminalVisited(true);
+              setTab(item);
+            }}
           >
             {item[0].toUpperCase() + item.slice(1)}
           </button>
         ))}
       </div>
-      <div className="detail">
+      <div className={`detail ${tab === "terminal" ? "terminal-detail" : ""}`}>
         {error ? (
           <p className="detail-error">{error}</p>
         ) : !detail ? (
           <p className="detail-loading">Loading node…</p>
-        ) : tab === "terminal" ? (
-          <Suspense
-            fallback={<p className="detail-loading">Loading terminal…</p>}
-          >
-            <TerminalView
-              node={detail.node}
-              artifacts={detail.artifacts}
-              runs={detail.runs}
-            />
-          </Suspense>
-        ) : tab === "diff" ? (
-          <DiffView artifacts={detail.artifacts} />
-        ) : tab === "history" ? (
-          <History detail={detail} />
-        ) : (
+        ) : tab === "overview" ? (
           <Overview
             detail={detail}
             capabilities={capabilities}
@@ -122,6 +112,13 @@ export function Inspector({
               dirty.current = value;
             }}
           />
+        ) : null}
+        {detail && terminalVisited && (
+          <div hidden={tab !== "terminal"} className="terminal-tab-panel">
+            <Suspense fallback={<p className="detail-loading">Loading terminal…</p>}>
+              <TerminalView node={detail.node} runs={detail.runs} />
+            </Suspense>
+          </div>
         )}
       </div>
     </aside>
@@ -143,19 +140,16 @@ function Overview({
   const [editingPrompt, setEditingPrompt] = useState(false);
   const [prompt, setPrompt] = useState(node.generated_prompt ?? "");
   const [objective, setObjective] = useState(node.objective);
-  const [agent, setAgent] = useState<AgentConfig | null>(node.agent ?? null);
-  const [cascade, setCascade] = useState(false);
+  const [agent, setAgent] = useState<Agent | null>(node.agent ?? null);
   const [feedback, setFeedback] = useState("");
   const [inputs, setInputs] = useState<Record<string, string>>({});
-  const [forking, setForking] = useState(false);
-  const [forkObjective, setForkObjective] = useState(node.objective);
-  const [forkPrompt, setForkPrompt] = useState(node.generated_prompt ?? "");
+  const primaryAction = primaryNodeAction(node);
   useEffect(() => {
     setPrompt(node.generated_prompt ?? "");
     setObjective(node.objective);
     setAgent(node.agent ?? null);
     setEditingPrompt(false);
-  }, [node.id, node.revision]);
+  }, [node.id]);
   const scopeDirty =
     objective !== node.objective || prompt !== (node.generated_prompt ?? "");
   const agentDirty = JSON.stringify(agent) !== JSON.stringify(node.agent);
@@ -164,7 +158,6 @@ function Overview({
       editingPrompt ||
         scopeDirty ||
         agentDirty ||
-        forking ||
         Boolean(feedback.trim()) ||
         Object.values(inputs).some(Boolean),
     );
@@ -173,7 +166,6 @@ function Overview({
     editingPrompt,
     scopeDirty,
     agentDirty,
-    forking,
     feedback,
     inputs,
     onDirtyChange,
@@ -187,7 +179,6 @@ function Overview({
             ? "generating"
             : node.ui_state.replaceAll("_", " ")}
         </span>
-        <span className="badge">Revision {node.revision}</span>
       </div>
       <section className="section instructions-section">
         <div className="section-heading">
@@ -210,11 +201,14 @@ function Overview({
                 onChange={(event) => setObjective(event.target.value)}
               />
             </label>
-            <textarea
-              className="instruction-editor"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-            />
+            <label className="field instruction-field">
+              <span>Prompt</span>
+              <textarea
+                className="instruction-editor"
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+              />
+            </label>
             <button
               className="button accent"
               disabled={!scopeDirty}
@@ -290,21 +284,13 @@ function Overview({
             <span>{agent.tools.length} tools</span>
             <span>{agent.mcp_servers.length} MCP</span>
           </div>
-          <label className="check cascade-option">
-            <input
-              type="checkbox"
-              checked={cascade}
-              onChange={(event) => setCascade(event.target.checked)}
-            />
-            Apply to active descendants
-          </label>
           <button
             className="button accent"
             disabled={!agentDirty}
             onClick={() =>
               mutate(
                 `/api/nodes/${node.id}/edit`,
-                json("POST", { agent, cascade_agent: cascade }),
+                json("POST", { agent }),
                 "Agent configuration updated",
               )
             }
@@ -354,7 +340,7 @@ function Overview({
             ))}
         </section>
       )}
-      {(node.needs_review || node.verification_status) && (
+      {node.needs_review && (
         <Review
           node={node}
           feedback={feedback}
@@ -369,23 +355,37 @@ function Overview({
         <div className="artifact-list">
           {detail.artifacts
             .filter(
-              (item) => item.name !== "transcript" && item.kind !== "code_diff",
+              (item) =>
+                item.name !== "transcript" &&
+                item.kind !== "code_diff" &&
+                !item.name.startsWith("revision-"),
             )
-            .map((item) => (
-              <details key={item.id} className="artifact-row">
-                <summary>
+            .map((item) => {
+              const hasContent =
+                item.content !== null &&
+                item.content !== undefined &&
+                item.content !== "";
+              const summary = (
+                <div className="artifact-summary">
                   <Icon name={item.kind === "file" ? "file" : "braces"} />
                   <span>{item.name}</span>
-                </summary>
-                {item.content ? (
+                </div>
+              );
+              return hasContent ? (
+                <details key={item.id} className="artifact-row">
+                  <summary>{summary}</summary>
                   <pre>
                     {typeof item.content === "string"
                       ? item.content
                       : JSON.stringify(item.content, null, 2)}
                   </pre>
-                ) : null}
-              </details>
-            ))}
+                </details>
+              ) : (
+                <div key={item.id} className="artifact-row artifact-row-static">
+                  {summary}
+                </div>
+              );
+            })}
         </div>
       </section>
       <section className="section">
@@ -394,121 +394,35 @@ function Overview({
         </div>
         <div className="action-groups">
           <div className="action-group">
-            <span>Node</span>
             <div className="action-row">
-              {node.allowed_actions
-                .filter((action) =>
-                  ["run", "pause", "resume", "retry", "cancel"].includes(
-                    action,
-                  ),
-                )
-                .map((action) => (
-                  <button
-                    key={action}
-                    className={`button compact ${action === "run" ? "accent" : action === "cancel" ? "danger" : ""}`}
-                    onClick={() =>
-                      mutate(
-                        `/api/nodes/${node.id}/${action}`,
-                        { method: "POST" },
-                        `${action} requested`,
+              {primaryAction ? (
+                <button
+                  className={`button compact ${primaryAction === "cancel" ? "danger" : "accent"}`}
+                  onClick={async () => {
+                    if (
+                      primaryAction === "regenerate" &&
+                      !confirm(
+                        "Run this planner again and replace its entire descendant tree? This cannot be undone.",
                       )
-                    }
-                  >
-                    {action[0].toUpperCase() + action.slice(1)}
-                  </button>
-                ))}
-              {!node.allowed_actions.some((action) =>
-                ["run", "pause", "resume", "retry", "cancel"].includes(action),
-              ) && <span className="empty-action">No direct action</span>}
-            </div>
-          </div>
-          <div className="action-group">
-            <span>Branch</span>
-            <div className="action-row">
-              <button
-                className="button compact"
-                onClick={() => setForking((value) => !value)}
-              >
-                Fork alternative
-              </button>
-              <button
-                className="button compact"
-                onClick={async () => {
-                  if (
-                    confirm(
-                      "Restart this branch and supersede its active descendants?",
                     )
-                  )
+                      return;
                     await mutate(
-                      `/api/nodes/${node.id}/regenerate`,
+                      `/api/nodes/${node.id}/${primaryAction}`,
                       { method: "POST" },
-                      "Branch restarted",
+                      primaryAction === "cancel"
+                        ? "Node stopped"
+                        : `${primaryNodeActionLabel(primaryAction)} started`,
                     );
-                }}
-              >
-                Restart branch
-              </button>
-              <details className="branch-action-menu">
-                <summary className="button compact">More</summary>
-                <div className="popover branch-popover">
-                  {["pause", "resume", "cancel"].map((action) => (
-                    <button
-                      key={`branch-${action}`}
-                      onClick={() =>
-                        mutate(
-                          `/api/nodes/${node.id}/branch`,
-                          json("POST", { action }),
-                          `Branch ${action} requested`,
-                        )
-                      }
-                    >
-                      {action[0].toUpperCase() + action.slice(1)} branch
-                    </button>
-                  ))}
-                </div>
-              </details>
+                  }}
+                >
+                  {primaryNodeActionLabel(primaryAction)}
+                </button>
+              ) : (
+                <span className="empty-action">No direct action</span>
+              )}
             </div>
           </div>
         </div>
-        {forking && (
-          <div className="inline-editor">
-            <label className="field">
-              <span>Alternative objective</span>
-              <input
-                value={forkObjective}
-                onChange={(event) => setForkObjective(event.target.value)}
-              />
-            </label>
-            <label className="field">
-              <span>Planning instructions</span>
-              <textarea
-                value={forkPrompt}
-                onChange={(event) => setForkPrompt(event.target.value)}
-              />
-            </label>
-            <div className="action-row">
-              <button
-                className="button accent"
-                disabled={!forkObjective.trim()}
-                onClick={() =>
-                  mutate(
-                    `/api/nodes/${node.id}/fork`,
-                    json("POST", {
-                      objective: forkObjective.trim(),
-                      generated_prompt: forkPrompt.trim() || null,
-                    }),
-                    "Alternative branch created",
-                  )
-                }
-              >
-                Create fork
-              </button>
-              <button className="button" onClick={() => setForking(false)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
       </section>
     </>
   );
@@ -525,52 +439,15 @@ function Review({
   setFeedback: (v: string) => void;
   mutate: (path: string, init?: RequestInit, message?: string) => Promise<void>;
 }) {
-  const parent = node.review_owner === "parent";
-  const status = node.verification_status;
-  if (parent && status === "accepted")
-    return (
-      <section className="section">
-        <div className="section-heading">
-          <span>Auto verification</span>
-        </div>
-        <div className="review-card verification-accepted">
-          <h3>Accepted by parent</h3>
-          <p>
-            {node.verification_summary &&
-            !/\b(awaiting|waiting)\b/i.test(node.verification_summary)
-              ? node.verification_summary
-              : "The parent verified and accepted this result."}
-          </p>
-        </div>
-      </section>
-    );
-  if (!parent && node.merge_accepted) return null;
-  const title = parent
-    ? status === "running"
-      ? "Parent is verifying"
-      : status === "rejected"
-        ? "Changes requested by parent"
-        : "Awaiting parent verification"
-    : "Review result";
-  const summary =
-    !parent &&
-    /\b(parent|awaiting|waiting)\b/i.test(node.verification_summary ?? "")
-      ? null
-      : node.verification_summary;
   return (
     <section className="section">
       <div className="section-heading">
-        <span>{parent ? "Auto verification" : "Review"}</span>
+        <span>Review</span>
       </div>
-      <div className={`review-card verification-${status ?? "pending"}`}>
-        <h3>{title}</h3>
-        <p>
-          {summary ||
-            (parent
-              ? "The parent will inspect the result and focused checks."
-              : "Accept the result or return feedback to the same agent session.")}
-        </p>
-        {!parent && node.allowed_actions.includes("accept") && (
+      <div className="review-card">
+        <h3>Review result</h3>
+        <p>Accept the result or return feedback to the same agent session.</p>
+        {node.allowed_actions.includes("accept") && (
           <div className="review-feedback">
             <textarea
               value={feedback}
@@ -607,24 +484,6 @@ function Review({
           </div>
         )}
       </div>
-    </section>
-  );
-}
-function History({ detail }: { detail: Detail }) {
-  return (
-    <section className="section">
-      <div className="section-heading">
-        <span>Run history</span>
-      </div>
-      {[...detail.runs].reverse().map((run) => (
-        <article className="history-item" key={run.id}>
-          <strong>
-            {run.worker} · attempt {run.attempt ?? 1}
-          </strong>
-          <small>{run.status}</small>
-          {run.summary && <p>{run.summary}</p>}
-        </article>
-      ))}
     </section>
   );
 }

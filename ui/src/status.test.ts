@@ -1,22 +1,35 @@
 import { describe, expect, it } from "vitest";
 import { deriveStatus } from "./state";
+import { nodeStatusLabel } from "./components/Graph";
 import type { GraphNode } from "./domain";
 const base: GraphNode = {
   id: "n",
   project_id: "n",
   parent_id: null,
   objective: "n",
+  project_name: null,
+  generated_prompt: null,
+  repo_path: null,
+  executor: null,
+  agent: null,
   status: "RUNNING",
+  run_policy: null,
   ui_state: "running",
+  state_reason: null,
+  agent_state: null,
+  agent_message: null,
   allowed_actions: [],
   generation_active: false,
   paused: false,
   auto_run: false,
   required_inputs: [],
-  revision: 1,
+  resource_refs: [],
+  artifact_refs: [],
+  progress: null,
+  created_at: "",
+  updated_at: "",
   needs_review: false,
   merge_accepted: false,
-  verification_round: 0,
 };
 describe("truthful status", () => {
   it("only calls a live provider generating", () => {
@@ -25,7 +38,7 @@ describe("truthful status", () => {
       "1 model generating",
     );
   });
-  it("separates parent verification from human review", () => {
+  it("reports explicit human review", () => {
     expect(
       deriveStatus([
         {
@@ -33,21 +46,17 @@ describe("truthful status", () => {
           status: "COMPLETE",
           ui_state: "review",
           needs_review: true,
-          review_owner: "parent",
-          verification_status: "pending",
-        },
-      ]),
-    ).toContain("parent verification");
-    expect(
-      deriveStatus([
-        {
-          ...base,
-          status: "COMPLETE",
-          ui_state: "review",
-          needs_review: true,
-          review_owner: "manual",
         },
       ]),
     ).toContain("need review");
+  });
+  it("shows the agent machine state and working message", () => {
+    expect(
+      nodeStatusLabel({
+        ...base,
+        agent_state: "working",
+        agent_message: "Implementing the parser",
+      }),
+    ).toBe("working — Implementing the parser");
   });
 });

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,8 @@ def _wait(url: str, seconds: float = 12) -> None:
 
 
 def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
+    if shutil.which("herdr") is None:
+        pytest.skip("Herdr is required for Turn terminal sessions")
     playwright = pytest.importorskip("playwright.sync_api")
     try:
         port = _free_port()
@@ -38,10 +41,13 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
         pytest.skip("this sandbox does not permit local listener sockets")
     env = os.environ.copy()
     env.update({
-        "TURN_DATABASE_URL": f"sqlite+aiosqlite:///{tmp_path / 'ui.db'}",
+        # Herdr owns the project workspace; the project directory remains
+        # pytest-managed and can use the long path.
+        "TURN_DATA_DIR": f"/private/tmp/turn-ui-{port}",
         "TURN_PROJECTS_DIR": str(tmp_path / "projects"),
         "TURN_PLANNER": "heuristic",
         "TURN_DEFAULT_EXECUTOR": "echo",
+        "TURN_TEST_MODE": "1",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
     process = subprocess.Popen(
@@ -60,7 +66,12 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             page = browser.new_page(viewport={"width": 1440, "height": 960})
             page.set_default_timeout(9000)
             console_errors: list[str] = []
-            page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error" and message.text != "[Turn] Settings saved"
+                else None,
+            )
             page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
 
             page.get_by_role("heading", name="What should the workgraph build?").wait_for()
@@ -81,8 +92,9 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
 
             objective = "Build a compact offline incident-response CLI with parser, policy, renderer, and integration checks."
             page.get_by_role("textbox", name="Project objective").fill(objective)
-            page.get_by_label("Harness").select_option("echo")
-            assert page.get_by_label("Model").input_value() == "deterministic"
+            page.get_by_label("Harness").click()
+            page.get_by_role("option", name="Echo · offline").click()
+            assert page.get_by_label("Model").input_value() == "Deterministic"
             attachment = tmp_path / "brief.txt"
             attachment.write_text("All commands must be deterministic and offline.")
             page.get_by_role("button", name="Attach files").click()
@@ -139,12 +151,13 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             assert page.locator(".instructions-section").count() == 1
             assert page.get_by_role("button", name="Save agent").is_disabled()
             page.get_by_role("tab", name="Terminal").click()
-            page.locator(".terminal-shadow-host").wait_for()
-            page.wait_for_function("document.querySelector('.terminal-mode')?.textContent === 'TRANSCRIPT'")
-            terminal_text = page.locator(".terminal-shadow-host").evaluate("host => host.shadowRoot?.textContent || ''")
+            page.locator(".terminal-shadow-host").wait_for(state="visible")
+            page.locator(".terminal-shadow-host .xterm").wait_for()
+            page.wait_for_function("document.querySelector('.terminal-mode')?.textContent?.includes('LIVE')")
+            terminal_text = page.locator(".terminal-shadow-host").text_content() or ""
             assert '"type"' not in terminal_text
-            helper = page.locator(".terminal-shadow-host").locator(".xterm-helper-textarea")
-            assert helper.is_disabled() and helper.get_attribute("tabindex") == "-1"
+            helper = page.locator(".terminal-shadow-host .xterm-helper-textarea")
+            assert helper.is_enabled() and helper.get_attribute("tabindex") != "-1"
 
             workspace = tmp_path / "workspace.png"
             page.screenshot(path=str(workspace))

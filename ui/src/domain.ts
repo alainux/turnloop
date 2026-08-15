@@ -1,141 +1,82 @@
-export type NodeStatus =
-  | "PENDING"
-  | "BLOCKED"
-  | "RUNNABLE"
-  | "RUNNING"
-  | "EXPANDED"
-  | "COMPLETE"
-  | "FAILED"
-  | "CANCELLED";
-export type UIState =
-  | "pending"
-  | "ready"
-  | "running"
-  | "verifying"
-  | "review"
-  | "waiting_input"
-  | "waiting_dependency"
-  | "complete"
-  | "accepted"
-  | "failed"
-  | "cancelled"
-  | "paused";
-export type HarnessId =
-  "codex" | "claude" | "opencode" | "pi" | "echo" | "shell";
-export type Reasoning = "default" | "low" | "medium" | "high" | "xhigh" | "max";
-export type Permission = "ask" | "workspace" | "full";
+import type {
+  Agent,
+  AgentType,
+  Artifact,
+  Edge,
+  GraphNodeView,
+  GraphView,
+  HarnessKind,
+  Node,
+  NodeUIState,
+  PermissionMode,
+  ReasoningLevel,
+  Run,
+  RunPolicy,
+  Usage,
+} from "./generated/domain";
 
-export interface AgentConfig {
-  type_id: string;
-  harness: HarnessId;
-  model: string | null;
-  reasoning: Reasoning;
-  permission: Permission;
-  skills: string[];
-  tools: string[];
-  mcp_servers: string[];
-  session_id: string | null;
+export type {
+  Agent,
+  AgentType,
+  Artifact,
+  Edge,
+  GraphNodeView,
+  GraphView,
+  HarnessKind,
+  InputSpec,
+  Node,
+  NodeAction,
+  NodeStatus,
+  NodeUIState,
+  PermissionMode,
+  ReasoningLevel,
+  Run,
+  RunPolicy,
+  Usage,
+} from "./generated/domain";
+
+/** UI aliases are generated contract types, kept short at call sites. */
+export type GraphNode = GraphNodeView;
+export type Graph = GraphView;
+export type Project = Node;
+export type HarnessId = HarnessKind;
+export type Permission = PermissionMode;
+export type Reasoning = ReasoningLevel;
+export type UIState = NodeUIState;
+
+export type PrimaryNodeAction = "run" | "retry" | "regenerate" | "cancel";
+
+/**
+ * Select the server-authorized primary action for presentation.
+ *
+ * The browser does not derive workflow policy from status or agent type. The
+ * API's allowed_actions projection is the only action authority; this helper
+ * merely applies a stable presentation priority.
+ */
+export function primaryNodeAction(node: GraphNode): PrimaryNodeAction | null {
+  const priority: PrimaryNodeAction[] = ["cancel", "run", "retry", "regenerate"];
+  return priority.find((action) => node.allowed_actions.includes(action)) ?? null;
 }
 
-export interface RunPolicy {
-  auto_run: boolean;
-  force_sequential: boolean;
-  delay_between_jobs_ms: number;
-  timeout_seconds: number;
-  stall_timeout_seconds: number;
-  max_retries: number;
-  retry_backoff_ms: number;
-  retry_choked_models: boolean;
-  compact_on_context_pressure: boolean;
-  review_mode: "manual" | "parent" | "auto_accept";
+export function primaryNodeActionLabel(action: PrimaryNodeAction): string {
+  if (action === "cancel") return "Stop";
+  if (action === "retry" || action === "regenerate") return "Run again";
+  return "Run";
 }
 
-export interface InputSpec {
-  id: string;
-  label: string;
-  kind: string;
-  description?: string;
-  satisfied_by?: string | null;
-}
-export interface GraphNode {
-  id: string;
-  project_id: string;
-  parent_id: string | null;
-  objective: string;
-  project_name?: string | null;
-  generated_prompt?: string | null;
-  repo_path?: string | null;
-  executor?: string | null;
-  agent?: AgentConfig | null;
-  status: NodeStatus;
-  ui_state: UIState;
-  state_reason?: string | null;
-  allowed_actions: string[];
-  generation_active: boolean;
-  paused: boolean;
-  auto_run: boolean;
-  run_policy?: RunPolicy | null;
-  required_inputs: InputSpec[];
-  revision: number;
-  progress?: number | null;
-  needs_review: boolean;
-  merge_accepted: boolean;
-  superseded_by?: string | null;
-  forked_from?: string | null;
-  review_owner?: "manual" | "parent";
-  verification_status?:
-    "pending" | "running" | "accepted" | "rejected" | "error" | null;
-  verification_summary?: string | null;
-  verification_round: number;
-  created_at?: string;
-  updated_at?: string;
-}
-export interface Edge {
-  id: string;
-  src: string;
-  dst: string;
-  type: "CONTAINS" | "DEPENDS_ON";
-}
-export interface Artifact {
-  id: string;
-  node_id: string;
-  kind: string;
-  name: string;
-  content?: unknown;
-  ref?: string | null;
-}
-export interface Run {
-  id: string;
-  worker: string;
-  status: string;
-  attempt?: number;
-  summary?: string | null;
-  logs?: string | null;
-  usage?: Usage;
-}
-export interface Usage {
-  input_tokens?: number;
-  cached_input_tokens?: number;
-  output_tokens?: number;
-  cost_usd?: number | null;
-}
-export interface GraphResponse {
-  project_id: string;
-  nodes: GraphNode[];
-  edges: Edge[];
-  artifacts: Artifact[];
-}
 export interface NodeDetail {
   node: GraphNode;
   runs: Run[];
   artifacts: Artifact[];
 }
+
 export interface ModelCapability {
   id: string;
   label: string;
   reasoning?: Reasoning[];
   source?: string;
 }
+
 export interface HarnessCapability {
   id: HarnessId;
   label: string;
@@ -144,19 +85,38 @@ export interface HarnessCapability {
   reasoning: Reasoning[];
   accepts_custom_models: boolean;
 }
+
 export interface Capabilities {
   harnesses: HarnessCapability[];
 }
+
 export interface ProjectsResponse {
-  projects: GraphNode[];
+  projects: Project[];
 }
+
 export interface UsageResponse {
   totals: Usage;
   by_node: Record<string, Usage>;
   by_branch: Record<string, Usage>;
 }
 
-export function isGraphResponse(value: unknown): value is GraphResponse {
+/** Keep run history focused on the human-facing summary, not the protocol envelope. */
+export function cleanRunSummary(summary?: string | null): string {
+  if (!summary) return "";
+  const value = summary.trim();
+  const marker = /```turn-result\s*([\s\S]*?)```/i.exec(value);
+  if (!marker) return value;
+
+  const prefix = value.slice(0, marker.index).trim();
+  const payload = JSON.parse(marker[1].trim()) as { summary?: unknown };
+  if (prefix) return prefix;
+  if (typeof payload.summary !== "string" || !payload.summary.trim()) {
+    throw new Error("run result envelope has no summary");
+  }
+  return payload.summary.trim();
+}
+
+export function isGraph(value: unknown): value is Graph {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   return (

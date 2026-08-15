@@ -1,14 +1,42 @@
 """Runtime configuration for Turn.
 
-All knobs are read from environment variables. SQLite is the default local
-store and requires zero external services; TURN_DATABASE_URL can point the
-same SQLAlchemy store at another database if desired.
+Turn keeps durable preferences in ``./turn/config.json`` by default and keeps
+each project's graph in that project's own ``.turn/state.json`` file.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+REAL_HARNESSES = frozenset({"codex", "claude", "opencode", "pi"})
+TEST_ONLY_PLANNERS = frozenset({"heuristic"})
+TEST_ONLY_EXECUTORS = frozenset({"echo"})
+
+
+def test_modes_enabled() -> bool:
+    return os.getenv("TURN_TEST_MODE", "").lower() in {"1", "true", "yes"}
+
+
+def validate_server_settings(config: "Settings") -> None:
+    """Reject deterministic/test-only modes at the served-app boundary."""
+    if config.planner in TEST_ONLY_PLANNERS:
+        raise RuntimeError(
+            "heuristic planning is test-only; the served app requires TURN_PLANNER=codex"
+        )
+    if config.planner != "codex":
+        raise RuntimeError(
+            f"unsupported planner '{config.planner}'; the served app requires TURN_PLANNER=codex"
+        )
+    if config.default_executor in TEST_ONLY_EXECUTORS:
+        raise RuntimeError(
+            "deterministic Echo execution is test-only; the served app requires a real harness"
+        )
+    if config.default_executor not in REAL_HARNESSES:
+        raise RuntimeError(
+            f"unsupported default executor '{config.default_executor}'; choose a real harness"
+        )
 
 
 def _load_env_file() -> None:
@@ -41,11 +69,8 @@ def _load_env_file() -> None:
 @dataclass
 class Settings:
     # --- storage ---------------------------------------------------------
-    # Postgres example: postgresql+asyncpg://user:pass@localhost:5432/turn
-    database_url: str = field(
-        default_factory=lambda: os.getenv(
-            "TURN_DATABASE_URL", "sqlite+aiosqlite:///./turnloop.db"
-        )
+    data_dir: str = field(
+        default_factory=lambda: os.getenv("TURN_DATA_DIR", str(Path.cwd() / "turn"))
     )
 
     # --- execution -------------------------------------------------------
@@ -69,11 +94,17 @@ class Settings:
     stall_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("TURN_STALL_TIMEOUT", "90"))
     )
+    # A quiet terminal is only considered for cleanup while detached from the
+    # browser. The warning is informational; the reaper is the actual grace
+    # period and never runs while a terminal client is attached.
+    terminal_idle_warning_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TURN_TERMINAL_IDLE_WARNING", "300"))
+    )
+    terminal_idle_reap_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TURN_TERMINAL_IDLE_REAP", "1800"))
+    )
     delay_between_jobs_ms: int = field(
         default_factory=lambda: int(os.getenv("TURN_JOB_DELAY_MS", "0"))
-    )
-    force_sequential: bool = field(
-        default_factory=lambda: os.getenv("TURN_FORCE_SEQUENTIAL", "0").lower() in ("1", "true", "yes")
     )
     retry_backoff_ms: int = field(
         default_factory=lambda: int(os.getenv("TURN_RETRY_BACKOFF_MS", "750"))
@@ -101,7 +132,8 @@ class Settings:
     default_executor: str = field(
         default_factory=lambda: os.getenv("TURN_DEFAULT_EXECUTOR", "codex")
     )
-    # "codex" (Codex-backed, with heuristic fallback) or "heuristic" (offline)
+    # "codex" is the real planner. "heuristic" is opt-in for offline tests;
+    # production never silently substitutes it.
     planner: str = field(
         default_factory=lambda: os.getenv("TURN_PLANNER", "codex")
     )
@@ -120,24 +152,18 @@ class Settings:
 
     # --- repo / resources ------------------------------------------------
     # Where NEW projects are created by default. Each project becomes its own
-    # git repository under this directory (e.g. ./projects/<id>/), so the
-    # user is left with a real, initialized repo they can keep or delete. The
-    # project repo path is recorded on the project's root node (repo_path);
-    # there is no global shared repository to isolate from.
+    # assigned directory under this directory (e.g. ./projects/<id>/). The
+    # default is deliberately repo-local so a local Turn server never creates
+    # project files in a temporary system directory. Version control is
+    # managed by the end user outside Turn.
     projects_dir: str = field(
-        default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", os.getcwd())
+        default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", str(Path.cwd() / "projects"))
     )
 
     # Optional directory of project-local skills / instructions. Files here
     # are inherited by descendant nodes as resources.
     skills_dir: str | None = field(default_factory=lambda: os.getenv("TURN_SKILLS_DIR"))
 
-    # When True, completed nodes are automatically verified by their parent
-    # agent. The parent may accept or reject with same-session feedback; Turn
-    # never silently accepts an unverified merge.
-    auto_accept_merges: bool = field(
-        default_factory=lambda: (os.getenv("TURN_AUTO_ACCEPT_MERGES", "0").lower() in ("1", "true", "yes"))
-    )
 
 
 # A single process-wide settings instance.

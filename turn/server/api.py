@@ -11,20 +11,28 @@ import json
 from pathlib import Path
 import re
 import uuid
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from turn.db.store import Store
-from turn.domain.schemas import AgentConfig, InputSpec, Node, NodeStatus, RunPolicy
+from turn.config import REAL_HARNESSES
+from turn.domain.schemas import AgentConfig, GraphView, InputSpec, Node, NodeStatus, RunPolicy
 from turn.domain.state_machine import present_node, review_blocked_ids
-from turn.graph.logic import evaluate
+from turn.graph.logic import GraphWalker
+from turn.contracts.schema import public_schema
 from turn.runner.runner import Runner
 
 
 router = APIRouter()
+
+
+@router.get("/api/schema")
+async def schema():
+    """Serve the domain contract consumed by generated web clients."""
+    return public_schema()
 
 
 # -- request bodies --------------------------------------------------------
@@ -33,11 +41,11 @@ router = APIRouter()
 class CreateProject(BaseModel):
     prompt: str
     name: Optional[str] = None
-    # "create" -> new empty project repo (or reuse the dir if it is already a
-    # git repo); "open" -> use an EXISTING git repo (e.g. to refactor it).
+    # "create" and "open" both use the supplied directory directly. Version
+    # control is intentionally outside Turn's MVP scope.
     mode: Optional[str] = "create"
-    # Working directory that becomes (or already is) the project's git root.
-    # When omitted in create mode, a repo is made under TURN_PROJECTS_DIR.
+    # Working directory assigned to every worker in the project.
+    # When omitted, a directory is made under TURN_PROJECTS_DIR.
     working_dir: Optional[str] = None
     agent: Optional[AgentConfig] = None
     run_policy: Optional[RunPolicy] = None
@@ -61,12 +69,6 @@ class EditNode(BaseModel):
     required_inputs: Optional[list[InputSpec]] = None
     resource_refs: Optional[list[str]] = None
     agent: Optional[AgentConfig] = None
-    cascade_agent: bool = False
-
-
-class ForkNode(BaseModel):
-    objective: Optional[str] = None
-    generated_prompt: Optional[str] = None
 
 
 class SetMode(BaseModel):
@@ -75,7 +77,6 @@ class SetMode(BaseModel):
 
 class SettingsUpdate(BaseModel):
     default_auto_run: Optional[bool] = None
-    auto_accept_merges: Optional[bool] = None
     theme: Optional[str] = None
     density: Optional[str] = None
     default_harness: Optional[str] = None
@@ -87,7 +88,6 @@ class SettingsUpdate(BaseModel):
     max_retries: Optional[int] = Field(default=None, ge=0, le=20)
     retry_backoff_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     delay_between_jobs_ms: Optional[int] = Field(default=None, ge=0, le=600000)
-    force_sequential: Optional[bool] = None
     retry_choked_models: Optional[bool] = None
 
 
@@ -103,6 +103,23 @@ class RenameProject(BaseModel):
     name: str = Field(min_length=1, max_length=72)
 
 
+def _validate_served_agent(agent: AgentConfig, request: Request) -> None:
+    if (
+        agent.harness.value not in REAL_HARNESSES
+        and not getattr(request.app.state, "test_mode", False)
+    ):
+        raise HTTPException(
+            422,
+            f"harness '{agent.harness.value}' is test-only and is not available in the served app",
+        )
+    from turn.workers.harnesses import validate_agent_capabilities
+
+    try:
+        validate_agent_capabilities(agent)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 # -- helpers ---------------------------------------------------------------
 
 
@@ -112,16 +129,12 @@ def _dump(n: Node):
 
 async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner | None = None) -> dict:
     nodes, edges, artifacts = await store.get_workgraph(project_id)
-    ev = evaluate(nodes, edges)
+    walker = GraphWalker(nodes, edges)
+    ev = walker.evaluate()
     for n in nodes:
         n.progress = ev.progress.get(n.id)
     review_blocked = review_blocked_ids(nodes)
     root = next((n for n in nodes if n.id == project_id), None)
-    review_owner = (
-        "parent"
-        if root and root.run_policy and root.run_policy.review_mode in ("parent", "auto_accept")
-        else "manual"
-    )
     serialized = []
     for n in nodes:
         effective_status = ev.status.get(n.id, n.status)
@@ -135,34 +148,28 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         ):
             effective_status = n.status
         effective = n.model_copy(update={"status": effective_status})
-        node_review_owner = (
-            "manual"
-            if n.verification_status and n.verification_status.value == "error"
-            else review_owner
-        )
         p = present_node(
             effective,
             blocked_reason=ev.blocked_reason.get(n.id),
             subtree_needs_review=n.id in review_blocked and not n.needs_review,
-            review_owner=node_review_owner,
         )
         item = _dump(n)
         item["ui_state"] = p.state.value
         item["allowed_actions"] = [a.value for a in p.actions]
         item["state_reason"] = p.reason
-        item["review_owner"] = node_review_owner
-        terminal = runner.terminal.snapshot(n.id) if runner is not None else {"active": False}
-        # Database RUNNING covers startup, provider generation, parsing and
-        # merge housekeeping. Only a live provider terminal is presented as
-        # generative activity in the graph.
-        item["generation_active"] = bool(terminal.get("active"))
+        # A node shell and an agent harness share a persistent Herdr pane.
+        # Only a runner-owned provider task is generation; an open user shell
+        # must not animate a completed node as if the agent were still working.
+        item["generation_active"] = bool(
+            runner is not None and runner.generation_active(n.id)
+        )
         serialized.append(item)
-    return {
+    return GraphView.model_validate({
         "project_id": str(project_id),
         "nodes": serialized,
         "edges": [e.model_dump(mode="json") for e in edges],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
-    }
+    }).model_dump(mode="json")
 
 
 # -- projects --------------------------------------------------------------
@@ -172,18 +179,11 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
 async def create_project(body: CreateProject, request: Request):
     store: Store = request.app.state.store
     runner: Runner = request.app.state.runner
-    from turn.workers import worktree as wtmod
+    from turn.workers.filesystem import init_project_directory
 
     mode = (body.mode or "create").lower()
-    open_existing = mode == "open"
-    if open_existing and not body.working_dir:
-        raise HTTPException(400, "open mode requires a working_dir (an existing git repo)")
     if body.agent is not None:
-        from turn.workers.harnesses import validate_agent_capabilities
-        try:
-            validate_agent_capabilities(body.agent)
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from error
+        _validate_served_agent(body.agent, request)
 
     decoded_attachments: list[tuple[str, bytes]] = []
     used_names: set[str] = set()
@@ -204,20 +204,17 @@ async def create_project(body: CreateProject, request: Request):
             raise HTTPException(413, f"attachment {attachment.name} exceeds 10 MB")
         decoded_attachments.append((candidate, payload))
 
-    # Each project gets its OWN git repo so the user is left with a real,
-    # initialized repository of their finished work (not a sub-worktree of the
-    # Turn app). The repo path is recorded on the root node.
+    # Each project gets its own assigned directory. Turn never initializes or
+    # manages version control in that directory.
     root_id = uuid.uuid4()
-    repo_path = None
     try:
-        repo_path = wtmod.init_project_repo(
+        repo_path = init_project_directory(
             root_id,
             working_dir=body.working_dir,
-            open_existing=open_existing,
             projects_dir=runner.s.projects_dir,
         )
     except Exception as e:
-        raise HTTPException(400, f"could not initialize project repo: {e}")
+        raise HTTPException(400, f"could not initialize project directory: {e}")
 
     if body.agent is None:
         from turn.config import settings as app_settings
@@ -225,42 +222,45 @@ async def create_project(body: CreateProject, request: Request):
 
         try:
             harness = HarnessKind(await store.get_setting("default_harness", app_settings.default_executor))
-        except ValueError:
-            harness = HarnessKind.CODEX
+        except ValueError as error:
+            raise HTTPException(500, "stored default harness is not supported by the served app") from error
+        if harness.value not in REAL_HARNESSES:
+            raise HTTPException(500, "stored default harness is test-only and cannot be used by the served app")
         try:
             reasoning = ReasoningLevel(await store.get_setting("reasoning", app_settings.default_reasoning))
-        except ValueError:
-            reasoning = ReasoningLevel.DEFAULT
+        except ValueError as error:
+            raise HTTPException(500, "stored reasoning level is not supported") from error
         try:
             permission = PermissionMode(await store.get_setting("permission", app_settings.default_permission))
-        except ValueError:
-            permission = PermissionMode.WORKSPACE
+        except ValueError as error:
+            raise HTTPException(500, "stored permission mode is not supported") from error
         body.agent = AgentConfig(
             harness=harness,
             model=(await store.get_setting("default_model", app_settings.codex_model or "")) or None,
             reasoning=reasoning,
             permission=permission,
         )
-        from turn.workers.harnesses import reasoning_levels_for
-        if body.agent.reasoning.value not in reasoning_levels_for(body.agent.harness, body.agent.model):
-            body.agent.reasoning = ReasoningLevel.DEFAULT
+        _validate_served_agent(body.agent, request)
     if body.run_policy is None:
         from turn.config import settings as app_settings
 
         body.run_policy = RunPolicy(
-            auto_run=str(await store.get_setting("default_auto_run", "1")).lower() not in ("0", "false", ""),
-            force_sequential=app_settings.force_sequential,
+            auto_run=str(await store.get_setting("default_auto_run", "0")).lower() not in ("0", "false", ""),
             delay_between_jobs_ms=app_settings.delay_between_jobs_ms,
             timeout_seconds=app_settings.default_run_timeout_seconds,
             max_retries=app_settings.max_retries,
             retry_backoff_ms=app_settings.retry_backoff_ms,
             retry_choked_models=app_settings.retry_choked_models,
-            review_mode="parent" if app_settings.auto_accept_merges else "manual",
+            review_mode="manual",
         )
     root = await store.create_project(
         body.prompt, name=body.name, repo_path=repo_path, id=root_id,
         agent=body.agent, run_policy=body.run_policy,
     )
+    # A project starts with its durable Herdr shell already allocated. Opening
+    # the inspector later only attaches to this shell; it never creates a new
+    # terminal or starts a harness by itself.
+    await runner.ensure_node_terminal(root.id)
     if decoded_attachments:
         attachment_dir = Path(repo_path) / ".turn" / "attachments"
         attachment_dir.mkdir(parents=True, exist_ok=True)
@@ -284,18 +284,11 @@ async def create_project(body: CreateProject, request: Request):
     }
 
 
-@router.get("/api/projects/{project_id}/graph-inspections")
-async def graph_inspections(project_id: str, request: Request):
-    store: Store = request.app.state.store
-    items = await store.get_graph_inspections(uuid.UUID(project_id))
-    return {"project_id": project_id, "inspections": items}
-
-
 @router.get("/api/settings")
 async def get_settings(request: Request):
     """Return cross-project preferences (e.g. the default auto-run mode)."""
     store: Store = request.app.state.store
-    raw = await store.get_setting("default_auto_run", "1")
+    raw = await store.get_setting("default_auto_run", "0")
     default_auto_run = str(raw) not in ("0", "false", "False", "")
     from turn.config import settings as app_settings
     keys = {
@@ -306,14 +299,12 @@ async def get_settings(request: Request):
     persisted = {k: await store.get_setting(k, v) for k, v in keys.items()}
     return {
         "default_auto_run": default_auto_run,
-        "auto_accept_merges": bool(app_settings.auto_accept_merges),
         **persisted,
         "timeout_seconds": app_settings.default_run_timeout_seconds,
         "stall_timeout_seconds": app_settings.stall_timeout_seconds,
         "max_retries": app_settings.max_retries,
         "retry_backoff_ms": app_settings.retry_backoff_ms,
         "delay_between_jobs_ms": app_settings.delay_between_jobs_ms,
-        "force_sequential": app_settings.force_sequential,
         "retry_choked_models": app_settings.retry_choked_models,
         "projects_dir": str(Path(app_settings.projects_dir).resolve()),
     }
@@ -323,9 +314,14 @@ async def get_settings(request: Request):
 async def update_settings(body: SettingsUpdate, request: Request):
     """Persist a cross-project preference (e.g. the default auto-run mode)."""
     store: Store = request.app.state.store
-    from turn.config import settings as app_settings
+    from turn.config import settings as app_settings, test_modes_enabled
     from turn.workers.harnesses import reasoning_levels_for
     effective_harness = body.default_harness or await store.get_setting("default_harness", app_settings.default_executor)
+    if effective_harness not in REAL_HARNESSES and not test_modes_enabled():
+        raise HTTPException(
+            422,
+            f"harness '{effective_harness}' is test-only and is not available in the served app",
+        )
     effective_model = body.default_model if body.default_model is not None else await store.get_setting("default_model", app_settings.codex_model or "")
     effective_reasoning = body.reasoning or await store.get_setting("reasoning", app_settings.default_reasoning)
     supported = reasoning_levels_for(effective_harness, effective_model)
@@ -337,10 +333,6 @@ async def update_settings(body: SettingsUpdate, request: Request):
         )
     if body.default_auto_run is not None:
         await store.set_setting("default_auto_run", "1" if body.default_auto_run else "0")
-    if body.auto_accept_merges is not None:
-        await store.set_setting("auto_accept_merges", "1" if body.auto_accept_merges else "0")
-        # Keep the runner's live view of the option in sync with the persisted value.
-        app_settings.auto_accept_merges = bool(body.auto_accept_merges)
     for key in ("theme", "density", "default_harness", "default_model", "reasoning", "permission"):
         value = getattr(body, key)
         if value is not None:
@@ -359,7 +351,6 @@ async def update_settings(body: SettingsUpdate, request: Request):
         "max_retries": "max_retries",
         "retry_backoff_ms": "retry_backoff_ms",
         "delay_between_jobs_ms": "delay_between_jobs_ms",
-        "force_sequential": "force_sequential",
         "retry_choked_models": "retry_choked_models",
     }
     for incoming, target in live_fields.items():
@@ -372,26 +363,33 @@ async def update_settings(body: SettingsUpdate, request: Request):
 
 @router.get("/api/capabilities")
 async def capabilities():
-    from turn.config import settings as app_settings
+    from turn.config import settings as app_settings, test_modes_enabled
     from turn.workers.harnesses import harness_capabilities
 
     harnesses = await asyncio.to_thread(
         harness_capabilities,
         {"codex": app_settings.codex_model or ""},
+        {"codex": app_settings.codex_binary},
     )
-    if app_settings.default_executor == "echo":
+    if test_modes_enabled():
         harnesses.append({
             "id": "echo", "label": "Echo · offline", "binary": "internal",
-            "reasoning": ["default"], "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "internal"}],
+            "reasoning": ["default"],
+            "models": [{
+                "id": "deterministic",
+                "label": "Deterministic",
+                "reasoning": ["default"],
+                "source": "internal",
+            }],
             "supports_sessions": False, "supports_tools": False,
-            "accepts_custom_models": False, "reasoning_profiles": [], "available": True,
+            "accepts_custom_models": False, "reasoning_profiles": [],
+            "available": True,
         })
     return {
         "harnesses": harnesses,
         "agent_types": [
             {"id": "planner", "label": "Planner"},
-            {"id": "general", "label": "General agent"},
-            {"id": "validator", "label": "Validator", "future": True},
+            {"id": "executor", "label": "Executor"},
         ],
         # This describes a registry seam, not selectable/rendered output types
         # in the current MVP. Keep that boundary machine-readable so clients
@@ -428,6 +426,7 @@ async def clear_projects(request: Request):
     runner: Runner = request.app.state.runner
     for project in await store.list_projects():
         await runner.cancel_project_runs(project.id)
+        await runner.close_project_workspace(project.id)
     await store.clear_projects()
     runner.wake()
     return {"ok": True}
@@ -439,6 +438,7 @@ async def delete_project(project_id: str, request: Request):
     runner: Runner = request.app.state.runner
     pid = uuid.UUID(project_id)
     await runner.cancel_project_runs(pid)
+    await runner.close_project_workspace(pid)
     await store.delete_project(pid)
     runner.wake()
     return {"ok": True}
@@ -487,7 +487,8 @@ async def set_project_policy(project_id: str, body: ProjectPolicyUpdate, request
 async def project_usage(project_id: str, request: Request):
     store: Store = request.app.state.store
     pid = uuid.UUID(project_id)
-    nodes, _, _ = await store.get_workgraph(pid)
+    nodes, edges, _ = await store.get_workgraph(pid)
+    walker = GraphWalker(nodes, edges)
     runs = await store.get_project_runs(pid)
     totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     by_node = {}
@@ -504,17 +505,16 @@ async def project_usage(project_id: str, request: Request):
         if run.usage.cost_usd is not None:
             row["cost_usd"] += run.usage.cost_usd
             totals["cost_usd"] += run.usage.cost_usd
-    parent_of = {str(node.id): str(node.parent_id) if node.parent_id else None for node in nodes}
     by_branch = {}
     for node in nodes:
         branch = {**totals, "runs": 0}
         branch.update({key: 0 for key in totals})
         member = str(node.id)
         for candidate_id, usage in by_node.items():
-            cursor = candidate_id
-            while cursor is not None and cursor != member:
-                cursor = parent_of.get(cursor)
-            if cursor == member:
+            if candidate_id == member or any(
+                str(ancestor.id) == member
+                for ancestor in walker.ancestors(uuid.UUID(candidate_id))
+            ):
                 branch["runs"] += usage["runs"]
                 for key in totals:
                     branch[key] += usage[key]
@@ -575,40 +575,144 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, default=str)}\n\n"
 
 
-@router.websocket("/api/nodes/{node_id}/terminal")
-async def terminal_socket(websocket: WebSocket, node_id: str):
-    """Bridge xterm to the active provider-neutral terminal transport."""
+async def _pty_socket(
+    websocket: WebSocket,
+    node_id: str,
+    transport,
+    cleanup: Callable[[], Awaitable[object]] | None = None,
+) -> None:
+    """Serve a raw PTY without interpreting or reformatting its bytes."""
+
+    def input_bytes(message: dict) -> str | bytes:
+        data = message.get("data") or ""
+        if message.get("encoding") != "base64":
+            return str(data)
+        try:
+            return base64.b64decode(str(data), validate=True)
+        except (ValueError, TypeError):
+            return b""
+
     await websocket.accept()
-    runner: Runner = websocket.scope["app"].state.runner
     nid = uuid.UUID(node_id)
-    queue = runner.terminal.subscribe(nid)
-    snapshot = runner.terminal.snapshot(nid)
-    await websocket.send_json({"type": "snapshot", **snapshot})
-
-    async def send_output():
-        while True:
-            chunk = await queue.get()
-            if not chunk:
-                await websocket.send_json({"type": "status", "active": False})
-                return
-            await websocket.send_json({"type": "output", "data": chunk})
-
-    sender = asyncio.create_task(send_output())
+    queue = transport.subscribe(nid)
+    sender = None
+    status_sender = None
     try:
+        # Establish the terminal dimensions before replaying a full-screen
+        # snapshot. The timeout keeps the endpoint compatible with simple
+        # clients that only want a read-only transcript.
+        first_message = None
+        try:
+            first_message = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        requested_resize = None
+        if isinstance(first_message, dict):
+            message_type = first_message.get("type")
+            if message_type == "resize":
+                requested_resize = (
+                    int(first_message.get("cols") or 80),
+                    int(first_message.get("rows") or 24),
+                )
+            elif message_type == "input":
+                await transport.write(nid, input_bytes(first_message))
+
+        if requested_resize is not None:
+            await transport.resize(nid, *requested_resize)
+            # Give a full-screen CLI one event-loop turn to consume SIGWINCH
+            # and repaint. Snapshot only after this so xterm never replays a
+            # screen captured at the old 80x24 geometry before it is resized.
+            await asyncio.sleep(0.1)
+
+        # Persistent terminal backends may provide a canonical replay before
+        # the browser receives its first snapshot. Other transports simply do
+        # not implement it.
+        refresh_snapshot = getattr(transport, "refresh_snapshot_from_persistent_pane", None)
+        if refresh_snapshot is not None:
+            await refresh_snapshot(nid)
+        snapshot = transport.snapshot(nid)
+        # All bytes currently in the subscription queue are included in the
+        # snapshot. Drain only before the first await; bytes emitted during the
+        # network send remain queued and are delivered exactly once afterward.
+        while not queue.empty():
+            queue.get_nowait()
+        await websocket.send_json({"type": "snapshot", **snapshot})
+
+        async def send_output():
+            while True:
+                chunk = await queue.get()
+                if not chunk:
+                    await websocket.send_json({"type": "status", "active": False})
+                    return
+                await websocket.send_json({"type": "output", "data": chunk})
+
+        sender = asyncio.create_task(send_output())
+
+        async def send_status():
+            try:
+                while True:
+                    await asyncio.sleep(5)
+                    await websocket.send_json({"type": "status", **transport.snapshot(nid)})
+            except (WebSocketDisconnect, RuntimeError):
+                return
+
+        status_sender = asyncio.create_task(send_status())
         while True:
             message = await websocket.receive_json()
             if message.get("type") == "input":
-                await runner.terminal.write(nid, str(message.get("data") or ""))
+                await transport.write(nid, input_bytes(message))
             elif message.get("type") == "resize":
-                await runner.terminal.resize(
+                await transport.resize(
                     nid, int(message.get("cols") or 80), int(message.get("rows") or 24)
                 )
     except WebSocketDisconnect:
         pass
     finally:
-        sender.cancel()
-        await asyncio.gather(sender, return_exceptions=True)
-        runner.terminal.unsubscribe(nid, queue)
+        if sender is not None:
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+        if status_sender is not None:
+            status_sender.cancel()
+            await asyncio.gather(status_sender, return_exceptions=True)
+        transport.unsubscribe(nid, queue)
+        if cleanup is not None:
+            await cleanup()
+
+
+@router.websocket("/api/nodes/{node_id}/terminal")
+async def terminal_socket(websocket: WebSocket, node_id: str):
+    """Expose the provider's raw PTY stream."""
+    runner: Runner = websocket.scope["app"].state.runner
+    await _pty_socket(websocket, node_id, runner.terminal)
+
+
+@router.websocket("/api/nodes/{node_id}/shell")
+async def shell_socket(websocket: WebSocket, node_id: str):
+    """Open a standalone interactive shell in the assigned project directory."""
+    runner: Runner = websocket.scope["app"].state.runner
+    nid = uuid.UUID(node_id)
+    if not await runner.open_shell(nid):
+        await websocket.close(code=1011, reason="project directory unavailable")
+        return
+    async def cleanup_shell() -> bool:
+        # A websocket disappearing is a detach, not an explicit close. This
+        # keeps the Herdr-backed shell available for reconnects and server
+        # restarts without allowing a stale browser tab to kill user work.
+        # Only the last viewer is allowed to release the server-side PTY;
+        # another tab or a short-lived diagnostic client must not interrupt
+        # the terminal that remains visible to the user.
+        if runner.shell.snapshot(nid).get("subscribers", 0) > 0:
+            return False
+        return await runner.detach_shell(nid)
+
+    await _pty_socket(websocket, node_id, runner.shell, cleanup_shell)
+
+
+@router.post("/api/nodes/{node_id}/shell/close")
+async def close_shell(node_id: str, request: Request):
+    """Explicitly close a user terminal and its persistent shell session."""
+    runner: Runner = request.app.state.runner
+    return {"ok": await runner.close_shell(uuid.UUID(node_id))}
 
 
 # -- node detail -----------------------------------------------------------
@@ -649,11 +753,7 @@ async def provide_input(node_id: str, body: ProvideInput, request: Request):
 @router.post("/api/nodes/{node_id}/edit")
 async def edit_node(node_id: str, body: EditNode, request: Request):
     if body.agent is not None:
-        from turn.workers.harnesses import validate_agent_capabilities
-        try:
-            validate_agent_capabilities(body.agent)
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from error
+        _validate_served_agent(body.agent, request)
     runner = await _runner(request)
     await runner.edit_node(
         uuid.UUID(node_id),
@@ -662,7 +762,6 @@ async def edit_node(node_id: str, body: EditNode, request: Request):
         required_inputs=body.required_inputs,
         resource_refs=body.resource_refs,
         agent=body.agent,
-        cascade_agent=body.cascade_agent,
     )
     return {"ok": True}
 
@@ -670,19 +769,8 @@ async def edit_node(node_id: str, body: EditNode, request: Request):
 @router.post("/api/nodes/{node_id}/regenerate")
 async def regenerate(node_id: str, request: Request):
     runner = await _runner(request)
-    result = await runner.regenerate_descendants(uuid.UUID(node_id))
+    result = await runner.regenerate_descendants(uuid.UUID(node_id), fresh_session=True)
     return {"ok": True, **result}
-
-
-@router.post("/api/nodes/{node_id}/fork")
-async def fork(node_id: str, request: Request, body: ForkNode | None = None):
-    runner = await _runner(request)
-    fork = await runner.fork(
-        uuid.UUID(node_id),
-        objective=body.objective if body else None,
-        generated_prompt=body.generated_prompt if body else None,
-    )
-    return {"ok": True, "fork_id": str(fork.id) if fork else None}
 
 
 @router.post("/api/nodes/{node_id}/retry")
@@ -690,6 +778,18 @@ async def retry(node_id: str, request: Request):
     runner = await _runner(request)
     await runner.retry(uuid.UUID(node_id))
     return {"ok": True}
+
+
+@router.post("/api/nodes/{node_id}/reconnect")
+async def reconnect(node_id: str, request: Request):
+    runner = await _runner(request)
+    return {"ok": await runner.reconnect(uuid.UUID(node_id))}
+
+
+@router.post("/api/nodes/{node_id}/terminal/close")
+async def close_terminal(node_id: str, request: Request):
+    runner = await _runner(request)
+    return {"ok": await runner.close_provider_terminal(uuid.UUID(node_id))}
 
 
 @router.post("/api/nodes/{node_id}/pause")
@@ -736,8 +836,7 @@ class RejectBody(BaseModel):
 
 @router.post("/api/nodes/{node_id}/accept")
 async def accept_merge(node_id: str, request: Request):
-    """Accept a merged node: keep the merged result (already in the parent)
-    and delete this node's redundant subtree worktree to reclaim space."""
+    """Accept a reviewed node without changing project files."""
     runner = await _runner(request)
     await runner.accept_merge(uuid.UUID(node_id))
     return {"ok": True}

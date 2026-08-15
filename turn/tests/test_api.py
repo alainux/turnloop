@@ -16,23 +16,25 @@ from turn.server.api import router
 from turn.workers.echo_worker import EchoWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
+from turn.tests.fakes import FakeHerdrAdapter
 
 
 async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path):
     cfg = Settings()
     cfg.projects_dir = str(tmp_path / "projects")
     cfg.default_executor = "echo"
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'turn.db'}")
+    store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
     registry.register(EchoWorker())
     registry.register_planner(HeuristicPlanner("echo"))
-    runner = Runner(store, registry, EventBus(), cfg)
+    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=FakeHerdrAdapter())
     app = FastAPI()
     app.include_router(router)
     app.state.store = store
     app.state.runner = runner
     app.state.events = runner.events
+    app.state.test_mode = True
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         caps = (await client.get("/api/capabilities")).json()
@@ -48,8 +50,8 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         created = await client.post("/api/projects", json={
             "name": "Inspectable demo",
             "prompt": "Build an inspectable demo",
-            "agent": {"harness": "echo", "type_id": "general"},
-            "run_policy": {"auto_run": False, "force_sequential": True, "delay_between_jobs_ms": 25},
+            "agent": {"harness": "echo", "type_id": "executor"},
+            "run_policy": {"auto_run": False, "delay_between_jobs_ms": 25},
             "attachments": [
                 {"name": "brief.txt", "mime": "text/plain", "content_base64": base64.b64encode(b"immutable project context").decode()},
                 {"name": "brief.txt", "mime": "text/plain", "content_base64": base64.b64encode(b"second copy").decode()},
@@ -70,7 +72,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert {Path(ref).name for ref in root["resource_refs"]} == {"brief.txt", "brief-2.txt"}
         assert all(Path(ref).is_file() for ref in root["resource_refs"])
         policy = root["run_policy"]
-        assert policy["force_sequential"] is True and policy["delay_between_jobs_ms"] == 25
+        assert "force_sequential" not in policy and policy["delay_between_jobs_ms"] == 25
         renamed = await client.patch(f"/api/projects/{pid}", json={"name": "Renamed demo"})
         assert renamed.status_code == 200
         renamed_root = renamed.json()["project"]
@@ -79,6 +81,9 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert renamed_root["generated_prompt"] == "Build an inspectable demo"
         root_node = await store.get_node(uuid.UUID(pid))
         run = await store.create_run(root_node, "echo")
+        await store.update_run(run.id, session_id="live-session")
+        live_run = (await store.get_runs(root_node.id))[0]
+        assert live_run.session_id == "live-session" and live_run.ended_at is None
         await store.update_run(
             run.id,
             status=RunStatus.COMPLETE,
@@ -113,5 +118,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert branch.status_code == 200
         node = (await client.get(f"/api/nodes/{pid}")).json()["node"]
         assert node["ui_state"] == "paused"
+        await runner.close_project_workspace(root_node.id)
+        await store.delete_project(root_node.id)
     await runner.stop()
     await store.dispose()

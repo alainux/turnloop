@@ -1,6 +1,6 @@
 """Pure UI/lifecycle projection for nodes.
 
-The database stores execution facts (status, paused, review flags).  This
+The local state store records execution facts (status, paused, review flags).  This
 module is the single policy that turns those facts into coherent user-visible
 states and permitted actions.  Both REST responses and tests use it, keeping
 the browser free of orchestration guesses.
@@ -8,39 +8,12 @@ the browser free of orchestration guesses.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 
-from turn.domain.schemas import Node, NodeStatus, VerificationStatus
-
-
-class UIState(str, Enum):
-    QUEUED = "queued"
-    READY = "ready"
-    RUNNING = "running"
-    PAUSED = "paused"
-    WAITING_INPUT = "waiting_input"
-    WAITING_DEPENDENCY = "waiting_dependency"
-    REVIEW = "review"
-    VERIFYING = "verifying"
-    ACCEPTED = "accepted"
-    COMPLETE = "complete"
-    CONTAINER = "container"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+from turn.domain.schemas import Node, NodeAction, NodeStatus, NodeUIState
 
 
-class Action(str, Enum):
-    RUN = "run"
-    PAUSE = "pause"
-    RESUME = "resume"
-    CANCEL = "cancel"
-    RETRY = "retry"
-    EDIT = "edit"
-    REGENERATE = "regenerate"
-    FORK = "fork"
-    ACCEPT = "accept"
-    REJECT = "reject"
-    PROVIDE_INPUT = "provide_input"
+UIState = NodeUIState
+Action = NodeAction
 
 
 @dataclass(frozen=True)
@@ -55,34 +28,21 @@ def present_node(
     *,
     blocked_reason: str | None = None,
     subtree_needs_review: bool = False,
-    review_owner: str = "manual",
 ) -> NodePresentation:
     """Project one node into a stable UI state and guarded action set."""
-    common = (Action.EDIT, Action.REGENERATE, Action.FORK)
-    if (
-        node.needs_review
-        and not node.merge_accepted
-        and node.verification_status == VerificationStatus.RUNNING
-    ):
-        return NodePresentation(
-            UIState.VERIFYING,
-            common,
-            "Parent agent is inspecting evidence and running focused checks",
-        )
+    common = (Action.EDIT, Action.REGENERATE)
     if node.needs_review and not node.merge_accepted:
-        actions = (Action.ACCEPT, Action.REJECT, *common) if review_owner == "manual" else common
-        reason = (
-            "Waiting for your review"
-            if review_owner == "manual"
-            else "Parent agent is queued to verify this result"
+        return NodePresentation(
+            UIState.REVIEW,
+            (Action.ACCEPT, Action.REJECT, *common),
+            "Waiting for your review",
         )
-        return NodePresentation(UIState.REVIEW, actions, reason)
     if subtree_needs_review:
         return NodePresentation(UIState.REVIEW, common, "A descendant awaits review")
     if node.paused:
         # Resuming never implicitly resets completion or acceptance. The runner
         # will only schedule it when the graph evaluation says it is runnable.
-        return NodePresentation(UIState.PAUSED, (Action.RESUME, Action.CANCEL, *common))
+        return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
     if node.status == NodeStatus.RUNNING:
         return NodePresentation(UIState.RUNNING, (Action.CANCEL,))
     if node.status == NodeStatus.FAILED:
@@ -94,23 +54,23 @@ def present_node(
     if node.status == NodeStatus.COMPLETE:
         return NodePresentation(UIState.COMPLETE, common)
     if node.status == NodeStatus.EXPANDED:
-        return NodePresentation(UIState.CONTAINER, (Action.PAUSE, Action.CANCEL, *common))
+        return NodePresentation(UIState.CONTAINER, (Action.PAUSE, *common))
     missing = [i for i in node.required_inputs if i.satisfied_by is None]
     if missing:
         return NodePresentation(
             UIState.WAITING_INPUT,
-            (Action.PROVIDE_INPUT, Action.PAUSE, Action.CANCEL, *common),
+            (Action.PROVIDE_INPUT, Action.PAUSE, *common),
             f"Needs {len(missing)} human input{'s' if len(missing) != 1 else ''}",
         )
     if node.status == NodeStatus.BLOCKED:
         return NodePresentation(
             UIState.WAITING_DEPENDENCY,
-            (Action.PAUSE, Action.CANCEL, *common),
+            (Action.PAUSE, *common),
             blocked_reason,
         )
     if node.status == NodeStatus.RUNNABLE:
-        return NodePresentation(UIState.READY, (Action.RUN, Action.PAUSE, Action.CANCEL, *common))
-    return NodePresentation(UIState.QUEUED, (Action.PAUSE, Action.CANCEL, *common))
+        return NodePresentation(UIState.READY, (Action.RUN, Action.PAUSE, *common))
+    return NodePresentation(UIState.QUEUED, (Action.PAUSE, *common))
 
 
 def review_blocked_ids(nodes: list[Node]) -> set:

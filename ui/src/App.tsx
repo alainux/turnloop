@@ -1,26 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import type {
-  AgentConfig,
+  Agent,
   Capabilities,
   GraphNode,
-  GraphResponse,
+  Graph,
   HarnessId,
+  Project,
   ProjectsResponse,
   Reasoning,
   RunPolicy,
   UsageResponse,
 } from "./domain";
-import { isGraphResponse, tokens } from "./domain";
+import {
+  isGraph,
+  primaryNodeAction,
+  primaryNodeActionLabel,
+  tokens,
+} from "./domain";
 import { api, json } from "./api";
-import { Graph } from "./components/Graph";
+import { Graph as GraphCanvas } from "./components/Graph";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
 import { ModelControl } from "./components/ModelControl";
 import { deriveStatus } from "./state";
 
 const defaultPolicy: RunPolicy = {
-  auto_run: true,
-  force_sequential: false,
+  auto_run: false,
   delay_between_jobs_ms: 0,
   timeout_seconds: 600,
   stall_timeout_seconds: 90,
@@ -30,7 +36,8 @@ const defaultPolicy: RunPolicy = {
   compact_on_context_pressure: true,
   review_mode: "manual",
 };
-const emptyAgent: AgentConfig = {
+const emptyAgent: Agent = {
+  id: crypto.randomUUID(),
   type_id: "planner",
   harness: "codex",
   model: null,
@@ -42,28 +49,122 @@ const emptyAgent: AgentConfig = {
   session_id: null,
 };
 
+type ResizeTarget = "sidebar" | "inspector";
+
+function usePanelResize() {
+  const [sidebarWidth, setSidebarWidth] = useState(236);
+  const [inspectorWidth, setInspectorWidth] = useState(360);
+  const [resizing, setResizing] = useState<ResizeTarget | null>(null);
+
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (event: PointerEvent) => {
+      if (resizing === "sidebar") {
+        setSidebarWidth(Math.min(420, Math.max(180, event.clientX)));
+      } else {
+        setInspectorWidth(
+          Math.min(520, Math.max(280, window.innerWidth - event.clientX)),
+        );
+      }
+    };
+    const stop = () => setResizing(null);
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", stop, { once: true });
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", stop);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [resizing]);
+
+  const beginResize = (target: ResizeTarget, event: React.PointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setResizing(target);
+  };
+
+  const adjustResize = (target: ResizeTarget, delta: number) => {
+    if (target === "sidebar") {
+      setSidebarWidth((value) => Math.min(420, Math.max(180, value + delta)));
+    } else {
+      setInspectorWidth((value) => Math.min(520, Math.max(280, value + delta)));
+    }
+  };
+
+  return {
+    sidebarWidth,
+    inspectorWidth,
+    resizing,
+    beginResize,
+    adjustResize,
+  };
+}
+
+function ResizeHandle({
+  target,
+  value,
+  onResize,
+  onAdjust,
+}: {
+  target: ResizeTarget;
+  value: number;
+  onResize: (target: ResizeTarget, event: React.PointerEvent) => void;
+  onAdjust: (target: ResizeTarget, delta: number) => void;
+}) {
+  const label = target === "sidebar" ? "Projects panel width" : "Inspector panel width";
+  return (
+    <div
+      className={`resize-handle ${target}-resize`}
+      role="separator"
+      aria-label={label}
+      aria-orientation="vertical"
+      aria-valuemin={target === "sidebar" ? 180 : 280}
+      aria-valuemax={target === "sidebar" ? 420 : 520}
+      aria-valuenow={value}
+      tabIndex={0}
+      onPointerDown={(event) => onResize(target, event)}
+      onKeyDown={(event) => {
+        const direction = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+        if (!direction) return;
+        event.preventDefault();
+        const step = event.shiftKey ? 40 : 10;
+        onAdjust(target, direction * step * (target === "sidebar" ? 1 : -1));
+      }}
+    >
+      <span />
+    </div>
+  );
+}
+
 export default function App() {
-  const [projects, setProjects] = useState<GraphNode[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
-  const [graph, setGraph] = useState<GraphResponse | null>(null);
+  const [graph, setGraph] = useState<Graph | null>(null);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
+  const graphLoadVersion = useRef(0);
   const [capabilities, setCapabilities] = useState<Capabilities>({
     harnesses: [],
   });
+  const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown> | null>(null);
+  const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
-  const [toast, setToast] = useState("");
   const [connected, setConnected] = useState(false);
+  const { sidebarWidth, inspectorWidth, beginResize, adjustResize } = usePanelResize();
   const [nodeMenu, setNodeMenu] = useState<{
     node: GraphNode;
     x: number;
     y: number;
   } | null>(null);
   const notify = useCallback((text: string) => {
-    setToast(text);
-    window.setTimeout(() => setToast(""), 3200);
+    // Terminal sessions are the conversation surface. Keep failures visible
+    // to developers without interrupting the workgraph with transient toasts.
+    console.error(`[Turn] ${text}`);
   }, []);
   const loadProjects = useCallback(async () => {
     const result = await api<ProjectsResponse>("/api/projects");
@@ -71,28 +172,35 @@ export default function App() {
   }, []);
   const loadGraph = useCallback(async () => {
     if (!projectId) return;
+    const version = ++graphLoadVersion.current;
     const [next, nextUsage] = await Promise.all([
       api<unknown>(`/api/projects/${projectId}/graph`),
       api<UsageResponse>(`/api/projects/${projectId}/usage`),
     ]);
-    if (!isGraphResponse(next))
+    if (version !== graphLoadVersion.current) return;
+    if (!isGraph(next))
       throw new Error("Server returned an invalid graph schema");
     setGraph(next);
     setUsage(nextUsage);
     await loadProjects();
   }, [projectId, loadProjects]);
   useEffect(() => {
+    setCapabilitiesLoading(true);
     void Promise.all([
       loadProjects(),
       api<Capabilities>("/api/capabilities").then(setCapabilities),
-      api<Record<string, unknown>>("/api/settings").then(applyAppearance),
-    ]).catch((error) => notify(String(error)));
+      api<Record<string, unknown>>("/api/settings").then((value) => {
+        setWorkspaceSettings(value);
+        applyAppearance(value);
+      }),
+    ])
+      .catch((error) => notify(String(error)))
+      .finally(() => setCapabilitiesLoading(false));
   }, [loadProjects, notify]);
   useEffect(() => {
+    setSelected(null);
+    setPolicyOpen(false);
     if (!projectId) {
-      setGraph(null);
-      setUsage(null);
-      setSelected(null);
       return;
     }
     void loadGraph();
@@ -101,7 +209,18 @@ export default function App() {
     stream.onerror = () => setConnected(false);
     stream.onmessage = (event) => {
       try {
-        const message = JSON.parse(event.data) as { type?: string };
+        const message = JSON.parse(event.data) as {
+          type?: string;
+          project_id?: string;
+        };
+        if (message.type === "project.deleted" && message.project_id === projectId) {
+          setProjectId(null);
+          setSelected(null);
+          setGraph(null);
+          setUsage(null);
+          void loadProjects();
+          return;
+        }
         if (message.type !== "heartbeat" && message.type !== "node.terminal")
           void loadGraph();
       } catch {
@@ -110,6 +229,12 @@ export default function App() {
     };
     return () => stream.close();
   }, [projectId, loadGraph]);
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void loadProjects();
+    }, 2000);
+    return () => window.clearInterval(interval);
+  }, [loadProjects]);
   useEffect(() => {
     const listener = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
@@ -137,12 +262,23 @@ export default function App() {
       removeEventListener("keydown", key);
     };
   }, [nodeMenu]);
-  const root = graph?.nodes.find((node) => node.id === projectId);
-  const status = deriveStatus(graph?.nodes ?? []);
+  const graphReady = Boolean(projectId && graph?.project_id === projectId);
+  const root = graphReady
+    ? graph?.nodes.find((node) => node.id === projectId)
+    : undefined;
+  const selectedProject = projects.find((node) => node.id === projectId);
+  const projectTitle = root || selectedProject;
+  const status = deriveStatus(graphReady ? graph?.nodes ?? [] : []);
   return (
     <div
       id="app-shell"
       className={`${sidebar ? "" : "sidebar-collapsed"} ${selected ? "inspector-open" : ""}`}
+      style={
+        {
+          "--sidebar-w": `${sidebarWidth}px`,
+          "--inspector-w": `${inspectorWidth}px`,
+        } as CSSProperties
+      }
     >
       <header className="titlebar">
         <button
@@ -182,34 +318,55 @@ export default function App() {
         open={sidebar}
         onSelect={setProjectId}
         onChanged={loadProjects}
+        onDeleted={(id) => {
+          if (id === projectId) {
+            setProjectId(null);
+            setGraph(null);
+            setSelected(null);
+          }
+        }}
         notify={notify}
       />
+      {sidebar && (
+        <ResizeHandle
+          target="sidebar"
+          value={sidebarWidth}
+          onResize={beginResize}
+          onAdjust={adjustResize}
+        />
+      )}
       <main className="workspace">
-        {projectId && graph && root ? (
+        {projectId ? (
           <section id="graph-view" className="graph-view">
             <div className="workspace-toolbar">
               <div className="project-title">
                 <div className="project-title-copy">
-                  <strong>{root.project_name || root.objective}</strong>
-                  <small>{root.repo_path || "Current directory"}</small>
+                  <strong>
+                    {projectTitle?.project_name || projectTitle?.objective || "Loading project…"}
+                  </strong>
+                  <small className="project-path" title="Project directory">
+                    {projectTitle?.repo_path || "Current directory"}
+                  </small>
                 </div>
               </div>
               <div className="toolbar-actions">
                 <div className="segmented">
                   <button
-                    className={root.run_policy?.auto_run ? "selected" : ""}
+                    className={root?.run_policy?.auto_run ? "selected" : ""}
+                    disabled={!root}
                     onClick={() => void setMode(projectId, true, loadGraph)}
                   >
                     Auto
                   </button>
                   <button
-                    className={!root.run_policy?.auto_run ? "selected" : ""}
+                    className={root && !root.run_policy?.auto_run ? "selected" : ""}
+                    disabled={!root}
                     onClick={() => void setMode(projectId, false, loadGraph)}
                   >
                     Step
                   </button>
                 </div>
-                {!root.run_policy?.auto_run && (
+                {root && !root.run_policy?.auto_run && (
                   <button
                     className="button accent"
                     onClick={() =>
@@ -223,6 +380,7 @@ export default function App() {
                 )}
                 <button
                   className="icon-button"
+                  disabled={!root}
                   onClick={() => setPolicyOpen(true)}
                   aria-label="Project execution policy"
                 >
@@ -230,25 +388,33 @@ export default function App() {
                 </button>
               </div>
             </div>
-            <div id="graph" className="graph">
-              <Graph
-                nodes={graph.nodes.filter((node) => !node.superseded_by)}
-                edges={graph.edges}
-                usage={usage?.by_node ?? {}}
-                selected={selected}
-                onSelect={setSelected}
-                onRun={(node) =>
-                  void api(`/api/nodes/${node.id}/run`, { method: "POST" })
-                    .then(loadGraph)
-                    .catch((error) => notify(String(error)))
-                }
-                onContextMenu={(node, x, y) => setNodeMenu({ node, x, y })}
-              />
-            </div>
+            {graphReady && root ? (
+              <div id="graph" className="graph">
+                <GraphCanvas
+                  nodes={graph!.nodes}
+                  edges={graph!.edges}
+                  usage={usage?.by_node ?? {}}
+                  selected={selected}
+                  onSelect={setSelected}
+                  onRun={(node, action) =>
+                    void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
+                      .then(loadGraph)
+                      .catch((error) => notify(String(error)))
+                  }
+                  onContextMenu={(node, x, y) => setNodeMenu({ node, x, y })}
+                />
+              </div>
+            ) : (
+              <div className="project-loading" aria-live="polite">
+                Loading project…
+              </div>
+            )}
           </section>
         ) : (
           <Author
             capabilities={capabilities}
+            capabilitiesLoading={capabilitiesLoading}
+            workspaceSettings={workspaceSettings}
             onCreated={(id) => {
               setProjectId(id);
               void loadProjects();
@@ -258,19 +424,31 @@ export default function App() {
         )}
       </main>
       {selected && (
-        <Inspector
-          nodeId={selected}
-          refreshKey={(() => {
-            const node = graph?.nodes.find((item) => item.id === selected);
-            return node
-              ? `${node.updated_at}:${node.status}:${node.generation_active}:${node.verification_status}`
-              : selected;
-          })()}
-          capabilities={capabilities.harnesses}
-          onClose={() => setSelected(null)}
-          onChanged={loadGraph}
-          notify={notify}
-        />
+        <>
+          <ResizeHandle
+            target="inspector"
+            value={inspectorWidth}
+            onResize={beginResize}
+            onAdjust={adjustResize}
+          />
+          <Inspector
+            nodeId={selected}
+            refreshKey={(() => {
+              const node = graph?.nodes.find((item) => item.id === selected);
+              return node
+                // Dependency evaluation can change the projected UI state
+                // without changing the node's persisted timestamp. Include
+                // that projection so a selected inspector never keeps saying
+                // "waiting dependency" after its parents complete.
+                ? `${node.updated_at}:${node.status}:${node.ui_state}:${node.state_reason}:${node.generation_active}`
+                : selected;
+            })()}
+            capabilities={capabilities.harnesses}
+            onClose={() => setSelected(null)}
+            onChanged={loadGraph}
+            notify={notify}
+          />
+        </>
       )}
       <footer className="statusbar">
         <span>{status}</span>
@@ -282,7 +460,7 @@ export default function App() {
               : "Ready"}
         </span>
         <span className="status-spacer" />
-        {graph && (
+        {graphReady && graph && (
           <>
             <span>{graph.nodes.length} nodes</span>
             <span>{tokens(usage?.totals).toLocaleString()} tokens</span>
@@ -322,45 +500,29 @@ export default function App() {
           >
             <Icon name="panel-right-close" /> Inspect node
           </button>
-          {nodeMenu.node.allowed_actions.includes("run") && (
+          {primaryNodeAction(nodeMenu.node) && primaryNodeAction(nodeMenu.node) !== "cancel" && (
             <button
               role="menuitem"
               onClick={() => {
                 const node = nodeMenu.node;
                 setNodeMenu(null);
-                void api(`/api/nodes/${node.id}/run`, { method: "POST" })
+                const action = primaryNodeAction(node);
+                if (!action || action === "cancel") return;
+                if (
+                  action === "regenerate" &&
+                  !confirm(
+                    "Run this planner again and replace its entire descendant tree? This cannot be undone.",
+                  )
+                )
+                  return;
+                void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
                   .then(loadGraph)
                   .catch((error) => notify(String(error)));
               }}
             >
-              <Icon name="circle-play" /> Run node
+              <Icon name="circle-play" /> {primaryNodeActionLabel(primaryNodeAction(nodeMenu.node) ?? "run")}
             </button>
           )}
-          <div className="popover-separator" />
-          <button
-            role="menuitem"
-            onClick={() => {
-              const node = nodeMenu.node;
-              setNodeMenu(null);
-              if (
-                !confirm(
-                  "Restart this branch and supersede its active descendants?",
-                )
-              )
-                return;
-              void api(`/api/nodes/${node.id}/regenerate`, { method: "POST" })
-                .then(loadGraph)
-                .then(() => notify("Branch restarted"))
-                .catch((error) => notify(String(error)));
-            }}
-          >
-            <Icon name="rotate-cw" /> Restart branch
-          </button>
-        </div>
-      )}
-      {toast && (
-        <div className="toast-region">
-          <div className="toast">{toast}</div>
         </div>
       )}
     </div>
@@ -373,18 +535,20 @@ function Projects({
   open,
   onSelect,
   onChanged,
+  onDeleted,
   notify,
 }: {
-  projects: GraphNode[];
+  projects: Project[];
   selected: string | null;
   open: boolean;
   onSelect: (id: string) => void;
   onChanged: () => Promise<void>;
+  onDeleted: (id: string) => void;
   notify: (s: string) => void;
 }) {
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<{
-    node: GraphNode;
+    node: Project;
     x: number;
     y: number;
   } | null>(null);
@@ -406,7 +570,7 @@ function Projects({
       removeEventListener("keydown", key);
     };
   }, [menu]);
-  const openMenu = (node: GraphNode, x: number, y: number) => {
+  const openMenu = (node: Project, x: number, y: number) => {
     setDraftName(node.project_name || node.objective);
     setRenaming(false);
     setMenu({ node, x, y });
@@ -420,6 +584,7 @@ function Projects({
         )
           return;
         await api(`/api/projects/${menu.node.id}`, { method: "DELETE" });
+        onDeleted(menu.node.id);
       } else {
         if (!draftName.trim()) return;
         await api(
@@ -530,32 +695,75 @@ function Projects({
 
 function Author({
   capabilities,
+  capabilitiesLoading,
+  workspaceSettings,
   onCreated,
   notify,
 }: {
   capabilities: Capabilities;
+  capabilitiesLoading: boolean;
+  workspaceSettings: Record<string, unknown> | null;
   onCreated: (id: string) => void;
   notify: (s: string) => void;
 }) {
   const [promptText, setPromptText] = useState("");
   const [name, setName] = useState("");
   const [directory, setDirectory] = useState("");
-  const [agent, setAgent] = useState<AgentConfig>(emptyAgent);
+  const [agent, setAgent] = useState<Agent>(emptyAgent);
   const [policy, setPolicy] = useState(defaultPolicy);
   const [config, setConfig] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
+    if (capabilitiesLoading || !workspaceSettings) return;
     const first = capabilities.harnesses.find((item) => item.available);
-    if (first)
-      setAgent((value) => ({
-        ...value,
-        harness: first.id,
-        model: first.models[0]?.id ?? value.model,
-        reasoning: first.models[0]?.reasoning?.[0] ?? value.reasoning,
-      }));
-  }, [capabilities]);
+    if (!first) return;
+    const configuredHarness = String(workspaceSettings.default_harness ?? "");
+    const harness =
+      capabilities.harnesses.find(
+        (item) => item.available && item.id === configuredHarness,
+      ) ?? first;
+    const configuredModel = String(workspaceSettings.default_model ?? "");
+    const model =
+      harness.models.find((item) => item.id === configuredModel) ??
+      harness.models[0];
+    const configuredReasoning = String(workspaceSettings.reasoning ?? "default");
+    const reasoning =
+      model?.reasoning?.some((level) => level === configuredReasoning)
+        ? configuredReasoning
+        : model?.reasoning?.[0] ?? "default";
+    setAgent((value) => ({
+      ...value,
+      harness: harness.id,
+      model: model?.id ?? value.model,
+      reasoning: reasoning as Reasoning,
+    }));
+    // New projects must inherit the workspace defaults exposed by Settings.
+    // Previously only the agent defaults were applied, so changing the
+    // workspace's auto-run, timing, or retry values had no effect on the
+    // next workgraph the user created.
+    setPolicy((value) => ({
+      ...value,
+      auto_run: Boolean(workspaceSettings.default_auto_run ?? value.auto_run),
+      delay_between_jobs_ms: Number(
+        workspaceSettings.delay_between_jobs_ms ?? value.delay_between_jobs_ms,
+      ),
+      timeout_seconds: Number(
+        workspaceSettings.timeout_seconds ?? value.timeout_seconds,
+      ),
+      stall_timeout_seconds: Number(
+        workspaceSettings.stall_timeout_seconds ?? value.stall_timeout_seconds,
+      ),
+      max_retries: Number(workspaceSettings.max_retries ?? value.max_retries),
+      retry_backoff_ms: Number(
+        workspaceSettings.retry_backoff_ms ?? value.retry_backoff_ms,
+      ),
+      retry_choked_models: Boolean(
+        workspaceSettings.retry_choked_models ?? value.retry_choked_models,
+      ),
+    }));
+  }, [capabilities, capabilitiesLoading, workspaceSettings]);
   const create = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!promptText.trim() || busy) return;
@@ -678,6 +886,7 @@ function Author({
             model={agent.model ?? ""}
             reasoning={agent.reasoning}
             capabilities={capabilities.harnesses}
+            loading={capabilitiesLoading}
             onHarness={(harness: HarnessId) => {
               const model = capabilities.harnesses.find(
                 (item) => item.id === harness,
@@ -731,7 +940,7 @@ function Author({
                     setAgent({
                       ...agent,
                       permission: event.target
-                        .value as AgentConfig["permission"],
+                        .value as Agent["permission"],
                     })
                   }
                 >
@@ -752,19 +961,6 @@ function Author({
                 />
                 Auto-run
               </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={policy.force_sequential}
-                  onChange={(event) =>
-                    setPolicy({
-                      ...policy,
-                      force_sequential: event.target.checked,
-                    })
-                  }
-                />
-                Sequential
-              </label>
               <label className="inline-field">
                 <span>Delay</span>
                 <input
@@ -780,26 +976,13 @@ function Author({
                 />
                 <small>ms</small>
               </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={policy.review_mode === "parent"}
-                  onChange={(event) =>
-                    setPolicy({
-                      ...policy,
-                      review_mode: event.target.checked ? "parent" : "manual",
-                    })
-                  }
-                />
-                Auto verify
-              </label>
             </div>
           </div>
         )}
       </form>
       <p className="author-disclaimer">
-        Agents run in isolated project worktrees. Review permissions before
-        starting.
+              Agents act directly in the assigned project directory. Review
+              permissions before starting.
       </p>
     </section>
   );
@@ -963,42 +1146,6 @@ function Policy({
             <Icon name="x" />
           </button>
         </div>
-        <section className="settings-section">
-          <h3>Dispatch</h3>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={value.auto_run}
-              onChange={(event) =>
-                setValue({ ...value, auto_run: event.target.checked })
-              }
-            />
-            Auto-run ready nodes
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={value.force_sequential}
-              onChange={(event) =>
-                setValue({ ...value, force_sequential: event.target.checked })
-              }
-            />
-            Force sequential
-          </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={value.review_mode === "parent"}
-              onChange={(event) =>
-                setValue({
-                  ...value,
-                  review_mode: event.target.checked ? "parent" : "manual",
-                })
-              }
-            />
-            Auto verify
-          </label>
-        </section>
         <section className="settings-section">
           <h3>Timing and recovery</h3>
           <div className="form-grid">

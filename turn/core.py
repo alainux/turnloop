@@ -16,17 +16,17 @@ from turn.runner.events import EventBus
 from turn.runner.prefect_adapter import get_execution_adapter
 from turn.runner.runner import Runner
 from turn.workers.registry import build_registry
-from turn.workers.worktree import init_project_repo
+from turn.workers.filesystem import init_project_directory
 
 
 class TurnCore:
-    def __init__(self, settings: Settings = default_settings):
+    def __init__(self, settings: Settings = default_settings, *, test_mode: bool = False):
         self.settings = settings
-        self.store = Store(settings.database_url)
+        self.store = Store(settings.data_dir)
         self.events = EventBus()
         self.runner = Runner(
             self.store,
-            build_registry(settings),
+            build_registry(settings, test_mode=test_mode),
             self.events,
             settings,
             get_execution_adapter(settings),
@@ -54,10 +54,9 @@ class TurnCore:
             from turn.workers.harnesses import validate_agent_capabilities
             validate_agent_capabilities(agent)
         project_id = uuid.uuid4()
-        repo = init_project_repo(
+        repo = init_project_directory(
             project_id,
             working_dir=working_dir,
-            open_existing=open_existing,
             projects_dir=self.settings.projects_dir,
         )
         return await self.store.create_project(

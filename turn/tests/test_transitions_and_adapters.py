@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import uuid
@@ -28,7 +31,6 @@ from turn.domain.schemas import (
     RunPolicy,
     RunStatus,
     Usage,
-    VerificationStatus,
     WorkerResult,
 )
 from turn.runner.events import EventBus
@@ -36,15 +38,16 @@ from turn.runner.runner import Runner
 from turn.tools import graph_explorer
 from turn.workers.base import NodeExecutionContext, Planner, Worker, render_context_block
 from turn.workers.echo_worker import EchoWorker
+from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
 import turn.workers.harnesses as harness_module
 from turn.workers import parsing
 from turn.workers.artifacts import has_material_change, missing_declared_files, requires_material_change
 from turn.workers.registry import WorkerRegistry
+from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
-from turn.workers import worktree
 import turn.workers.planner as planner_module
-from turn.workers.terminal import TerminalResult
+from turn.workers.terminal import LocalPtyTransport, TerminalResult
 
 
 def test_codex_model_discovery_handles_long_lived_server_bytes(monkeypatch):
@@ -119,33 +122,6 @@ class FixedPlanner(Planner):
         )
 
 
-class ParentVerifierWorker(Worker):
-    name = "codex"
-
-    def __init__(self):
-        self.contexts: list[NodeExecutionContext] = []
-
-    async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
-        self.contexts.append(ctx)
-        if len(self.contexts) == 1:
-            return WorkerResult(
-                outcome=Outcome.BLOCK,
-                summary="Add a deterministic collision regression before acceptance.",
-                session_id="parent-verifier-session",
-            )
-        return WorkerResult(
-            outcome=Outcome.COMPLETE,
-            summary="Collision regression passes and the parent accepts the branch.",
-            session_id="parent-verifier-session",
-        )
-        return WorkerResult(
-            outcome=Outcome.COMPLETE,
-            summary="revision complete",
-            session_id=ctx.node.agent.session_id,
-            usage=Usage(input_tokens=12, output_tokens=4, cost_usd=0.01),
-        )
-
-
 async def test_heuristic_planner_keeps_card_titles_short_and_full_intent_in_prompts():
     intent = "Build a tiny dependency-free one-page constellation name generator with deterministic seeds and accessible controls."
     root = Node(
@@ -154,74 +130,36 @@ async def test_heuristic_planner_keeps_card_titles_short_and_full_intent_in_prom
     )
     plan = await HeuristicPlanner("echo").plan(NodeExecutionContext(node=root))
     assert [node.objective for node in plan.nodes] == [
-        "Investigate context", "Clarify scope", "Produce deliverable", "Verify result",
+        "Define core structure", "Handle inputs and storage",
+        "Create output surface", "Integrate the deliverable",
     ]
-    assert all(len(node.objective) <= 24 for node in plan.nodes)
+    assert all(len(node.objective) <= 50 for node in plan.nodes)
     assert all(intent in (node.generated_prompt or "") for node in plan.nodes)
 
 
-async def test_parent_auto_verification_can_reject_then_accept_without_losing_sessions(tmp_path):
-    worker = ParentVerifierWorker()
-    cfg, store, runner = await _runtime(tmp_path, worker)
-    policy = RunPolicy(auto_run=False, review_mode=ReviewMode.PARENT, max_retries=2)
-    root = await store.create_project(
-        "Build game", name="Game", run_policy=policy,
-        agent=AgentConfig(harness=HarnessKind.CODEX),
+async def test_heuristic_planner_inherits_the_project_agent_harness():
+    root = Node(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        objective="Luna game",
+        executor="planner",
+        agent=AgentConfig(harness=HarnessKind.CODEX, model="gpt-5.6-luna"),
     )
-    parent = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="Simulation parent",
-        status=NodeStatus.EXPANDED,
-        agent=AgentConfig(harness=HarnessKind.CODEX), executor="planner",
-    )
-    child = await store.create_node(
-        project_id=root.id, parent_id=parent.id, objective="Collision runtime",
-        generated_prompt="Implement collisions", status=NodeStatus.COMPLETE,
-        agent=AgentConfig(harness=HarnessKind.CODEX, session_id="child-session"),
-        executor="codex",
-    )
-    child.needs_review = True
-    await store._save_node(child)
-
-    async def reserve_without_launch(node_id):
-        return node_id
-
-    runner.run_node = reserve_without_launch
-    await runner._verify_with_parent(child.id)
-    rejected = await store.get_node(child.id)
-    remembered_parent = await store.get_node(parent.id)
-    assert rejected.needs_review is False
-    assert rejected.agent.session_id == "child-session"
-    assert "deterministic collision regression" in rejected.generated_prompt
-    assert remembered_parent.agent.session_id is None
-    assert rejected.verification_session_id == "parent-verifier-session"
-    assert worker.contexts[0].purpose == "verify"
-    assert worker.contexts[0].node.agent.session_id is None
-
-    # Simulate the same child session completing its requested correction.
-    rejected.status = NodeStatus.COMPLETE
-    rejected.needs_review = True
-    await store._save_node(rejected)
-    await runner._verify_with_parent(child.id)
-    accepted = await store.get_node(child.id)
-    assert accepted.merge_accepted is True
-    assert accepted.verification_summary.startswith("Collision regression passes")
-    assert worker.contexts[1].node.agent.session_id == "parent-verifier-session"
-    evidence = [a for a in await store.get_artifacts(child.id) if a.name.startswith("parent-verification-")]
-    assert [item.content["decision"] for item in evidence] == ["rejected", "accepted"]
-    await store.dispose()
+    plan = await HeuristicPlanner("echo").plan(NodeExecutionContext(node=root))
+    assert {node.executor for node in plan.nodes} == {"codex"}
 
 
 async def _runtime(tmp_path, worker: Worker):
     cfg = Settings()
     cfg.default_executor = worker.name
     cfg.runner_tick_seconds = 0.001
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'turn.db'}")
+    store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
     registry.register(worker)
     if worker.name != "echo":
         registry.register(EchoWorker())
-    runner = Runner(store, registry, EventBus(), cfg)
+    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=FakeHerdrAdapter())
     return cfg, store, runner
 
 
@@ -267,9 +205,249 @@ def test_cli_harness_commands_distinguish_new_and_resumed_sessions():
     pi_event = '{"type":"session","id":"019ffb1f-2223-7c64-bf37-26e5d98c0b31"}'
     assert _json_text_and_session(pi_event)[1] == "019ffb1f-2223-7c64-bf37-26e5d98c0b31"
     assert recover_session_id("noise\n" + pi_event) == "019ffb1f-2223-7c64-bf37-26e5d98c0b31"
+    opencode_event = (
+        '{"type":"text","sessionID":"ses-1","part":{"text":"```turn-result\\n'
+        '{\\"outcome\\":\\"COMPLETE\\",\\"summary\\":\\"ok\\"}\\n```",'
+        '"tokens":{"input":13,"output":4,"cache":{"read":8}}}}'
+    )
+    opencode_text, opencode_session, opencode_usage = _json_text_and_session(opencode_event)
+    assert '"outcome":"COMPLETE"' in opencode_text
+    assert opencode_session == "ses-1"
+    assert opencode_usage.input_tokens == 13
+    assert opencode_usage.cached_input_tokens == 8
+    assert opencode_usage.output_tokens == 4
 
 
-async def test_agent_config_inherits_cascades_and_forks(tmp_path):
+def test_local_cli_harnesses_use_native_commands_for_the_browser_terminal():
+    pi = CLIHarnessWorker(HarnessKind.PI)._command(
+        AgentConfig(harness=HarnessKind.PI, model="nous/tencent/hy3:free"),
+        "do the work",
+        "/tmp/project",
+        native=True,
+    )
+    opencode = CLIHarnessWorker(HarnessKind.OPENCODE)._command(
+        AgentConfig(harness=HarnessKind.OPENCODE, model="opencode/deepseek-v4-flash-free"),
+        "do the work",
+        "/tmp/project",
+        native=True,
+    )
+    assert "--mode" not in pi and "--print" not in pi and "do the work" not in pi
+    assert "run" not in opencode and "--format" not in opencode
+    # The transport does not classify commands. Native-vs-machine behavior is
+    # solely a launch decision owned by the harness catalog.
+    assert pi[0] == "pi" and opencode[0] == "opencode"
+    assert "--prompt" not in opencode
+
+
+@pytest.mark.parametrize(
+    ("harness", "session_id"),
+    [
+        (HarnessKind.PI, "pi-native-session"),
+        (HarnessKind.OPENCODE, "ses_native_session"),
+    ],
+)
+async def test_native_executor_persists_provider_session_before_result(
+    tmp_path, monkeypatch, harness, session_id
+):
+    class FakeNativeTransport:
+        pass
+
+    async def fake_run_until_result(_transport, _node_id, _command, **kwargs):
+        (tmp_path / "native-output.txt").write_text("native output")
+        kwargs["result_path"].write_text(
+            '{"outcome":"COMPLETE","summary":"native executor verified"}'
+        )
+        await kwargs["session_callback"](session_id)
+        return TerminalResult(returncode=0, output=b"\x1b[32mnative PTY\x1b[0m")
+
+    monkeypatch.setattr(harness_module, "LocalPtyTransport", FakeNativeTransport)
+    monkeypatch.setattr(harness_module, "run_until_result", fake_run_until_result)
+    monkeypatch.setattr(harness_module, "opencode_session_ids", lambda: [])
+    seen: list[str] = []
+
+    async def remember(value: str) -> None:
+        seen.append(value)
+
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Create native-output.txt",
+        generated_prompt="Create native-output.txt.",
+        repo_path=str(tmp_path),
+        executor=harness.value,
+        agent=AgentConfig(harness=harness, model="free-test"),
+    )
+    result = await CLIHarnessWorker(harness).execute(
+        NodeExecutionContext(
+            node=node,
+            repo_path=str(tmp_path),
+            session_callback=remember,
+        )
+    )
+
+    assert result.outcome == Outcome.COMPLETE
+    assert result.session_id == session_id
+    assert seen and seen[-1] == session_id
+
+
+def test_reconnect_commands_use_native_provider_sessions():
+    runner = Runner(
+        Store(Path("/tmp/turn-reconnect-test")),
+        WorkerRegistry(),
+        EventBus(),
+        Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+    project_id = uuid.uuid4()
+    node = Node(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        objective="resume",
+        executor="codex",
+        agent=AgentConfig(model="gpt-5.6-luna", session_id="session-123"),
+    )
+    codex = runner._reconnect_command(node, "/tmp/project", "session-123")
+    assert codex is not None
+    assert codex[1] == "resume"
+    assert "exec" not in codex and "--json" not in codex
+    assert "--thinking" not in codex
+    assert "model_reasoning_effort=\"default\"" not in codex
+
+    node.agent = AgentConfig(harness=HarnessKind.PI, model="nous/tencent/hy3:free")
+    pi = runner._reconnect_command(node, "/tmp/project", "pi-session")
+    assert pi == ["pi", "--session", "pi-session", "--model", "nous/tencent/hy3:free"]
+
+    node.agent = AgentConfig(
+        harness=HarnessKind.OPENCODE,
+        model="opencode/deepseek-v4-flash-free",
+    )
+    opencode = runner._reconnect_command(node, "/tmp/project", "opencode-session")
+    assert opencode is not None
+    assert opencode[:3] == ["opencode", "--session", "opencode-session"]
+    assert "run" not in opencode and "--format" not in opencode and "--auto" in opencode
+
+
+async def test_user_shell_is_independent_from_node_activity(tmp_path):
+    store = Store(tmp_path / "shell-state")
+    await store.init()
+    root = await store.create_project(
+        "standalone shell",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    runner = Runner(
+        store,
+        WorkerRegistry(),
+        EventBus(),
+        Settings(data_dir=str(tmp_path / "turn-shell-state")),
+        terminal_transport=FakeTerminalTransport(),
+    )
+    initial_status = (await store.get_node(root.id)).status
+    assert runner.shell is runner.terminal
+
+    assert await runner.open_shell(root.id)
+    for _ in range(100):
+        if runner.shell.snapshot(root.id).get("active"):
+            break
+        await asyncio.sleep(0.01)
+    assert runner.shell.snapshot(root.id).get("active")
+    assert await runner.shell.resize(root.id, 91, 29)
+    assert runner.shell.pane_id(root.id)
+    assert await runner.detach_shell(root.id)
+    assert await runner.shell.has_persistent_session(root.id)
+    assert await runner.open_shell(root.id)
+    for _ in range(100):
+        if runner.shell.snapshot(root.id).get("active"):
+            break
+        await asyncio.sleep(0.01)
+    assert runner.shell.snapshot(root.id).get("active")
+    for _ in range(100):
+        if runner.shell.snapshot(root.id).get("output"):
+            break
+        await asyncio.sleep(0.01)
+    # Shell and harness access share one per-node Herdr pane. Shell
+    # activity is still independent from node lifecycle state.
+    assert runner.terminal.snapshot(root.id).get("active")
+    assert await runner.shell.write(root.id, "printf '\\033[32mSHELL_OK\\033[0m\\n'\n")
+    for _ in range(100):
+        if "SHELL_OK" in runner.shell.snapshot(root.id).get("output", ""):
+            break
+        await asyncio.sleep(0.01)
+    assert "SHELL_OK" in runner.shell.snapshot(root.id)["output"]
+    assert (await store.get_node(root.id)).status == initial_status
+
+    assert await runner.close_shell(root.id)
+    assert not runner.shell.snapshot(root.id).get("active")
+    assert (await store.get_node(root.id)).status == initial_status
+    await store.dispose()
+
+
+async def test_runtime_session_survives_run_creation_and_agent_config_save(tmp_path):
+    store = Store(tmp_path / "session-state")
+    await store.init()
+    root = await store.create_project(
+        "session continuity",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    agent = root.agent.model_copy(deep=True)
+    agent.session_id = "session-keep-me"
+    await store.edit_node(root.id, agent=agent)
+    saved = await store.get_node(root.id)
+    assert saved is not None and saved.agent is not None
+
+    edited = saved.agent.model_copy(deep=True)
+    edited.reasoning = edited.reasoning
+    edited.session_id = None
+    await store.edit_node(root.id, agent=edited)
+    preserved = await store.get_node(root.id)
+    assert preserved is not None and preserved.agent is not None
+    assert preserved.agent.session_id == "session-keep-me"
+
+    run = await store.create_run(preserved, "codex")
+    assert run.session_id == "session-keep-me"
+    await store.dispose()
+
+
+def test_non_codex_planner_commands_keep_resumable_sessions():
+    planner = AgentPlanner(settings=Settings())
+    pi = planner._command(
+        AgentConfig(harness=HarnessKind.PI, session_id="pi-session"),
+        "plan this",
+    )
+    assert "--no-session" not in pi
+    assert pi[pi.index("--session-id") + 1] == "pi-session"
+
+    opencode = planner._command(
+        AgentConfig(harness=HarnessKind.OPENCODE, session_id="opencode-session"),
+        "plan this",
+    )
+    assert "--format" not in opencode
+    assert opencode[opencode.index("--session") + 1] == "opencode-session"
+
+
+async def test_agent_planner_uses_the_selected_opencode_harness(monkeypatch):
+    planner = AgentPlanner(settings=Settings())
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Plan a puzzle room",
+        executor="planner",
+        agent=AgentConfig(harness=HarnessKind.OPENCODE, type_id="planner"),
+    )
+    observed: list[HarnessKind] = []
+
+    async def fake_call(agent, prompt, ctx):
+        observed.append(agent.harness)
+        return '''```turn-plan
+{"nodes":[{"key":"room","objective":"Build room","executor":"codex"}],"edges":[]}
+```'''
+
+    monkeypatch.setattr(planner, "_call_harness", fake_call)
+    plan = await planner.plan(NodeExecutionContext(node=node))
+    assert observed == [HarnessKind.OPENCODE]
+    assert plan.nodes and plan.nodes[0].objective == "Build room"
+
+
+async def test_agent_config_inherits_and_cascades(tmp_path):
     cfg, store, runner = await _runtime(tmp_path, EchoWorker())
     runner.registry.register_planner(FixedPlanner())
     chosen = AgentConfig(
@@ -295,48 +473,85 @@ async def test_agent_config_inherits_cascades_and_forks(tmp_path):
         reasoning=ReasoningLevel.HIGH,
     )
     await runner.edit_node(root.id, agent=pi, cascade_agent=True)
-    live = [n for n in await store.descendants(root.id) if not n.superseded_by]
+    live = await store.descendants(root.id)
     assert all(n.agent.harness == HarnessKind.PI for n in live)
     assert all(n.agent.model == pi.model and n.agent.reasoning == pi.reasoning for n in live)
 
-    planner_child = next(n for n in live if n.executor == "planner")
-    fork = await runner.fork(planner_child.id, generated_prompt="try a stranger fork")
-    assert fork.forked_from == planner_child.id
-    assert fork.agent.harness == HarnessKind.PI and fork.agent.model == pi.model
-    assert fork.agent.session_id is None
-    assert fork.generated_prompt == "try a stranger fork"
     await store.dispose()
 
 
-async def test_root_fork_stays_visible_in_its_project(tmp_path):
+async def test_regeneration_has_no_fork_or_revision_branch(tmp_path):
     _, store, runner = await _runtime(tmp_path, EchoWorker())
     runner.registry.register_planner(FixedPlanner())
     root = await store.create_project("visible root fork", run_policy=RunPolicy(auto_run=False))
 
-    fork = await runner.fork(root.id, objective="alternative root plan")
+    await runner.regenerate_descendants(root.id)
 
     nodes, edges, _ = await store.get_workgraph(root.id)
-    assert fork.project_id == root.id
-    assert fork.parent_id == root.id
-    assert fork.agent.type_id == "planner"
-    assert any(node.id == fork.id for node in nodes)
-    assert any(edge.src == root.id and edge.dst == fork.id for edge in edges)
+    assert all(not hasattr(node, "revision") for node in nodes)
+    assert all(not artifact.name.startswith("revision-") for artifact in (await store.get_artifacts(root.id)))
+    assert all(edge.src == root.id or edge.dst != root.id for edge in edges)
     await store.dispose()
 
 
-async def test_store_migrates_legacy_planner_agent_type(tmp_path):
-    database_url = f"sqlite+aiosqlite:///{tmp_path / 'legacy-planner.db'}"
-    store = Store(database_url)
+async def test_regeneration_closes_removed_herdr_panes_and_projects_agent_status(tmp_path):
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    runner.registry.register_planner(FixedPlanner())
+    repo = tmp_path / "project"
+    root = await store.create_project(
+        "status and cleanup",
+        repo_path=str(repo),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    assert await runner.ensure_node_terminal(root.id)
+    await runner.regenerate_descendants(root.id)
+    old_child = (await store.descendants(root.id))[0]
+    assert await runner.ensure_node_terminal(old_child.id)
+    old_pane = runner.terminal.pane_id(old_child.id)
+    assert old_pane is not None
+
+    status_path = repo / ".turn" / "interactive" / f"{old_child.id}.status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    watcher = asyncio.create_task(
+        runner._watch_agent_status(old_child.id, root.id, status_path)
+    )
+    status_path.write_text(
+        '{"node_id":"%s","state":"working","message":"writing domain files"}'
+        % old_child.id
+    )
+    for _ in range(100):
+        current = await store.get_node(old_child.id)
+        if current and current.agent_message == "writing domain files":
+            break
+        await asyncio.sleep(0.01)
+    current = await store.get_node(old_child.id)
+    assert current is not None
+    assert current.agent_state == "working"
+    assert current.agent_message == "writing domain files"
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
+
+    await runner.regenerate_descendants(root.id)
+    assert await store.get_node(old_child.id) is None
+    with pytest.raises(HerdrResourceNotFound):
+        await runner.terminal.adapter.get_pane(old_pane)
+    await runner.stop()
+    await store.dispose()
+
+
+async def test_store_preserves_explicit_planner_agent_type(tmp_path):
+    store_path = tmp_path / "planner-agent"
+    store = Store(store_path)
     await store.init()
     root = await store.create_project("legacy planner")
-    root.agent.type_id = "general"
+    root.agent.type_id = "executor"
     await store._save_node(root)
     await store.dispose()
 
-    reopened = Store(database_url)
+    reopened = Store(store_path)
     await reopened.init()
-    migrated = await reopened.get_node(root.id)
-    assert migrated.agent.type_id == "planner"
+    persisted = await reopened.get_node(root.id)
+    assert persisted.agent.type_id == "executor"
     await reopened.dispose()
 
 
@@ -387,35 +602,6 @@ async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
     await store.dispose()
 
 
-async def test_regeneration_cancels_descendant_verifiers_and_releases_stale_review(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
-    runner.registry.register_planner(FixedPlanner())
-    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
-    parent = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="Planner branch",
-        executor="planner", status=NodeStatus.EXPANDED,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    child = await store.create_node(
-        project_id=root.id, parent_id=parent.id, objective="Stale child",
-        executor="echo", status=NodeStatus.COMPLETE,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    child.needs_review = True
-    await store._save_node(child)
-    verifier = asyncio.create_task(asyncio.Event().wait())
-    runner._verifying[child.id] = verifier
-
-    await runner.regenerate_descendants(parent.id)
-
-    assert verifier.cancelled()
-    stale = await store.get_node(child.id)
-    assert stale.status == NodeStatus.CANCELLED
-    assert stale.superseded_by == parent.id
-    assert stale.needs_review is False
-    await store.dispose()
-
-
 async def test_scheduler_reconciles_cancelled_stale_review_from_persisted_history(tmp_path):
     _, store, runner = await _runtime(tmp_path, EchoWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
@@ -428,17 +614,12 @@ async def test_scheduler_reconciles_cancelled_stale_review_from_persisted_histor
         agent=AgentConfig(harness=HarnessKind.ECHO),
     )
     stale.needs_review = True
-    stale.verification_status = VerificationStatus.ERROR
     await store._save_node(stale)
-    verifier = asyncio.create_task(asyncio.Event().wait())
-    runner._verifying[stale.id] = verifier
 
     await runner._schedule_project(root.id)
 
     repaired = await store.get_node(stale.id)
     assert repaired.needs_review is False
-    assert repaired.verification_status == VerificationStatus.ERROR  # history is retained
-    assert verifier.cancelled()
     await store.dispose()
 
 
@@ -464,155 +645,14 @@ async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_pat
     late_child.needs_review = True
     await store._save_node(late_child)
     worker = asyncio.create_task(asyncio.Event().wait())
-    verifier = asyncio.create_task(asyncio.Event().wait())
     runner._running[late_child.id] = worker
-    runner._verifying[late_child.id] = verifier
 
     await runner._schedule_project(root.id)
 
     repaired = await store.get_node(late_child.id)
     assert repaired.status == NodeStatus.CANCELLED
-    assert repaired.superseded_by == cancelled_parent.id
     assert repaired.needs_review is False
-    assert worker.cancelled() and verifier.cancelled()
-    await store.dispose()
-
-
-async def test_parent_verification_never_resets_the_child_worktree(monkeypatch, tmp_path):
-    from turn.workers.codex_worker import CodexWorker
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    observed: list[bool] = []
-    merges: list[uuid.UUID] = []
-
-    def fake_worktree(node_id, parent_id, force=False, repo_path=None):
-        observed.append(force)
-        return str(repo)
-
-    async def fake_exec(*args, **kwargs):
-        class Reader:
-            async def read(self, _size):
-                return b""
-
-        class Process:
-            stdout = Reader()
-            stderr = Reader()
-
-            async def wait(self):
-                return 0
-
-        return Process()
-
-    monkeypatch.setattr("turn.workers.codex_worker.worktree.get_or_create_worktree", fake_worktree)
-    monkeypatch.setattr(
-        "turn.workers.codex_worker.worktree.merge_into_parent",
-        lambda node_id, *args, **kwargs: merges.append(node_id),
-    )
-    monkeypatch.setattr("turn.workers.codex_worker.asyncio.create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(
-        "turn.workers.codex_worker.CodexWorker._parse_result",
-        lambda self, text: WorkerResult(outcome=Outcome.COMPLETE, summary="verified"),
-    )
-    node = Node(
-        project_id=uuid.uuid4(),
-        parent_id=uuid.uuid4(),
-        objective="Verify branch",
-        executor="codex",
-        agent=AgentConfig(harness=HarnessKind.CODEX),
-    )
-    context = NodeExecutionContext(node=node, repo_path=str(repo), purpose="verify", terminal=StubTerminal())
-
-    await CodexWorker(Settings()).execute(context)
-
-    validator_node = node.model_copy(deep=True)
-    validator_node.agent.type_id = "validator"
-    await CodexWorker(Settings()).execute(
-        NodeExecutionContext(node=validator_node, repo_path=str(repo), terminal=StubTerminal())
-    )
-
-    assert observed == [False, False]
-    assert merges == []
-
-
-@pytest.mark.parametrize("harness", [HarnessKind.CLAUDE, HarnessKind.OPENCODE, HarnessKind.PI])
-async def test_generic_parent_verification_is_read_only_for_every_provider(
-    harness, monkeypatch, tmp_path
-):
-    repo = tmp_path / harness.value
-    repo.mkdir()
-    (repo / ".git").mkdir()
-    forces: list[bool] = []
-    merges: list[uuid.UUID] = []
-    commands: list[tuple[str, ...]] = []
-
-    def fake_worktree(node_id, parent_id, force=False, repo_path=None):
-        forces.append(force)
-        return str(repo)
-
-    class Process:
-        returncode = 0
-
-        async def communicate(self):
-            payload = '```turn-result\n{"outcome":"COMPLETE","summary":"verified"}\n```'
-            return (f'{{"text":{payload!r}}}'.replace("'", '"').encode(), b"")
-
-    async def fake_exec(*command, **kwargs):
-        commands.append(tuple(command))
-        # Use valid provider JSON-lines while preserving the fenced result.
-        class ValidProcess(Process):
-            async def communicate(self):
-                import json
-                text = '```turn-result\n{"outcome":"COMPLETE","summary":"verified"}\n```'
-                return ((json.dumps({"text": text}) + "\n").encode(), b"")
-        return ValidProcess()
-
-    monkeypatch.setattr("turn.workers.harnesses.worktree.get_or_create_worktree", fake_worktree)
-    monkeypatch.setattr(
-        "turn.workers.harnesses.worktree.merge_into_parent",
-        lambda node_id, *args, **kwargs: merges.append(node_id),
-    )
-    monkeypatch.setattr("turn.workers.harnesses.capture_worktree", lambda cwd: [])
-    monkeypatch.setattr("turn.workers.harnesses.asyncio.create_subprocess_exec", fake_exec)
-    node = Node(
-        project_id=uuid.uuid4(),
-        parent_id=uuid.uuid4(),
-        objective="Verify provider branch",
-        executor=harness.value,
-        agent=AgentConfig(harness=harness, session_id="review-session"),
-    )
-
-    import json
-    structured = '```turn-result\n{"outcome":"COMPLETE","summary":"verified"}\n```'
-    terminal = StubTerminal((json.dumps({"text": structured}) + "\n").encode(), {"commands": commands})
-    result = await CLIHarnessWorker(harness).execute(
-        NodeExecutionContext(node=node, repo_path=str(repo), purpose="verify", terminal=terminal)
-    )
-
-    assert result.outcome == Outcome.COMPLETE
-    assert forces == [False]
-    assert merges == []
-    assert any("Do not edit files." in part for part in terminal.capture["args"])
-
-
-async def test_old_verifier_callback_cannot_drop_new_single_flight_reservation(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
-    node_id = uuid.uuid4()
-    async def finishes_immediately(_node_id):
-        return None
-
-    runner._verify_with_parent = finishes_immediately
-    runner._queue_parent_verification(node_id)
-    old = runner._verifying[node_id]
-    replacement = asyncio.create_task(asyncio.Event().wait())
-    runner._verifying[node_id] = replacement
-    await asyncio.sleep(0)
-    await old
-    await asyncio.sleep(0)
-
-    assert runner._verifying[node_id] is replacement
-    replacement.cancel()
+    assert worker.cancelled()
     await store.dispose()
 
 
@@ -635,20 +675,17 @@ async def test_accepting_container_stops_descendant_tasks_before_cleanup(tmp_pat
         agent=AgentConfig(harness=HarnessKind.ECHO),
     )
     accepted_child.merge_accepted = True
-    accepted_child.verification_status = VerificationStatus.ACCEPTED
     await store._save_node(accepted_child)
     parent.needs_review = True
     await store._save_node(parent)
     worker = asyncio.create_task(asyncio.Event().wait())
-    verifier = asyncio.create_task(asyncio.Event().wait())
     accepted_worker = asyncio.create_task(asyncio.Event().wait())
     runner._running[child.id] = worker
     runner._running[accepted_child.id] = accepted_worker
-    runner._verifying[child.id] = verifier
 
     await runner.accept_merge(parent.id)
 
-    assert worker.cancelled() and verifier.cancelled() and accepted_worker.cancelled()
+    assert worker.cancelled() and accepted_worker.cancelled()
     repaired = await store.get_node(child.id)
     assert repaired.status == NodeStatus.CANCELLED
     assert repaired.merge_accepted is False
@@ -705,29 +742,10 @@ async def test_late_failure_cannot_revive_an_accepted_node(tmp_path):
 
     repaired = await store.get_node(node.id)
     saved_run = (await store.get_runs(node.id))[-1]
-    assert repaired.status == NodeStatus.COMPLETE
-    assert repaired.merge_accepted is True
-    assert saved_run.status == RunStatus.CANCELLED
-    assert runner._retries.get(node.id, 0) == 0
+    assert repaired.status == NodeStatus.RUNNABLE
+    assert saved_run.status == RunStatus.FAILED
+    assert runner._retries.get(node.id, 0) == 1
     await store.dispose()
-
-
-def test_nested_child_merges_into_parent_worktree_not_repository_root(tmp_path):
-    repo = worktree.init_project_repo(uuid.uuid4(), working_dir=str(tmp_path / "repo"))
-    root_id = uuid.uuid4()
-    parent_id = uuid.uuid4()
-    child_id = uuid.uuid4()
-    worktree.get_or_create_worktree(root_id, None, repo_path=repo)
-    parent_wt = worktree.get_or_create_worktree(parent_id, root_id, repo_path=repo)
-    child_wt = worktree.get_or_create_worktree(child_id, parent_id, repo_path=repo)
-    assert parent_wt and child_wt
-    (Path(child_wt) / "nested-output.txt").write_text("from child\n")
-
-    worktree.merge_into_parent(child_id, parent_id, repo_path=repo)
-
-    assert (Path(parent_wt) / "nested-output.txt").read_text() == "from child\n"
-    assert not (Path(repo) / "nested-output.txt").exists()
-    assert worktree._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo).stdout.strip() == worktree.branch_name(root_id)
 
 
 async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
@@ -769,9 +787,9 @@ async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
     assert session == "planner-session"
 
 
-async def test_graph_inspection_is_audited_and_integrators_get_glue_contract(tmp_path):
-    db_url = f"sqlite+aiosqlite:///{tmp_path / 'turn.db'}"
-    store = Store(db_url)
+async def test_graph_explorer_is_read_only_and_integrators_get_glue_contract(tmp_path):
+    data_dir = tmp_path / "turn"
+    store = Store(data_dir)
     await store.init()
     root = await store.create_project("Assemble the adventure")
     ctx = NodeExecutionContext(node=root)
@@ -781,11 +799,10 @@ async def test_graph_inspection_is_audited_and_integrators_get_glue_contract(tmp
     assert "INTEGRATOR CONTRACT" in block
     assert "Limit changes to assembly" in block
 
-    await graph_explorer._query(db_url, str(root.id), str(root.id), "tree")
-    evidence = await store.get_graph_inspections(root.id)
-    assert len(evidence) == 1
-    assert evidence[0]["requester_node_id"] == str(root.id)
-    assert evidence[0]["query"] == "tree"
+    state_file = data_dir / "projects" / f"proj-{root.id.hex[:8]}" / ".turn" / "state.json"
+    await graph_explorer._query(str(state_file), str(root.id), str(root.id), "tree")
+    state = json.loads(state_file.read_text())
+    assert "audits" not in state
     await store.dispose()
 
 
@@ -800,12 +817,16 @@ def test_planner_honors_editable_planning_instructions():
     assert "Use two nested planning branches" in prompt
 
 
-def test_codex_choked_output_is_retryable_not_a_false_success():
+def test_codex_choked_output_is_not_a_false_success():
     from turn.workers.codex_worker import CodexWorker
 
+    # A choked/non-structured result must be a clean FAIL, never a false
+    # success. Automatic respawn is disabled by design (a node is only
+    # re-run on an explicit user action), so the worker does not recommend a
+    # retry here.
     parsed = CodexWorker()._parse_result("I will inspect the project now.")
     assert parsed.outcome == Outcome.FAIL
-    assert parsed.retry_recommended is True
+    assert parsed.retry_recommended is False
     assert "structured result" in parsed.summary
 
 
@@ -838,6 +859,14 @@ def test_graph_tool_json_cannot_be_mistaken_for_a_worker_plan():
     assert parsing.first_result_json(mixed)["summary"] == "verified"
 
 
+def test_protocol_envelope_is_removed_from_human_run_summary():
+    summary = (
+        "Tests passed.\n\n"
+        '```turn-result\n{"outcome":"COMPLETE","summary":"Duplicate"}\n```'
+    )
+    assert parsing.clean_summary(summary) == "Tests passed."
+
+
 def test_bare_schema_plan_is_accepted_and_explicit_edges_follow_domain_direction():
     bare = '{"nodes":[{"key":"a","objective":"write story"},{"key":"b","objective":"build UI"}],"edges":[{"src":"a","dst":"b"}]}'
     assert parsing.first_plan_json(bare)["nodes"][0]["key"] == "a"
@@ -857,11 +886,13 @@ def test_final_structured_worker_result_wins_and_material_work_is_explicit():
     assert not has_material_change([])
 
 
-def test_parent_verification_is_read_only_and_does_not_require_a_file_diff():
+def test_workers_have_no_parent_verifier_path():
     source = (Path(__file__).parents[1] / "workers" / "codex_worker.py").read_text()
-    assert 'ctx.node.agent.type_id == "validator"' in source
-    assert "force=not is_verification" in source
-    assert "and not is_verification" in source
+    assert "PARENT VERIFICATION TASK" not in source
+    assert 'ctx.purpose == "verify"' not in source
+    assert 'type_id == "validator"' not in source
+    assert "snapshot_filesystem" in source
+    assert "is_verification" not in source
 
 
 def test_local_harnesses_share_the_bidirectional_terminal_transport():
@@ -872,7 +903,7 @@ def test_local_harnesses_share_the_bidirectional_terminal_transport():
 
 
 async def test_harness_switch_clears_provider_session_in_store(tmp_path):
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'session.db'}")
+    store = Store(tmp_path / "session")
     await store.init()
     root = await store.create_project("session invariant")
     root = await store.edit_node(
@@ -888,137 +919,82 @@ async def test_harness_switch_clears_provider_session_in_store(tmp_path):
     await store.dispose()
 
 
-async def test_completed_project_reships_correction_and_repairs_accepted_residue(tmp_path):
-    import subprocess
-    from turn.workers import worktree
-
-    root_id = uuid.uuid4()
-    repo = worktree.init_project_repo(root_id, working_dir=str(tmp_path / "repo"))
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'reship.db'}")
+async def test_acceptance_keeps_shared_project_files_in_place(tmp_path):
+    """The old shipping test exercised git branches, not current MVP behavior."""
+    project_dir = tmp_path / "project"
+    store = Store(tmp_path / "state")
     await store.init()
-    policy = RunPolicy(auto_run=False, review_mode=ReviewMode.AUTO_ACCEPT)
-    root = await store.create_project("root", id=root_id, repo_path=repo, run_policy=policy)
+    root = await store.create_project(
+        "root", repo_path=str(project_dir), run_policy=RunPolicy(auto_run=False)
+    )
     child = await store.create_node(
         project_id=root.id,
         parent_id=root.id,
         objective="integrate correction",
-        status=NodeStatus.CANCELLED,
+        status=NodeStatus.COMPLETE,
     )
-    child.merge_accepted = True
-    await store._save_node(child)
-    await store.set_status(root.id, NodeStatus.COMPLETE)
+    correction = project_dir / "correction.txt"
+    correction.write_text("fixed")
 
-    # Simulate a correction merged to the root working branch after the first
-    # project shipment, plus stale lifecycle resources from a prior accept.
-    (tmp_path / "repo" / "correction.txt").write_text("fixed")
-    subprocess.run(["git", "add", "correction.txt"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-qm", "correction"], cwd=repo, check=True)
-    subprocess.run(["git", "branch", worktree.branch_name(child.id)], cwd=repo, check=True)
-    orphan = worktree.worktree_path(child.id, repo)
-    orphan.mkdir(parents=True)
-    (orphan / "residue.txt").write_text("stale")
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    await runner.accept_merge(child.id)
 
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings())
-    await runner._schedule_project(root.id)
-
-    branch = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo, check=True,
-        capture_output=True, text=True,
-    ).stdout.strip()
-    assert branch == "master" or branch == "main"
-    assert subprocess.run(
-        ["git", "merge-base", "--is-ancestor", worktree.branch_name(root.id), branch],
-        cwd=repo,
-    ).returncode == 0
-    assert not orphan.exists()
-    assert not worktree._branch_exists(worktree.branch_name(child.id), repo)
-    repaired = await store.get_node(child.id)
-    assert repaired.status == NodeStatus.COMPLETE
-    assert repaired.merge_accepted is True
+    accepted = await store.get_node(child.id)
+    assert correction.read_text() == "fixed"
+    assert accepted.status == NodeStatus.COMPLETE
+    assert accepted.merge_accepted is True
     await store.dispose()
 
 
-async def test_accepted_cleanup_refetches_stale_snapshot_before_removal(tmp_path):
-    from turn.workers import worktree
-
-    root_id = uuid.uuid4()
-    repo = worktree.init_project_repo(root_id, working_dir=str(tmp_path / "repo"))
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
+async def test_accepted_cleanup_leaves_shared_project_files_untouched(tmp_path):
+    """Accepted nodes no longer own disposable per-node directories."""
+    project_dir = tmp_path / "project"
+    store = Store(tmp_path / "state")
     await store.init()
-    root = await store.create_project("root", id=root_id, repo_path=repo)
+    root = await store.create_project("root", repo_path=str(project_dir))
     child = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="child", status=NodeStatus.COMPLETE,
     )
     child.merge_accepted = True
     await store._save_node(child)
-    stale = await store.get_node(child.id)
+    active = project_dir / "active.txt"
+    active.write_text("do not delete")
 
-    # A reviewer revives the node after the scheduler captured `stale`.
-    fresh = await store.get_node(child.id)
-    fresh.merge_accepted = False
-    fresh.status = NodeStatus.RUNNABLE
-    await store._save_node(fresh)
-    active = worktree.worktree_path(child.id, repo)
-    active.mkdir(parents=True)
-    (active / "active.txt").write_text("do not delete")
-
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings())
-    await runner._cleanup_accepted(stale)
-    assert active.exists()
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    await runner._cleanup_accepted(child)
+    assert active.read_text() == "do not delete"
     await store.dispose()
 
 
-async def test_rejection_waits_for_inflight_accepted_cleanup(tmp_path):
-    from turn.workers import worktree
-
-    root_id = uuid.uuid4()
-    repo = worktree.init_project_repo(root_id, working_dir=str(tmp_path / "repo"))
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'barrier.db'}")
+async def test_rejection_keeps_shared_project_files_available_for_rerun(tmp_path):
+    """Feedback reruns the same node in the same assigned directory."""
+    project_dir = tmp_path / "project"
+    store = Store(tmp_path / "state")
     await store.init()
-    root = await store.create_project("root", id=root_id, repo_path=repo)
+    root = await store.create_project("root", repo_path=str(project_dir))
     child = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="child", status=NodeStatus.COMPLETE,
     )
     child.merge_accepted = True
     await store._save_node(child)
-    active = worktree.worktree_path(child.id, repo)
-    active.mkdir(parents=True)
-    (active / "stale.txt").write_text("stale")
+    active = project_dir / "active.txt"
+    active.write_text("preserve")
 
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings())
-    async def reserve_without_worker(node_id):
-        return node_id
-    runner.run_node = reserve_without_worker
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    original_remove = runner._remove_merged_resources
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    async def no_run(_node_id):
+        return None
+    runner.run_node = no_run
+    await runner.reject_merge(child.id, "revise safely")
 
-    async def paused_remove(ids, project_repo):
-        entered.set()
-        await release.wait()
-        return await original_remove(ids, project_repo)
-
-    runner._remove_merged_resources = paused_remove
-    cleanup = asyncio.create_task(runner._cleanup_accepted(child))
-    await entered.wait()
-    rejection = asyncio.create_task(runner.reject_merge(child.id, "revise safely"))
-    await asyncio.sleep(0)
-    # Rejection cannot flip lifecycle state while cleanup holds the lock.
-    during = await store.get_node(child.id)
-    assert during.merge_accepted is True
-    assert not rejection.done()
-
-    release.set()
-    await cleanup
-    await rejection
-    after = await store.get_node(child.id)
-    assert after.merge_accepted is False
-    assert after.status in (NodeStatus.RUNNABLE, NodeStatus.RUNNING)
+    revised = await store.get_node(child.id)
+    assert active.read_text() == "preserve"
+    assert revised.merge_accepted is False
+    assert "revise safely" in revised.generated_prompt
     await store.dispose()
 
 
 async def test_scheduler_snapshot_cannot_regress_a_fresh_complete_node(tmp_path):
-    store = Store(f"sqlite+aiosqlite:///{tmp_path / 'scheduler-race.db'}")
+    store = Store(tmp_path / "scheduler-race")
     await store.init()
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=True))
     await store.set_status(root.id, NodeStatus.EXPANDED)
@@ -1032,7 +1008,7 @@ async def test_scheduler_snapshot_cannot_regress_a_fresh_complete_node(tmp_path)
         return stale_graph
 
     store.get_workgraph = old_snapshot
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings())
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
     await runner._schedule_project(root.id)
     assert (await store.get_node(child.id)).status == NodeStatus.COMPLETE
     assert child.id not in runner._running
@@ -1065,6 +1041,36 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
     runs = await store.get_runs(child.id)
     assert cancelled.status == NodeStatus.CANCELLED
     assert runs[-1].status.value == "CANCELLED"
+    await store.dispose()
+
+
+async def test_disconnected_terminal_output_is_durable_after_release(tmp_path):
+    store = Store(tmp_path / "terminal-transcript")
+    await store.init()
+    root = await store.create_project("root", repo_path=str(tmp_path / "project"))
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    # This test exercises raw transcript persistence, not the server-backed
+    # Herdr lifecycle. Keep it on the direct PTY transport so a short-lived
+    # command is observed byte-for-byte without a persistent pane repaint.
+    runner.terminal = LocalPtyTransport()
+
+    await runner.terminal.run(
+        root.id,
+        [
+            sys.executable,
+            "-c",
+            "print('\\x1b[32mcolored output\\x1b[0m', flush=True)",
+        ],
+        cwd=str(tmp_path),
+        timeout=5,
+    )
+    await runner._persist_terminal_transcript(root.id, root.id)
+    assert runner.terminal.release(root.id)
+
+    artifacts = await store.get_artifacts(root.id)
+    transcript = next(a.content for a in artifacts if a.name == "transcript")
+    assert "colored output" in transcript
+    assert "\x1b[32m" in transcript
     await store.dispose()
 
 
@@ -1128,10 +1134,4 @@ async def test_accept_is_terminal_and_reject_reuses_agent_session(tmp_path):
     accepted = await store.get_node(child.id)
     assert accepted.status == NodeStatus.COMPLETE
     assert accepted.merge_accepted and not accepted.needs_review
-    assert not runner._auto_accept(await store.get_node(root.id))
-
-    auto_root = await store.get_node(root.id)
-    auto_root.run_policy.review_mode = ReviewMode.AUTO_ACCEPT
-    await store._save_node(auto_root)
-    assert runner._auto_accept(await store.get_node(root.id))
     await store.dispose()

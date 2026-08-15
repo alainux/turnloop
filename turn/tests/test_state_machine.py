@@ -67,14 +67,6 @@ def test_review_propagates_to_parent_only_as_a_projection():
     assert root.status == NodeStatus.EXPANDED
 
 
-def test_parent_review_owner_never_exposes_human_accept_reject():
-    node = Node(project_id="00000000-0000-0000-0000-000000000001", parent_id="00000000-0000-0000-0000-000000000001", objective="child", status=NodeStatus.COMPLETE, needs_review=True)
-    manual = present_node(node, review_owner="manual")
-    parent = present_node(node, review_owner="parent")
-    assert {Action.ACCEPT, Action.REJECT}.issubset(set(manual.actions))
-    assert Action.ACCEPT not in parent.actions and Action.REJECT not in parent.actions
-
-
 def test_unaccepted_dependency_blocks_dispatch_and_reopens_complete_parent():
     root = Node(id="00000000-0000-0000-0000-000000000001", project_id="00000000-0000-0000-0000-000000000001", objective="root", status=NodeStatus.COMPLETE)
     prerequisite = Node(id="00000000-0000-0000-0000-000000000002", project_id=root.id, parent_id=root.id, objective="review me", status=NodeStatus.COMPLETE, needs_review=True)
@@ -91,10 +83,55 @@ def test_unaccepted_dependency_blocks_dispatch_and_reopens_complete_parent():
     assert result.status[root.id] == NodeStatus.EXPANDED
 
 
+def test_completed_container_satisfies_integrator_dependency():
+    root = Node(
+        id="00000000-0000-0000-0000-000000000011",
+        project_id="00000000-0000-0000-0000-000000000011",
+        objective="root",
+        status=NodeStatus.EXPANDED,
+    )
+    branch = Node(
+        id="00000000-0000-0000-0000-000000000012",
+        project_id=root.id,
+        parent_id=root.id,
+        objective="subplanner",
+        status=NodeStatus.EXPANDED,
+    )
+    executor = Node(
+        id="00000000-0000-0000-0000-000000000013",
+        project_id=root.id,
+        parent_id=branch.id,
+        objective="executor",
+        status=NodeStatus.COMPLETE,
+    )
+    integrator = Node(
+        id="00000000-0000-0000-0000-000000000014",
+        project_id=root.id,
+        parent_id=root.id,
+        objective="integrator",
+        status=NodeStatus.PENDING,
+    )
+    from turn.domain.schemas import Edge, EdgeType
+    edges = [
+        Edge(src=root.id, dst=branch.id, type=EdgeType.CONTAINS),
+        Edge(src=branch.id, dst=executor.id, type=EdgeType.CONTAINS),
+        Edge(src=root.id, dst=integrator.id, type=EdgeType.CONTAINS),
+        Edge(src=branch.id, dst=integrator.id, type=EdgeType.DEPENDS_ON),
+    ]
+
+    result = evaluate([root, branch, executor, integrator], edges)
+
+    assert result.status[branch.id] == NodeStatus.COMPLETE
+    assert integrator.id in result.runnable
+
+
 def test_recovery_classification_and_backoff():
     assert classify_failure("context window exceeded") == DamageKind.CONTEXT_PRESSURE
     assert classify_failure("429 rate limit") == DamageKind.RATE_LIMIT
     assert classify_failure("service overloaded") == DamageKind.CHOKED
-    assert should_retry("overloaded", False, True)
+    # Auto-respawn is disabled by design: a node is only re-run on an explicit
+    # user action, so even a choked error is not retried unless the worker
+    # also recommended it.
+    assert not should_retry("overloaded", False, True)
     assert not should_retry("invalid credentials", False, True)
     assert [backoff_seconds(n, 500) for n in (1, 2, 3)] == [0.5, 1.0, 2.0]

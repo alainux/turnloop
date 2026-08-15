@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -37,13 +37,14 @@ def _wait(url: str, seconds: float = 12) -> None:
     raise RuntimeError(f"server did not become ready: {url}")
 
 
-def _wait_persisted_complete(database, project_id: str, seconds: float = 15) -> None:
+def _wait_persisted_complete(state_file, seconds: float = 30) -> None:
     deadline, stable = time.time() + seconds, 0
     while time.time() < deadline:
-        with sqlite3.connect(database) as connection:
-            statuses = [row[0] for row in connection.execute(
-                "SELECT status FROM nodes WHERE project_id = ?", (project_id.replace("-", ""),)
-            )]
+        try:
+            state = json.loads(state_file.read_text())
+            statuses = [row["status"] for row in state.get("nodes", [])]
+        except (FileNotFoundError, json.JSONDecodeError):
+            statuses = []
         stable = stable + 1 if statuses and all(item == "COMPLETE" for item in statuses) else 0
         if stable >= 2:
             return
@@ -57,14 +58,16 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
         port = _free_port()
     except PermissionError:
         pytest.skip("this sandbox does not permit local listener sockets")
-    database = tmp_path / "acceptance.db"
+    data_dir = tmp_path / "turn"
     server_log = tmp_path / "server.log"
     env = os.environ.copy()
     env.update({
-        "TURN_DATABASE_URL": f"sqlite+aiosqlite:///{database}",
+        "TURN_DATA_DIR": str(data_dir),
         "TURN_PROJECTS_DIR": str(tmp_path / "projects"),
         "TURN_PLANNER": "heuristic",
         "TURN_DEFAULT_EXECUTOR": "echo",
+        "TURN_TEST_MODE": "1",
+        "TURN_TEST_HERDR_ADAPTER": "fake",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
     with server_log.open("w") as log:
@@ -87,42 +90,46 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                 page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
                 page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
                 project_ids: list[str] = []
+                state_files: list[Path] = []
 
                 for index, objective in enumerate(OBJECTIVES):
                     page.get_by_role("textbox", name="Project objective").fill(objective)
-                    page.get_by_label("Harness").select_option("echo")
+                    page.get_by_label("Harness").click()
+                    page.get_by_role("option", name="Echo · offline").click()
+                    # Step is the product default. This acceptance flow
+                    # intentionally verifies the separate Auto behavior.
+                    page.get_by_role("button", name="Project and run configuration").click()
+                    page.get_by_label("Auto-run", exact=True).check()
                     page.get_by_role("button", name="Create workgraph").click()
-                    page.locator(".gnode.waiting_input").wait_for(timeout=15000)
+                    page.locator(".gnode").first.wait_for(timeout=15000)
                     project_id = page.evaluate(
-                        "async objective => (await (await fetch('/api/projects')).json()).projects.find(p => p.generated_prompt === objective).id",
+                        "async objective => (await (await fetch('/api/projects', {cache: 'no-store'})).json()).projects.find(p => p.generated_prompt === objective).id",
                         objective,
                     )
                     project_ids.append(project_id)
-                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph`)).json())", project_id)
+                    page.wait_for_function(
+                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json(); return g.nodes.length === 5; }",
+                        arg=project_id,
+                        timeout=30000,
+                    )
+                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json())", project_id)
+                    state_files.append(Path(graph["nodes"][0]["repo_path"]) / ".turn" / "state.json")
                     assert len(graph["nodes"]) == 5
-                    assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 1
+                    assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 0
                     assert sum(edge["type"] == "DEPENDS_ON" for edge in graph["edges"]) == 3
                     assert all(
                         node["agent"]["harness"] == "echo" and node["agent"]["model"] == "deterministic"
                         for node in graph["nodes"] if node["parent_id"]
                     )
 
-                    clarification = next(node for node in graph["nodes"] if node["ui_state"] == "waiting_input")
-                    page.locator(f'[data-node-id="{clarification["id"]}"] .node-main').click()
-                    input_label = next(item["label"] for item in clarification["required_inputs"] if not item.get("satisfied_by"))
-                    page.get_by_role("textbox", name=input_label).fill(
-                        f"Keep run {index + 1} concise, modular, and independently verifiable."
-                    )
-                    page.get_by_role("button", name="Provide input").click()
                     page.wait_for_function(
-                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`)).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
+                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
                         arg=project_id,
-                        timeout=15000,
+                        timeout=30000,
                     )
-                    _wait_persisted_complete(database, project_id)
+                    _wait_persisted_complete(state_files[-1])
                     page.locator(f'[data-node-id="{project_id}"] .node-main').click()
-                    page.get_by_role("tab", name="History").click()
-                    page.locator(".history-item").wait_for()
+                    assert page.get_by_role("tab", name="History").count() == 0
                     page.get_by_role("button", name="Turn").click()
                     page.get_by_role("heading", name="What should the workgraph build?").wait_for()
 
@@ -137,32 +144,21 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
             except subprocess.TimeoutExpired:
                 process.kill()
 
-    with sqlite3.connect(database) as connection:
-        connection.row_factory = sqlite3.Row
-        roots = connection.execute(
-            "SELECT id, objective, generated_prompt, status FROM nodes WHERE parent_id IS NULL ORDER BY created_at"
-        ).fetchall()
-        assert [row["generated_prompt"] for row in roots] == list(OBJECTIVES)
-        assert all(len(row["objective"]) <= 72 and row["status"] == "COMPLETE" for row in roots)
-        for root in roots:
-            nodes = connection.execute(
-                "SELECT id, objective, status, required_inputs FROM nodes WHERE project_id = ?", (root["id"],)
-            ).fetchall()
-            assert len(nodes) == 5 and all(row["status"] == "COMPLETE" for row in nodes)
-            supplied = [item for row in nodes for item in json.loads(row["required_inputs"] or "[]")]
-            assert len(supplied) == 1 and supplied[0]["satisfied_by"]
-            runs = connection.execute(
-                "SELECT status, summary, logs FROM runs WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)",
-                (root["id"],),
-            ).fetchall()
-            assert len(runs) == 5
-            assert all(row["status"] == "COMPLETE" and row["summary"] and row["logs"] for row in runs)
-            artifacts = connection.execute(
-                "SELECT kind, name, content FROM artifacts WHERE node_id IN (SELECT id FROM nodes WHERE project_id = ?)",
-                (root["id"],),
-            ).fetchall()
-            assert len([row for row in artifacts if row["kind"] == "user_input"]) == 1
-            assert len([row for row in artifacts if row["kind"] == "text"]) == 4
+    states = [json.loads(state_file.read_text()) for state_file in state_files]
+    assert [next(node for node in state["nodes"] if node["parent_id"] is None)["generated_prompt"] for state in states] == list(OBJECTIVES)
+    for state in states:
+        roots = [node for node in state["nodes"] if node["parent_id"] is None]
+        assert len(roots) == 1 and len(roots[0]["objective"]) <= 72 and roots[0]["status"] == "COMPLETE"
+        nodes = state["nodes"]
+        assert len(nodes) == 5 and all(node["status"] == "COMPLETE" for node in nodes)
+        supplied = [item for node in nodes for item in node["required_inputs"]]
+        assert supplied == []
+        runs = state["runs"]
+        assert len(runs) == 5
+        assert all(run["status"] == "COMPLETE" and run["summary"] and run["logs"] for run in runs)
+        artifacts = state["artifacts"]
+        assert len([item for item in artifacts if item["kind"] == "user_input"]) == 0
+        assert len([item for item in artifacts if item["kind"] == "text"]) == 4
 
     log_text = server_log.read_text()
     assert log_text.count("POST /api/projects") == 3

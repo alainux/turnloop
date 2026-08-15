@@ -6,7 +6,7 @@ Proves the smallest useful path works across an unrelated objective:
   leaves -> block -> provide input -> complete -> edit parent -> regenerate
   descendants -> execution resumes.
 
-Runs entirely offline against a temp SQLite store with deterministic workers.
+Runs entirely offline against a temporary local-file store with deterministic workers.
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from turn.workers.codex_worker import CodexWorker
 from turn.workers.echo_worker import EchoWorker
 from turn.workers.registry import WorkerRegistry
 from turn.workers.shell_worker import ShellWorker
+from turn.tests.fakes import FakeHerdrAdapter
 
 
 # --- deterministic planner ------------------------------------------------
@@ -117,8 +118,8 @@ def find_node(nodes, objective_substr: str):
 
 
 async def main() -> None:
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
-    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    tmp = tempfile.mkdtemp()
+    store = Store(tmp)
     await store.init()
     events = EventBus()
     captured: list[dict] = []
@@ -131,7 +132,13 @@ async def main() -> None:
 
     asyncio.create_task(collector())
 
-    runner = Runner(store, registry=build_registry(), events=events, settings=settings)
+    runner = Runner(
+        store,
+        registry=build_registry(),
+        events=events,
+        settings=settings,
+        herdr_adapter=FakeHerdrAdapter(),
+    )
 
     # 1) prompt -> root node -> initial planner
     root = await store.create_project("Ship a tiny landing page for turnloop.tech")
@@ -167,28 +174,21 @@ async def main() -> None:
     # 5) edit the parent, then regenerate descendants
     await runner.edit_node(root.id, objective="Ship a tiny landing page (v2, with pricing)")
     await runner.regenerate_descendants(root.id)
-    # old branch should be superseded
-    old_a = await store.get_node(a.id)
-    old_b = await store.get_node(b.id)
-    assert old_a.status == NodeStatus.CANCELLED, old_a.status
-    assert old_b.status == NodeStatus.CANCELLED, old_b.status
+    # regeneration replaces the old branch instead of retaining revisions
+    assert await store.get_node(a.id) is None
+    assert await store.get_node(b.id) is None
 
     # new branch was created and resumes execution
     nodes, _, _ = await store.get_workgraph(root.id)
-    new_b = find_node([n for n in nodes if n.status != NodeStatus.CANCELLED], "Confirm the key decision")
+    new_b = find_node(nodes, "Confirm the key decision")
     assert new_b is not None, "regenerated branch missing"
     await runner.provide_input(new_b.id, "decision_x", "Add a pricing table too.")
     await drain(runner)
     new_b = await store.get_node(new_b.id)
-    new_c = find_node([n for n in nodes if n.status != NodeStatus.CANCELLED], "Produce the deliverable")
+    new_c = find_node(nodes, "Produce the deliverable")
     new_c = await store.get_node(new_c.id)
     assert new_b.status == NodeStatus.COMPLETE, new_b.status
     assert new_c.status == NodeStatus.COMPLETE, new_c.status
-
-    # 6) fork creates an independent alternative branch
-    fork = await runner.fork(new_b.id)
-    assert fork is not None and fork.forked_from == new_b.id
-    await drain(runner)
 
     # events were emitted for the key transitions
     types = {e["type"] for e in captured}
@@ -203,11 +203,17 @@ async def main() -> None:
 async def test_manual_mode() -> None:
     """Manual stepping: the runner plans but never auto-executes; each step
     runs exactly one runnable node, and a plain tick does nothing."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
-    store = Store(f"sqlite+aiosqlite:///{tmp}")
+    tmp = tempfile.mkdtemp()
+    store = Store(tmp)
     await store.init()
     events = EventBus()
-    runner = Runner(store, registry=build_registry(), events=events, settings=settings)
+    runner = Runner(
+        store,
+        registry=build_registry(),
+        events=events,
+        settings=settings,
+        herdr_adapter=FakeHerdrAdapter(),
+    )
 
     root = await store.create_project("Ship a tiny landing page for turnloop.tech (manual)")
     await store.set_auto_run(root.id, False)
