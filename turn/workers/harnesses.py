@@ -30,15 +30,9 @@ from turn.domain.schemas import (
     Usage,
     WorkerResult,
 )
+from turn.contracts.dag import parse_result
 from turn.config import settings
 from turn.workers import parsing
-from turn.workers.artifacts import (
-    capture_filesystem,
-    has_material_change,
-    missing_declared_files,
-    requires_material_change,
-    snapshot_filesystem,
-)
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers.terminal import LocalPtyTransport
 from turn.workers.harness_catalog import (
@@ -290,7 +284,7 @@ TASK:
 {task}
 
 Use BLOCK only for genuinely external human input. Continue the existing
-session when reviewer feedback is supplied; preserve prior context and files.
+session when a node is rerun; preserve prior context and files.
 """
     return f"{prompt}\n\n{result_handoff()}"
 
@@ -396,7 +390,6 @@ class CLIHarnessWorker(Worker):
                 error=f"selected harness '{self.harness.value}' is unavailable",
             )
         cwd = repo
-        before = snapshot_filesystem(cwd)
         agent = (ctx.node.agent or AgentConfig(harness=self.harness)).model_copy(deep=True)
         try:
             validate_agent_capabilities(agent)
@@ -547,27 +540,19 @@ class CLIHarnessWorker(Worker):
                 ],
             )
         try:
-            outcome = Outcome(data.get("outcome", "COMPLETE"))
-        except ValueError:
-            outcome = Outcome.COMPLETE
-        result = WorkerResult(
-            outcome=outcome,
-            summary=parsing.clean_summary(
-                data.get("summary", text[-2000:] or f"{self.name} completed")
-            ),
-            missing_inputs=[InputSpec(**i) for i in data.get("missing_inputs", [])],
-            artifacts=parsing.artifact_specs(data.get("artifacts", [])),
-            error=data.get("error"),
-            retry_recommended=bool(data.get("retry_recommended", False)),
-            session_id=session or agent.session_id,
-            usage=usage,
-        )
-        missing_files = missing_declared_files(result.artifacts, cwd)
-        if missing_files:
-            result.outcome = Outcome.FAIL
-            result.summary = f"{self.name} reported missing file outputs: {', '.join(missing_files)}"
-            result.error = result.summary
-            result.retry_recommended = True
+            result = parse_result(data)
+        except (TypeError, ValueError) as error:
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary=f"{self.name} returned an invalid Turn result",
+                error=str(error),
+                retry_recommended=False,
+                session_id=session or agent.session_id,
+                usage=usage,
+            )
+        result.summary = parsing.clean_summary(result.summary)
+        result.session_id = session or agent.session_id
+        result.usage = usage
         display_out = (
             terminal.output.decode(errors="replace")
             if native
@@ -580,18 +565,4 @@ class CLIHarnessWorker(Worker):
                 content=display_out or text,
             )
         )
-        # Keep this comparison as a correctness invariant, but do not derive
-        # UI artifacts from the filesystem. Artifact reporting belongs to the
-        # agent's explicit CLI submission.
-        captured = capture_filesystem(cwd, before)
-        missing_material = (
-            result.outcome == Outcome.COMPLETE
-            and requires_material_change(ctx.node.objective, ctx.node.generated_prompt)
-            and not has_material_change(captured)
-        )
-        if missing_material:
-            result.outcome = Outcome.FAIL
-            result.summary = f"{self.name} completed a file-writing objective without a material filesystem change"
-            result.error = result.summary
-            result.retry_recommended = True
         return result

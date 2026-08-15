@@ -87,8 +87,6 @@ export interface GraphNodeView {
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
   artifact_refs: Array<string>;
-  needs_review: boolean;
-  merge_accepted: boolean;
   created_at: string;
   updated_at: string;
   progress: number | null;
@@ -136,8 +134,6 @@ export interface Node {
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
   artifact_refs: Array<string>;
-  needs_review: boolean;
-  merge_accepted: boolean;
   created_at: string;
   updated_at: string;
   progress: number | null;
@@ -145,7 +141,7 @@ export interface Node {
   agent_message: string | null;
 }
 
-export type NodeAction = "run" | "pause" | "resume" | "cancel" | "retry" | "edit" | "regenerate" | "accept" | "reject" | "provide_input";
+export type NodeAction = "run" | "pause" | "resume" | "cancel" | "retry" | "edit" | "regenerate" | "provide_input";
 
 export interface NodeSpec {
   key: string;
@@ -162,7 +158,7 @@ export interface NodeSpec {
 
 export type NodeStatus = "PENDING" | "BLOCKED" | "RUNNABLE" | "RUNNING" | "EXPANDED" | "COMPLETE" | "FAILED" | "CANCELLED";
 
-export type NodeUIState = "queued" | "ready" | "running" | "paused" | "waiting_input" | "waiting_dependency" | "review" | "accepted" | "complete" | "container" | "failed" | "cancelled";
+export type NodeUIState = "queued" | "ready" | "running" | "paused" | "waiting_input" | "waiting_dependency" | "complete" | "container" | "failed" | "cancelled";
 
 export type Outcome = "COMPLETE" | "EXPAND" | "BLOCK" | "FAIL";
 
@@ -191,8 +187,6 @@ export interface Planner {
 
 export type ReasoningLevel = "default" | "low" | "medium" | "high" | "xhigh" | "max";
 
-export type ReviewMode = "manual";
-
 export interface Run {
   id: string;
   node_id: string;
@@ -219,7 +213,6 @@ export interface RunPolicy {
   retry_backoff_ms: number;
   retry_choked_models: boolean;
   compact_on_context_pressure: boolean;
-  review_mode: ReviewMode;
 }
 
 export type RunStatus = "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";

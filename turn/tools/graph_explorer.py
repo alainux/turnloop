@@ -57,7 +57,6 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
             "objective": item.get("objective", ""),
             "status": item.get("status", "PENDING"),
             "executor": item.get("executor"),
-            "needs_review": bool(item.get("needs_review")),
             "files": _files_for(artifacts.get(node_id, [])),
         }
         nodes.append(node)

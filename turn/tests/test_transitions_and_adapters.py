@@ -26,7 +26,6 @@ from turn.domain.schemas import (
     NodeStatus,
     Outcome,
     PlanResult,
-    ReviewMode,
     ReasoningLevel,
     RunPolicy,
     RunStatus,
@@ -42,7 +41,6 @@ from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
 import turn.workers.harnesses as harness_module
 from turn.workers import parsing
-from turn.workers.artifacts import has_material_change, missing_declared_files, requires_material_change
 from turn.workers.registry import WorkerRegistry
 from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
@@ -99,18 +97,6 @@ class SlowWorker(Worker):
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
-
-
-class SessionWorker(Worker):
-    name = "echo"
-
-    def __init__(self):
-        self.seen: list[tuple[str, str | None, str | None]] = []
-
-    async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
-        self.seen.append(
-            (str(ctx.node.id), ctx.node.agent.session_id, ctx.node.generated_prompt)
-        )
 
 
 class FixedPlanner(Planner):
@@ -602,27 +588,6 @@ async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
     await store.dispose()
 
 
-async def test_scheduler_reconciles_cancelled_stale_review_from_persisted_history(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
-    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
-    stale = await store.create_node(
-        project_id=root.id,
-        parent_id=root.id,
-        objective="Cancelled historical work",
-        executor="echo",
-        status=NodeStatus.CANCELLED,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    stale.needs_review = True
-    await store._save_node(stale)
-
-    await runner._schedule_project(root.id)
-
-    repaired = await store.get_node(stale.id)
-    assert repaired.needs_review is False
-    await store.dispose()
-
-
 async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_path):
     _, store, runner = await _runtime(tmp_path, EchoWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
@@ -642,8 +607,6 @@ async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_pat
         status=NodeStatus.RUNNING,
         agent=AgentConfig(harness=HarnessKind.ECHO),
     )
-    late_child.needs_review = True
-    await store._save_node(late_child)
     worker = asyncio.create_task(asyncio.Event().wait())
     runner._running[late_child.id] = worker
 
@@ -651,48 +614,7 @@ async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_pat
 
     repaired = await store.get_node(late_child.id)
     assert repaired.status == NodeStatus.CANCELLED
-    assert repaired.needs_review is False
     assert worker.cancelled()
-    await store.dispose()
-
-
-async def test_accepting_container_stops_descendant_tasks_before_cleanup(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
-    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
-    parent = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="Container",
-        executor="planner", status=NodeStatus.COMPLETE,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    child = await store.create_node(
-        project_id=root.id, parent_id=parent.id, objective="Late worker",
-        executor="echo", status=NodeStatus.RUNNING,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    accepted_child = await store.create_node(
-        project_id=root.id, parent_id=parent.id, objective="Previously accepted worker",
-        executor="echo", status=NodeStatus.RUNNING,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
-    )
-    accepted_child.merge_accepted = True
-    await store._save_node(accepted_child)
-    parent.needs_review = True
-    await store._save_node(parent)
-    worker = asyncio.create_task(asyncio.Event().wait())
-    accepted_worker = asyncio.create_task(asyncio.Event().wait())
-    runner._running[child.id] = worker
-    runner._running[accepted_child.id] = accepted_worker
-
-    await runner.accept_merge(parent.id)
-
-    assert worker.cancelled() and accepted_worker.cancelled()
-    repaired = await store.get_node(child.id)
-    assert repaired.status == NodeStatus.CANCELLED
-    assert repaired.merge_accepted is False
-    assert repaired.needs_review is False
-    accepted_projection = await store.get_node(accepted_child.id)
-    assert accepted_projection.status == NodeStatus.COMPLETE
-    assert accepted_projection.merge_accepted is True
     await store.dispose()
 
 
@@ -702,13 +624,15 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
     await store.set_status(root.id, NodeStatus.EXPANDED)
     orphan = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="Interrupted work",
-        status=NodeStatus.CANCELLED, agent=AgentConfig(harness=HarnessKind.ECHO),
+        status=NodeStatus.RUNNING,
+        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="stale-session"),
     )
     live = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="Owned work",
         status=NodeStatus.RUNNING, agent=AgentConfig(harness=HarnessKind.ECHO),
     )
     orphan_run = await store.create_run(orphan, "echo")
+    await runner.terminal.ensure_persistent_shell(orphan.id, cwd=str(tmp_path))
     live_run = await store.create_run(live, "echo")
     live_task = asyncio.create_task(asyncio.Event().wait())
     runner._running[live.id] = live_task
@@ -716,6 +640,10 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
     await runner._schedule_project(root.id)
 
     assert (await store.get_runs(orphan.id))[-1].status == RunStatus.CANCELLED
+    repaired_orphan = await store.get_node(orphan.id)
+    assert repaired_orphan.status == NodeStatus.RUNNABLE
+    assert repaired_orphan.agent.session_id is None
+    assert await runner.terminal.has_persistent_session(orphan.id)
     assert (await store.get_runs(live.id))[-1].status == RunStatus.RUNNING
     assert orphan_run.id != live_run.id
     live_task.cancel()
@@ -723,16 +651,35 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
     await store.dispose()
 
 
-async def test_late_failure_cannot_revive_an_accepted_node(tmp_path):
+async def test_retry_starts_a_fresh_provider_call_in_the_existing_pane(tmp_path):
     _, store, runner = await _runtime(tmp_path, EchoWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     node = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="Accepted while running",
+        project_id=root.id,
+        parent_id=root.id,
+        objective="Retryable work",
+        status=NodeStatus.FAILED,
+        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="stale-session"),
+    )
+    await runner.terminal.ensure_persistent_shell(node.id, cwd=str(tmp_path))
+
+    await runner.retry(node.id)
+
+    retried = await store.get_node(node.id)
+    assert retried.status == NodeStatus.RUNNABLE
+    assert retried.agent.session_id is None
+    assert await runner.terminal.has_persistent_session(node.id)
+    await store.dispose()
+
+
+async def test_late_failure_retries_a_running_node(tmp_path):
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
+    node = await store.create_node(
+        project_id=root.id, parent_id=root.id, objective="Node while running",
         executor="echo", status=NodeStatus.RUNNING,
         agent=AgentConfig(harness=HarnessKind.ECHO),
     )
-    node.merge_accepted = True
-    await store._save_node(node)
     run = await store.create_run(node, "echo", 1)
 
     await runner._handle_outcome(
@@ -844,12 +791,6 @@ def test_agent_artifact_shorthand_is_normalized():
     assert specs[1].ref == "docs/README.md"
 
 
-def test_claimed_file_outputs_must_exist_in_the_worktree(tmp_path):
-    (tmp_path / "present.js").write_text("ok")
-    specs = parsing.artifact_specs(["present.js", "missing.js"])
-    assert missing_declared_files(specs, str(tmp_path)) == ["missing.js"]
-
-
 def test_graph_tool_json_cannot_be_mistaken_for_a_worker_plan():
     graph_output = '{"nodes":[{"id":"existing","objective":"already built"}],"edges":[]}'
     assert parsing.first_plan_json(graph_output) is None
@@ -876,14 +817,12 @@ def test_bare_schema_plan_is_accepted_and_explicit_edges_follow_domain_direction
     assert plan.nodes[1].depends_on == ["a"]
 
 
-def test_final_structured_worker_result_wins_and_material_work_is_explicit():
+def test_final_structured_worker_result_wins():
     messages = (
         '{"outcome":"COMPLETE","summary":"I will inspect"}\n'
         '{"outcome":"COMPLETE","summary":"finished integration"}'
     )
     assert parsing.first_result_json(messages)["summary"] == "finished integration"
-    assert requires_material_change("Assemble the application", None)
-    assert not has_material_change([])
 
 
 def test_workers_have_no_parent_verifier_path():
@@ -891,7 +830,6 @@ def test_workers_have_no_parent_verifier_path():
     assert "PARENT VERIFICATION TASK" not in source
     assert 'ctx.purpose == "verify"' not in source
     assert 'type_id == "validator"' not in source
-    assert "snapshot_filesystem" in source
     assert "is_verification" not in source
 
 
@@ -916,80 +854,6 @@ async def test_harness_switch_clears_provider_session_in_store(tmp_path):
     )
     assert changed.agent.harness == HarnessKind.PI
     assert changed.agent.session_id is None
-    await store.dispose()
-
-
-async def test_acceptance_keeps_shared_project_files_in_place(tmp_path):
-    """The old shipping test exercised git branches, not current MVP behavior."""
-    project_dir = tmp_path / "project"
-    store = Store(tmp_path / "state")
-    await store.init()
-    root = await store.create_project(
-        "root", repo_path=str(project_dir), run_policy=RunPolicy(auto_run=False)
-    )
-    child = await store.create_node(
-        project_id=root.id,
-        parent_id=root.id,
-        objective="integrate correction",
-        status=NodeStatus.COMPLETE,
-    )
-    correction = project_dir / "correction.txt"
-    correction.write_text("fixed")
-
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
-    await runner.accept_merge(child.id)
-
-    accepted = await store.get_node(child.id)
-    assert correction.read_text() == "fixed"
-    assert accepted.status == NodeStatus.COMPLETE
-    assert accepted.merge_accepted is True
-    await store.dispose()
-
-
-async def test_accepted_cleanup_leaves_shared_project_files_untouched(tmp_path):
-    """Accepted nodes no longer own disposable per-node directories."""
-    project_dir = tmp_path / "project"
-    store = Store(tmp_path / "state")
-    await store.init()
-    root = await store.create_project("root", repo_path=str(project_dir))
-    child = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="child", status=NodeStatus.COMPLETE,
-    )
-    child.merge_accepted = True
-    await store._save_node(child)
-    active = project_dir / "active.txt"
-    active.write_text("do not delete")
-
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
-    await runner._cleanup_accepted(child)
-    assert active.read_text() == "do not delete"
-    await store.dispose()
-
-
-async def test_rejection_keeps_shared_project_files_available_for_rerun(tmp_path):
-    """Feedback reruns the same node in the same assigned directory."""
-    project_dir = tmp_path / "project"
-    store = Store(tmp_path / "state")
-    await store.init()
-    root = await store.create_project("root", repo_path=str(project_dir))
-    child = await store.create_node(
-        project_id=root.id, parent_id=root.id, objective="child", status=NodeStatus.COMPLETE,
-    )
-    child.merge_accepted = True
-    await store._save_node(child)
-    active = project_dir / "active.txt"
-    active.write_text("preserve")
-
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
-    async def no_run(_node_id):
-        return None
-    runner.run_node = no_run
-    await runner.reject_merge(child.id, "revise safely")
-
-    revised = await store.get_node(child.id)
-    assert active.read_text() == "preserve"
-    assert revised.merge_accepted is False
-    assert "revise safely" in revised.generated_prompt
     await store.dispose()
 
 
@@ -1095,43 +959,4 @@ async def test_resume_respects_step_and_auto_modes(tmp_path):
     await runner._schedule_project(root.id)
     await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
     assert (await store.get_node(child.id)).status == NodeStatus.COMPLETE
-    await store.dispose()
-
-
-async def test_accept_is_terminal_and_reject_reuses_agent_session(tmp_path):
-    session_worker = SessionWorker()
-    _, store, runner = await _runtime(tmp_path, session_worker)
-    root = await store.create_project(
-        "root", run_policy=RunPolicy(auto_run=True, review_mode=ReviewMode.MANUAL)
-    )
-    await store.set_status(root.id, NodeStatus.EXPANDED)
-    child = await store.create_node(
-        project_id=root.id,
-        parent_id=root.id,
-        objective="reviewed work",
-        generated_prompt="initial context",
-        executor="echo",
-        status=NodeStatus.COMPLETE,
-    )
-    child.agent = AgentConfig(harness=HarnessKind.ECHO, session_id="session-42")
-    child.needs_review = True
-    await store._save_node(child)
-
-    await runner.reject_merge(child.id, "preserve the ending")
-    await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
-    revised = await store.get_node(child.id)
-    assert session_worker.seen == [
-        (str(child.id), "session-42", revised.generated_prompt)
-    ]
-    assert revised.id == child.id and revised.agent.session_id == "session-42"
-    assert "preserve the ending" in revised.generated_prompt
-
-    revised.needs_review = True
-    revised.status = NodeStatus.COMPLETE
-    await store._save_node(revised)
-    await runner.accept_merge(child.id)
-    await runner.resume(child.id)
-    accepted = await store.get_node(child.id)
-    assert accepted.status == NodeStatus.COMPLETE
-    assert accepted.merge_accepted and not accepted.needs_review
     await store.dispose()

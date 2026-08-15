@@ -9,6 +9,7 @@ export interface Layout {
   positions: Map<string, Position>;
   width: number;
   height: number;
+  stageCount: number;
 }
 export const NODE_WIDTH = 224,
   NODE_HEIGHT = 64,
@@ -48,13 +49,48 @@ function hasAlternativePath(
  */
 export function displayEdges(nodes: GraphNode[], edges: Edge[]): Edge[] {
   const ids = new Set(nodes.map((node) => node.id));
+  const children = new Map<string, string[]>();
+  for (const node of nodes) {
+    if (node.parent_id && ids.has(node.parent_id)) {
+      children.set(node.parent_id, [
+        ...(children.get(node.parent_id) ?? []),
+        node.id,
+      ]);
+    }
+  }
+  for (const edge of edges) {
+    if (edge.type !== "CONTAINS" || !ids.has(edge.src) || !ids.has(edge.dst)) {
+      continue;
+    }
+    children.set(edge.src, [...(children.get(edge.src) ?? []), edge.dst]);
+  }
+  const terminalDescendants = (id: string): string[] => {
+    const descendants = [...new Set(children.get(id) ?? [])];
+    if (!descendants.length) return [id];
+    return descendants.flatMap(terminalDescendants);
+  };
   const dependencies = edges.filter(
     (edge) =>
       edge.type === "DEPENDS_ON" && ids.has(edge.src) && ids.has(edge.dst),
   );
-  const reducedDependencies = dependencies.filter(
+  // A dependency on a planner/container means that the dependent consumes
+  // the completed branch, not the container card itself. Project that handoff
+  // onto the branch's terminal outputs so nested decompositions remain visibly
+  // connected to their downstream integrator.
+  const expandedDependencies = dependencies.flatMap((edge) =>
+    terminalDescendants(edge.src).map((source) =>
+      source === edge.src
+        ? edge
+        : {
+            ...edge,
+            id: `${edge.id}:terminal:${source}`,
+            src: source,
+          },
+    ),
+  );
+  const reducedDependencies = expandedDependencies.filter(
     (edge) =>
-      !hasAlternativePath(edge.src, edge.dst, dependencies, edge.id),
+      !hasAlternativePath(edge.src, edge.dst, expandedDependencies, edge.id),
   );
   const dependencyTargets = new Set(
     reducedDependencies.map((edge) => edge.dst),
@@ -150,6 +186,27 @@ export function layoutDendrogram(nodes: GraphNode[], edges: Edge[] = []): Layout
       }
     }
   }
+
+  // A dependency on a container means that the dependent consumes the
+  // container's completed workgraph, not merely the container card. Expand
+  // that dependency for stage calculation so a final integration node is
+  // placed after the container's deepest work, while keeping the original
+  // edge for rendering and graph semantics.
+  const terminalDescendants = (id: string): string[] => {
+    const descendants = children.get(id) ?? [];
+    if (!descendants.length) return [id];
+    return descendants.flatMap(terminalDescendants);
+  };
+  for (const edge of visibleEdges) {
+    if (edge.type !== "DEPENDS_ON") continue;
+    for (const source of terminalDescendants(edge.src)) {
+      if (source === edge.dst) continue;
+      const pair = `${source}:${edge.dst}`;
+      if (stagePairs.has(pair)) continue;
+      stagePairs.add(pair);
+      stageEdges.push({ src: source, dst: edge.dst });
+    }
+  }
   for (const edge of stageEdges) {
     outgoing.set(edge.src, [...(outgoing.get(edge.src) ?? []), edge.dst]);
     indegree.set(edge.dst, (indegree.get(edge.dst) ?? 0) + 1);
@@ -199,12 +256,14 @@ export function layoutDendrogram(nodes: GraphNode[], edges: Edge[] = []): Layout
     if (!positions.has(node.id)) place(node.id);
   });
   let width = NODE_WIDTH,
-    height = NODE_HEIGHT;
+    height = NODE_HEIGHT,
+    maxDepth = 0;
   positions.forEach((p) => {
     width = Math.max(width, p.x + NODE_WIDTH);
     height = Math.max(height, p.y + NODE_HEIGHT);
+    maxDepth = Math.max(maxDepth, p.depth);
   });
-  return { positions, width, height };
+  return { positions, width, height, stageCount: maxDepth + 1 };
 }
 
 export function pathBetween(

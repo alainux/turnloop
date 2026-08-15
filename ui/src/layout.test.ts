@@ -34,8 +34,6 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   progress: null,
   created_at: "",
   updated_at: "",
-  needs_review: false,
-  merge_accepted: false,
 });
 describe("dendrogram", () => {
   it("centers parents and uses orthogonal paths", () => {
@@ -137,5 +135,135 @@ describe("dendrogram", () => {
     ]);
     expect(shown).not.toContainEqual(expect.objectContaining({ src: "root", dst: "end" }));
     expect(shown).not.toContainEqual(expect.objectContaining({ src: "first", dst: "end" }));
+  });
+
+  it("places a final integration after a nested branch completes", () => {
+    const nodes = [
+      node("root", null),
+      node("branch", "root"),
+      node("leaf", "branch"),
+      node("branch-end", "branch"),
+      node("final", "root"),
+    ];
+    const edges: Edge[] = [
+      ["root", "branch"],
+      ["branch", "leaf"],
+      ["branch", "branch-end"],
+      ["root", "final"],
+    ].map(([src, dst]) => ({
+      id: `contains-${src}-${dst}`,
+      src,
+      dst,
+      type: "CONTAINS" as const,
+      created_at: "",
+    }));
+    edges.push(
+      {
+        id: "leaf-branch-end",
+        src: "leaf",
+        dst: "branch-end",
+        type: "DEPENDS_ON",
+        created_at: "",
+      },
+      {
+        id: "branch-final",
+        src: "branch",
+        dst: "final",
+        type: "DEPENDS_ON",
+        created_at: "",
+      },
+    );
+
+    const layout = layoutDendrogram(nodes, edges);
+
+    expect(layout.positions.get("final")!.x).toBeGreaterThan(
+      layout.positions.get("branch-end")!.x,
+    );
+  });
+
+  it("connects every nested branch output to a singular final product", () => {
+    const nodes = [
+      node("root", null),
+      node("branch", "root"),
+      node("first-output", "branch"),
+      node("second-output", "branch"),
+      node("final", "root"),
+    ];
+    const edges: Edge[] = [
+      ["root", "branch"],
+      ["branch", "first-output"],
+      ["branch", "second-output"],
+      ["root", "final"],
+    ].map(([src, dst]) => ({
+      id: `contains-${src}-${dst}`,
+      src,
+      dst,
+      type: "CONTAINS" as const,
+      created_at: "",
+    }));
+    edges.push({
+      id: "branch-final",
+      src: "branch",
+      dst: "final",
+      type: "DEPENDS_ON",
+      created_at: "",
+    });
+
+    const workflow = displayEdges(nodes, edges)
+      .filter((edge) => edge.type === "DEPENDS_ON")
+      .map((edge) => `${edge.src}->${edge.dst}`);
+
+    expect(workflow).toEqual([
+      "first-output->final",
+      "second-output->final",
+    ]);
+    expect(workflow).not.toContain("branch->final");
+  });
+
+  it("places a singular final integration in the last stage", () => {
+    const nodes = [
+      node("root", null),
+      node("branch-a", "root"),
+      node("a-leaf", "branch-a"),
+      node("branch-b", "root"),
+      node("b-leaf", "branch-b"),
+      node("integrate", "root"),
+    ];
+    const edges: Edge[] = [
+      ["root", "branch-a"],
+      ["branch-a", "a-leaf"],
+      ["root", "branch-b"],
+      ["branch-b", "b-leaf"],
+      ["root", "integrate"],
+    ].map(([src, dst]) => ({
+      id: `contains-${src}-${dst}`,
+      src,
+      dst,
+      type: "CONTAINS" as const,
+      created_at: "",
+    }));
+    edges.push(
+      ...["branch-a", "branch-b"].map((src) => ({
+        id: `${src}-integrate`,
+        src,
+        dst: "integrate",
+        type: "DEPENDS_ON" as const,
+        created_at: "",
+      })),
+    );
+
+    const layout = layoutDendrogram(nodes, edges);
+    const finalDepth = layout.stageCount - 1;
+    const finalStage = [...layout.positions.entries()]
+      .filter(([, position]) => position.depth === finalDepth)
+      .map(([id]) => id);
+
+    expect(finalStage).toEqual(["integrate"]);
+    expect(layout.positions.get("integrate")!.x).toBeGreaterThan(
+      layout.positions.get("a-leaf")!.x,
+    );
+    expect(layout.positions.get("integrate")!.x).toBeGreaterThan(
+      layout.positions.get("b-leaf")!.x,
+    );
   });
 });

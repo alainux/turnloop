@@ -735,7 +735,7 @@ form.composer:has(.searchable-select.open) {
   border-top: 1px solid var(--text-3);
 }
 .legend-line.depends {
-  border-top: 1px dashed var(--amber);
+  border-top-color: var(--amber);
 }
 .graph-stats {
   min-width: 0;
@@ -780,11 +780,32 @@ form.composer:has(.searchable-select.open) {
   overflow: auto;
   position: relative;
   display: flex;
-  align-items: safe center;
-  justify-content: safe center;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+.graph-guide {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 28px;
+  padding: 4px 12px;
+  color: var(--text-3);
+  font-size: 9px;
+  letter-spacing: 0.02em;
+}
+.graph-guide span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 .graph-canvas {
   flex: 0 0 auto;
+  align-self: flex-start;
   position: relative;
   transform-origin: 0 0;
   transition: transform 0.16s ease-out;
@@ -797,9 +818,38 @@ form.composer:has(.searchable-select.open) {
 }
 .edge-workflow {
   fill: none;
-  stroke: var(--border-strong);
   stroke-width: 1.25;
   stroke-linejoin: round;
+}
+.edge-contains {
+  stroke: var(--border-strong);
+}
+.edge-depends {
+  stroke: var(--amber);
+}
+.graph-stage-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+.graph-stage-label {
+  position: absolute;
+  top: 12px;
+  width: 224px;
+  color: var(--text-3);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: center;
+}
+.legend-line.contains {
+  border-top-color: var(--border-strong);
+}
+.gnode.graph-final-node {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .gnode {
   position: absolute;
@@ -978,12 +1028,10 @@ form.composer:has(.searchable-select.open) {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.gnode.complete .node-glyph,
-.gnode.accepted .node-glyph {
+.gnode.complete .node-glyph {
   color: var(--green);
   background: var(--green-soft);
 }
-.gnode.review .node-glyph,
 .gnode.verifying .node-glyph,
 .gnode.waiting_input .node-glyph,
 .gnode.waiting_dependency .node-glyph {
@@ -1107,11 +1155,9 @@ form.composer:has(.searchable-select.open) {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
 }
-.badge.complete,
-.badge.accepted {
+.badge.complete {
   color: var(--green);
 }
-.badge.review,
 .badge.verifying,
 .badge.waiting_input,
 .badge.waiting_dependency {
@@ -1166,19 +1212,16 @@ form.composer:has(.searchable-select.open) {
 .action-menu {
   position: relative;
 }
-.review-card,
 .input-card {
   padding: 11px;
   border: 1px solid color-mix(in srgb, var(--amber) 38%, var(--border));
   background: var(--amber-soft);
   border-radius: 8px;
 }
-.review-card h3,
 .input-card h3 {
   margin: 0 0 4px;
   font-size: 12px;
 }
-.review-card p,
 .input-card p {
   /* Supporting copy uses the design system's secondary text token. */
   color: var(--text-2);
@@ -2492,8 +2535,7 @@ img.icon {
 .markdown-body code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
-.instruction-editor,
-.review-feedback textarea {
+.instruction-editor {
   width: 100%;
   min-height: 120px;
   padding: 8px;
@@ -2502,10 +2544,6 @@ img.icon {
   background: var(--surface-0);
   color: var(--text);
   resize: vertical;
-}
-.review-feedback {
-  display: grid;
-  gap: 7px;
 }
 .empty-note {
   padding: 20px;

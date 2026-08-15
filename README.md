@@ -22,16 +22,16 @@ IDE-like web UI and the headless CLI are clients of that same core.
   stages share the same grey orthogonal edges, with parallel domain branches
   and explicit integration points visible in the graph.
 - Server-owned node/UI states with guarded transitions for run, step, pause,
-  resume, cancel, retry, review, accept, reject, input, branch regeneration, and
+  resume, cancel, retry, input, branch regeneration, and
   forks.
 - Per-project execution policy: auto/step, parallel dispatch, inter-job delay,
-  timeout, retry/backoff, choked-model retry, and explicit user review.
+  timeout, retry/backoff, and choked-model retry.
 - Codex, Claude Code, OpenCode, and Pi harness adapters with automatic local
   availability detection, editable model selectors, and model-dependent
   reasoning options. Deterministic Echo and heuristic planning exist only in
   tests and are never exposed by the served application.
-- Persistent agent session IDs so review feedback continues the same agent
-  context and project directory.
+- Persistent agent session IDs so reruns can continue the same agent context
+  and project directory.
 - Agent-, branch-, and project-level token/cost reporting when a harness emits
   usage telemetry.
 - A headless Python facade and `turn` CLI.
@@ -59,7 +59,7 @@ human terminal. Code diffs are durable artifacts rendered in the
 inspector.
 
 Current scope includes local POSIX PTYs, local harness discovery, provider
-sessions, explicit user review, model-dependent
+sessions, model-dependent
 reasoning controls, attachments, direct filesystem project execution, recovery
 policies, usage accounting, CLI/headless execution, and the tested web UI.
 
@@ -102,7 +102,7 @@ pytest -q
 
 The acceptance suite covers test-only deterministic software/story/book runs,
 browser authoring and inspection, PTY ANSI/input/resize/stall behavior,
-state/review transitions, persisted logs/artifacts/diffs, and server security.
+state transitions, persisted logs/artifacts/diffs, and server security.
 Model-backed demonstrations are intentionally separate from those tests: they
 prove installed-harness integration but are not deterministic quality scores.
 

@@ -150,103 +150,137 @@ async def run_until_result(
     not accumulate.
     """
     owns_attachment = True
-    if getattr(transport, "supports_inject", False):
-        # The persistent session is a plain shell. Launch the harness by typing
-        # its command, exactly as a user would. The native harness then
-        # receives its first message through the PTY below.
-        # The inspector may already be attached to this node's durable Herdr
-        # shell.  Do not create a second outer attachment: LocalPtyTransport
-        # stores one client per node and a second one used to replace the
-        # browser client, yielding a misleading "[terminated]" panel.
-        if transport.snapshot(node_id).get("active"):
-            task = None
-            owns_attachment = False
-        else:
-            task = asyncio.create_task(
-                transport.ensure_session(
-                    node_id,
-                    cwd=cwd,
-                    environment=environment,
-                    stream=stream,
-                    idle_warning=idle_warning,
-                    idle_reap=idle_reap,
+    task: asyncio.Task | None = None
+
+    async def abort_owned_attachment() -> None:
+        if not owns_attachment:
+            return
+        try:
+            await transport.stop(node_id)
+        finally:
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def wait_for_attachment() -> None:
+        """Do not type into a Herdr pane until its control stream is live."""
+        if task is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while True:
+            if transport.snapshot(node_id).get("active"):
+                return
+            if task.done():
+                try:
+                    await task
+                except Exception as error:
+                    raise RuntimeError(
+                        "harness terminal closed before Turn could inject its command"
+                    ) from error
+                raise RuntimeError(
+                    "harness terminal closed before Turn could inject its command"
                 )
-            )
-            for _ in range(50):
-                snapshot = transport.snapshot(node_id)
-                if task.done() or snapshot.get("active"):
-                    break
-                await asyncio.sleep(0.02)
-        if task is None or not task.done():
-            # Shell-quote each argument so multi-word payloads (e.g. a
-            # `-c "..."` script) are passed to the shell intact.
-            await transport.inject_command(
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "harness terminal did not become ready before Turn injected its command"
+                )
+            await asyncio.sleep(0.05)
+
+    try:
+        if getattr(transport, "supports_inject", False):
+            # The persistent session is a plain shell. Launch the harness by typing
+            # its command, exactly as a user would. The native harness then
+            # receives its first message through the PTY below.
+            # The inspector may already be attached to this node's durable Herdr
+            # shell. Do not create a second outer attachment: LocalPtyTransport
+            # stores one client per node and a second one used to replace the
+            # browser client, yielding a misleading "[terminated]" panel.
+            if transport.snapshot(node_id).get("active"):
+                owns_attachment = False
+            else:
+                task = asyncio.create_task(
+                    transport.ensure_session(
+                        node_id,
+                        cwd=cwd,
+                        environment=environment,
+                        stream=stream,
+                        idle_warning=idle_warning,
+                        idle_reap=idle_reap,
+                    )
+                )
+            await wait_for_attachment()
+            injected = await transport.inject_command(
                 node_id,
                 " ".join(shlex.quote(part) for part in command),
                 environment=environment,
             )
-    else:
-        task = asyncio.create_task(
-            transport.run(
-                node_id,
-                command,
-                cwd=cwd,
-                environment=environment,
-                stream=stream,
-                # A native TUI can legitimately be quiet while the model thinks
-                # or while it waits for the user. The run stays open until the
-                # harness submits its result file; completion is signaled by the
-                # file, not by a whole-run timeout.
-                timeout=None,
-                stall_timeout=None,
-                idle_warning=idle_warning,
-                idle_reap=idle_reap,
+            if not injected:
+                raise RuntimeError("Turn could not inject the harness command into Herdr")
+        else:
+            task = asyncio.create_task(
+                transport.run(
+                    node_id,
+                    command,
+                    cwd=cwd,
+                    environment=environment,
+                    stream=stream,
+                    # A native TUI can legitimately be quiet while the model thinks
+                    # or while it waits for the user. The run stays open until the
+                    # harness submits its result file; completion is signaled by the
+                    # file, not by a whole-run timeout.
+                    timeout=None,
+                    stall_timeout=None,
+                    idle_warning=idle_warning,
+                    idle_reap=idle_reap,
+                )
             )
-        )
-    if initial_input:
-        # Native Codex must be started without a positional prompt. Passing
-        # one on the command line makes the CLI run a single non-interactive
-        # turn and exit at the very moment the user should be able to follow up
-        # or correct the result. Send the first message through the PTY so the
-        # process remains the same interactive conversation as a normal `codex`
-        # invocation.
-        for _ in range(50):
-            snapshot = transport.snapshot(node_id)
-            if task is not None and task.done():
-                break
-            if snapshot.get("active") and snapshot.get("output"):
-                # Codex's native process becomes writable before its composer
-                # is painted. Give the TUI a short settling window so the
-                # first message is not lost in startup noise.
-                # PTY output starts with terminal capability probes. Allow
-                # the interactive program to finish its first paint before
-                # injecting the initial message; sending while a TUI is still
-                # negotiating capabilities is indistinguishable from a user
-                # typing into a half-started terminal and is flaky across
-                # harnesses.
-                await asyncio.sleep(2.5)
-                break
-            await asyncio.sleep(0.1)
-        if task is None or not task.done():
-            # Keep the submit key as a separate PTY event.  Codex renders a
-            # long first message as pasted content; appending Enter to that
-            # same write can leave the message in the composer instead of
-            # submitting it.
-            # This is ordinary PTY input. Preserve line breaks and spacing so
-            # the harness receives exactly the same instruction the user
-            # selected in Turn; the transport does not parse it.
-            # Deliver the instruction as a standard terminal bracketed paste,
-            # in bounded chunks. A single large write can overflow the PTY's
-            # canonical input buffer (and has caused native TUIs to crash),
-            # while bracketed paste preserves newlines without submitting
-            # them as separate messages. The transport still treats every
-            # byte as opaque terminal input.
-            paste = f"\x1b[200~{initial_input}\x1b[201~"
-            for offset in range(0, len(paste), 512):
-                await transport.write(node_id, paste[offset : offset + 512])
-                await asyncio.sleep(0.01)
-            await asyncio.sleep(0.25)
-            await transport.write(node_id, "\r")
+        if initial_input:
+            # Native Codex must be started without a positional prompt. Passing
+            # one on the command line makes the CLI run a single non-interactive
+            # turn and exit at the very moment the user should be able to follow up
+            # or correct the result. Send the first message through the PTY so the
+            # process remains the same interactive conversation as a normal `codex`
+            # invocation.
+            for _ in range(50):
+                snapshot = transport.snapshot(node_id)
+                if task is not None and task.done():
+                    break
+                if snapshot.get("active") and snapshot.get("output"):
+                    # Codex's native process becomes writable before its composer
+                    # is painted. Give the TUI a short settling window so the
+                    # first message is not lost in startup noise; sending while a
+                    # TUI is still negotiating capabilities is indistinguishable
+                    # from a user typing into a half-started terminal and is flaky
+                    # across harnesses.
+                    await asyncio.sleep(2.5)
+                    break
+                await asyncio.sleep(0.1)
+            if task is None or not task.done():
+                # Keep the submit key as a separate PTY event. Codex renders a
+                # long first message as pasted content; appending Enter to that
+                # same write can leave the message in the composer instead of
+                # submitting it.
+                # This is ordinary PTY input. Preserve line breaks and spacing so
+                # the harness receives exactly the same instruction the user
+                # selected in Turn; the transport does not parse it.
+                # Deliver the instruction as a standard terminal bracketed paste,
+                # in bounded chunks. A single large write can overflow the PTY's
+                # canonical input buffer (and has caused native TUIs to crash),
+                # while bracketed paste preserves newlines without submitting
+                # them as separate messages. The transport still treats every
+                # byte as opaque terminal input.
+                paste = f"\x1b[200~{initial_input}\x1b[201~"
+                for offset in range(0, len(paste), 512):
+                    sent = await transport.write(node_id, paste[offset : offset + 512])
+                    if getattr(transport, "supports_inject", False) and not sent:
+                        raise RuntimeError("Turn could not inject the harness prompt into Herdr")
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.25)
+                sent = await transport.write(node_id, "\r")
+                if getattr(transport, "supports_inject", False) and not sent:
+                    raise RuntimeError("Turn could not submit the harness prompt in Herdr")
+    except BaseException:
+        await abort_owned_attachment()
+        raise
     started_at = time.time()
     discovered_session: str | None = None
     last_probe = 0.0

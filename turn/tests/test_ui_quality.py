@@ -36,7 +36,7 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     graph = source("components", "Graph.tsx")
     css = (UI / "style.css").read_text()
     api = (ROOT / "turn" / "server" / "api.py").read_text()
-    assert 'node.allowed_actions.includes("run")' in graph
+    assert 'const runnable = node.allowed_actions.includes("run");' in graph
     assert "node.generation_active" in graph and 'name={running ? "square-stop" : "play"}' in graph
     assert 'item["generation_active"]' in api
     assert ".edge-active" not in css and "@keyframes flow" not in css
@@ -45,7 +45,8 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "GRAPH_PADDING" in graph
     assert "pathBetween(a, b, edge.type)" in graph
     assert "<g transform=" not in graph
-    assert "align-items: safe center" in css
+    assert "align-items: flex-start" in css
+    assert "align-self: flex-start" in css
 
 
 def test_terminal_is_a_raw_dom_pty_view():
@@ -84,6 +85,8 @@ def test_inspector_prioritizes_markdown_instructions_without_legacy_review_surfa
     assert 'Revision {node.revision}' not in inspector
     assert "Save instructions" in inspector and "disabled={!scopeDirty}" in inspector
     assert "disabled={!agentDirty}" in inspector
+    assert "Review" not in inspector
+    assert "/accept" not in inspector and "/reject" not in inspector
 
 
 def test_model_and_reasoning_controls_share_dynamic_capabilities():
@@ -103,12 +106,12 @@ def test_model_and_reasoning_controls_share_dynamic_capabilities():
     assert "capabilitiesLoading" in app
 
 
-def test_composer_submit_states_and_review_copy_use_design_tokens():
+def test_composer_submit_states_use_design_tokens():
     css = (UI / "style.css").read_text()
     assert ".send-button:disabled" in css
     assert "background: var(--accent);" in css
     assert "background: var(--surface-3);" in css
-    assert ".review-card p" in css and "color: var(--text-2);" in css
+    assert ".review-card" not in css
 
 
 def test_inspector_always_cascades_agent_configuration():
@@ -118,11 +121,10 @@ def test_inspector_always_cascades_agent_configuration():
     assert "if node.agent is not None:" in runner
 
 
-def test_review_copy_has_one_explicit_user_controlled_state():
+def test_review_surface_is_not_exposed():
     inspector = source("components", "Inspector.tsx")
-    assert '<span>Review</span>' in inspector
-    assert "Accept result" in inspector
-    assert "Request changes" in inspector
+    assert "Accept result" not in inspector
+    assert "Request changes" not in inspector
     assert "Auto verification" not in inspector
     assert "Awaiting parent verification" not in inspector
 

@@ -853,11 +853,14 @@ class HerdrPtyTransport(LocalPtyTransport):
             idle_reap=idle_reap,
         )
         if not existed and not self._is_interactive_shell(command):
-            await self.inject_command(
+            injected = await self.inject_command(
                 node_id,
                 " ".join(shlex.quote(part) for part in command),
                 environment=environment,
             )
+            if not injected:
+                await self.stop(node_id)
+                raise RuntimeError("Turn could not inject the harness command into Herdr")
         # Herdr owns the actual terminal process. The controller's timeout and
         # stall policy still apply to Turn's attachment, matching the
         # browser-facing behavior.
@@ -898,6 +901,10 @@ class HerdrPtyTransport(LocalPtyTransport):
         *,
         environment: dict[str, str] | None = None,
     ) -> bool:
+        # Reruns are injected into a durable shell that may still contain a
+        # partially typed command from the previous attempt. Interrupt that
+        # line and accept an empty line before typing the new command so the
+        # shell cannot concatenate stale input with the fresh invocation.
         if environment:
             assignments = " ".join(
                 f"{key}={shlex.quote(str(value))}"
@@ -905,11 +912,12 @@ class HerdrPtyTransport(LocalPtyTransport):
                 if value is not None
             )
             command = f"env {assignments} {command}"
+        input_bytes = b"\x03\r" + (command + "\r").encode()
         return await self._send_control(
             node_id,
             {
                 "type": "terminal.input",
-                "bytes": base64.b64encode((command + "\r").encode()).decode(),
+                "bytes": base64.b64encode(input_bytes).decode(),
             },
         )
 

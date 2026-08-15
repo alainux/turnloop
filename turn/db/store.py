@@ -575,9 +575,8 @@ class Store:
     # -- runs -------------------------------------------------------------
 
     async def create_run(self, node: Node, worker: str, attempt: int = 1) -> Run:
-        # A new attempt inherits the current harness conversation. Review
-        # feedback therefore resumes the same session; an explicit fresh
-        # re-run clears node.agent.session_id before this method is called.
+        # A new attempt inherits the current harness conversation; an explicit
+        # fresh re-run clears node.agent.session_id before this method is called.
         run = Run(
             id=uuid.uuid4(),
             node_id=node.id,

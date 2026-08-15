@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 from turn.__main__ import parser
 from turn.config import Settings
 from turn.core import TurnCore
@@ -67,3 +69,28 @@ def test_agent_cli_writes_atomic_status_and_result_handoffs(tmp_path, monkeypatc
         "outcome": "COMPLETE", "summary": "done", "artifacts": ["src"]
     }
     assert json.loads(status.read_text())["state"] == "complete"
+
+
+def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.result.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "result",
+        "--payload", '{"outcome":"COMPLETE","summary":42}',
+    ])
+    with pytest.raises(SystemExit, match="invalid result submission"):
+        agent_command(args)
+    assert not handoff.exists()
+
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan",
+        "--payload", (
+            '{"nodes":[{"key":"a","objective":"A","depends_on":["b"]},'
+            '{"key":"b","objective":"B","depends_on":["a"]}],"edges":[]}'
+        ),
+    ])
+    with pytest.raises(SystemExit, match="invalid plan submission"):
+        agent_command(args)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import uuid
 
@@ -10,7 +11,25 @@ from turn.workers.interactive import (
     result_handoff,
     run_until_result,
 )
-from turn.workers.terminal import TerminalResult
+from turn.tests.fakes import FakeHerdrAdapter
+from turn.workers.terminal import HerdrPtyTransport, TerminalResult
+
+
+async def test_injected_command_clears_partial_shell_input(tmp_path, monkeypatch):
+    transport = HerdrPtyTransport(str(tmp_path), adapter=FakeHerdrAdapter())
+    sent: list[dict] = []
+
+    async def capture(_node_id, command):
+        sent.append(command)
+        return True
+
+    monkeypatch.setattr(transport, "_send_control", capture)
+    await transport.inject_command(
+        uuid.uuid4(), "codex --model test", environment={"TURN_PROJECT_ID": "project"}
+    )
+
+    raw = base64.b64decode(sent[0]["bytes"])
+    assert raw == b"\x03\renv TURN_PROJECT_ID=project codex --model test\r"
 
 
 def test_agent_handoff_prompt_uses_only_cli_payload_submission():
@@ -39,6 +58,53 @@ class WaitingTransport:
         self.stopped = True
         self.released.set()
         return True
+
+
+class RejectingHerdrLaunch:
+    supports_inject = True
+
+    def __init__(self):
+        self.active = False
+        self.stopped = False
+        self.released = asyncio.Event()
+
+    def snapshot(self, node_id):
+        return {"active": self.active, "output": "shell ready" if self.active else ""}
+
+    async def ensure_session(self, node_id, **kwargs):
+        self.active = True
+        await self.released.wait()
+        return TerminalResult(returncode=0, output=b"")
+
+    async def inject_command(self, node_id, command, **kwargs):
+        return False
+
+    async def stop(self, node_id):
+        self.stopped = True
+        self.active = False
+        self.released.set()
+        return True
+
+
+async def test_native_launch_fails_when_herdr_rejects_prompt_injection(tmp_path):
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    transport = RejectingHerdrLaunch()
+
+    try:
+        await run_until_result(
+            transport,
+            node_id,
+            ["codex"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+        )
+    except RuntimeError as error:
+        assert str(error) == "Turn could not inject the harness command into Herdr"
+    else:
+        raise AssertionError("a rejected Herdr launch must fail instead of waiting forever")
+
+    assert transport.stopped
 
 
 async def test_native_session_stops_only_after_valid_project_file(tmp_path):

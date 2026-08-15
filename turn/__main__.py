@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from turn.config import settings
+from turn.contracts.dag import validate_agent_submission
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, ReasoningLevel, RunPolicy
 
@@ -116,8 +117,10 @@ def agent_command(args) -> int:
         })
         return 0
     value = _read_agent_object(args)
-    if args.kind == "result" and value.get("outcome") not in {"COMPLETE", "BLOCK", "FAIL", "EXPAND"}:
-        raise SystemExit("result submissions require outcome COMPLETE, BLOCK, FAIL, or EXPAND")
+    try:
+        validate_agent_submission(args.kind, value)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"invalid {args.kind} submission: {error}") from error
     target = _agent_protocol_path(args.kind)
     _write_agent_json(target, value)
     status_path = os.getenv("TURN_STATUS_FILE")

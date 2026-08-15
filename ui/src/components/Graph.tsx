@@ -39,6 +39,10 @@ export function Graph({
 }: Props) {
   const visibleEdges = useMemo(() => displayEdges(nodes, edges), [nodes, edges]);
   const layout = useMemo(() => layoutDendrogram(nodes, visibleEdges), [nodes, visibleEdges]);
+  const finalDepth = layout.stageCount - 1;
+  const finalStageNodeCount = [...layout.positions.values()].filter(
+    (position) => position.depth === finalDepth,
+  ).length;
   return (
     <div
       className="graph-canvas"
@@ -47,20 +51,55 @@ export function Graph({
         height: layout.height + GRAPH_PADDING * 2,
       }}
     >
+      <div className="graph-stage-labels" aria-hidden="true">
+        {Array.from({ length: layout.stageCount }, (_, depth) => (
+          <span
+            key={depth}
+            className="graph-stage-label"
+            style={{
+              left: depth * (NODE_WIDTH + 54) + GRAPH_PADDING,
+            }}
+          >
+            {depth === 0
+              ? "Start"
+              : depth === finalDepth && finalStageNodeCount === 1
+                ? "Final integration"
+                : depth === finalDepth
+                  ? "Final stage"
+                  : `Stage ${depth + 1}`}
+          </span>
+        ))}
+      </div>
       <svg
         className="graph-edges"
         width={layout.width + GRAPH_PADDING * 2}
         height={layout.height + GRAPH_PADDING * 2}
         aria-hidden="true"
       >
+        <defs>
+          <marker
+            id="dependency-arrow"
+            viewBox="0 0 6 6"
+            refX="5"
+            refY="3"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto-start-reverse"
+            markerUnits="strokeWidth"
+          >
+            <path d="M0,0 L6,3 L0,6 z" fill="var(--amber)" />
+          </marker>
+        </defs>
         {visibleEdges.map((edge) => {
           const a = layout.positions.get(edge.src),
             b = layout.positions.get(edge.dst);
           return a && b ? (
             <path
               key={edge.id}
-              className="edge-workflow"
+              className={`edge-workflow ${edge.type === "DEPENDS_ON" ? "edge-depends" : "edge-contains"}`}
               d={pathBetween(a, b, edge.type)}
+              data-edge-type={edge.type}
+              markerEnd={edge.type === "DEPENDS_ON" ? "url(#dependency-arrow)" : undefined}
             />
           ) : null;
         })}
@@ -71,15 +110,15 @@ export function Graph({
         // The action projection is authoritative, but keep the status guard
         // here as a last line of defense against a stale event arriving while
         // a completed/cancelled PTY is being released.
-        const runnable =
-          node.allowed_actions.includes("run") && node.status !== "COMPLETE" && node.status !== "RUNNING";
+        const runnable = node.allowed_actions.includes("run");
         const running = node.status === "RUNNING";
         const primaryAction = primaryNodeAction(node);
+        const finalNode = p.depth === finalDepth && finalStageNodeCount === 1;
         return (
           <article
             key={node.id}
             data-node-id={node.id}
-            className={`gnode ${node.ui_state} ${selected === node.id ? "selected" : ""}`}
+            className={`gnode ${node.ui_state} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
             onContextMenu={(event) => {
               event.preventDefault();
               onSelect(node.id);

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from turn.config import settings
+from turn.contracts.dag import parse_result
 from turn.domain.schemas import (
     ArtifactKind,
     ArtifactSpec,
@@ -23,13 +24,6 @@ from turn.domain.schemas import (
     WorkerResult,
 )
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
-from turn.workers.artifacts import (
-    capture_filesystem,
-    has_material_change,
-    missing_declared_files,
-    requires_material_change,
-    snapshot_filesystem,
-)
 from turn.workers.interactive import (
     agent_environment,
     prepare_result_file,
@@ -60,7 +54,6 @@ class CodexWorker(Worker):
                 retry_recommended=False,
             )
         cwd = repo
-        before = snapshot_filesystem(cwd)
         transport = ctx.terminal or LocalPtyTransport()
         native = isinstance(transport, LocalPtyTransport)
         agent = ctx.node.agent
@@ -117,8 +110,8 @@ class CodexWorker(Worker):
                     *native_args,
                 ]
         elif session_id:
-            # Continue the same conversation after review feedback. Resume has
-            # a deliberately smaller flag surface than a fresh exec.
+            # Continue the same conversation when the runner resumes a node.
+            # Resume has a deliberately smaller flag surface than a fresh exec.
             resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else permission_flags
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
@@ -211,27 +204,6 @@ class CodexWorker(Worker):
         text = structured_text
         result = self._parse_result(text)
         result.session_id = discovered_session or session_id
-        if cwd:
-            missing_files = missing_declared_files(result.artifacts, cwd)
-            if missing_files:
-                result.outcome = Outcome.FAIL
-                result.summary = f"codex reported missing file outputs: {', '.join(missing_files)}"
-                result.error = result.summary
-                result.retry_recommended = True
-            # Filesystem inspection remains an execution invariant, but it is
-            # never an artifact source. The agent's CLI submission is the
-            # single authority for the small artifact list shown in Turn.
-            captured = self._capture_filesystem(cwd, before)
-            missing_material = (
-                result.outcome == Outcome.COMPLETE
-                and requires_material_change(ctx.node.objective, ctx.node.generated_prompt)
-                and not has_material_change(captured)
-            )
-            if missing_material:
-                result.outcome = Outcome.FAIL
-                result.summary = "codex completed a file-writing objective without a material filesystem change"
-                result.error = result.summary
-                result.retry_recommended = True
         # Preserve the unaltered PTY stream as a durable artifact after the
         # live terminal transport has closed.
         transcript = (
@@ -308,27 +280,20 @@ and return "COMPLETE".
                 retry_recommended=False,
             )
 
-        data = result_json
-        outcome = Outcome(data.get("outcome", "COMPLETE"))
-        children = self._to_plan(plan_json) if (outcome == Outcome.EXPAND and plan_json) else None
-
-        return WorkerResult(
-            outcome=outcome,
-            summary=parsing.clean_summary(data.get("summary", text[:500])),
-            artifacts=parsing.artifact_specs(data.get("artifacts", [])),
-            children=children,
-            missing_inputs=[
-                InputSpec(
-                    id=i["id"],
-                    label=i.get("label", i["id"]),
-                    kind=parsing.safe_input_kind(i.get("kind")),
-                    description=i.get("description"),
-                )
-                for i in data.get("missing_inputs", [])
-            ],
-            error=data.get("error"),
-            retry_recommended=bool(data.get("retry_recommended", False)),
-        )
+        data = dict(result_json)
+        if plan_json is not None and data.get("outcome") == Outcome.EXPAND.value:
+            data.setdefault("children", plan_json)
+        try:
+            result = parse_result(data)
+        except (TypeError, ValueError) as error:
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary="codex returned an invalid Turn result",
+                error=str(error),
+                retry_recommended=False,
+            )
+        result.summary = parsing.clean_summary(result.summary)
+        return result
 
     @staticmethod
     def _to_plan(plan_json: dict) -> PlanResult:
@@ -358,6 +323,3 @@ and return "COMPLETE".
             for e in plan_json.get("edges", [])
         ]
         return PlanResult(nodes=nodes, edges=edges, notes=plan_json.get("notes"))
-
-    def _capture_filesystem(self, path: str, before: dict[str, str]) -> list[ArtifactSpec]:
-        return capture_filesystem(path, before)

@@ -1,7 +1,7 @@
 # Turn design system
 
 Turn is an operating surface for adaptive workgraphs. Its visual mode is
-**operate**: users arrive to author, decompose, inspect, steer, review, and
+**operate**: users arrive to author, decompose, inspect, steer, and
 ship—not to admire a dashboard. The product is deliberately sober: no logo,
 hero illustration, decorative status lights, or literal “AI” imagery. The
 wordmark, professional Lucide vocabulary, orthogonal workgraph, and truthful
@@ -76,7 +76,7 @@ guesswork whenever the harness exposes them.
 
 ### Inspector
 
-Overview order is identity → agent configuration → current gate/review → usage
+Overview order is identity → agent configuration → usage
 → valid execution actions → scope. Agent and scope fields are the presentation,
 not duplicate edit forms. Save is disabled while pristine. Regeneration and
 cancellation use one app-native confirmation component.
@@ -102,7 +102,7 @@ custom tooltip. Shortcuts and the product safety disclaimer have one standard
 Implemented now: prompt-first authoring, attachments, native directory-picker
 boundary, detected local harnesses, model-aware reasoning, IDE panels/themes,
 dendrogram, compact node cards, in-place configuration/scope editing, graph
-menus, human gates, explicit user review, PTY+xterm, stream-stall recovery, usage, CLI/headless core, visual
+menus, human gates, PTY+xterm, stream-stall recovery, usage, CLI/headless core, visual
 tests, and responsive desktop/compact layouts.
 
 Future-ready only: provider API/cloud terminal transports, portable explicit

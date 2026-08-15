@@ -60,8 +60,6 @@ class NodeUIState(str, Enum):
     PAUSED = "paused"
     WAITING_INPUT = "waiting_input"
     WAITING_DEPENDENCY = "waiting_dependency"
-    REVIEW = "review"
-    ACCEPTED = "accepted"
     COMPLETE = "complete"
     CONTAINER = "container"
     FAILED = "failed"
@@ -78,8 +76,6 @@ class NodeAction(str, Enum):
     RETRY = "retry"
     EDIT = "edit"
     REGENERATE = "regenerate"
-    ACCEPT = "accept"
-    REJECT = "reject"
     PROVIDE_INPUT = "provide_input"
 
 
@@ -155,10 +151,6 @@ class PermissionMode(str, Enum):
     ASK = "ask"
     WORKSPACE = "workspace"
     FULL = "full"
-
-
-class ReviewMode(str, Enum):
-    MANUAL = "manual"
 
 
 class AgentType(str, Enum):
@@ -251,7 +243,6 @@ class RunPolicy(BaseModel):
     retry_backoff_ms: int = Field(default=750, ge=0, le=600_000)
     retry_choked_models: bool = True
     compact_on_context_pressure: bool = True
-    review_mode: ReviewMode = ReviewMode.MANUAL
 
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
@@ -267,6 +258,8 @@ class Usage(BaseModel):
 
 class InputSpec(BaseModel):
     """One explicitly-requested input for a node."""
+
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     label: str
@@ -308,12 +301,6 @@ class Node(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
-
-    # --- review metadata (set by the runner, surfaced to the UI) ----------
-    # Retained as graph metadata for existing state files. Files are already
-    # written to the assigned project directory; no merge or cleanup is done.
-    needs_review: bool = False
-    merge_accepted: bool = False
 
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -445,6 +432,8 @@ class Resource(BaseModel):
 class NodeSpec(BaseModel):
     """A node to be created by a planner. Referenced by `key` within a plan."""
 
+    model_config = ConfigDict(extra="forbid")
+
     key: str
     objective: str
     generated_prompt: Optional[str] = None
@@ -463,6 +452,8 @@ class NodeSpec(BaseModel):
 
 
 class EdgeSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     type: EdgeType
     src: str  # key
     dst: str  # key
@@ -470,6 +461,8 @@ class EdgeSpec(BaseModel):
 
 class PlanResult(BaseModel):
     """The output of the Plan operation: schema-valid nodes + edges."""
+
+    model_config = ConfigDict(extra="forbid")
 
     nodes: list[NodeSpec]
     edges: list[EdgeSpec] = Field(default_factory=list)
@@ -540,6 +533,8 @@ class PlanResult(BaseModel):
 class ArtifactSpec(BaseModel):
     """An artifact a worker wants persisted."""
 
+    model_config = ConfigDict(extra="forbid")
+
     kind: ArtifactKind = ArtifactKind.TEXT
     name: str
     content: Optional[Any] = None
@@ -548,6 +543,8 @@ class ArtifactSpec(BaseModel):
 
 class WorkerResult(BaseModel):
     """The output of the Execute operation: exactly one outcome."""
+
+    model_config = ConfigDict(extra="forbid")
 
     outcome: Outcome
     summary: str = ""

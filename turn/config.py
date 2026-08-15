@@ -79,9 +79,6 @@ class Settings:
     execution_backend: str = field(
         default_factory=lambda: os.getenv("TURN_EXECUTION_BACKEND", "direct")
     )
-    max_concurrency: int = field(
-        default_factory=lambda: int(os.getenv("TURN_MAX_CONCURRENCY", "4"))
-    )
     max_retries: int = field(
         default_factory=lambda: int(os.getenv("TURN_MAX_RETRIES", "1"))
     )

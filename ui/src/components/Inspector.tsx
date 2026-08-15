@@ -3,7 +3,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
   Agent,
-  GraphNode,
   HarnessCapability,
   NodeDetail as Detail,
   Permission,
@@ -141,7 +140,6 @@ function Overview({
   const [prompt, setPrompt] = useState(node.generated_prompt ?? "");
   const [objective, setObjective] = useState(node.objective);
   const [agent, setAgent] = useState<Agent | null>(node.agent ?? null);
-  const [feedback, setFeedback] = useState("");
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const primaryAction = primaryNodeAction(node);
   useEffect(() => {
@@ -158,7 +156,6 @@ function Overview({
       editingPrompt ||
         scopeDirty ||
         agentDirty ||
-        Boolean(feedback.trim()) ||
         Object.values(inputs).some(Boolean),
     );
     return () => onDirtyChange(false);
@@ -166,7 +163,6 @@ function Overview({
     editingPrompt,
     scopeDirty,
     agentDirty,
-    feedback,
     inputs,
     onDirtyChange,
   ]);
@@ -340,14 +336,6 @@ function Overview({
             ))}
         </section>
       )}
-      {node.needs_review && (
-        <Review
-          node={node}
-          feedback={feedback}
-          setFeedback={setFeedback}
-          mutate={mutate}
-        />
-      )}
       <section className="section">
         <div className="section-heading">
           <span>Artifacts</span>
@@ -425,65 +413,5 @@ function Overview({
         </div>
       </section>
     </>
-  );
-}
-
-function Review({
-  node,
-  feedback,
-  setFeedback,
-  mutate,
-}: {
-  node: GraphNode;
-  feedback: string;
-  setFeedback: (v: string) => void;
-  mutate: (path: string, init?: RequestInit, message?: string) => Promise<void>;
-}) {
-  return (
-    <section className="section">
-      <div className="section-heading">
-        <span>Review</span>
-      </div>
-      <div className="review-card">
-        <h3>Review result</h3>
-        <p>Accept the result or return feedback to the same agent session.</p>
-        {node.allowed_actions.includes("accept") && (
-          <div className="review-feedback">
-            <textarea
-              value={feedback}
-              onChange={(event) => setFeedback(event.target.value)}
-              placeholder="Feedback if changes are required…"
-            />
-            <div className="action-row">
-              <button
-                className="button accent"
-                onClick={() =>
-                  mutate(
-                    `/api/nodes/${node.id}/accept`,
-                    { method: "POST" },
-                    "Result accepted",
-                  )
-                }
-              >
-                Accept result
-              </button>
-              <button
-                className="button"
-                disabled={!feedback.trim()}
-                onClick={() =>
-                  mutate(
-                    `/api/nodes/${node.id}/reject`,
-                    json("POST", { feedback }),
-                    "Feedback returned to the same session",
-                  )
-                }
-              >
-                Request changes
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-    </section>
   );
 }

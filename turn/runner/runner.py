@@ -40,7 +40,6 @@ from turn.runner.recovery import backoff_seconds, should_retry
 from turn.workers.base import NodeExecutionContext, Worker
 from turn.workers.herdr import HerdrAdapter
 from turn.workers import parsing
-from turn.workers.harnesses import recover_session_id
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
@@ -77,13 +76,9 @@ class Runner:
         self._running: dict[uuid.UUID, asyncio.Task] = {}
         self._reconnect_tasks: dict[uuid.UUID, asyncio.Task] = {}
         self._retries: dict[uuid.UUID, int] = {}
-        self._sem = asyncio.Semaphore(settings.max_concurrency)
         self._wake = asyncio.Event()
         self._stop = False
         self._task: Optional[asyncio.Task] = None
-        # Serialize review metadata transitions; this no longer protects
-        # version-control operations because Turn does not perform any.
-        self._merge_lock = asyncio.Lock()
         self._last_launch_at: dict[uuid.UUID, float] = {}
         self._last_workspace_reconcile_at = 0.0
         # Herdr owns one durable project workspace and one pane per node. Turn
@@ -228,7 +223,22 @@ class Runner:
             for node_id, task in mapping.items()
             if not task.done()
         }
+        orphaned_nodes = [
+            node
+            for node in nodes
+            if node.status == NodeStatus.RUNNING and node.id not in active_node_ids
+        ]
         await self.store.cancel_orphaned_runs(project_id, active_node_ids)
+
+        # A process restart leaves the provider conversation outside this
+        # Runner process. Never resume that conversation automatically: the
+        # provider may still have an active writer in its durable Herdr pane,
+        # and a second ``resume`` would fail while leaving the graph spinning.
+        # Keep the orphaned pane, but start the next attempt with a fresh
+        # provider session; the prior run remains available in history. The
+        # terminal injection path interrupts any stale shell input first.
+        for orphan in orphaned_nodes:
+            await self._reset_provider_session(orphan.id)
 
         by_id = {node.id: node for node in nodes}
 
@@ -250,18 +260,8 @@ class Runner:
                 if task is not None and not task.done():
                     task.cancel()
             node.status = NodeStatus.CANCELLED
-            node.needs_review = False
             await self.store._save_node(node)
             await self._emit("node.updated", project_id, _dump(node))
-
-        # Cancelled nodes must never keep owning an actionable review slot.
-        for node in nodes:
-            if node.needs_review and (
-                node.status == NodeStatus.CANCELLED
-            ):
-                node.needs_review = False
-                await self.store._save_node(node)
-                await self._emit("node.updated", project_id, _dump(node))
 
         walker = GraphWalker(nodes, edges)
         ev = walker.evaluate()
@@ -302,7 +302,6 @@ class Runner:
             settled = all(
                 ev.status.get(n.id)
                 in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED)
-                and not n.needs_review
                 for n in nodes
                 if n.id != project_id
             )
@@ -319,10 +318,18 @@ class Runner:
 
         policy = root.run_policy if root and root.run_policy else None
         delay_ms = policy.delay_between_jobs_ms if policy else self.s.delay_between_jobs_ms
-        project_running = [nid for nid in self._running if node_by_id.get(nid)]
         if delay_ms and time.monotonic() - self._last_launch_at.get(project_id, 0) < delay_ms / 1000:
             return
-        for nid in sorted(ev.runnable, key=str):
+        # Launch every currently runnable node. Dependency edges define the
+        # frontier; there is no hidden concurrency cap in the MVP. A stable
+        # topological order keeps manual inspection and launch logs readable,
+        # while independent nodes remain genuinely parallel.
+        runnable_order = [
+            candidate.id
+            for candidate in walker.topological()
+            if candidate.id in ev.runnable
+        ]
+        for nid in runnable_order:
             if nid in self._running:
                 continue
             snapshot = node_by_id.get(nid)
@@ -351,61 +358,60 @@ class Runner:
     # -- execution -------------------------------------------------------
 
     async def _execute_node(self, node: Node, project_id: uuid.UUID) -> None:
-        async with self._sem:
-            watcher: asyncio.Task | None = None
-            try:
-                fresh = await self.store.get_node(node.id)
-                if fresh is None:
-                    return
-                node = fresh
-                await self.store.set_agent_status(node.id, state=None, message=None)
-                status_path = await self._agent_status_path(node)
-                if status_path is not None:
-                    watcher = asyncio.create_task(
-                        self._watch_agent_status(node.id, project_id, status_path)
-                    )
-                    self._status_watchers[node.id] = watcher
-                # Every executed agent gets a durable Herdr pane, including
-                # deterministic test agents that do not themselves attach a
-                # harness. Planning stays lazy; execution owns the pane.
-                await self.ensure_node_terminal(node.id)
-                # A pre-run shell is the same durable Herdr pane the worker
-                # will use. Detach only Turn's temporary control stream; do
-                # not close the pane before the provider takes it over.
-                await self.detach_shell(node.id)
-                if node.executor == PLANNER_EXECUTOR and node.status != NodeStatus.EXPANDED:
-                    await self._plan_node(node, project_id)
-                else:
-                    await self._run_worker(node, project_id)
-            except asyncio.CancelledError:
-                await self._mark_cancelled(node)
-                raise
-            except GenerationStalled as e:
-                root = await self.store.get_node(project_id)
-                policy = root.run_policy if root else None
-                max_retries = policy.max_retries if policy else self.s.max_retries
-                retry_stalled = policy.retry_choked_models if policy else self.s.retry_choked_models
-                if retry_stalled and self._retries.get(node.id, 0) < max_retries:
-                    self._retries[node.id] = self._retries.get(node.id, 0) + 1
-                    await self.store.set_status(node.id, NodeStatus.RUNNABLE)
-                else:
-                    await self._mark_failed(node, str(e))
-                await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
-            except Exception as e:
-                logger.exception("node %s failed", node.id)
-                await self._mark_failed(node, f"runner error: {e}")
-            finally:
-                if watcher is not None:
-                    watcher.cancel()
-                    await asyncio.gather(watcher, return_exceptions=True)
-                    self._status_watchers.pop(node.id, None)
-                cleared = await self.store.set_agent_status(
-                    node.id, state=None, message=None
+        watcher: asyncio.Task | None = None
+        try:
+            fresh = await self.store.get_node(node.id)
+            if fresh is None:
+                return
+            node = fresh
+            await self.store.set_agent_status(node.id, state=None, message=None)
+            status_path = await self._agent_status_path(node)
+            if status_path is not None:
+                watcher = asyncio.create_task(
+                    self._watch_agent_status(node.id, project_id, status_path)
                 )
-                if cleared is not None:
-                    await self._emit("node.updated", project_id, _dump(cleared))
-                self._running.pop(node.id, None)
-                self.wake()
+                self._status_watchers[node.id] = watcher
+            # Every executed agent gets a durable Herdr pane, including
+            # deterministic test agents that do not themselves attach a
+            # harness. Planning stays lazy; execution owns the pane.
+            await self.ensure_node_terminal(node.id)
+            # A pre-run shell is the same durable Herdr pane the worker
+            # will use. Detach only Turn's temporary control stream; do
+            # not close the pane before the provider takes it over.
+            await self.detach_shell(node.id)
+            if node.executor == PLANNER_EXECUTOR and node.status != NodeStatus.EXPANDED:
+                await self._plan_node(node, project_id)
+            else:
+                await self._run_worker(node, project_id)
+        except asyncio.CancelledError:
+            await self._mark_cancelled(node)
+            raise
+        except GenerationStalled as e:
+            root = await self.store.get_node(project_id)
+            policy = root.run_policy if root else None
+            max_retries = policy.max_retries if policy else self.s.max_retries
+            retry_stalled = policy.retry_choked_models if policy else self.s.retry_choked_models
+            if retry_stalled and self._retries.get(node.id, 0) < max_retries:
+                self._retries[node.id] = self._retries.get(node.id, 0) + 1
+                await self.store.set_status(node.id, NodeStatus.RUNNABLE)
+            else:
+                await self._mark_failed(node, str(e))
+            await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
+        except Exception as e:
+            logger.exception("node %s failed", node.id)
+            await self._mark_failed(node, f"runner error: {e}")
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+                self._status_watchers.pop(node.id, None)
+            cleared = await self.store.set_agent_status(
+                node.id, state=None, message=None
+            )
+            if cleared is not None:
+                await self._emit("node.updated", project_id, _dump(cleared))
+            self._running.pop(node.id, None)
+            self.wake()
 
     async def _agent_status_path(self, node: Node) -> Path | None:
         repo = await self._project_repo(node.project_id)
@@ -475,9 +481,9 @@ class Runner:
         """Detach Turn's PTY without destroying the harness conversation.
 
         The Herdr pane is the durable conversation boundary. A worker can
-        finish its handoff while the native harness remains open for review,
-        reconnect, or a later follow-up. Only the explicit terminal-close or
-        fresh re-run actions are allowed to kill that session.
+        finish its handoff while the native harness remains open for reconnect
+        or a later follow-up. An explicit terminal-close may kill that session;
+        a fresh rerun keeps the pane and injects a new harness call instead.
         """
         await self._persist_terminal_transcript(node_id, project_id)
         self.terminal.release(node_id)
@@ -697,118 +703,6 @@ class Runner:
                 "node.updated", root.project_id, _dump(await self.store.get_node(root.id))
             )
 
-    async def accept_merge(self, node_id: uuid.UUID) -> None:
-        """Accept a reviewed node without changing the shared project files.
-
-        Cleaning the whole subtree (node + all descendants) means accepting a
-        high-level container also resolves every review beneath it.
-        """
-        node = await self.store.get_node(node_id)
-        if node is None or node.parent_id is None:
-            return
-        repo = await self._project_repo(node.project_id)
-        desc = await self.store.descendants(node_id)
-        ids = [node_id] + [d.id for d in desc]
-        current = asyncio.current_task()
-        active_tasks: list[asyncio.Task] = []
-        cancelled_descendants: set[uuid.UUID] = set()
-        for nid in ids:
-            for task in (self._running.get(nid),):
-                if task is not None and task is not current and not task.done():
-                    task.cancel()
-                    active_tasks.append(task)
-                    if nid != node_id:
-                        cancelled_descendants.add(nid)
-        if active_tasks:
-            await asyncio.gather(*dict.fromkeys(active_tasks), return_exceptions=True)
-        async with self._merge_lock:
-            cleaned = await self._remove_merged_resources(ids, repo)
-            if not cleaned:
-                logger.warning("acceptance cleanup incomplete for %s; retaining review state", node_id)
-                return
-            for nid in ids:
-                n = await self.store.get_node(nid)
-                if n is None:
-                    continue
-                n.needs_review = False
-                if nid in cancelled_descendants and not n.merge_accepted:
-                    n.status = NodeStatus.CANCELLED
-                if nid != node_id and n.status == NodeStatus.CANCELLED and not n.merge_accepted:
-                    # A cancelled historical attempt is not evidence accepted
-                    # by the container decision. Keep it cancelled/unaccepted
-                    # instead of visually reviving it as completed work.
-                    await self.store._save_node(n)
-                    await self._emit("node.updated", n.project_id, _dump(n))
-                    continue
-                n.merge_accepted = True
-                # Acceptance is a terminal positive projection. A concurrent
-                # container cleanup may cancel a task, but cannot relabel work
-                # already accepted by the user as cancelled.
-                n.status = NodeStatus.COMPLETE
-                await self.store._save_node(n)
-                await self._emit("node.updated", n.project_id, _dump(n))
-        self.wake()
-
-    async def _remove_merged_resources(self, ids: list[uuid.UUID], repo: str | None) -> bool:
-        """Compatibility hook: shared project files are never removed."""
-        return True
-
-    async def _cleanup_accepted(self, node: Node) -> None:
-        """Repair filesystem residue for a node already marked accepted."""
-        # Accepted nodes do not own disposable directories in filesystem mode.
-        return None
-
-    async def reject_merge(self, node_id: uuid.UUID, feedback: str) -> None:
-        """Reject a merged node: send feedback into the SAME node (no new node)
-        and re-run it in place so it can correct its output.
-
-        For a planner/container this supersedes its descendants and re-plans the
-        same node; for a leaf it re-runs the same node with the feedback appended
-        to its prompt. The shared project directory remains in place so the
-        re-run starts from the current files.
-        """
-        node = await self.store.get_node(node_id)
-        if node is None or node.parent_id is None:
-            return
-        if node.agent is not None and not node.agent.session_id:
-            # Compatibility recovery for transcripts written before a harness
-            # exposed its session id through the adapter. This keeps review
-            # feedback in the existing conversation instead of restarting it.
-            for artifact in reversed(await self.store.get_artifacts(node_id)):
-                if artifact.name != "transcript" or not isinstance(artifact.content, str):
-                    continue
-                session_id = recover_session_id(artifact.content)
-                if session_id:
-                    node.agent.session_id = session_id
-                    await self.store._save_node(node)
-                    break
-        if feedback and feedback.strip():
-            base = node.generated_prompt or ""
-            await self.store.edit_node(
-                node_id, generated_prompt=base + f"\n\n[Reviewer feedback]\n{feedback.strip()}"
-            )
-        # Serialize the accepted -> active transition with review metadata.
-        async with self._merge_lock:
-            n = await self.store.get_node(node_id)
-            if n is None:
-                return
-            n.needs_review = False
-            n.merge_accepted = False
-            is_planner = n.executor == PLANNER_EXECUTOR or n.status == NodeStatus.EXPANDED
-            if is_planner:
-                n.status = NodeStatus.PENDING
-            elif n.status != NodeStatus.RUNNING:
-                n.status = NodeStatus.RUNNABLE
-            await self.store._save_node(n)
-        if is_planner:
-            await self.regenerate_descendants(node_id)
-        elif n.status != NodeStatus.RUNNING:
-            await self.run_node(node_id)
-        await self._emit(
-            "node.updated", n.project_id, _dump(await self.store.get_node(node_id))
-        )
-        self.wake()
-
     # -- user actions ----------------------------------------------------
 
     async def provide_input(self, node_id: uuid.UUID, input_id: str, value: str) -> None:
@@ -866,18 +760,11 @@ class Runner:
         if node is None:
             return
         if fresh_session and node.agent is not None:
-            # “Re-run” is the one intentionally destructive session action:
-            # discard the old Herdr conversation before the new planner uses
-            # the same node id. Otherwise the persistent transport quite correctly
-            # finds the old session and attaches the fresh prompt to it.
-            if self.terminal.snapshot(node_id).get("active"):
-                await self.terminal.stop(node_id)
-            close_persistent = getattr(self.terminal, "close_persistent_session", None)
-            if close_persistent is not None:
-                await close_persistent(node_id)
-            self.terminal.release(node_id)
-            node.agent.session_id = None
-            node = await self.store._save_node(node)
+            # A rerun is a fresh harness call in the existing Herdr pane. The
+            # command injector interrupts any active input line before typing
+            # the new invocation, so there is no reason to replace the pane.
+            await self._reset_provider_session(node_id)
+            node = await self.store.get_node(node_id) or node
         try:
             created = await self._plan_node(node, node.project_id)
         except Exception:
@@ -901,6 +788,7 @@ class Runner:
             return
         if node.status == NodeStatus.FAILED:
             self._retries[node.id] = 0
+            await self._reset_provider_session(node_id)
             await self.store.set_status(node_id, NodeStatus.RUNNABLE)
             await self._emit("node.updated", node.project_id, _dump(node))
             self.wake()
@@ -1181,7 +1069,7 @@ class Runner:
     # -- manual stepping --------------------------------------------------
 
     async def step(self, project_id: uuid.UUID) -> Optional[uuid.UUID]:
-        """Manual mode: run exactly one runnable node (shallowest first).
+        """Manual mode: run exactly one runnable node in dependency order.
 
         Returns the executed node id, or None if nothing is runnable.
         """
@@ -1190,13 +1078,12 @@ class Runner:
             return None
         walker = GraphWalker(nodes, edges)
         ev = walker.evaluate()
-        idx = walker.indexes
-        candidates = [nid for nid in ev.runnable if nid not in self._running]
-        if not candidates:
-            return None
-        # shallowest-first so planners/containers run before their leaves
-        candidates.sort(key=lambda nid: (walker.depth(nid), str(nid)))
-        node = idx.node_by_id.get(candidates[0])
+        ordered = walker.topological()
+        node = next(
+            (candidate for candidate in ordered
+             if candidate.id in ev.runnable and candidate.id not in self._running),
+            None,
+        )
         if node is None:
             return None
         self._running[node.id] = asyncio.create_task(
@@ -1219,6 +1106,7 @@ class Runner:
             return None
         # Revive a cancelled or paused node so the user can run it again.
         if node.status == NodeStatus.CANCELLED:
+            await self._reset_provider_session(node_id)
             await self.store.set_status(node_id, NodeStatus.RUNNABLE)
         if node.paused:
             await self.store.set_paused(node_id, False)
@@ -1321,7 +1209,15 @@ class Runner:
         if n is None:
             return
         await self.store.set_status(node.id, NodeStatus.CANCELLED)
+        await self._reset_provider_session(node.id)
         await self._emit("node.updated", n.project_id, _dump(n))
+
+    async def _reset_provider_session(self, node_id: uuid.UUID) -> None:
+        """Clear the provider session so the next call is injected fresh."""
+        fresh = await self.store.get_node(node_id)
+        if fresh is not None and fresh.agent is not None and fresh.agent.session_id:
+            fresh.agent.session_id = None
+            await self.store._save_node(fresh)
 
     async def _mark_failed(self, node: Node, error: str) -> None:
         await self.store.set_status(node.id, NodeStatus.FAILED)

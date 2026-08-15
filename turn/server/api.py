@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from turn.db.store import Store
 from turn.config import REAL_HARNESSES
 from turn.domain.schemas import AgentConfig, GraphView, InputSpec, Node, NodeStatus, RunPolicy
-from turn.domain.state_machine import present_node, review_blocked_ids
+from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker
 from turn.contracts.schema import public_schema
 from turn.runner.runner import Runner
@@ -133,7 +133,6 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
     ev = walker.evaluate()
     for n in nodes:
         n.progress = ev.progress.get(n.id)
-    review_blocked = review_blocked_ids(nodes)
     root = next((n for n in nodes if n.id == project_id), None)
     serialized = []
     for n in nodes:
@@ -151,7 +150,6 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         p = present_node(
             effective,
             blocked_reason=ev.blocked_reason.get(n.id),
-            subtree_needs_review=n.id in review_blocked and not n.needs_review,
         )
         item = _dump(n)
         item["ui_state"] = p.state.value
@@ -251,7 +249,6 @@ async def create_project(body: CreateProject, request: Request):
             max_retries=app_settings.max_retries,
             retry_backoff_ms=app_settings.retry_backoff_ms,
             retry_choked_models=app_settings.retry_choked_models,
-            review_mode="manual",
         )
     root = await store.create_project(
         body.prompt, name=body.name, repo_path=repo_path, id=root_id,
@@ -828,24 +825,3 @@ async def run_node(node_id: str, request: Request):
     runner = await _runner(request)
     nid = await runner.run_node(uuid.UUID(node_id))
     return {"ok": nid is not None, "ran": str(nid) if nid else None}
-
-
-class RejectBody(BaseModel):
-    feedback: Optional[str] = None
-
-
-@router.post("/api/nodes/{node_id}/accept")
-async def accept_merge(node_id: str, request: Request):
-    """Accept a reviewed node without changing project files."""
-    runner = await _runner(request)
-    await runner.accept_merge(uuid.UUID(node_id))
-    return {"ok": True}
-
-
-@router.post("/api/nodes/{node_id}/reject")
-async def reject_merge(node_id: str, body: RejectBody, request: Request):
-    """Reject a merged node: send feedback into the SAME node (no new node)
-    and re-run it in place so it can correct its output."""
-    runner = await _runner(request)
-    await runner.reject_merge(uuid.UUID(node_id), body.feedback or "")
-    return {"ok": True}

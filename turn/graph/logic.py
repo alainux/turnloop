@@ -88,8 +88,6 @@ def is_runnable(
         )
         if pn is None or prerequisite_status != NodeStatus.COMPLETE:
             return False, "dependency incomplete"
-        if pn.needs_review and not pn.merge_accepted:
-            return False, "dependency awaits review"
     for inp in node.required_inputs:
         if inp.satisfied_by is None:
             return False, f"missing input: {inp.label}"
@@ -172,7 +170,6 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
         done = [
             d for d in active_leaves
             if d.status == NodeStatus.COMPLETE
-            and not (d.needs_review and not d.merge_accepted)
         ]
         status[n.id] = (
             NodeStatus.COMPLETE
@@ -216,7 +213,6 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
         done = [
             d for d in active_leaves
             if d.status == NodeStatus.COMPLETE
-            and not (d.needs_review and not d.merge_accepted)
         ]
         total = len(active_leaves)
         if total == 0:
@@ -227,7 +223,7 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             status[n.id] = NodeStatus.COMPLETE
         elif n.status not in (NodeStatus.CANCELLED, NodeStatus.FAILED):
             # Container completion is derived, never sticky. A newly forked,
-            # input-blocked, or review-blocked descendant reopens its parents
+            # input-blocked descendant reopens its parents
             # until that work is genuinely settled.
             status[n.id] = NodeStatus.EXPANDED
 

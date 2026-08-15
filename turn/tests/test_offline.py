@@ -8,8 +8,10 @@ import uuid
 from turn.config import Settings, settings
 from turn.db.store import Store
 from turn.domain.schemas import (
+    AgentConfig,
     ArtifactSpec,
     EdgeType,
+    HarnessKind,
     Node,
     NodeSpec,
     NodeStatus,
@@ -21,7 +23,6 @@ from turn.domain.schemas import (
 from turn.graph.logic import evaluate
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
-from turn.workers.artifacts import capture_filesystem, snapshot_filesystem
 from turn.workers.base import NodeExecutionContext, Planner
 from turn.workers.codex_worker import CodexWorker
 from turn.workers.echo_worker import EchoWorker
@@ -29,16 +30,6 @@ from turn.workers.filesystem import init_project_directory
 from turn.workers.registry import WorkerRegistry
 from turn.workers.planner import HeuristicPlanner
 from turn.tests.fakes import FakeHerdrAdapter
-
-
-def test_capture_filesystem_includes_new_file(tmp_path) -> None:
-    before = snapshot_filesystem(str(tmp_path))
-    (tmp_path / "PLAN.md").write_text("# Plan\n\nVerify the graph.\n")
-    captured = capture_filesystem(str(tmp_path), before)
-    patch = next(item.content for item in captured if item.kind.value == "code_diff")
-    assert "+++ b/PLAN.md" in patch
-    assert "+# Plan" in patch
-    assert any(item.name == "filesystem-status" for item in captured)
 
 
 def test_project_directory_does_not_initialize_git(tmp_path) -> None:
@@ -158,7 +149,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     await store.dispose()
 
 
-async def test_auto_runner_dispatches_independent_lanes_together(tmp_path) -> None:
+async def test_auto_runner_dispatches_all_independent_lanes_together(tmp_path) -> None:
     class ProbeWorker:
         name = "codex"
 
@@ -177,7 +168,7 @@ async def test_auto_runner_dispatches_independent_lanes_together(tmp_path) -> No
                 artifacts=[ArtifactSpec(name="result", content=ctx.node.objective)],
             )
 
-    cfg = Settings(max_concurrency=3)
+    cfg = Settings()
     store = Store(tmp_path / "turn")
     await store.init()
     worker = ProbeWorker()
@@ -209,8 +200,42 @@ async def test_auto_runner_dispatches_independent_lanes_together(tmp_path) -> No
     await store.dispose()
 
 
+async def test_manual_step_uses_dependency_order_not_uuid_order(tmp_path) -> None:
+    store = Store(tmp_path / "turn")
+    await store.init()
+    registry = WorkerRegistry()
+    registry.register(EchoWorker())
+    runner = Runner(
+        store,
+        registry=registry,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+    root = await store.create_project(
+        "ordered manual demo",
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    created = await store.apply_plan(
+        root,
+        PlanResult(nodes=[
+            NodeSpec(key="finish", objective="finish", executor="echo", depends_on=["middle"]),
+            NodeSpec(key="middle", objective="middle", executor="echo", depends_on=["first"]),
+            NodeSpec(key="first", objective="first", executor="echo"),
+        ]),
+    )
+
+    selected = await runner.step(root.id)
+    first = next(node for node in created if node.objective == "first")
+    assert selected == first.id
+    await asyncio.gather(*runner._running.values())
+    await store.dispose()
+
+
 def test_sequential_policy_is_removed_from_runtime_contract():
     assert not hasattr(Settings(), "force_sequential")
+    assert not hasattr(Settings(), "max_concurrency")
     assert "force_sequential" not in RunPolicy().model_dump()
 
 

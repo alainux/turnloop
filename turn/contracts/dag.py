@@ -8,74 +8,21 @@ from __future__ import annotations
 
 import json
 import tempfile
-from typing import Any
+from typing import Any, Literal
 
 from turn.domain.schemas import PlanResult, WorkerResult
 
-_INPUT = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "id": {"type": "string"}, "label": {"type": "string"},
-        "kind": {"type": "string"}, "description": {"type": "string"},
-    },
-    "required": ["id", "label", "kind", "description"],
-}
-_NODE = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "key": {"type": "string"}, "objective": {"type": "string"},
-        "generated_prompt": {"type": "string"}, "executor": {"type": "string"},
-        "required_inputs": {"type": "array", "items": _INPUT},
-        "resource_refs": {"type": "array", "items": {"type": "string"}},
-        "parent_key": {"type": ["string", "null"]},
-        "depends_on": {"type": "array", "items": {"type": "string"}},
-        "plan": {"type": "boolean"},
-    },
-    "required": [
-        "key", "objective", "generated_prompt", "executor", "required_inputs",
-        "resource_refs", "parent_key", "depends_on", "plan",
-    ],
-}
-_EDGE = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "type": {"type": "string", "enum": ["CONTAINS", "DEPENDS_ON"]},
-        "src": {"type": "string"}, "dst": {"type": "string"},
-    },
-    "required": ["type", "src", "dst"],
-}
-PLAN_SCHEMA: dict[str, Any] = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "nodes": {"type": "array", "items": _NODE},
-        "edges": {"type": "array", "items": _EDGE},
-        "notes": {"type": "string"},
-    },
-    "required": ["nodes", "edges", "notes"],
-}
-_RESULT_ITEM = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "kind": {"type": "string"}, "name": {"type": "string"},
-        "content": {"type": "string"}, "ref": {"type": "string"},
-    },
-    "required": ["kind", "name", "content", "ref"],
-}
-RESULT_SCHEMA: dict[str, Any] = {
-    "type": "object", "additionalProperties": False,
-    "properties": {
-        "outcome": {"type": "string", "enum": ["COMPLETE", "EXPAND", "BLOCK", "FAIL"]},
-        "summary": {"type": "string"},
-        "artifacts": {"type": "array", "items": _RESULT_ITEM},
-        "missing_inputs": {"type": "array", "items": _INPUT},
-        "error": {"type": "string"},
-        "retry_recommended": {"type": "boolean"},
-        "children": PLAN_SCHEMA,
-    },
-    "required": [
-        "outcome", "summary", "artifacts", "missing_inputs", "error",
-        "retry_recommended", "children",
-    ],
+# The domain models are the single source of truth. Artifact strings are the
+# one intentionally compact wire form accepted by the agent CLI; they are
+# normalized before the domain model validates the result.
+PLAN_SCHEMA: dict[str, Any] = PlanResult.model_json_schema(ref_template="#/$defs/{model}")
+RESULT_SCHEMA: dict[str, Any] = WorkerResult.model_json_schema(ref_template="#/$defs/{model}")
+artifact_schema = RESULT_SCHEMA["$defs"]["ArtifactSpec"]
+RESULT_SCHEMA["$defs"]["ArtifactSpec"] = {
+    "oneOf": [
+        {"type": "string"},
+        artifact_schema,
+    ]
 }
 
 
@@ -84,7 +31,47 @@ def parse_plan(value: str | dict[str, Any]) -> PlanResult:
 
 
 def parse_result(value: str | dict[str, Any]) -> WorkerResult:
-    return WorkerResult.model_validate(_decode(value))
+    return WorkerResult.model_validate(_normalize_result_payload(_decode(value)))
+
+
+def validate_agent_submission(
+    kind: Literal["plan", "result"], value: dict[str, Any]
+) -> PlanResult | WorkerResult:
+    """Validate one agent handoff against the shared operation contract.
+
+    The CLI accepts the deliberately small artifact shorthand used in agent
+    prompts (for example ``"src"``). It is normalized into an ``ArtifactSpec``
+    before Pydantic validation. No path lookup, content check, or filesystem
+    comparison happens here.
+    """
+    if kind == "plan":
+        return parse_plan(value)
+    return parse_result(value)
+
+
+def _normalize_result_payload(value: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    raw_artifacts = payload.get("artifacts")
+    if raw_artifacts is None:
+        return payload
+    if not isinstance(raw_artifacts, list):
+        return payload
+
+    artifacts: list[Any] = []
+    for item in raw_artifacts:
+        if isinstance(item, str):
+            artifacts.append({
+                "kind": "file",
+                "name": item.rsplit("/", 1)[-1] or item,
+                "ref": item,
+            })
+            continue
+        if isinstance(item, dict):
+            artifacts.append(dict(item))
+            continue
+        artifacts.append(item)
+    payload["artifacts"] = artifacts
+    return payload
 
 
 def _decode(value: str | dict[str, Any]) -> dict[str, Any]:

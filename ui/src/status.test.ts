@@ -28,8 +28,6 @@ const base: GraphNode = {
   progress: null,
   created_at: "",
   updated_at: "",
-  needs_review: false,
-  merge_accepted: false,
 };
 describe("truthful status", () => {
   it("only calls a live provider generating", () => {
@@ -37,18 +35,6 @@ describe("truthful status", () => {
     expect(deriveStatus([{ ...base, generation_active: true }])).toBe(
       "1 model generating",
     );
-  });
-  it("reports explicit human review", () => {
-    expect(
-      deriveStatus([
-        {
-          ...base,
-          status: "COMPLETE",
-          ui_state: "review",
-          needs_review: true,
-        },
-      ]),
-    ).toContain("need review");
   });
   it("shows the agent machine state and working message", () => {
     expect(

@@ -179,7 +179,7 @@ investigate / plan / verify scaffolding.
 genuinely distinct domains, modules, capabilities, or output sections that
 make up the result. Prefer 2–5 orthogonal direct children that can proceed in
 parallel. Name them in the vocabulary of the domain; do not turn milestones,
-tests, or generic review steps into fake domains.
+tests, or generic approval steps into fake domains.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it. Never list the
 same sub-task twice, and do NOT create parallel sub-planners that cover the
@@ -220,8 +220,17 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   ordinary executor child whose objective says integrate, assemble, merge, or
   otherwise recombine. It lists all of those sibling keys in depends_on and
   reads their outputs. Integrators are not a special agent type.
-- FINAL INTEGRATION: if there are several branch integrators or major outputs,
-  add one final ordinary executor to recombine them into the parent result.
+- SINGULAR PRODUCT: when THIS node represents one product, deliverable, or
+  end-to-end outcome, add exactly one final ordinary executor to produce that
+  result. It must depend on every direct branch output, including nested
+  planner/container branches. That final node is the only terminal output at
+  this workflow boundary. Multiple terminal outputs are appropriate only when
+  the objective explicitly requests multiple products or independent outputs.
+- FINAL INTEGRATION: name the singular-product node integrate, assemble,
+  merge, or otherwise recombine, and make it the final stage after all branch
+  integrators or major outputs. A nested planner is itself a direct branch
+  output; depend on its container key rather than reaching into its future
+  grandchildren.
 - SEQUENTIAL: use a dependency whenever later work truly cannot begin before
   earlier output. Such edges are left-to-right workflow stages and should be
   explicit; never use them just to make a checklist or to order unrelated

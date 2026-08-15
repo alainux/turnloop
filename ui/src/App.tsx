@@ -34,7 +34,6 @@ const defaultPolicy: RunPolicy = {
   retry_backoff_ms: 750,
   retry_choked_models: true,
   compact_on_context_pressure: true,
-  review_mode: "manual",
 };
 const emptyAgent: Agent = {
   id: crypto.randomUUID(),
@@ -390,6 +389,11 @@ export default function App() {
             </div>
             {graphReady && root ? (
               <div id="graph" className="graph">
+                <div className="graph-guide" aria-label="Graph guide">
+                  <span><i className="legend-line contains" /> nesting</span>
+                  <span><i className="legend-line depends" /> dependency — must finish first</span>
+                  <span>same stage = can run in parallel</span>
+                </div>
                 <GraphCanvas
                   nodes={graph!.nodes}
                   edges={graph!.edges}
@@ -981,7 +985,7 @@ function Author({
         )}
       </form>
       <p className="author-disclaimer">
-              Agents act directly in the assigned project directory. Review
+              Agents act directly in the assigned project directory. Check
               permissions before starting.
       </p>
     </section>
