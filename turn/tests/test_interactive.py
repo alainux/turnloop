@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import subprocess
 import uuid
 
 from turn.workers.interactive import (
+    agent_environment,
     prepare_result_file,
     read_result_file,
     result_handoff,
@@ -43,6 +45,23 @@ def test_agent_handoff_prompt_uses_only_cli_payload_submission():
         assert "--file" not in prompt
         assert "--stdin" not in prompt
         assert ".turn/" not in prompt
+
+
+def test_worker_environment_points_to_installed_turn_cli(tmp_path):
+    node_id = uuid.uuid4()
+    handoff = prepare_result_file(str(tmp_path), node_id, "result")
+    environment = agent_environment(str(tmp_path), node_id, "result", handoff)
+    cli = environment["TURN_CLI"]
+
+    assert cli.endswith("/turn")
+    completed = subprocess.run(
+        [cli, "agent", "--help"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "submit" in completed.stdout
 
 
 class WaitingTransport:

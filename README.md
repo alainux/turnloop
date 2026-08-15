@@ -49,6 +49,13 @@ project files; UI and CLI are clients. A node owns intent and an `AgentConfig`, 
 harness-specific flags remain inside replaceable planner/worker adapters:
 `graph → node → agent → type/harness`.
 
+For broad requests, a `PlanResult` also carries graph-owned architectural
+metadata: an executive summary, approach and strategy, typed sections,
+decisions, risks, acceptance criteria, and optional diagrams. The document view
+renders that metadata alongside the dependency graph, and every worker receives
+the same root/branch metadata through its graph context. It is not a second
+document store or a filesystem handoff protocol.
+
 The React client is strict TypeScript and mirrors the Python domain vocabulary.
   It consumes server-projected `ui_state`, `allowed_actions`, and
 and `generation_active`; it does not guess workflow state. A provider-neutral
@@ -112,7 +119,7 @@ prove installed-harness integration but are not deterministic quality scores.
 turn doctor
 turn create "Build an adaptive narrative engine" --harness codex --run
 turn projects
-turn graph PROJECT_UUID
+turn graph PROJECT_UUID --tree
 turn run PROJECT_UUID
 turn serve --port 8000
 ```

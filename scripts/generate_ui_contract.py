@@ -106,6 +106,11 @@ def generate(document: dict[str, Any] | None = None) -> str:
     for name, schema in definitions.items():
         declarations[name] = _declaration(name, schema)
     for name, schema in document["models"].items():
+        # Pydantic emits recursive models as a top-level $ref plus their
+        # concrete object in $defs. Do not replace that concrete declaration
+        # with the self-referential alias `type Section = Section`.
+        if _ref_name(schema) == name and name in definitions:
+            continue
         declarations[name] = _declaration(name, schema)
 
     sections = [

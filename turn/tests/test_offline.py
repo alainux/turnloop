@@ -141,6 +141,9 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     evaluation = evaluate(nodes, edges)
     parallel = [node for node in created if node.objective != "Integrate the deliverable"]
     integrator = next(node for node in created if node.objective == "Integrate the deliverable")
+    assert integrator.agent is not None
+    assert integrator.agent.type_id.value == "integrator"
+    assert any(path.endswith("turn-integrating.md") for path in integrator.agent.skills)
     assert all(node.id in evaluation.runnable for node in parallel)
     assert integrator.id not in evaluation.runnable
     assert {edge.src for edge in edges if edge.dst == integrator.id and edge.type == EdgeType.DEPENDS_ON} == {
@@ -228,7 +231,57 @@ async def test_manual_step_uses_dependency_order_not_uuid_order(tmp_path) -> Non
 
     selected = await runner.step(root.id)
     first = next(node for node in created if node.objective == "first")
-    assert selected == first.id
+    assert selected == [first.id]
+    await asyncio.gather(*runner._running.values())
+    await store.dispose()
+
+
+async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> None:
+    store = Store(tmp_path / "turn")
+    await store.init()
+    registry = WorkerRegistry()
+    registry.register(EchoWorker())
+    runner = Runner(
+        store,
+        registry=registry,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+    root = await store.create_project(
+        "parallel manual demo",
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    created = await store.apply_plan(
+        root,
+        PlanResult(
+            nodes=[
+                NodeSpec(key="world", objective="world", executor="echo"),
+                NodeSpec(key="systems", objective="systems", executor="echo"),
+                NodeSpec(
+                    key="integrate",
+                    objective="integrate",
+                    executor="echo",
+                    depends_on=["world", "systems"],
+                ),
+            ]
+        ),
+    )
+
+    first_stage = await runner.step(root.id)
+    world = next(node for node in created if node.objective == "world")
+    systems = next(node for node in created if node.objective == "systems")
+    integrate = next(node for node in created if node.objective == "integrate")
+    assert set(first_stage) == {world.id, systems.id}
+    assert integrate.id not in first_stage
+
+    # A second click while the stage is still active cannot advance early.
+    assert await runner.step(root.id) == []
+    await asyncio.gather(*runner._running.values())
+
+    second_stage = await runner.step(root.id)
+    assert second_stage == [integrate.id]
     await asyncio.gather(*runner._running.values())
     await store.dispose()
 

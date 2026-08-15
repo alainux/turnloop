@@ -301,8 +301,10 @@ class Store:
 
     async def get_graph(self, project_id: uuid.UUID) -> Graph:
         state = self._states.get(project_id, self._empty_state())
+        root = state["nodes"].get(project_id)
         return Graph(
             project_id=project_id,
+            architecture_spec=root.architecture_spec if root is not None else None,
             nodes=[node.model_copy(deep=True) for node in state["nodes"].values()],
             edges=[edge.model_copy(deep=True) for edge in state["edges"].values()],
             artifacts=[artifact.model_copy(deep=True) for artifact in state["artifacts"].values()],
@@ -509,6 +511,8 @@ class Store:
         return [item.id for item in descendants]
 
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
+        if plan.architecture_spec is not None:
+            parent.architecture_spec = plan.architecture_spec
         if not plan.nodes:
             parent.status = NodeStatus.COMPLETE
             await self._save_node(parent)
@@ -538,7 +542,12 @@ class Store:
             else:
                 node_agent = inherited_agent or AgentConfig()
             node_agent.session_id = None
-            if not spec.agent:
+            requested_agent_type = spec.agent_type or (
+                spec.agent.type_id if spec.agent is not None else None
+            )
+            if requested_agent_type is not None:
+                node_agent = node_agent.as_type(requested_agent_type)
+            elif not spec.agent:
                 node_agent = node_agent.as_type(
                     AgentType.PLANNER if executor == PLANNER_EXECUTOR else AgentType.EXECUTOR
                 )

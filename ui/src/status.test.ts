@@ -9,6 +9,7 @@ const base: GraphNode = {
   objective: "n",
   project_name: null,
   generated_prompt: null,
+  architecture_spec: null,
   repo_path: null,
   executor: null,
   agent: null,

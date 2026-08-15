@@ -14,6 +14,7 @@ import subprocess
 import sys
 from typing import Any, Awaitable, Callable
 
+from turn.contracts.dag import plan_handoff_example
 from turn.workers.terminal import TerminalResult
 
 
@@ -82,6 +83,11 @@ def agent_environment(
     # the metadata only so the Turn CLI can publish into the control plane;
     # prompts explicitly forbid writing them directly.
     status = handoff.parent / f"{node_id}.status.json"
+    turn_cli = shutil.which("turn")
+    if not turn_cli:
+        raise RuntimeError(
+            "Turn CLI is not installed; install the project package before launching workers"
+        )
     return {
         "TURN_NODE_ID": str(node_id),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
@@ -89,7 +95,7 @@ def agent_environment(
         "TURN_HANDOFF_KIND": kind,
         "TURN_HANDOFF_FILE": str(handoff),
         "TURN_STATUS_FILE": str(status),
-        "TURN_CLI": f"{sys.executable} -m turn",
+        "TURN_CLI": turn_cli,
         "TURN_HARNESS": str(getattr(getattr(agent, "harness", None), "value", "") or ""),
         "TURN_AGENT_MODEL": str(getattr(agent, "model", None) or ""),
         "TURN_AGENT_REASONING": str(getattr(getattr(agent, "reasoning", None), "value", "") or ""),
@@ -329,8 +335,14 @@ async def run_until_result(
 
 def result_handoff(*, plan: bool = False) -> str:
     """Prompt fragment for the harness-neutral Turn control plane."""
+    turn_cli = shutil.which("turn")
+    if not turn_cli:
+        raise RuntimeError(
+            "Turn CLI is not installed; install the project package before launching workers"
+        )
+    turn_cli = shlex.quote(turn_cli)
     if plan:
-        shape = '{"nodes":[{"key":"unique","objective":"Short title","executor":"codex","generated_prompt":"Detailed instructions","depends_on":[]}],"edges":[]}'
+        shape = plan_handoff_example()
     else:
         shape = '{"outcome":"COMPLETE","summary":"What happened","missing_inputs":[]}'
     kind = "plan" if plan else "result"
@@ -351,16 +363,18 @@ This is an ordinary terminal session. Use the harness normally: type, run
 commands, inspect files, and communicate with the user here. Turn does not
 parse or summarize your terminal output, and the harness must not use a
 structured-output or JSON-output mode for this protocol.
+`TURN_CLI` is a single installed executable path; invoke it directly for all
+Turn status and handoff commands.
 
 Publish status when useful:
-  {sys.executable} -m turn agent status --state working --message "..."
+  {turn_cli} agent status --state working --message "..."
 Keep the status message short: a few words describing the current action.
 
 For the final {kind}, submit one JSON object matching this shape through the
 Turn CLI. The CLI is the only submission interface and writes Turn's internal
 record. Do not use filesystem output as a protocol:
 {shape}
-  {sys.executable} -m turn agent submit --kind {kind} --payload '<JSON_OBJECT>'
+  {turn_cli} agent submit --kind {kind} --payload '<JSON_OBJECT>'
 Replace `<JSON_OBJECT>` with the actual single-line JSON object.
 {artifact_guidance}
 

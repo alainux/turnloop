@@ -21,5 +21,8 @@ def test_generated_ui_contract_matches_shared_schema():
     assert "export interface Agent" in generated
     assert "export interface Planner" in generated
     assert "export interface Executor" in generated
+    assert "export interface Integrator" in generated
     assert "export interface GraphNodeView" in generated
     assert "export interface GraphView" in generated
+    assert "export interface ArchitectureSpec" in generated
+    assert "export interface ArchitectureDiagram" in generated

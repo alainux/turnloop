@@ -15,6 +15,7 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   objective: id,
   project_name: null,
   generated_prompt: null,
+  architecture_spec: null,
   repo_path: null,
   executor: null,
   agent: null,

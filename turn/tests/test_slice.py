@@ -225,8 +225,8 @@ async def test_manual_mode() -> None:
     assert len(nodes) == 1, "planner should not have run yet"
 
     # Step the planner -> it builds the graph.
-    nid = await runner.step(root.id)
-    assert nid == root.id, "first step should run the planner root"
+    stepped = await runner.step(root.id)
+    assert stepped == [root.id], "first step should run the planner root"
     if runner._running:
         await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
     assert runner._running == {}, "step task should have finished"
@@ -242,8 +242,8 @@ async def test_manual_mode() -> None:
     assert a.status == NodeStatus.RUNNABLE
 
     # Step one leaf at a time; shallowest (a) runs first.
-    nid = await runner.step(root.id)
-    assert nid == a.id
+    stepped = await runner.step(root.id)
+    assert stepped == [a.id]
     if runner._running:
         await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
     a = await store.get_node(a.id)
@@ -254,8 +254,8 @@ async def test_manual_mode() -> None:
     b = await store.get_node(find_node(children, "Confirm the key decision").id)
     assert b.status == NodeStatus.BLOCKED
     await runner.provide_input(b.id, "decision_x", "single hero section")
-    nid = await runner.step(root.id)
-    assert nid == b.id
+    stepped = await runner.step(root.id)
+    assert stepped == [b.id]
     if runner._running:
         await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
     b = await store.get_node(b.id)
@@ -263,8 +263,8 @@ async def test_manual_mode() -> None:
 
     # c joins after b; step it to finish.
     c = find_node(children, "Produce the deliverable")
-    nid = await runner.step(root.id)
-    assert nid == c.id
+    stepped = await runner.step(root.id)
+    assert stepped == [c.id]
     if runner._running:
         await asyncio.gather(*list(runner._running.values()), return_exceptions=True)
     c = await store.get_node(c.id)

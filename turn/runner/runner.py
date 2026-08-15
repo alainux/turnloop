@@ -80,6 +80,10 @@ class Runner:
         self._stop = False
         self._task: Optional[asyncio.Task] = None
         self._last_launch_at: dict[uuid.UUID, float] = {}
+        # A manual step advances the whole runnable frontier. This barrier
+        # prevents a fast branch from unlocking downstream work while a
+        # sibling from the same stage is still running.
+        self._manual_stages: dict[uuid.UUID, set[uuid.UUID]] = {}
         self._last_workspace_reconcile_at = 0.0
         # Herdr owns one durable project workspace and one pane per node. Turn
         # only opens short-lived control streams into those panes, so Herdr's
@@ -102,6 +106,7 @@ class Runner:
     async def stop(self) -> None:
         self._stop = True
         self._wake.set()
+        self._manual_stages.clear()
         for t in self._running.values():
             t.cancel()
         for t in self._reconnect_tasks.values():
@@ -726,7 +731,9 @@ class Runner:
                         continue
                     inherited = node.agent.model_copy(deep=True)
                     inherited = inherited.as_type(
-                        "planner" if child.executor == PLANNER_EXECUTOR else "executor"
+                        child.agent.type_id
+                        if child.agent is not None
+                        else ("planner" if child.executor == PLANNER_EXECUTOR else "executor")
                     )
                     changed = await self.store.edit_node(child.id, agent=inherited)
                     if changed is not None:
@@ -1049,6 +1056,7 @@ class Runner:
 
     async def cancel_project_runs(self, project_id: uuid.UUID) -> None:
         """Stop every in-flight task before a project is removed."""
+        self._manual_stages.pop(project_id, None)
         nodes, _, _ = await self.store.get_workgraph(project_id)
         tasks = [self._running[node.id] for node in nodes if node.id in self._running]
         tasks.extend(
@@ -1068,28 +1076,52 @@ class Runner:
 
     # -- manual stepping --------------------------------------------------
 
-    async def step(self, project_id: uuid.UUID) -> Optional[uuid.UUID]:
-        """Manual mode: run exactly one runnable node in dependency order.
+    async def step(self, project_id: uuid.UUID) -> list[uuid.UUID]:
+        """Manual mode: run the next runnable DAG stage as one batch.
 
-        Returns the executed node id, or None if nothing is runnable.
+        A stage is the current runnable frontier. The next frontier is not
+        exposed until every node in this batch settles, so a fast branch cannot
+        cause downstream work to start while its siblings are still in flight.
         """
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
-            return None
+            return []
+
+        stage = self._manual_stages.get(project_id)
+        if stage:
+            current = {node.id: node for node in nodes}
+            settled = all(
+                node_id not in self._running
+                and current.get(node_id) is not None
+                and current[node_id].status
+                in (
+                    NodeStatus.COMPLETE,
+                    NodeStatus.FAILED,
+                    NodeStatus.CANCELLED,
+                    NodeStatus.EXPANDED,
+                )
+                for node_id in stage
+            )
+            if not settled:
+                return []
+            self._manual_stages.pop(project_id, None)
+
         walker = GraphWalker(nodes, edges)
         ev = walker.evaluate()
-        ordered = walker.topological()
-        node = next(
-            (candidate for candidate in ordered
-             if candidate.id in ev.runnable and candidate.id not in self._running),
-            None,
-        )
-        if node is None:
-            return None
-        self._running[node.id] = asyncio.create_task(
-            self._execute_node(node, project_id)
-        )
-        return node.id
+        stage_nodes = [
+            candidate
+            for candidate in walker.topological()
+            if candidate.id in ev.runnable and candidate.id not in self._running
+        ]
+        if not stage_nodes:
+            return []
+
+        self._manual_stages[project_id] = {node.id for node in stage_nodes}
+        for node in stage_nodes:
+            self._running[node.id] = asyncio.create_task(
+                self._execute_node(node, project_id)
+            )
+        return [node.id for node in stage_nodes]
 
     async def run_node(self, node_id: uuid.UUID) -> Optional[uuid.UUID]:
         """Manually execute a specific node regardless of auto-run mode."""
@@ -1116,6 +1148,8 @@ class Runner:
         return node.id
 
     async def set_mode(self, project_id: uuid.UUID, auto_run: bool) -> None:
+        if auto_run:
+            self._manual_stages.pop(project_id, None)
         node = await self.store.set_auto_run(project_id, auto_run)
         if node is not None:
             if node.run_policy:
@@ -1137,6 +1171,13 @@ class Runner:
         project_repo = await self._project_repo(node.project_id)
         root = await self.store.get_node(node.project_id)
         policy = root.run_policy if root else None
+        chain = [*ancestry, node]
+        project_spec = root.architecture_spec if root else None
+        branch_spec = next(
+            (candidate.architecture_spec for candidate in reversed(chain)
+             if candidate.architecture_spec is not None),
+            project_spec,
+        )
 
         # Wire a live terminal stream: the worker emits raw output chunks and we
         # fan them out over the project SSE bus as `node.terminal` events.
@@ -1149,6 +1190,8 @@ class Runner:
             node=node,
             ancestry=ancestry,
             resources=resources,
+            project_spec=project_spec,
+            branch_spec=branch_spec,
             repo_path=project_repo,
             stream=_stream,
             terminal=self.terminal,

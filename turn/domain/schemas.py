@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -156,6 +156,7 @@ class PermissionMode(str, Enum):
 class AgentType(str, Enum):
     PLANNER = "planner"
     EXECUTOR = "executor"
+    INTEGRATOR = "integrator"
 
 
 def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
@@ -165,6 +166,7 @@ def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
     paths = {
         AgentType.PLANNER.value: [root / "planner" / "turn-planning.md"],
         AgentType.EXECUTOR.value: [root / "executor" / "turn-executing.md"],
+        AgentType.INTEGRATOR.value: [root / "integrator" / "turn-integrating.md"],
     }
     return [str(path) for path in paths.get(key, [])]
 
@@ -172,8 +174,9 @@ def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
 class Agent(BaseModel):
     """Top-level domain object describing one executable agent.
 
-    ``type_id`` names the agent specialization. Planner and executor are the
-    built-in types; each receives its filesystem skill contract automatically.
+    ``type_id`` names the agent specialization. Planner, executor, and
+    integrator are the built-in types; each receives its filesystem skill
+    contract automatically.
     """
 
     model_config = ConfigDict(validate_assignment=True)
@@ -204,7 +207,13 @@ class Agent(BaseModel):
             for path in skill_paths_for_agent_type(kind)
         }
         custom_skills = [skill for skill in self.skills if skill not in built_in]
-        agent_model = Planner if target is AgentType.PLANNER else Executor
+        agent_model = (
+            Planner
+            if target is AgentType.PLANNER
+            else Integrator
+            if target is AgentType.INTEGRATOR
+            else Executor
+        )
         return agent_model.model_validate(
             {
                 **self.model_dump(mode="python"),
@@ -228,6 +237,12 @@ class Executor(Agent):
     """Specialized agent type carrying the turn-executing skill."""
 
     type_id: AgentType = AgentType.EXECUTOR
+
+
+class Integrator(Agent):
+    """Specialized agent type carrying the turn-integrating skill."""
+
+    type_id: AgentType = AgentType.INTEGRATOR
 
 
 class RunPolicy(BaseModel):
@@ -269,6 +284,141 @@ class InputSpec(BaseModel):
     satisfied_by: Optional[uuid.UUID] = None
 
 
+# --------------------------------------------------------------------------
+# Architecture specification
+# --------------------------------------------------------------------------
+
+
+class ArchitectureDecision(BaseModel):
+    """One deliberate architectural choice and the reason for it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    decision: str
+    rationale: str
+    consequences: list[str] = Field(default_factory=list)
+
+
+class ArchitectureRisk(BaseModel):
+    """A material risk that the implementation plan must account for."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    description: str
+    mitigation: Optional[str] = None
+
+
+class ArchitectureDiagramNode(BaseModel):
+    """A typed node in a planner-authored architecture diagram."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    label: str
+    kind: str = "component"
+
+
+class ArchitectureDiagramEdge(BaseModel):
+    """A directed relationship in an architecture diagram."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str
+    dst: str
+    label: Optional[str] = None
+
+
+class ArchitectureDiagram(BaseModel):
+    """A renderer-neutral diagram that the document view can lay out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    description: Optional[str] = None
+    direction: Literal["LR", "TB"] = "LR"
+    nodes: list[ArchitectureDiagramNode] = Field(default_factory=list)
+    edges: list[ArchitectureDiagramEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> "ArchitectureDiagram":
+        node_ids = [node.id for node in self.nodes]
+        known = set(node_ids)
+        if len(node_ids) != len(known):
+            raise ValueError(f"diagram {self.id} node ids must be unique")
+        for edge in self.edges:
+            if edge.src not in known or edge.dst not in known:
+                missing = edge.src if edge.src not in known else edge.dst
+                raise ValueError(f"diagram {self.id} references unknown node {missing}")
+        return self
+
+
+class ArchitectureSection(BaseModel):
+    """A collapsible, markdown-backed section of the architecture document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    content: str = ""
+    diagram_ids: list[str] = Field(default_factory=list)
+    subsections: list["ArchitectureSection"] = Field(default_factory=list)
+
+
+class ArchitectureSpec(BaseModel):
+    """The planner-authored architectural contract for a project or branch.
+
+    The graph remains the execution model. This document explains why the
+    graph has its shape, what is being built, which choices are intentional,
+    and how the finished result will be accepted. The document is optional for
+    atomic work, but broad product/system plans are expected to provide it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(default=1, ge=1)
+    title: str = Field(min_length=1)
+    executive_summary: str = Field(min_length=1)
+    approach: Optional[str] = None
+    strategy: Optional[str] = None
+    architecture_principles: list[str] = Field(default_factory=list)
+    requirements: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    decisions: list[ArchitectureDecision] = Field(default_factory=list)
+    risks: list[ArchitectureRisk] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    sections: list[ArchitectureSection] = Field(default_factory=list)
+    diagrams: list[ArchitectureDiagram] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_document_references(self) -> "ArchitectureSpec":
+        section_ids: list[str] = []
+        diagram_refs: list[str] = []
+
+        def collect(section: ArchitectureSection) -> None:
+            section_ids.append(section.id)
+            diagram_refs.extend(section.diagram_ids)
+            for child in section.subsections:
+                collect(child)
+
+        for section in self.sections:
+            collect(section)
+        if len(section_ids) != len(set(section_ids)):
+            raise ValueError("architecture section ids must be unique")
+        diagram_ids = [diagram.id for diagram in self.diagrams]
+        if len(diagram_ids) != len(set(diagram_ids)):
+            raise ValueError("architecture diagram ids must be unique")
+        known_diagrams = set(diagram_ids)
+        missing = [ref for ref in diagram_refs if ref not in known_diagrams]
+        if missing:
+            raise ValueError(f"architecture section references unknown diagram {missing[0]}")
+        return self
+
+
 class Node(BaseModel):
     """A unit of intent. Persisted; workers are temporary."""
 
@@ -279,6 +429,9 @@ class Node(BaseModel):
     objective: str
     project_name: Optional[str] = None  # concise root-only navigation identity
     generated_prompt: Optional[str] = None  # prompt handed to the worker
+    # Planner-authored architecture for this project/branch. The root owns the
+    # project document; a nested planner may own a more focused branch spec.
+    architecture_spec: Optional[ArchitectureSpec] = None
 
     # --- repo (per-project working directory) ---------------------------
     # The absolute path assigned to every worker in THIS project (the directory
@@ -389,6 +542,7 @@ class Graph(BaseModel):
     """The extensible workgraph aggregate owned by the server."""
 
     project_id: uuid.UUID
+    architecture_spec: Optional[ArchitectureSpec] = None
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
@@ -407,6 +561,7 @@ class GraphView(BaseModel):
     """Serialized graph returned to the web client."""
 
     project_id: uuid.UUID
+    architecture_spec: Optional[ArchitectureSpec] = None
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
@@ -439,6 +594,10 @@ class NodeSpec(BaseModel):
     generated_prompt: Optional[str] = None
     executor: Optional[str] = None
     agent: Optional[Agent] = None
+    # A plan can request a built-in agent specialization while inheriting the
+    # parent's harness/model configuration. An explicit ``agent`` remains the
+    # escape hatch for a fully configured agent.
+    agent_type: Optional[AgentType] = None
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
 
@@ -447,7 +606,8 @@ class NodeSpec(BaseModel):
     depends_on: list[str] = Field(default_factory=list)  # prior left-to-right stage keys
     # When True (or executor == "planner") the created node is itself a
     # sub-planner: the runner will decompose it again on its next turn instead
-    # of executing it as a leaf. This lets plans nest planners arbitrarily.
+    # of executing it as a leaf. This is intentionally available for very
+    # large or uncertain scopes, but should be rare for one user request.
     plan: bool = False
 
 
@@ -465,6 +625,9 @@ class PlanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nodes: list[NodeSpec]
+    # Present for broad/system planning; omitted for atomic requests where a
+    # full architecture document would add noise rather than clarity.
+    architecture_spec: Optional[ArchitectureSpec] = None
     edges: list[EdgeSpec] = Field(default_factory=list)
     notes: Optional[str] = None
     usage: Usage = Field(default_factory=Usage)

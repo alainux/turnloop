@@ -10,8 +10,10 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from turn.config import settings
-from turn.contracts.dag import validate_agent_submission
+from turn.contracts.dag import compact_validation_error, validate_agent_submission
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, ReasoningLevel, RunPolicy
 
@@ -40,6 +42,16 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("projects", help="list projects")
     graph = sub.add_parser("graph", help="print a project's workgraph as JSON")
     graph.add_argument("project_id", type=uuid.UUID)
+    graph.add_argument(
+        "--state-file",
+        help="explicit local state path; normally discovered from the current directory",
+    )
+    graph.add_argument("--node", help="show one node from a local graph")
+    graph.add_argument("--children", help="show direct children of a local node")
+    graph.add_argument("--ancestors", help="show the parent chain of a local node")
+    graph.add_argument("--requester", help="node id performing this read")
+    graph.add_argument("--format", choices=["tree", "json"], default="json")
+    graph.add_argument("--tree", action="store_const", dest="format", const="tree")
     run = sub.add_parser("run", help="execute a project headlessly until settled")
     run.add_argument("project_id", type=uuid.UUID)
     agent = sub.add_parser("agent", help="small local protocol used by a running agent")
@@ -120,7 +132,12 @@ def agent_command(args) -> int:
     try:
         validate_agent_submission(args.kind, value)
     except (TypeError, ValueError) as error:
-        raise SystemExit(f"invalid {args.kind} submission: {error}") from error
+        detail = (
+            compact_validation_error(error)
+            if isinstance(error, ValidationError)
+            else str(error)
+        )
+        raise SystemExit(f"invalid {args.kind} submission: {detail}") from error
     target = _agent_protocol_path(args.kind)
     _write_agent_json(target, value)
     status_path = os.getenv("TURN_STATUS_FILE")
@@ -133,9 +150,68 @@ def agent_command(args) -> int:
     return 0
 
 
+def discover_project_state(start: Path | None = None) -> Path:
+    """Find the nearest project state while staying within the user's home."""
+    current = (start or Path.cwd()).expanduser().resolve()
+    home = Path.home().expanduser().resolve()
+    while True:
+        candidate = current / ".turn" / "state.json"
+        if candidate.is_file():
+            return candidate
+        if current == home or current.parent == current:
+            break
+        current = current.parent
+    raise SystemExit(
+        "no project state found: run this command inside a project with .turn/state.json"
+    )
+
+
+async def local_graph_command(args) -> int:
+    """Read a project-local graph through the installed Turn CLI."""
+    from turn.tools import graph_explorer
+
+    state_file = args.state_file or str(discover_project_state())
+    query = (
+        "node" if args.node
+        else "children" if args.children
+        else "ancestors" if args.ancestors
+        else args.format
+    )
+    nodes, children = await graph_explorer._query(
+        state_file, str(args.project_id), args.requester, query
+    )
+    by_id = {uuid.UUID(item["id"]).hex: item for item in nodes}
+    if args.node:
+        node_id = uuid.UUID(args.node).hex
+        output = [by_id[node_id]] if node_id in by_id else []
+    elif args.children:
+        parent_id = uuid.UUID(args.children).hex
+        output = [by_id[item] for item in children.get(parent_id, []) if item in by_id]
+    elif args.ancestors:
+        current_id = uuid.UUID(args.ancestors).hex
+        output = []
+        while current_id in by_id:
+            current = by_id[current_id]
+            output.append(current)
+            current_id = uuid.UUID(current["parent_id"]).hex if current["parent_id"] else ""
+    else:
+        output = nodes
+
+    if args.format == "json":
+        print(json.dumps(output, indent=2))
+    elif args.node or args.children or args.ancestors:
+        for item in output:
+            print("- " + graph_explorer._summary(item))
+    else:
+        graph_explorer._print_tree(nodes, children)
+    return 0
+
+
 async def async_main(args) -> int:
     if args.command == "agent":
         return agent_command(args)
+    if args.command == "graph":
+        return await local_graph_command(args)
     if args.command == "doctor":
         from turn.workers.harnesses import harness_capabilities
 
@@ -145,10 +221,6 @@ async def async_main(args) -> int:
         if args.command == "projects":
             projects = await core.store.list_projects()
             print(json.dumps([p.model_dump(mode="json") for p in projects], indent=2))
-            return 0
-        if args.command == "graph":
-            nodes, edges, artifacts = await core.graph(args.project_id)
-            print(json.dumps({"nodes": [n.model_dump(mode="json") for n in nodes], "edges": [e.model_dump(mode="json") for e in edges], "artifacts": [a.model_dump(mode="json") for a in artifacts]}, indent=2))
             return 0
         if args.command == "create":
             project = await core.create_project(

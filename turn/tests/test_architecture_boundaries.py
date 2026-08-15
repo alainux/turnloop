@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from pathlib import Path
 
@@ -9,11 +10,26 @@ import httpx
 from fastapi import FastAPI
 
 from turn.config import Settings
-from turn.contracts.dag import parse_plan, parse_result
+from turn.contracts.dag import parse_plan, parse_result, plan_handoff_example
 from turn.db.store import Store
-from turn.domain.schemas import AgentType, Executor, Node, Outcome, Planner
+from turn.domain.schemas import (
+    AgentType,
+    ArchitectureDiagram,
+    ArchitectureDiagramEdge,
+    ArchitectureDiagramNode,
+    ArchitectureSection,
+    ArchitectureSpec,
+    Executor,
+    Integrator,
+    Node,
+    NodeSpec,
+    Outcome,
+    PlanResult,
+    Planner,
+)
 from turn.graph.logic import GraphWalker
 from turn.runner.events import EventBus
+from turn.runner.runner import Runner
 from turn.server.api import router
 from turn.server.runtime import TurnRuntime
 from turn.tests.fakes import DeterministicExecutionAdapter, FakeHerdrAdapter
@@ -29,6 +45,16 @@ async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition did not become true before the timeout")
         await asyncio.sleep(0.01)
+
+
+def test_canonical_plan_handoff_uses_minimal_text_sections():
+    payload = json.loads(plan_handoff_example())
+    plan = parse_plan(payload)
+
+    assert "edges" not in payload
+    assert plan.architecture_spec is not None
+    assert plan.architecture_spec.sections[0].content == "Markdown text only."
+    assert plan.architecture_spec.sections[0].diagram_ids == []
 
 
 async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
@@ -88,9 +114,12 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
             nodes, edges, _ = await components.store.get_workgraph(project_id)
             walker = GraphWalker(nodes, edges)
             assert walker.descendants(project_id)
+            graph_response = await client.get(f"/api/projects/{project_id}/graph")
+            assert graph_response.json()["architecture_spec"]["title"].startswith("Architecture:")
 
             stepped = await client.post(f"/api/projects/{project_id}/step")
             assert stepped.status_code == 200, stepped.text
+            assert len(stepped.json()["stepped"]) == 3
             await _wait_for(
                 lambda: any(
                     node.status.value == "COMPLETE"
@@ -98,7 +127,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
                     if node.id != project_id
                 )
             )
-            assert execution.workers == ["echo"]
+            assert execution.workers == ["echo", "echo", "echo"]
 
             deleted = await client.delete(f"/api/projects/{project_id}")
             assert deleted.status_code == 200, deleted.text
@@ -138,13 +167,96 @@ def test_dag_contract_codecs_reject_invalid_graphs_and_parse_deterministically()
 def test_planner_and_executor_are_agent_types_with_filesystem_skills():
     planner = Planner()
     executor = Executor()
+    integrator = Integrator()
     assert planner.type_id is AgentType.PLANNER
     assert executor.type_id is AgentType.EXECUTOR
+    assert integrator.type_id is AgentType.INTEGRATOR
     assert planner.skills and all(Path(path).is_file() for path in planner.skills)
     assert executor.skills and all(Path(path).is_file() for path in executor.skills)
+    assert integrator.skills and all(Path(path).is_file() for path in integrator.skills)
     planner_context = render_context_block(
         NodeExecutionContext(
             node=Node(project_id=uuid.uuid4(), objective="plan", agent=planner)
         )
     )
     assert "Turn planning skill" in planner_context
+    integration_context = render_context_block(
+        NodeExecutionContext(
+            node=Node(project_id=uuid.uuid4(), objective="Integrate result", agent=integrator)
+        )
+    )
+    assert "Turn integration skill" in integration_context
+    assert "integrator-only directory" in integration_context
+
+
+async def test_architecture_metadata_is_persisted_in_graph_and_visible_to_workers(tmp_path):
+    store = Store(tmp_path / "turn")
+    await store.init()
+    root = await store.create_project("Build an inspectable system")
+    spec = ArchitectureSpec(
+        title="Inspectable system architecture",
+        executive_summary="A real system with a durable user-facing result.",
+        approach="Split independent domains behind explicit contracts, then integrate.",
+        strategy="Prefer parallel work and verify the actual launch path.",
+        requirements=["The result must be usable end to end."],
+        acceptance_criteria=["The final integration can be launched by a user."],
+        sections=[
+            ArchitectureSection(
+                id="boundaries",
+                title="System boundaries",
+                content="The domain and delivery boundaries are explicit.",
+                diagram_ids=["flow"],
+                subsections=[
+                    ArchitectureSection(
+                        id="delivery",
+                        title="Delivery path",
+                        content="The user-facing path is verified at integration.",
+                    )
+                ],
+            )
+        ],
+        diagrams=[
+            ArchitectureDiagram(
+                id="flow",
+                title="System flow",
+                nodes=[
+                    ArchitectureDiagramNode(id="domain", label="Domain"),
+                    ArchitectureDiagramNode(id="app", label="Application"),
+                ],
+                edges=[ArchitectureDiagramEdge(src="domain", dst="app")],
+            )
+        ],
+    )
+    await store.apply_plan(
+        root,
+        PlanResult(
+            architecture_spec=spec,
+            nodes=[NodeSpec(key="worker", objective="Build the system", executor="echo")],
+        ),
+    )
+
+    graph = await store.get_graph(root.id)
+    assert graph.architecture_spec == spec
+    state = (root.repo_path and Path(root.repo_path) / ".turn" / "state.json") or next(
+        (tmp_path / "turn" / "projects").glob("*/.turn/state.json")
+    )
+    raw = json.loads(state.read_text())
+    persisted_root = next(item for item in raw["nodes"] if item["id"] == str(root.id))
+    assert persisted_root["architecture_spec"]["title"] == spec.title
+
+    registry = WorkerRegistry()
+    registry.register(EchoWorker())
+    runner = Runner(
+        store,
+        registry=registry,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+    context = await runner._build_context(root)
+    rendered = render_context_block(context)
+    assert "PROJECT GRAPH ARCHITECTURE METADATA" in rendered
+    assert spec.title in rendered
+    assert "Delivery path" in rendered
+
+    await store.dispose()

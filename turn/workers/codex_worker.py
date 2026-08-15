@@ -10,6 +10,7 @@ from pathlib import Path
 from turn.config import settings
 from turn.contracts.dag import parse_result
 from turn.domain.schemas import (
+    ArchitectureSpec,
     ArtifactKind,
     ArtifactSpec,
     EdgeType,
@@ -303,6 +304,8 @@ and return "COMPLETE".
                 objective=n["objective"],
                 generated_prompt=n.get("generated_prompt"),
                 executor=n.get("executor"),
+                agent=n.get("agent"),
+                agent_type=n.get("agent_type"),
                 required_inputs=[
                     InputSpec(
                         id=i["id"],
@@ -315,6 +318,7 @@ and return "COMPLETE".
                 resource_refs=list(n.get("resource_refs", [])),
                 parent_key=n.get("parent_key"),
                 depends_on=list(n.get("depends_on", [])),
+                plan=bool(n.get("plan", False)),
             )
             for n in plan_json.get("nodes", [])
         ]
@@ -322,4 +326,14 @@ and return "COMPLETE".
             EdgeSpec(type=EdgeType(e["type"]), src=e["src"], dst=e["dst"])
             for e in plan_json.get("edges", [])
         ]
-        return PlanResult(nodes=nodes, edges=edges, notes=plan_json.get("notes"))
+        architecture_spec = plan_json.get("architecture_spec")
+        return PlanResult(
+            nodes=nodes,
+            architecture_spec=(
+                ArchitectureSpec.model_validate(architecture_spec)
+                if architecture_spec is not None
+                else None
+            ),
+            edges=edges,
+            notes=plan_json.get("notes"),
+        )

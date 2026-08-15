@@ -13,6 +13,14 @@ import sys
 import uuid
 from pathlib import Path
 
+from turn.contracts.graph_inspection import (
+    GraphInspection,
+    GraphInspectionArtifact,
+    GraphInspectionNode,
+    GraphInspectionRun,
+)
+from turn.domain.schemas import Artifact, Edge, Node, Run
+
 _DELIVERABLE_KINDS = {"file", "code_diff", "log", "evidence"}
 _INTERNAL_NAMES = {"transcript", "filesystem-path", "codex-output", "plan"}
 
@@ -34,42 +42,102 @@ def _load_state(location: str, project_id: str) -> dict:
 
 
 async def _query(state_file: str, project_id: str, requester: str | None = None, query: str = "tree"):
-    """Return nodes and CONTAINS children; ``requester`` is intentionally ignored."""
+    """Return the coordination-relevant graph state and CONTAINS children."""
     raw = await asyncio.to_thread(_load_state, state_file, project_id)
-    wanted = uuid.UUID(project_id).hex
-    nodes = []
-    by_id: dict[str, dict] = {}
-    artifacts: dict[str, list] = {}
-    for artifact in raw.get("artifacts", []):
-        artifact_id = str(artifact.get("node_id", ""))
-        artifacts.setdefault(artifact_id.replace("-", ""), []).append(
-            (artifact.get("name"), artifact.get("kind"), artifact.get("ref"))
-        )
-    for item in raw.get("nodes", []):
-        node_id = uuid.UUID(str(item["id"])).hex
-        if uuid.UUID(str(item["project_id"])).hex != wanted:
-            continue
-        parent_id = item.get("parent_id")
-        parent_id = uuid.UUID(str(parent_id)).hex if parent_id else None
-        node = {
-            "id": node_id,
-            "parent_id": parent_id,
-            "objective": item.get("objective", ""),
-            "status": item.get("status", "PENDING"),
-            "executor": item.get("executor"),
-            "files": _files_for(artifacts.get(node_id, [])),
-        }
-        nodes.append(node)
-        by_id[node_id] = node
+    project_uuid = uuid.UUID(project_id)
+    parsed_nodes = [
+        Node.model_validate(item)
+        for item in raw.get("nodes", [])
+        if uuid.UUID(str(item["project_id"])) == project_uuid
+    ]
+    by_id = {node.id: node for node in parsed_nodes}
+    parsed_edges = [
+        Edge.model_validate(item)
+        for item in raw.get("edges", [])
+        if uuid.UUID(str(item["src"])) in by_id and uuid.UUID(str(item["dst"])) in by_id
+    ]
+    parsed_runs = [Run.model_validate(item) for item in raw.get("runs", [])]
+    parsed_artifacts = [Artifact.model_validate(item) for item in raw.get("artifacts", [])]
+
     children: dict[str, list[str]] = {}
-    for edge in raw.get("edges", []):
-        if edge.get("type") != "CONTAINS":
-            continue
-        src = uuid.UUID(str(edge["src"])).hex
-        dst = uuid.UUID(str(edge["dst"])).hex
-        if src in by_id and dst in by_id:
-            children.setdefault(src, []).append(dst)
-    return nodes, children
+    dependencies: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for parsed_edge in parsed_edges:
+        if parsed_edge.type.value == "CONTAINS":
+            children.setdefault(parsed_edge.src.hex, []).append(parsed_edge.dst.hex)
+        elif parsed_edge.type.value == "DEPENDS_ON":
+            dependencies.setdefault(parsed_edge.dst, []).append(parsed_edge.src)
+
+    artifacts_by_node: dict[uuid.UUID, list[Artifact]] = {}
+    for artifact in parsed_artifacts:
+        if artifact.node_id in by_id:
+            artifacts_by_node.setdefault(artifact.node_id, []).append(artifact)
+    runs_by_node: dict[uuid.UUID, list[Run]] = {}
+    for run in parsed_runs:
+        if run.node_id in by_id:
+            runs_by_node.setdefault(run.node_id, []).append(run)
+
+    inspection_nodes: list[GraphInspectionNode] = []
+    for node in parsed_nodes:
+        node_artifacts = artifacts_by_node.get(node.id, [])
+        node_runs = runs_by_node.get(node.id, [])
+        inspection_nodes.append(
+            GraphInspectionNode(
+                id=node.id,
+                parent_id=node.parent_id,
+                objective=node.objective,
+                instructions=node.generated_prompt,
+                architecture_spec=node.architecture_spec,
+                status=node.status,
+                executor=node.executor,
+                agent=node.agent,
+                session_id=node.agent.session_id if node.agent else None,
+                agent_state=node.agent_state,
+                agent_message=node.agent_message,
+                paused=node.paused,
+                auto_run=node.auto_run,
+                run_policy=node.run_policy,
+                required_inputs=node.required_inputs,
+                resource_refs=node.resource_refs,
+                artifact_refs=node.artifact_refs,
+                depends_on=dependencies.get(node.id, []),
+                children=[uuid.UUID(child) for child in children.get(node.id.hex, [])],
+                files=_files_for(
+                    [(artifact.name, artifact.kind.value, artifact.ref) for artifact in node_artifacts]
+                ),
+                artifacts=[
+                    GraphInspectionArtifact(
+                        id=artifact.id,
+                        node_id=artifact.node_id,
+                        kind=artifact.kind,
+                        name=artifact.name,
+                        ref=artifact.ref,
+                    )
+                    for artifact in node_artifacts
+                ],
+                runs=[
+                    GraphInspectionRun(
+                        id=run.id,
+                        attempt=run.attempt,
+                        worker=run.worker,
+                        status=run.status,
+                        outcome=run.outcome,
+                        summary=run.summary,
+                        error=run.error,
+                        started_at=run.started_at,
+                        ended_at=run.ended_at,
+                        session_id=run.session_id,
+                    )
+                    for run in node_runs
+                ],
+            )
+        )
+
+    inspection = GraphInspection(
+        project_id=project_uuid,
+        nodes=inspection_nodes,
+        edges=parsed_edges,
+    )
+    return [node.model_dump(mode="json") for node in inspection.nodes], children
 
 
 def _files_for(rows) -> list[str]:
@@ -86,19 +154,63 @@ def _files_for(rows) -> list[str]:
 
 
 def _summary(item: dict) -> str:
-    line = f"[{item['status']}|{item['executor']}] {item['objective']}"
+    line = f"[{item['id']}] [{item['status']}|{item['executor']}] {item['objective']}"
+    if item.get("parent_id"):
+        line += f"  parent={item['parent_id']}"
+    if item.get("depends_on"):
+        line += "\n  depends_on: " + ", ".join(item["depends_on"])
+    line += f"\n  execution: paused={item['paused']}, auto_run={item['auto_run']}"
+    if item.get("run_policy"):
+        line += "\n  run_policy: " + json.dumps(item["run_policy"], sort_keys=True)
+    if item.get("required_inputs"):
+        line += "\n  required_inputs: " + ", ".join(
+            input_spec["id"] for input_spec in item["required_inputs"]
+        )
+    agent = item.get("agent") or {}
+    if agent:
+        config = ", ".join(
+            f"{key}={agent.get(key) or 'default'}"
+            for key in ("type_id", "harness", "model", "reasoning", "permission", "session_id")
+        )
+        line += "\n  agent: " + config
+        if agent.get("skills"):
+            line += "\n  skills: " + ", ".join(agent["skills"])
+        if agent.get("tools"):
+            line += "\n  tools: " + ", ".join(agent["tools"])
+        if agent.get("mcp_servers"):
+            line += "\n  mcp_servers: " + ", ".join(agent["mcp_servers"])
+    if item.get("instructions"):
+        instructions = str(item["instructions"]).strip()
+        line += "\n  instructions:\n" + "\n".join(f"    {part}" for part in instructions.splitlines())
+    if item.get("architecture_spec"):
+        spec = item["architecture_spec"]
+        section_count = len(spec.get("sections") or [])
+        diagram_count = len(spec.get("diagrams") or [])
+        line += (
+            f"\n  architecture: {spec.get('title', 'untitled')}"
+            f"; sections={section_count}; diagrams={diagram_count}"
+        )
+    if item.get("agent_state") or item.get("agent_message"):
+        line += "\n  working: " + " — ".join(
+            value for value in (item.get("agent_state"), item.get("agent_message")) if value
+        )
+    if item.get("runs"):
+        sessions = [run["session_id"] for run in item["runs"] if run.get("session_id")]
+        line += f"\n  runs: {len(item['runs'])}"
+        if sessions:
+            line += "; sessions=" + ", ".join(sessions)
     if item["files"]:
-        line += "  -> " + ", ".join(item["files"])
+        line += "\n  files: " + ", ".join(item["files"])
     return line
 
 
 def _print_tree(nodes, children):
-    by_id = {item["id"]: item for item in nodes}
+    by_id = {uuid.UUID(item["id"]).hex: item for item in nodes}
     roots = [item for item in nodes if not item["parent_id"]]
 
     def show(item, depth):
         print("  " * depth + "- " + _summary(item))
-        for child_id in children.get(item["id"], []):
+        for child_id in children.get(uuid.UUID(item["id"]).hex, []):
             if child_id in by_id:
                 show(by_id[child_id], depth + 1)
 
@@ -120,7 +232,7 @@ async def _main_async():
 
     query = "node" if args.node else "children" if args.children else "ancestors" if args.ancestors else args.format
     nodes, children = await _query(args.state_file, args.project, args.requester, query)
-    by_id = {item["id"]: item for item in nodes}
+    by_id = {uuid.UUID(item["id"]).hex: item for item in nodes}
     if args.node:
         node_id = uuid.UUID(args.node).hex
         output = [by_id[node_id]] if node_id in by_id else []
@@ -133,7 +245,7 @@ async def _main_async():
         while current_id in by_id:
             current = by_id[current_id]
             output.append(current)
-            current_id = current["parent_id"] or ""
+            current_id = uuid.UUID(current["parent_id"]).hex if current["parent_id"] else ""
     else:
         output = nodes
 

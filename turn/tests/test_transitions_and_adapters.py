@@ -17,8 +17,11 @@ from turn.config import Settings
 from turn.db.store import Store
 from turn.domain.schemas import (
     AgentConfig,
+    AgentType,
+    ArtifactSpec,
     ArtifactKind,
     EdgeSpec,
+    Edge,
     EdgeType,
     HarnessKind,
     NodeSpec,
@@ -133,6 +136,7 @@ async def test_heuristic_planner_inherits_the_project_agent_harness():
     )
     plan = await HeuristicPlanner("echo").plan(NodeExecutionContext(node=root))
     assert {node.executor for node in plan.nodes} == {"codex"}
+    assert plan.nodes[-1].agent_type.value == "integrator"
 
 
 async def _runtime(tmp_path, worker: Worker):
@@ -566,6 +570,38 @@ async def test_new_plan_children_inherit_config_but_not_parent_session(tmp_path)
     await store.dispose()
 
 
+async def test_plan_can_assign_integrator_specialization_without_new_harness_config(tmp_path):
+    _, store, _ = await _runtime(tmp_path, EchoWorker())
+    parent = await store.create_project(
+        "assemble product",
+        agent=AgentConfig(
+            harness=HarnessKind.ECHO,
+            model="deterministic",
+            session_id="planner-thread",
+        ),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    created = await store.apply_plan(
+        parent,
+        PlanResult(
+            nodes=[
+                NodeSpec(
+                    key="integrate",
+                    objective="Integrate product",
+                    executor="echo",
+                    agent_type=AgentType.INTEGRATOR,
+                )
+            ]
+        ),
+    )
+
+    assert created[0].agent.type_id is AgentType.INTEGRATOR
+    assert created[0].agent.harness is HarnessKind.ECHO
+    assert created[0].agent.model == "deterministic"
+    assert created[0].agent.session_id is None
+    await store.dispose()
+
+
 async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
     _, store, _ = await _runtime(tmp_path, EchoWorker())
     parent = await store.create_project(
@@ -741,15 +777,92 @@ async def test_graph_explorer_is_read_only_and_integrators_get_glue_contract(tmp
     root = await store.create_project("Assemble the adventure")
     ctx = NodeExecutionContext(node=root)
     block = render_context_block(ctx)
-    assert shlex.quote(sys.executable) in block
+    assert shlex.quote(shutil.which("turn")) in block
+    assert "graph_explorer.py" not in block
+    assert "turn graph" in block
+    assert "--state-file" not in block
     assert f"--requester {root.id}" in block
     assert "INTEGRATOR CONTRACT" in block
     assert "Limit changes to assembly" in block
+    assert "integrator-only directory" in block
 
     state_file = data_dir / "projects" / f"proj-{root.id.hex[:8]}" / ".turn" / "state.json"
     await graph_explorer._query(str(state_file), str(root.id), str(root.id), "tree")
+    cli_run = subprocess.run(
+        [
+            shutil.which("turn"),
+            "graph",
+            str(root.id),
+            "--requester",
+            str(root.id),
+            "--tree",
+        ],
+        cwd=state_file.parent.parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Assemble the adventure" in cli_run.stdout
     state = json.loads(state_file.read_text())
     assert "audits" not in state
+    await store.dispose()
+
+
+async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
+    store = Store(tmp_path / "turn")
+    await store.init()
+    root = await store.create_project("Original user intention")
+    worker = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="Build the domain",
+        generated_prompt="Implement the domain contract from the original intention.",
+        executor="echo",
+        agent=AgentConfig(
+            harness=HarnessKind.ECHO,
+            model="deterministic",
+            session_id="worker-session",
+        ),
+        status=NodeStatus.RUNNING,
+    )
+    dependent = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="Integrate the product",
+        generated_prompt="Read the domain output and assemble the product.",
+        executor="echo",
+        agent=AgentConfig(harness=HarnessKind.ECHO, model="deterministic"),
+        status=NodeStatus.BLOCKED,
+    )
+    state = store._states[root.id]
+    dependency = Edge(src=worker.id, dst=dependent.id, type=EdgeType.DEPENDS_ON)
+    state["edges"][dependency.id] = dependency
+    await store._persist_project(root.id)
+    await store.set_agent_status(worker.id, state="working", message="writing the domain")
+    run = await store.create_run(worker, "echo")
+    await store.update_run(run.id, summary="Started domain work", session_id="worker-session")
+    await store.add_artifacts(worker.id, [ArtifactSpec(kind=ArtifactKind.FILE, name="domain.py")])
+
+    state_file = tmp_path / "turn" / "projects" / f"proj-{root.id.hex[:8]}" / ".turn" / "state.json"
+    nodes, children = await graph_explorer._query(str(state_file), str(root.id), str(worker.id), "tree")
+    by_id = {item["id"]: item for item in nodes}
+    worker_view = by_id[str(worker.id)]
+    dependent_view = by_id[str(dependent.id)]
+
+    assert worker_view["instructions"] == "Implement the domain contract from the original intention."
+    assert worker_view["agent"]["harness"] == "echo"
+    assert worker_view["agent"]["model"] == "deterministic"
+    assert worker_view["session_id"] == "worker-session"
+    assert worker_view["agent_state"] == "working"
+    assert worker_view["agent_message"] == "writing the domain"
+    assert worker_view["runs"][0]["session_id"] == "worker-session"
+    assert worker_view["files"] == ["domain.py"]
+    assert dependent_view["depends_on"] == [str(worker.id)]
+    assert children[root.id.hex] == [worker.id.hex, dependent.id.hex]
+    summary = graph_explorer._summary(worker_view)
+    assert str(worker.id) in summary
+    assert "worker-session" in summary
+    assert "Implement the domain contract" in summary
     await store.dispose()
 
 
@@ -762,6 +875,18 @@ def test_planner_honors_editable_planning_instructions():
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
     assert "PLANNING INSTRUCTIONS FOR THIS NODE" in prompt
     assert "Use two nested planning branches" in prompt
+
+
+def test_planner_treats_subplanners_as_rare_exceptions():
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a product",
+        generated_prompt="Build a product for one user request.",
+    )
+    prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
+    assert "exception, not the normal shape" in prompt
+    assert "multi-organization" in prompt
+    assert "visible at a glance" in prompt
 
 
 def test_codex_choked_output_is_not_a_false_success():
@@ -815,6 +940,50 @@ def test_bare_schema_plan_is_accepted_and_explicit_edges_follow_domain_direction
     assert plan is not None
     assert plan.nodes[0].depends_on == []
     assert plan.nodes[1].depends_on == ["a"]
+
+
+def test_agent_plan_parser_preserves_specializations_and_nested_planners():
+    payload = {
+        "nodes": [
+            {
+                "key": "world",
+                "objective": "Build world",
+                "executor": "codex",
+                "agent_type": "executor",
+                "plan": False,
+            },
+            {
+                "key": "systems",
+                "objective": "Build systems",
+                "executor": "planner",
+                "agent_type": "planner",
+                "plan": True,
+            },
+            {
+                "key": "integrate",
+                "objective": "Integrate game",
+                "executor": "codex",
+                "agent_type": "integrator",
+                "depends_on": ["world", "systems"],
+            },
+        ],
+        "edges": [],
+    }
+    plan = AgentPlanner._parse_plan(json.dumps(payload), "Build game")
+
+    assert plan is not None
+    assert plan.nodes[0].agent_type is AgentType.EXECUTOR
+    assert plan.nodes[1].agent_type is AgentType.PLANNER
+    assert plan.nodes[1].plan is True
+    assert plan.nodes[2].agent_type is AgentType.INTEGRATOR
+    assert plan.nodes[2].depends_on == ["world", "systems"]
+
+    from turn.workers.codex_worker import CodexWorker
+
+    worker_plan = CodexWorker._to_plan(payload)
+    assert worker_plan.nodes[1].agent_type is AgentType.PLANNER
+    assert worker_plan.nodes[1].plan is True
+    assert worker_plan.nodes[2].agent_type is AgentType.INTEGRATOR
 
 
 def test_final_structured_worker_result_wins():

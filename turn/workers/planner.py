@@ -17,9 +17,15 @@ import uuid
 from pathlib import Path
 
 from turn.config import settings
+from turn.contracts.dag import plan_handoff_example
 from turn.workers import parsing
 from turn.domain.schemas import (
     AgentConfig,
+    ArchitectureDiagram,
+    ArchitectureDiagramEdge,
+    ArchitectureDiagramNode,
+    ArchitectureSection,
+    ArchitectureSpec,
     EdgeSpec,
     EdgeType,
     HarnessKind,
@@ -47,8 +53,8 @@ from turn.workers.terminal import GenerationStalled, LocalPtyTransport
 class HeuristicPlanner(Planner):
     """Deterministic test-only decomposition — domain-agnostic scaffolding.
 
-    Produces a few independent domain lanes and an ordinary executor that
-    recomposes their outputs. This keeps the offline fallback representative
+    Produces a few independent domain lanes and an integrator agent that
+    recomposes their outputs. This keeps the deterministic test fixture
     of Turn's architectural model instead of manufacturing a checklist.
     """
 
@@ -110,11 +116,12 @@ class HeuristicPlanner(Planner):
                 generated_prompt=(
                     f"Read the outputs produced by the core, inputs, and outputs lanes and integrate them into "
                     f"one coherent result for: {objective}. Preserve each lane's contracts, resolve conflicts "
-                    "explicitly, run an appropriate end-to-end check, and write the integrated result to the "
-                    "assigned project directory or final output namespace. This is ordinary executor work, "
-                    "not a planning task."
+                    "explicitly, run the real user-facing launch command and an end-to-end check, and make the "
+                    "requested result usable from the assigned project directory. Do not create an integration "
+                    "directory or duplicate the lane implementations; wire the existing package entry points."
                 ),
                 executor=exe,
+                agent_type="integrator",
                 depends_on=["core", "inputs", "outputs"],
             ),
         ]
@@ -125,6 +132,70 @@ class HeuristicPlanner(Planner):
         ]
         return PlanResult(
             nodes=nodes,
+            architecture_spec=ArchitectureSpec(
+                title=f"Architecture: {ctx.node.objective}",
+                executive_summary=(
+                    f"A modular implementation plan for {objective}, with independent "
+                    "domain lanes and one final integration boundary."
+                ),
+                approach=(
+                    "Establish the core domain contract first, develop independent "
+                    "input/storage and user-facing output lanes in parallel, then "
+                    "integrate them into the requested deliverable."
+                ),
+                strategy=(
+                    "Keep boundaries explicit, preserve the user's end-to-end outcome, "
+                    "and make the final integrator validate the real launch/use path."
+                ),
+                architecture_principles=[
+                    "Independent lanes own stable boundaries.",
+                    "Dependencies describe real artifact or contract consumption.",
+                    "The final integration produces the user-facing result.",
+                ],
+                requirements=[objective],
+                acceptance_criteria=[
+                    "The requested result is present in the assigned project directory.",
+                    "The result can be launched, used, or inspected through its intended path.",
+                ],
+                sections=[
+                    ArchitectureSection(
+                        id="workstreams",
+                        title="Workstreams and ownership",
+                        content=(
+                            "The core, input/storage, and output lanes are independent "
+                            "where possible. The integration lane consumes their concrete "
+                            "outputs and owns the final assembly."
+                        ),
+                        diagram_ids=["workstream-flow"],
+                    ),
+                    ArchitectureSection(
+                        id="delivery",
+                        title="Delivery and verification",
+                        content=(
+                            "The integrator verifies the actual user-facing outcome rather "
+                            "than stopping at isolated contracts or passing unit tests."
+                        ),
+                    ),
+                ],
+                diagrams=[
+                    ArchitectureDiagram(
+                        id="workstream-flow",
+                        title="Workstream flow",
+                        description="Independent work converges at the final integration boundary.",
+                        nodes=[
+                            ArchitectureDiagramNode(id="core", label="Core structure", kind="domain"),
+                            ArchitectureDiagramNode(id="inputs", label="Inputs and storage", kind="boundary"),
+                            ArchitectureDiagramNode(id="outputs", label="Output surface", kind="surface"),
+                            ArchitectureDiagramNode(id="integrate", label="Final integration", kind="integration"),
+                        ],
+                        edges=[
+                            ArchitectureDiagramEdge(src="core", dst="integrate"),
+                            ArchitectureDiagramEdge(src="inputs", dst="integrate"),
+                            ArchitectureDiagramEdge(src="outputs", dst="integrate"),
+                        ],
+                    )
+                ],
+            ),
             edges=edges,
             notes="Heuristic architectural decomposition (no LLM planner available).",
         )
@@ -157,6 +228,7 @@ class CodexPlanner(Planner):
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
+        handoff_example = plan_handoff_example()
         return f"""{render_context_block(ctx)}
 THIS NODE'S OBJECTIVE:
 {ctx.node.objective}
@@ -165,9 +237,54 @@ PLANNING INSTRUCTIONS FOR THIS NODE:
 {ctx.node.generated_prompt or "No additional planning instructions."}
 
 You are the architect decomposing THIS node into its direct children. Produce
-the smallest useful workgraph that exposes the real domains of work and lets
-independent work begin in parallel. This is decomposition of a system,
-workflow, or body of work — not a chronological checklist.
+the smallest useful workgraph that divides the actual labor required to
+accomplish the user's objective. This is an orchestration effort, not a mere
+abstraction exercise or chronological checklist.
+
+ARCHITECTURAL METADATA — the graph is also the durable project specification:
+- For a broad product, system, or multi-part deliverable, include an
+  `architecture_spec` object in the submitted PlanResult. This is mandatory
+  for broad work and optional only when the objective is genuinely atomic.
+- Treat it as an implementation-ready architecture brief, not a task-list
+  preamble. It must explain the requested outcome, approach, strategy,
+  boundaries, important decisions, constraints, risks, and acceptance criteria.
+- Use `sections` for substantive, named parts of the approach. Each section
+  has an id, title, Markdown `content`, and optional `subsections`. The
+  document view derives its table of contents from this section tree, so use
+  meaningful section order and nesting.
+- Use typed `diagrams` when a relationship, data flow, system boundary, or
+  execution topology is clearer visually. A diagram has nodes with stable ids
+  and edges using those ids; do not submit decorative or generic diagrams.
+- Keep the metadata specific to this request. Do not pad it with generic
+  headings. Every work node must map to a meaningful section or boundary in
+  the spec, and every integrator must be accountable for the acceptance
+  criteria, not merely for merging files.
+- The submitted architecture metadata is persisted on this graph boundary and
+  is automatically shown to every descendant worker. Do not write a separate
+  architecture document to the filesystem as a Turn protocol handoff.
+- The architecture metadata is strict JSON. Use only the fields in the exact
+  example below; do not invent aliases or extra fields. Omit optional arrays
+  when they are not useful. A section is only `id`, `title`, Markdown `content`,
+  and optional nested `subsections`; do not put decisions, risks, or diagram
+  objects inside a section. Diagrams, when useful, live in the top-level
+  `diagrams` array. For a simple plan, use one or two text sections and no
+  diagrams.
+- If you use `decisions`, each item is exactly `{{id,title,decision,rationale,
+  consequences}}`. If you use `risks`, each item is exactly
+  `{{id,title,description,mitigation}}`. Diagram nodes are exactly
+  `{{id,label,kind}}` and diagram edges are exactly `{{src,dst,label}}`. Do not
+  add `id`-like keys to a section or invent alternate names such as `choice`,
+  `why`, `from`, or `to`.
+- Put dependencies only in each node's `depends_on` list. Omit the optional
+  top-level `edges` array; Turn creates the graph edges from those lists. This
+  avoids a duplicate relationship syntax and the edge `type` enum entirely.
+
+First preserve the requested outcome. State what must be runnable, usable,
+readable, or otherwise deliverable at the end. For software, account for the
+concrete runtime/host, launch command, user interaction loop, and a complete
+end-to-end acceptance scenario. A collection of contracts, mocks, services,
+or tests is not a finished application unless the user explicitly requested
+those things.
 
 DECOMPOSITION POLICY — match the structure to the objective:
 - ATOMIC step: if the objective is a SINGLE concrete step (it says "one", "a
@@ -180,14 +297,22 @@ genuinely distinct domains, modules, capabilities, or output sections that
 make up the result. Prefer 2–5 orthogonal direct children that can proceed in
 parallel. Name them in the vocabulary of the domain; do not turn milestones,
 tests, or generic approval steps into fake domains.
+- PARALLELISM AUDIT: for a broad software product, at least two direct product
+branches should normally have empty `depends_on` lists and be runnable from
+the user request plus stable interfaces. Do not serialize every branch behind
+one content or architecture branch just to impose order. Add that dependency
+only when the downstream branch truly cannot begin without the sibling's
+concrete files, contract, or decision; the final integrator reconciles the
+independent outputs.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it. Never list the
 same sub-task twice, and do NOT create parallel sub-planners that cover the
 same scope under different names (e.g. do not make both a "Kanto cities"
 planner and a "Kanto guide" planner). Each distinct scope appears exactly once
 in the plan. BEFORE you finalize the plan, use the GRAPH EXPLORATION TOOL in
-  the context block (python -m turn.tools.graph_explorer --tree) to confirm no
-  existing or already-planned node elsewhere in the graph already covers a scope
+  the context block (`turn graph "$TURN_PROJECT_ID" --tree`) to confirm no
+  existing or already-planned node
+  elsewhere in the graph already covers a scope
   you were about to add; if it does, reference or extend that node instead of
   recreating it.
 
@@ -217,11 +342,13 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   implementation branches; they must not be parallel merely because they are
   called "tests".
 - INTEGRATION: when several sibling outputs must be recombined, add an
-  ordinary executor child whose objective says integrate, assemble, merge, or
-  otherwise recombine. It lists all of those sibling keys in depends_on and
-  reads their outputs. Integrators are not a special agent type.
+  integrator child whose objective says integrate, assemble, merge, or
+  otherwise recombine. Set `agent_type` to `integrator`, list all sibling
+  outputs in `depends_on`, and make its prompt tell it to read and wire those
+  existing outputs. It must not create a special integration directory or
+  regenerate prerequisite domain work.
 - SINGULAR PRODUCT: when THIS node represents one product, deliverable, or
-  end-to-end outcome, add exactly one final ordinary executor to produce that
+  end-to-end outcome, add exactly one final integrator to produce that
   result. It must depend on every direct branch output, including nested
   planner/container branches. That final node is the only terminal output at
   this workflow boundary. Multiple terminal outputs are appropriate only when
@@ -236,9 +363,15 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   explicit; never use them just to make a checklist or to order unrelated
   work.
 - NESTED PLANNERS: for a sub-domain that is itself broad, set "plan": true
-  and "executor": "planner". Do not add a planner at every bifurcation: a
-  broad parent may directly create concrete executors and integrators. Nest
-  only when the sub-domain genuinely needs another architectural decision.
+  and "executor": "planner". This is an exception, not the normal shape for
+  one user's request: prefer direct concrete executors and a final integrator
+  so the initial specification is visible at a glance. Use a nested planner
+  only for a genuinely huge or uncertain scope, such as a multi-organization
+  enterprise, many independently governed platforms, or a sub-system whose
+  architecture cannot responsibly be decided yet. If the work can be named
+  and assigned now, do that instead. Do not add a planner at every
+  bifurcation: a broad parent may directly create concrete executors and
+  integrators.
 - LEAF WORK: every node that actually does work (writing code, prose, files)
   gets "executor": "codex" and a concrete "generated_prompt". The generated_prompt
   MUST tell the worker to WRITE its deliverable to a domain-appropriate file,
@@ -261,7 +394,10 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   prerequisites already produced in the working directory and merge/stitch them.
   A "depends_on" edge means each prerequisite has already run in this same
   assigned project area, so the node should load and integrate those existing
-  outputs — never regenerate their content from the prompt text.
+  outputs — never regenerate their content from the prompt text. Its result
+  belongs in the existing package/application composition boundary, not in a
+  new integrator-specific directory. It must verify the actual user-facing
+  outcome and report failure if only a framework was produced.
 
 ORDER & SAFETY:
 - List children in architectural order from left to right: domain branches,
@@ -285,16 +421,11 @@ ORDER & SAFETY:
 Before finishing, submit the plan object through the Turn CLI. The CLI is the
 only submission interface and writes Turn's internal handoff record. Do not
 use filesystem output as a protocol. Use `TURN_CLI agent submit --kind plan --payload '<JSON_OBJECT>'`,
-replacing the placeholder with the actual single-line JSON object. Do not
-return a fenced `turn-plan` block or use provider JSON output mode. The CLI
-submission is the only valid plan handoff:
-{{
-  "nodes": [
-    {{"key":"unique","objective":"...","executor":"codex"|"planner","plan":false|true,"generated_prompt":"...","required_inputs":[{{"id":"x","label":"...","kind":"text|decision|credential|account|approval|file"}}],"resource_refs":[],"parent_key":null,"depends_on":["otherkey"]}}
-  ],
-  "edges": []
-}}
-"""
+    replacing the placeholder with the actual single-line JSON object. Do not
+    return a fenced `turn-plan` block or use provider JSON output mode. The CLI
+    submission is the only valid plan handoff:
+    {handoff_example}
+    """
 
     async def _call_codex(
         self, prompt: str, cwd: str, *, agent: AgentConfig | None = None,
@@ -563,6 +694,8 @@ class AgentPlanner(Planner):
                 objective=n["objective"],
                 generated_prompt=n.get("generated_prompt"),
                 executor=n.get("executor"),
+                agent=n.get("agent"),
+                agent_type=n.get("agent_type"),
                 required_inputs=[
                     InputSpec(
                         id=i["id"],
@@ -607,14 +740,27 @@ class AgentPlanner(Planner):
         #    edges (domain convention: src is prerequisite, dst dependent). Then enforce a
         #    DAG by keeping only a dependency whose prerequisite appears EARLIER
         #    in the node list (the prompt asks Codex to list in execution order).
-        deps: dict[str, set[str]] = {n.key: set(n.depends_on) for n in nodes}
+        deps: dict[str, list[str]] = {
+            n.key: list(dict.fromkeys(n.depends_on)) for n in nodes
+        }
         for e in data.get("edges", []):
             s, d = e.get("src"), e.get("dst")
             if s in deps and d in deps and s != d:
-                deps[d].add(s)
+                if s not in deps[d]:
+                    deps[d].append(s)
         for n in nodes:
             n.depends_on = [
                 d for d in deps[n.key] if d in index and index[d] < index[n.key]
             ]
 
-        return PlanResult(nodes=nodes, edges=[], notes=data.get("notes"))
+        architecture_spec = data.get("architecture_spec")
+        return PlanResult(
+            nodes=nodes,
+            architecture_spec=(
+                ArchitectureSpec.model_validate(architecture_spec)
+                if architecture_spec is not None
+                else None
+            ),
+            edges=[],
+            notes=data.get("notes"),
+        )

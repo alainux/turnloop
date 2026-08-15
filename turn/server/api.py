@@ -164,6 +164,11 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         serialized.append(item)
     return GraphView.model_validate({
         "project_id": str(project_id),
+        "architecture_spec": (
+            root.architecture_spec.model_dump(mode="json")
+            if root is not None and root.architecture_spec is not None
+            else None
+        ),
         "nodes": serialized,
         "edges": [e.model_dump(mode="json") for e in edges],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
@@ -527,10 +532,10 @@ async def project_usage(project_id: str, request: Request):
 
 @router.post("/api/projects/{project_id}/step")
 async def step_project(project_id: str, request: Request):
-    """Manual mode: execute the next runnable node (one step)."""
+    """Manual mode: execute the next runnable DAG stage in parallel."""
     runner = await _runner(request)
-    nid = await runner.step(uuid.UUID(project_id))
-    return {"ok": nid is not None, "stepped": str(nid) if nid else None}
+    node_ids = await runner.step(uuid.UUID(project_id))
+    return {"ok": bool(node_ids), "stepped": [str(node_id) for node_id in node_ids]}
 
 
 @router.get("/api/projects/{project_id}/graph")

@@ -8,22 +8,22 @@ from __future__ import annotations
 
 import os
 import shlex
-import sys
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from turn.config import settings
 from turn.domain.schemas import (
+    ArchitectureSpec,
     ArtifactSpec,
     Node,
     PlanResult,
     Resource,
     WorkerResult,
 )
-from turn.tools import graph_explorer as _graph_explorer
+from turn.domain.specification import architecture_spec_text
 
 
 class NodeExecutionContext(BaseModel):
@@ -34,6 +34,10 @@ class NodeExecutionContext(BaseModel):
     node: Node
     ancestry: list[Node] = Field(default_factory=list)  # root .. immediate parent
     resources: list[Resource] = Field(default_factory=list)
+    # The root project metadata and the nearest branch metadata are both
+    # available so nested planners cannot lose the original intent.
+    project_spec: Optional[ArchitectureSpec] = None
+    branch_spec: Optional[ArchitectureSpec] = None
     repo_path: Optional[str] = None
     purpose: str = "execute"
     # Optional live stream plus provider-neutral terminal transport. Local
@@ -114,23 +118,44 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             else:
                 lines.append(f"# {r.ref} (ref only)")
         lines.append("")
-    # GRAPH EXPLORATION TOOL — baked with absolute, copy-pasteable values so
-    # the agent needs no environment variables or PYTHONPATH to use it.
-    ge_path = os.path.abspath(_graph_explorer.__file__)
-    # The graph explorer receives the project's own state file. It remains
-    # usable from any assigned project directory because this path is absolute.
-    ge_state = os.path.abspath(os.path.join(ctx.repo_path or ctx.node.repo_path or settings.projects_dir, ".turn", "state.json"))
+    project_spec = ctx.project_spec
+    branch_spec = ctx.branch_spec
+    if project_spec is None or branch_spec is None:
+        for candidate in [*ctx.ancestry, ctx.node]:
+            if candidate.architecture_spec is None:
+                continue
+            if project_spec is None:
+                project_spec = candidate.architecture_spec
+            branch_spec = candidate.architecture_spec
+    if project_spec is not None:
+        lines.append("PROJECT GRAPH ARCHITECTURE METADATA (read-only):")
+        lines.append(architecture_spec_text(project_spec))
+        lines.append("")
+    if branch_spec is not None and branch_spec != project_spec:
+        lines.append("CURRENT BRANCH ARCHITECTURE METADATA (read-only):")
+        lines.append(architecture_spec_text(branch_spec))
+        lines.append("")
+    # GRAPH EXPLORATION TOOL — expose the same installed Turn CLI that agents
+    # use for status and handoff. The agent is launched in the assigned project
+    # directory, so the project-local state path stays relative and no internal
+    # Python module path leaks into the agent protocol.
+    turn_cli = os.getenv("TURN_CLI") or shutil.which("turn")
+    if not turn_cli:
+        raise RuntimeError(
+            "Turn CLI is not installed; install the project package before launching workers"
+        )
     ge_pid = ctx.node.project_id
     lines.append("GRAPH EXPLORATION TOOL (query the live project graph at runtime):")
     lines.append("  Before you plan or write, explore what is already planned/built so you")
     lines.append("  build on existing work instead of duplicating it. Run this EXACT command:")
     lines.append(
-        f'    {shlex.quote(sys.executable)} {shlex.quote(ge_path)} '
-        f'--project {ge_pid} --state-file {shlex.quote(ge_state)} '
-        f'--requester {ctx.node.id} --tree'
+        f'    {shlex.quote(turn_cli)} graph {shlex.quote(str(ge_pid))} '
+        f'--requester {shlex.quote(str(ctx.node.id))} --tree'
     )
-    lines.append("  It prints every node in this project: objective, parent, status, executor,")
-    lines.append("  and the files each produced. Useful filters:")
+    lines.append("  It prints every node in this project: ids, hierarchy, dependencies, status,")
+    lines.append("  instructions, agent configuration/session, run history, and produced files.")
+    lines.append("  Use --format json when you need the complete machine-readable spec state.")
+    lines.append("  Useful filters:")
     lines.append("    --node <id>       show one node")
     lines.append("    --children <id>   show a node's direct children")
     lines.append("    --ancestors <id>  show a node's parent chain")
@@ -140,11 +165,15 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
     lines.append("  recreating it.")
     lines.append("")
     objective = ctx.node.objective.lower()
-    if any(word in objective for word in ("assemble", "merge", "integrate", "combine", "stitch")):
+    agent_type = ctx.node.agent.type_id.value if ctx.node.agent is not None else ""
+    if agent_type == "integrator" or any(
+        word in objective for word in ("assemble", "merge", "integrate", "combine", "stitch")
+    ):
         lines.append("INTEGRATOR CONTRACT:")
-        lines.append("  This node is ordinary executor integration work. Inspect and reuse prior")
-        lines.append("  stage outputs already in the assigned working area. Preserve their")
-        lines.append("  Limit changes to assembly, interfaces, wiring, and compatibility; preserve contracts,")
-        lines.append("  and do not recreate their domain content.")
+        lines.append("  Read and reuse all prerequisite outputs already in the assigned working area.")
+        lines.append("  Make those outputs form one coherent result that satisfies the original user objective.")
+        lines.append("  Limit changes to assembly, interfaces, wiring, and necessary integration fixes;")
+        lines.append("  preserve prerequisite domain content and do not create an integrator-only directory.")
+        lines.append("  Verify the real user-facing launch/use path, not only imports or unit tests.")
         lines.append("")
     return "\n".join(lines)

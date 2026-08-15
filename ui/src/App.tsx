@@ -20,6 +20,7 @@ import {
 } from "./domain";
 import { api, json } from "./api";
 import { Graph as GraphCanvas } from "./components/Graph";
+import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
 import { ModelControl } from "./components/ModelControl";
@@ -150,6 +151,7 @@ export default function App() {
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown> | null>(null);
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"graph" | "document">("graph");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
@@ -198,6 +200,7 @@ export default function App() {
   }, [loadProjects, notify]);
   useEffect(() => {
     setSelected(null);
+    setViewMode("graph");
     setPolicyOpen(false);
     if (!projectId) {
       return;
@@ -349,6 +352,27 @@ export default function App() {
                 </div>
               </div>
               <div className="toolbar-actions">
+                <div className="segmented view-toggle" role="tablist" aria-label="Project view">
+                  <button
+                    role="tab"
+                    aria-selected={viewMode === "graph"}
+                    className={viewMode === "graph" ? "selected" : ""}
+                    onClick={() => setViewMode("graph")}
+                  >
+                    Graph
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={viewMode === "document"}
+                    className={viewMode === "document" ? "selected" : ""}
+                    onClick={() => {
+                      setSelected(null);
+                      setViewMode("document");
+                    }}
+                  >
+                    Document
+                  </button>
+                </div>
                 <div className="segmented">
                   <button
                     className={root?.run_policy?.auto_run ? "selected" : ""}
@@ -374,7 +398,7 @@ export default function App() {
                       }).then(loadGraph)
                     }
                   >
-                    Next turn
+                    Next stage
                   </button>
                 )}
                 <button
@@ -388,26 +412,34 @@ export default function App() {
               </div>
             </div>
             {graphReady && root ? (
-              <div id="graph" className="graph">
-                <div className="graph-guide" aria-label="Graph guide">
-                  <span><i className="legend-line contains" /> nesting</span>
-                  <span><i className="legend-line depends" /> dependency — must finish first</span>
-                  <span>same stage = can run in parallel</span>
-                </div>
-                <GraphCanvas
+              viewMode === "document" ? (
+                <DocumentView
                   nodes={graph!.nodes}
                   edges={graph!.edges}
-                  usage={usage?.by_node ?? {}}
-                  selected={selected}
-                  onSelect={setSelected}
-                  onRun={(node, action) =>
-                    void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
-                      .then(loadGraph)
-                      .catch((error) => notify(String(error)))
-                  }
-                  onContextMenu={(node, x, y) => setNodeMenu({ node, x, y })}
+                  architectureSpec={graph!.architecture_spec}
                 />
-              </div>
+              ) : (
+                <div id="graph" className="graph">
+                  <div className="graph-guide" aria-label="Graph guide">
+                    <span><i className="legend-line contains" /> nesting</span>
+                    <span><i className="legend-line depends" /> dependency — must finish first</span>
+                    <span>same stage = can run in parallel</span>
+                  </div>
+                  <GraphCanvas
+                    nodes={graph!.nodes}
+                    edges={graph!.edges}
+                    usage={usage?.by_node ?? {}}
+                    selected={selected}
+                    onSelect={setSelected}
+                    onRun={(node, action) =>
+                      void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
+                        .then(loadGraph)
+                        .catch((error) => notify(String(error)))
+                    }
+                    onContextMenu={(node, x, y) => setNodeMenu({ node, x, y })}
+                  />
+                </div>
+              )
             ) : (
               <div className="project-loading" aria-live="polite">
                 Loading project…

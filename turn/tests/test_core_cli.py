@@ -6,6 +6,7 @@ import json
 import pytest
 
 from turn.__main__ import parser
+from turn.__main__ import discover_project_state
 from turn.config import Settings
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, RunPolicy
@@ -20,6 +21,22 @@ def test_cli_exposes_headless_commands_and_policy_flags():
     assert parsed.manual and parsed.run
     assert parser().parse_args(["doctor"]).command == "doctor"
     assert parser().parse_args(["serve", "--port", "9000"]).port == 9000
+
+
+def test_graph_cli_discovers_the_nearest_parent_project_state(tmp_path):
+    project = tmp_path / "project"
+    nested = project / "src" / "package"
+    nested.mkdir(parents=True)
+    state = project / ".turn" / "state.json"
+    state.parent.mkdir()
+    state.write_text("{}")
+
+    assert discover_project_state(nested) == state
+
+    nearer = nested / ".turn" / "state.json"
+    nearer.parent.mkdir()
+    nearer.write_text("{}")
+    assert discover_project_state(nested) == nearer
 
 
 async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):

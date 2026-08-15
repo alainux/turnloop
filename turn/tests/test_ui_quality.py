@@ -160,4 +160,16 @@ def test_object_context_menus_edges_and_theme_are_wired_to_real_actions():
     assert "GRAPH_PADDING" in layout and "edge-workflow" in graph
     assert "displayEdges" in layout and "hasAlternativePath" in layout
     assert "applyAppearance(settings)" in app
-    assert "Next turn" in app and "Auto-run" in app
+    assert "Next stage" in app and "Auto-run" in app
+
+
+def test_document_view_is_a_read_only_spec_projection():
+    app = source("App.tsx")
+    document = source("components", "DocumentView.tsx")
+    css = (UI / "style.css").read_text()
+    assert "DocumentView" in app and 'viewMode === "document"' in app
+    assert "Read-only specification" in document
+    assert "orderDocumentNodes" in document
+    assert "ReactMarkdown" in document
+    assert "<button" not in document and "<input" not in document
+    assert ".document-children" in css and ".document-node-summary" in css
