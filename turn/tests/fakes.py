@@ -117,6 +117,10 @@ class FakeTerminalTransport:
         state["active"] = False
         return TerminalResult(0, str(state["output"]).encode())
 
+    async def ensure_session(self, node_id: uuid.UUID, **kwargs) -> TerminalResult:
+        """Attach to the deterministic persistent pane without launching work."""
+        return await self.run(node_id, ["persistent-pane"], **kwargs)
+
     async def write(self, node_id: uuid.UUID, data: str | bytes) -> bool:
         state = self._node(node_id)
         if not state["active"]:

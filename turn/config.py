@@ -19,6 +19,20 @@ def test_modes_enabled() -> bool:
     return os.getenv("TURN_TEST_MODE", "").lower() in {"1", "true", "yes"}
 
 
+def _default_agent_defaults() -> dict[str, dict[str, str]]:
+    """Return explicit defaults for every built-in agent specialization."""
+    shared = {
+        "harness": os.getenv("TURN_DEFAULT_EXECUTOR", "codex"),
+        "model": os.getenv("TURN_CODEX_MODEL", ""),
+        "reasoning": os.getenv("TURN_REASONING", "default"),
+        "permission": os.getenv("TURN_PERMISSION", "workspace"),
+    }
+    return {
+        role: dict(shared)
+        for role in ("planner", "executor", "integrator", "verifier")
+    }
+
+
 def validate_server_settings(config: "Settings") -> None:
     """Reject deterministic/test-only modes at the served-app boundary."""
     if config.planner in TEST_ONLY_PLANNERS:
@@ -128,6 +142,12 @@ class Settings:
     )
     default_executor: str = field(
         default_factory=lambda: os.getenv("TURN_DEFAULT_EXECUTOR", "codex")
+    )
+    # Role-specific defaults are persisted and exposed as one explicit
+    # contract. The older process-level fields remain inputs for startup and
+    # CLI execution, while new agents resolve through this map.
+    agent_defaults: dict[str, dict[str, str]] = field(
+        default_factory=_default_agent_defaults
     )
     # "codex" is the real planner. "heuristic" is opt-in for offline tests;
     # production never silently substitutes it.

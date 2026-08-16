@@ -8,7 +8,12 @@ import type {
   Permission,
   Reasoning,
 } from "../domain";
-import { primaryNodeAction, primaryNodeActionLabel } from "../domain";
+import {
+  displayNodeTitle,
+  primaryNodeAction,
+  primaryNodeActionLabel,
+  skillReferenceLabel,
+} from "../domain";
 import { api, json } from "../api";
 import { Icon } from "./Icon";
 import { ModelControl } from "./ModelControl";
@@ -142,6 +147,7 @@ function Overview({
   const [agent, setAgent] = useState<Agent | null>(node.agent ?? null);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const primaryAction = primaryNodeAction(node);
+  const skillRefs = agent?.skill_ids ?? [];
   useEffect(() => {
     setPrompt(node.generated_prompt ?? "");
     setObjective(node.objective);
@@ -168,7 +174,7 @@ function Overview({
   ]);
   return (
     <>
-      <h2 className="detail-title">{node.objective}</h2>
+      <h2 className="detail-title">{displayNodeTitle(node)}</h2>
       <div className="detail-meta">
         <span className={`badge ${node.ui_state}`}>
           {node.generation_active
@@ -176,6 +182,27 @@ function Overview({
             : node.ui_state.replaceAll("_", " ")}
         </span>
       </div>
+      {node.verification && (
+        <section className="section verification-section">
+          <div className="section-heading">
+            <span>Verification</span>
+            <span className={`badge ${node.verification.decision === "APPROVE" ? "complete" : "failed"}`}>
+              {node.verification.decision.toLowerCase()}
+            </span>
+          </div>
+          <p className="verification-summary">{node.verification.summary}</p>
+          {node.verification.findings.length > 0 && (
+            <ul className="verification-findings">
+              {node.verification.findings.map((finding) => <li key={finding}>{finding}</li>)}
+            </ul>
+          )}
+          {node.verification.required_changes.length > 0 && (
+            <ul className="verification-findings">
+              {node.verification.required_changes.map((change) => <li key={change}>{change}</li>)}
+            </ul>
+          )}
+        </section>
+      )}
       <section className="section instructions-section">
         <div className="section-heading">
           <span>Agent instructions</span>
@@ -276,10 +303,37 @@ function Overview({
             </label>
           </div>
           <div className="agent-resources">
-            <span>{agent.skills.length} skills</span>
+            <span>{skillRefs.length} skills</span>
             <span>{agent.tools.length} tools</span>
             <span>{agent.mcp_servers.length} MCP</span>
           </div>
+          {skillRefs.length > 0 && (
+            <div className="agent-skill-list" aria-label="Skills">
+              <span className="agent-skill-heading">Skills</span>
+              {skillRefs.map((reference) => {
+                const external = /^https?:\/\//i.test(reference);
+                const label = skillReferenceLabel(reference);
+                return external ? (
+                  <a
+                    className="agent-skill"
+                    href={reference}
+                    target="_blank"
+                    rel="noreferrer"
+                    key={reference}
+                    title={reference}
+                  >
+                    <Icon name="file" />
+                    <span>{label}</span>
+                  </a>
+                ) : (
+                  <div className="agent-skill" key={reference} title={reference}>
+                    <Icon name="file" />
+                    <span>{label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           <button
             className="button accent"
             disabled={!agentDirty}
@@ -353,20 +407,29 @@ function Overview({
                 item.content !== null &&
                 item.content !== undefined &&
                 item.content !== "";
+              // Older runs called this artifact a transcript. When the
+              // persisted node has a structured verdict, show that submitted
+              // result rather than exposing the unreadable PTY capture.
+              const isVerification =
+                item.name === "verification-result" ||
+                item.name === "verification-transcript";
+              const content =
+                isVerification && detail.node.verification
+                  ? JSON.stringify(detail.node.verification, null, 2)
+                  : typeof item.content === "string"
+                    ? item.content
+                    : JSON.stringify(item.content, null, 2);
+              const name = isVerification ? "verification-result" : item.name;
               const summary = (
                 <div className="artifact-summary">
                   <Icon name={item.kind === "file" ? "file" : "braces"} />
-                  <span>{item.name}</span>
+                  <span>{name}</span>
                 </div>
               );
               return hasContent ? (
                 <details key={item.id} className="artifact-row">
                   <summary>{summary}</summary>
-                  <pre>
-                    {typeof item.content === "string"
-                      ? item.content
-                      : JSON.stringify(item.content, null, 2)}
-                  </pre>
+                  <pre>{content}</pre>
                 </details>
               ) : (
                 <div key={item.id} className="artifact-row artifact-row-static">
@@ -403,6 +466,7 @@ function Overview({
                     );
                   }}
                 >
+                  {primaryAction === "cancel" && <Icon name="square-stop" />}
                   {primaryNodeActionLabel(primaryAction)}
                 </button>
               ) : (

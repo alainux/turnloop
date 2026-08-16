@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
-from turn.domain.schemas import PlanResult, WorkerResult
+from turn.domain.schemas import PlanResult, VerificationResult, WorkerResult
 
 # The domain models are the single source of truth. Artifact strings are the
 # one intentionally compact wire form accepted by the agent CLI; they are
@@ -36,9 +36,13 @@ def parse_result(value: str | dict[str, Any]) -> WorkerResult:
     return WorkerResult.model_validate(_normalize_result_payload(_decode(value)))
 
 
+def parse_verification(value: str | dict[str, Any]) -> VerificationResult:
+    return VerificationResult.model_validate(_decode(value))
+
+
 def validate_agent_submission(
-    kind: Literal["plan", "result"], value: dict[str, Any]
-) -> PlanResult | WorkerResult:
+    kind: Literal["plan", "result", "verification"], value: dict[str, Any]
+) -> PlanResult | WorkerResult | VerificationResult:
     """Validate one agent handoff against the shared operation contract.
 
     The CLI accepts the deliberately small artifact shorthand used in agent
@@ -48,6 +52,8 @@ def validate_agent_submission(
     """
     if kind == "plan":
         return parse_plan(value)
+    if kind == "verification":
+        return parse_verification(value)
     return parse_result(value)
 
 
@@ -94,12 +100,8 @@ def plan_handoff_example() -> str:
                 "executive_summary": "What will be built and why",
                 "approach": "How the work is shaped",
                 "strategy": "How delivery and risk are managed",
-                "architecture_principles": [],
-                "requirements": [],
-                "constraints": [],
-                "decisions": [],
-                "risks": [],
-                "acceptance_criteria": [],
+                "filesystem_structure": "src/\n  feature/\ntests/",
+                "research_sources": ["https://example.com/relevant-guidance"],
                 "sections": [
                     {
                         "id": "overview",
@@ -108,7 +110,6 @@ def plan_handoff_example() -> str:
                         "subsections": [],
                     }
                 ],
-                "diagrams": [],
             },
         },
         separators=(",", ":"),

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
+import json
 from typing import Any
 
 from turn.config import Settings, test_modes_enabled, validate_server_settings
@@ -11,6 +13,7 @@ from turn.runner.prefect_adapter import get_execution_adapter
 from turn.runner.runner import Runner
 from turn.workers.herdr import HerdrAdapter
 from turn.workers.registry import WorkerRegistry, build_registry
+from turn.workers.harnesses import harness_capabilities
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,7 @@ class RuntimeComponents:
     events: EventBus
     runner: Runner
     test_mode: bool
+    capabilities: list[dict[str, Any]]
 
 
 class TurnRuntime:
@@ -51,6 +55,7 @@ class TurnRuntime:
         self._herdr_adapter = herdr_adapter
         self.test_mode = test_modes_enabled() if test_mode is None else test_mode
         self.runner: Runner | None = None
+        self.capabilities: list[dict[str, Any]] = []
         self._started = False
 
     async def start(self) -> RuntimeComponents:
@@ -60,6 +65,23 @@ class TurnRuntime:
         await self._restore_settings()
         if not self.test_mode:
             validate_server_settings(self.settings)
+        # Discover provider capabilities once during daemon startup. The UI
+        # reads this server-owned snapshot instead of repeatedly launching
+        # provider discovery subprocesses on every page load.
+        self.capabilities = await asyncio.to_thread(
+            harness_capabilities,
+            {"codex": self.settings.codex_model or ""},
+            {"codex": self.settings.codex_binary},
+        )
+        if self.test_mode:
+            self.capabilities.append({
+                "id": "echo", "label": "Echo · offline", "binary": "internal",
+                "reasoning": ["default"],
+                "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "internal"}],
+                "supports_sessions": False, "supports_tools": False,
+                "accepts_custom_models": False, "reasoning_profiles": [],
+                "available": True,
+            })
         registry = self._registry or build_registry(self.settings, test_mode=self.test_mode)
         adapter = self._execution_adapter or get_execution_adapter(self.settings)
         self.runner = Runner(
@@ -85,7 +107,7 @@ class TurnRuntime:
     def components(self) -> RuntimeComponents:
         if self.runner is None:
             raise RuntimeError("Turn runtime has not been started")
-        return RuntimeComponents(self.store, self.events, self.runner, self.test_mode)
+        return RuntimeComponents(self.store, self.events, self.runner, self.test_mode, self.capabilities)
 
     async def _restore_settings(self) -> None:
         """Restore durable preferences before constructing the runner."""
@@ -119,3 +141,9 @@ class TurnRuntime:
             value = await self.store.get_setting(key)
             if value:
                 setattr(self.settings, target, value)
+        raw_defaults = await self.store.get_setting("agent_defaults")
+        if raw_defaults:
+            parsed = json.loads(raw_defaults)
+            if not isinstance(parsed, dict):
+                raise ValueError("stored agent_defaults must be an object")
+            self.settings.agent_defaults = parsed

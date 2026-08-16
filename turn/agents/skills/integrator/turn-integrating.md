@@ -16,6 +16,26 @@ domain implementation. Put wiring in the package or application entry point
 that naturally owns composition. A directory is not an integration result;
 the result is the assembled system.
 
+## Coherence gate
+
+Before changing files, map each prerequisite's exported contract to the one
+real entry point and canonical runtime state. Resolve incompatible names,
+events, IDs, asset paths, coordinate systems, and lifecycle assumptions at the
+composition boundary. The final result must be one product:
+
+- one documented launch path;
+- one connected user journey from start to the requested outcome;
+- one state model that drives all visible controls, overlays, and feedback;
+- no unrelated story/demo overlay, placeholder surface, duplicate loop, or
+  orphaned asset that is not part of the requested experience;
+- no prerequisite hidden behind an unmounted or unreachable module.
+
+For a browser or game product, inspect the rendered experience at the actual
+entry point. Confirm that the visible scene, controls, interaction feedback,
+and narrative/content state agree with one another. If the pieces cannot be
+made coherent without inventing missing product decisions, return FAIL with
+the concrete gap instead of quietly shipping a disconnected prototype.
+
 Before completing, verify the user-facing outcome, not only imports or unit
 tests. Run the real launch command and a deterministic end-to-end scenario
 appropriate to the objective. If the requested product cannot actually be

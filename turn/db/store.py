@@ -163,12 +163,17 @@ class Store:
 
     def _decode_state(self, raw: dict[str, Any]) -> dict[str, dict[uuid.UUID, Any]]:
         state = self._empty_state()
+        edge_keys: set[tuple[uuid.UUID, uuid.UUID, EdgeType]] = set()
         for item in raw.get("nodes", []):
             node = Node.model_validate(item)
             state["nodes"][node.id] = node
         for item in raw.get("edges", []):
             edge = Edge.model_validate(item)
+            key = (edge.src, edge.dst, edge.type)
+            if key in edge_keys:
+                continue
             state["edges"][edge.id] = edge
+            edge_keys.add(key)
         for item in raw.get("runs", []):
             run = Run.model_validate(item)
             state["runs"][run.id] = run
@@ -237,12 +242,17 @@ class Store:
             AgentType.PLANNER
         )
         root_agent.session_id = None
-        display_name = name or _concise_title(prompt)
+        explicit_name = name.strip() if name and name.strip() else None
+        display_name = explicit_name or _concise_title(prompt)
         node = Node(
             id=root_id,
             project_id=root_id,
             objective=display_name,
-            project_name=display_name,
+            # A derived title is navigation copy, not a user override. Keep
+            # the field empty until the user explicitly names the project so
+            # a later planner-authored document title can become the tile
+            # title without losing that distinction.
+            project_name=explicit_name,
             generated_prompt=prompt,
             executor=PLANNER_EXECUTOR,
             status=NodeStatus.PENDING,
@@ -298,6 +308,11 @@ class Store:
     async def get_workgraph(self, project_id: uuid.UUID):
         graph = await self.get_graph(project_id)
         return graph.nodes, graph.edges, graph.artifacts
+
+    def project_path(self, project_id: uuid.UUID) -> Path | None:
+        """Return the project root for server-owned asset serving."""
+        path = self._project_paths.get(project_id)
+        return path.resolve() if path is not None else None
 
     async def get_graph(self, project_id: uuid.UUID) -> Graph:
         state = self._states.get(project_id, self._empty_state())
@@ -520,6 +535,16 @@ class Store:
 
         keys_to_ids = {spec.key: uuid.uuid4() for spec in plan.nodes}
         state = self._state(parent.project_id)
+        edge_keys = {(edge.src, edge.dst, edge.type) for edge in state["edges"].values()}
+
+        def add_edge(src: uuid.UUID, dst: uuid.UUID, edge_type: EdgeType) -> None:
+            key = (src, dst, edge_type)
+            if key in edge_keys:
+                return
+            edge = Edge(src=src, dst=dst, type=edge_type)
+            state["edges"][edge.id] = edge
+            edge_keys.add(key)
+
         created: list[Node] = []
         for spec in plan.nodes:
             node_id = keys_to_ids[spec.key]
@@ -551,6 +576,7 @@ class Store:
                 node_agent = node_agent.as_type(
                     AgentType.PLANNER if executor == PLANNER_EXECUTOR else AgentType.EXECUTOR
                 )
+            node_agent.skill_ids = list(dict.fromkeys([*node_agent.skill_ids, *spec.skills]))
             node = Node(
                 id=node_id, project_id=parent.project_id, parent_id=parent_id,
                 objective=spec.objective, generated_prompt=spec.generated_prompt,
@@ -560,22 +586,15 @@ class Store:
             state["nodes"][node.id] = node
             created.append(node)
             if not spec.parent_key:
-                edge = Edge(src=parent.id, dst=node.id, type=EdgeType.CONTAINS)
-                state["edges"][edge.id] = edge
+                add_edge(parent.id, node.id, EdgeType.CONTAINS)
         for spec in plan.nodes:
             if spec.parent_key:
-                edge = Edge(src=keys_to_ids[spec.parent_key], dst=keys_to_ids[spec.key], type=EdgeType.CONTAINS)
-                state["edges"][edge.id] = edge
+                add_edge(keys_to_ids[spec.parent_key], keys_to_ids[spec.key], EdgeType.CONTAINS)
             for dep in spec.depends_on:
-                edge = Edge(src=keys_to_ids[dep], dst=keys_to_ids[spec.key], type=EdgeType.DEPENDS_ON)
-                state["edges"][edge.id] = edge
-        edge_keys = {(edge.src, edge.dst, edge.type) for edge in state["edges"].values()}
+                add_edge(keys_to_ids[dep], keys_to_ids[spec.key], EdgeType.DEPENDS_ON)
         for item in plan.edges:
             key = (keys_to_ids[item.src], keys_to_ids[item.dst], item.type)
-            if key not in edge_keys:
-                edge = Edge(src=key[0], dst=key[1], type=key[2])
-                state["edges"][edge.id] = edge
-                edge_keys.add(key)
+            add_edge(key[0], key[1], key[2])
         parent.status = NodeStatus.EXPANDED
         state["nodes"][parent.id] = parent.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
         await self._persist_project(parent.project_id)

@@ -4,6 +4,7 @@ import asyncio
 import sys
 import uuid
 
+from turn.tests.fakes import FakeHerdrAdapter
 from turn.workers.herdr import HerdrCliAdapter
 from turn.workers.terminal import HerdrPtyTransport, LocalPtyTransport
 
@@ -184,6 +185,25 @@ async def test_attached_terminal_is_not_reaped_while_quiet(tmp_path):
     transport.unsubscribe(node_id, queue)
     assert result.returncode == 0
     assert not result.idle_reaped
+
+
+async def test_herdr_replaces_an_externally_closed_workspace_mapping(tmp_path):
+    adapter = FakeHerdrAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    created = await adapter.create_workspace(cwd=str(tmp_path), label="stale")
+    transport._projects["project-1"] = {
+        "workspace_id": created.workspace_id,
+        "root_pane": created.root_pane_id,
+        "panes": {},
+    }
+    await adapter.close_workspace(created.workspace_id)
+
+    replacement = await transport.ensure_project_workspace(
+        "project-1", cwd=str(tmp_path), label="replacement"
+    )
+
+    assert replacement != created.workspace_id
+    assert await adapter.get_workspace(replacement)
 
 
 async def test_local_pty_bounds_completed_reconnect_snapshots(tmp_path):

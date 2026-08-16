@@ -179,13 +179,20 @@ def test_planner_and_executor_are_agent_types_with_filesystem_skills():
             node=Node(project_id=uuid.uuid4(), objective="plan", agent=planner)
         )
     )
-    assert "Turn planning skill" in planner_context
+    assert "turn-planning" in planner_context
+    assert "turn-architecture-research" not in planner_context
+    assert "turn-product-coherence" not in planner_context
+    assert "find-skills" in planner_context
+    assert "imagegen" in planner_context
+    assert "read every selected skill file" in planner_context
+    assert "AGENT SKILL:" not in planner_context
     integration_context = render_context_block(
         NodeExecutionContext(
             node=Node(project_id=uuid.uuid4(), objective="Integrate result", agent=integrator)
         )
     )
-    assert "Turn integration skill" in integration_context
+    assert "turn-integrating" in integration_context
+    assert "turn-product-coherence" not in integration_context
     assert "integrator-only directory" in integration_context
 
 

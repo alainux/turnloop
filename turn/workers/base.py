@@ -83,27 +83,36 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
     if ctx.node.agent is not None:
         agent = ctx.node.agent
         lines.append("TURN LAUNCH CONFIGURATION:")
+        lines.append(f"- Turn node id: {ctx.node.id}")
         lines.append(
             f"- harness: {agent.harness.value}; model: {agent.model or 'harness default'}; "
             f"reasoning: {agent.reasoning.value}; permission: {agent.permission.value}"
         )
-        if agent.skills:
-            lines.append(f"- skills available at launch: {', '.join(agent.skills)}")
+        if agent.skill_ids:
+            lines.append(
+                "- skills available through the project-scoped Turn library: "
+                + ", ".join(agent.skill_ids)
+            )
         if agent.tools:
             lines.append(f"- tools allowed at launch: {', '.join(agent.tools)}")
         if agent.mcp_servers:
             lines.append(f"- MCP servers available at launch: {', '.join(agent.mcp_servers)}")
+        lines.append(
+            "- Use `turn skills list` and `turn skills show <id>` for local skills; "
+            "external references are installed under `turn/skills` and their "
+            "paths are listed in TURN_AGENT_SKILLS. Skill text is delivered "
+            "through the project filesystem, not appended to this initial prompt."
+        )
+        lines.append(
+            "- Project-authored skills use `project:<slug>` and live at "
+            "`turn/skills/<slug>/SKILL.md`; read them from the project filesystem."
+        )
+        lines.append(
+            "- Before acting, read every selected skill file from `TURN_AGENT_SKILLS` "
+            "and apply its contract to this node. Skill text is not a substitute "
+            "for inspecting the graph, predecessor outputs, or the user's outcome."
+        )
         lines.append("")
-        for skill_ref in agent.skills:
-            skill_path = Path(skill_ref).expanduser()
-            if not skill_path.is_file():
-                raise FileNotFoundError(f"agent skill does not exist: {skill_path}")
-            skill_text = skill_path.read_text(encoding="utf-8").strip()
-            if not skill_text:
-                raise ValueError(f"agent skill is empty: {skill_path}")
-            lines.append(f"AGENT SKILL: {skill_path}")
-            lines.append(skill_text)
-            lines.append("")
     if ctx.ancestry:
         lines.append("ANCESTOR CONTEXT (root -> parent):")
         for a in ctx.ancestry:
@@ -175,5 +184,12 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         lines.append("  Limit changes to assembly, interfaces, wiring, and necessary integration fixes;")
         lines.append("  preserve prerequisite domain content and do not create an integrator-only directory.")
         lines.append("  Verify the real user-facing launch/use path, not only imports or unit tests.")
+        lines.append("")
+    if agent_type == "verifier":
+        lines.append("VERIFIER CONTRACT:")
+        lines.append("  Inspect the target's actual deliverables, graph contracts, invariants, and user-facing behavior.")
+        lines.append("  Approve only when the stated acceptance criteria are evidenced; otherwise reject with concrete findings.")
+        lines.append("  Submit exactly one APPROVE or REJECT decision through `turn agent verify --payload '<JSON_OBJECT>'`.")
+        lines.append("  Do not edit the target's work and do not write Turn protocol files directly.")
         lines.append("")
     return "\n".join(lines)

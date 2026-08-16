@@ -24,6 +24,7 @@ from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
     ArtifactSpec,
+    EdgeType,
     HarnessKind,
     Node,
     NodeStatus,
@@ -32,6 +33,7 @@ from turn.domain.schemas import (
     Resource,
     Run,
     RunStatus,
+    VerificationDecision,
     WorkerResult,
 )
 from turn.graph.logic import GraphWalker
@@ -450,36 +452,6 @@ class Runner:
                 last = current
             await asyncio.sleep(0.2)
 
-    async def _persist_terminal_transcript(
-        self, node_id: uuid.UUID, project_id: uuid.UUID
-    ) -> None:
-        """Save the raw PTY stream before its completed session is released.
-
-        A worker normally returns a transcript artifact, but cancellation,
-        timeout, and reconnect teardown can happen after the PTY has emitted
-        useful output and before a ``WorkerResult`` is available.  Preserve
-        that output at the lifecycle boundary so a disconnected terminal can
-        still be inspected or reconnected without retaining the PTY in
-        memory.  The content remains raw ANSI text; the browser terminal
-        emulator owns rendering it.
-        """
-        snapshot = self.terminal.snapshot(node_id)
-        transcript = snapshot.get("output")
-        if not isinstance(transcript, str) or not transcript.strip():
-            return
-        artifacts = await self.store.get_artifacts(node_id)
-        if any(
-            artifact.name == "transcript" and artifact.content == transcript
-            for artifact in artifacts
-        ):
-            return
-        created = await self.store.add_artifacts(
-            node_id,
-            [ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)],
-        )
-        for artifact in created:
-            await self._emit("artifact.created", project_id, _dump(artifact))
-
     async def _finish_provider_terminal(
         self, node_id: uuid.UUID, project_id: uuid.UUID
     ) -> None:
@@ -490,7 +462,6 @@ class Runner:
         or a later follow-up. An explicit terminal-close may kill that session;
         a fresh rerun keeps the pane and injects a new harness call instead.
         """
-        await self._persist_terminal_transcript(node_id, project_id)
         self.terminal.release(node_id)
         node = await self.store.get_node(node_id)
         if node is not None:
@@ -503,16 +474,6 @@ class Runner:
         ctx = await self._build_context(node)
         # The planner and all descendants use the same assigned project
         # directory, so files are immediately available downstream.
-        # Collect the planner's raw Codex transcript so it can be shown in the
-        # node-detail terminal pane, exactly like a worker node's output.
-        transcript_chunks: list[str] = []
-        orig_stream = ctx.stream
-
-        async def _stream(nid, chunk):
-            await orig_stream(nid, chunk)
-            transcript_chunks.append(chunk)
-
-        ctx.stream = _stream
         run = await self.store.create_run(node, PLANNER_EXECUTOR, self._retries.get(node.id, 0) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
@@ -522,20 +483,23 @@ class Runner:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
             created = await self.store.apply_plan(node, plan)
-            transcript = "".join(transcript_chunks)
-            if transcript.strip():
-                arts = await self.store.add_artifacts(
-                    node.id,
-                    [ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)],
-                )
-                for a in arts:
-                    await self._emit("artifact.created", project_id, _dump(a))
+            submitted = await self.store.add_artifacts(
+                node.id,
+                [ArtifactSpec(
+                    kind=ArtifactKind.JSON,
+                    name="plan-submission",
+                    content=plan.model_dump(mode="json"),
+                )],
+            )
+            for artifact in submitted:
+                await self._emit("artifact.created", project_id, _dump(artifact))
+            session_note = f"session_id={plan.session_id}" if plan.session_id else "session_id=unavailable"
             await self.store.update_run(
                 run.id,
                 status=RunStatus.COMPLETE,
                 outcome=Outcome.COMPLETE,
                 summary=f"planned {len(created)} node(s)",
-                logs=transcript or f"Planned {len(created)} node(s). {plan.notes or ''}".strip(),
+                logs=f"{session_note}; planned {len(created)} node(s)",
                 usage=plan.usage,
                 session_id=plan.session_id,
             )
@@ -545,21 +509,15 @@ class Runner:
                 await self._emit("node.created", project_id, _dump(c))
             return created
         except Exception as error:
-            transcript = "".join(transcript_chunks)
             await self.store.update_run(
                 run.id,
                 status=RunStatus.FAILED,
                 outcome=Outcome.FAIL,
                 summary=str(error),
-                logs=transcript,
+                logs="planner submission failed; inspect the live Herdr session",
                 error=str(error),
                 retry_recommended=isinstance(error, GenerationStalled),
             )
-            if transcript:
-                await self.store.add_artifacts(
-                    node.id,
-                    [ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)],
-                )
             raise
         finally:
             await self._finish_provider_terminal(node.id, project_id)
@@ -631,6 +589,9 @@ class Runner:
     async def _handle_outcome(
         self, node: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
+        if result.verification is not None:
+            await self._handle_verification(node, run, project_id, result)
+            return
         fresh = await self.store.get_node(node.id)
         if result.outcome == Outcome.COMPLETE:
             arts = await self.store.add_artifacts(node.id, result.artifacts)
@@ -699,6 +660,203 @@ class Runner:
 
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
         self.wake()
+
+    async def _handle_verification(
+        self, verifier: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
+    ) -> None:
+        """Persist a verifier decision and route rejections to its target."""
+        decision = result.verification
+        if decision is None:
+            raise RuntimeError("verification outcome missing decision")
+        for artifact in await self.store.add_artifacts(verifier.id, result.artifacts):
+            await self._emit("artifact.created", project_id, _dump(artifact))
+        current = await self.store.get_node(verifier.id)
+        if current is None:
+            return
+        current.verification = decision
+        await self.store.update_run(
+            run.id,
+            status=RunStatus.COMPLETE,
+            outcome=Outcome.COMPLETE,
+            summary=decision.summary,
+            logs=result.executor_notes or decision.summary,
+            usage=result.usage,
+            session_id=result.session_id,
+        )
+        if result.session_id and current.agent is not None:
+            current.agent.session_id = result.session_id
+        current.status = NodeStatus.COMPLETE
+        await self.store._save_node(current)
+
+        if decision.decision is VerificationDecision.REJECT:
+            nodes, edges, _ = await self.store.get_workgraph(project_id)
+            target_ids = [
+                edge.src
+                for edge in edges
+                if edge.type is EdgeType.DEPENDS_ON and edge.dst == current.id
+            ]
+            target = await self.store.get_node(target_ids[0]) if len(target_ids) == 1 else None
+            if target is None:
+                raise RuntimeError(
+                    "verifier rejection requires exactly one dependency target"
+                )
+            await self._notify_rejection(target, verifier, decision)
+            # A verifier may be the active member of a manual Step barrier.
+            # Rejection moves that verifier back behind the corrected target,
+            # so the old barrier can never settle. The next Step must be
+            # allowed to select the repaired target, and then the verifier
+            # again after that target completes.
+            self._manual_stages.pop(project_id, None)
+            # A rejection invalidates the target and every dependent result;
+            # the graph will replay them in dependency order. The verifier
+            # itself becomes runnable again after the target completes.
+            walker = GraphWalker(nodes, edges)
+            invalidated = [target]
+            pending = list(walker.indexes.dependents.get(target.id, []))
+            seen: set[uuid.UUID] = set()
+            while pending:
+                dependent_id = pending.pop(0)
+                if dependent_id in seen:
+                    continue
+                seen.add(dependent_id)
+                dependent = walker.indexes.node_by_id.get(dependent_id)
+                if dependent is not None:
+                    invalidated.append(dependent)
+                    pending.extend(walker.indexes.dependents.get(dependent_id, []))
+            for item in invalidated:
+                if item.id == target.id or item.id == verifier.id or item.status != NodeStatus.RUNNING:
+                    item.status = NodeStatus.RUNNABLE if item.id == target.id else NodeStatus.PENDING
+                    item.agent_state = None
+                    item.agent_message = None
+                    # Keep the target's provider session. The rejection was
+                    # injected into that active conversation, so the next
+                    # attempt must continue with the same context rather than
+                    # starting a new conversation from zero.
+                    await self.store._save_node(item)
+                    await self._emit("node.updated", project_id, _dump(item))
+        await self._emit("node.updated", project_id, _dump(await self.store.get_node(verifier.id)))
+        self.wake()
+
+    async def _notify_rejection(self, target: Node, verifier: Node, decision) -> None:
+        """Deliver feedback to the predecessor's node-scoped conversation."""
+        repo = await self._project_repo(target.project_id)
+        if not repo:
+            return
+        lines = [
+            "TURN VERIFICATION REJECTED",
+            f"Verifier: {verifier.objective}",
+            f"Summary: {decision.summary}",
+            *[f"- {item}" for item in decision.findings],
+            "Required changes:",
+            *[f"- {item}" for item in decision.required_changes],
+            "Continue the responsible node through Turn after addressing these findings; the project execution mode controls when the refinement runs.",
+        ]
+        message = "\n".join(lines)
+        if getattr(self.terminal, "supports_inject", False):
+            process_reader = getattr(self.terminal, "foreground_process_names", None)
+            process_names = await process_reader(target.id) if process_reader is not None else ()
+            harness_name = (
+                target.agent.harness.value
+                if target.agent is not None
+                else None
+            )
+            if harness_name not in process_names:
+                # A completed native harness may have returned to the shell.
+                # Resume the exact session stored on this predecessor node;
+                # never select a global or most-recent session.
+                session_id = target.agent.session_id if target.agent is not None else None
+                command = (
+                    self._reconnect_command(target, repo, session_id)
+                    if session_id
+                    else None
+                )
+                if command is None:
+                    raise RuntimeError(
+                        f"cannot deliver rejection to node {target.id}: "
+                        "its Herdr pane is not running the selected harness and "
+                        "the node has no persisted session id"
+                    )
+                if not self.terminal.snapshot(target.id).get("active"):
+                    task = asyncio.create_task(
+                        self.terminal.ensure_session(
+                            target.id,
+                            cwd=repo,
+                            environment={"TURN_PROJECT_ID": str(target.project_id)},
+                            idle_warning=self.s.terminal_idle_warning_seconds,
+                            idle_reap=self.s.terminal_idle_reap_seconds,
+                        )
+                    )
+                    for _ in range(100):
+                        if self.terminal.snapshot(target.id).get("active"):
+                            break
+                        if task.done():
+                            break
+                        await asyncio.sleep(0.01)
+                injected = await self.terminal.inject_command(
+                    target.id,
+                    " ".join(shlex.quote(part) for part in command),
+                    environment={"TURN_PROJECT_ID": str(target.project_id)},
+                )
+                if not injected:
+                    raise RuntimeError(
+                        f"could not resume node {target.id}'s persisted harness session"
+                    )
+                found_harness = False
+                for _ in range(100):
+                    process_reader = getattr(self.terminal, "foreground_process_names", None)
+                    process_names = (
+                        await process_reader(target.id)
+                        if process_reader is not None
+                        else ()
+                    )
+                    if harness_name in process_names:
+                        found_harness = True
+                        break
+                    await asyncio.sleep(0.05)
+                if not found_harness:
+                    raise RuntimeError(
+                        f"node {target.id}'s persisted harness session did not become active"
+                    )
+            paste = f"\x1b[200~{message}\x1b[201~"
+            for offset in range(0, len(paste), 512):
+                if not await self.terminal.write(target.id, paste[offset : offset + 512]):
+                    raise RuntimeError(
+                        f"could not deliver rejection to node {target.id}'s Herdr conversation"
+                    )
+                await asyncio.sleep(0.01)
+            if not await self.terminal.write(target.id, "\r"):
+                raise RuntimeError(
+                    f"could not submit rejection feedback to node {target.id}'s Herdr conversation"
+                )
+            return
+
+        # Deterministic non-Herdr transports used by tests do not expose a
+        # process table. Preserve their byte-level assertion surface; served
+        # runs always use the branch above.
+        payload = "\x03\r" + message + "\r"
+        if not self.terminal.snapshot(target.id).get("active"):
+            task = asyncio.create_task(
+                self.terminal.ensure_session(
+                    target.id,
+                    cwd=repo,
+                    environment={"TURN_PROJECT_ID": str(target.project_id)},
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                )
+            )
+            try:
+                for _ in range(100):
+                    if self.terminal.snapshot(target.id).get("active"):
+                        break
+                    if task.done():
+                        break
+                    await asyncio.sleep(0.01)
+                await self.terminal.write(target.id, payload)
+            finally:
+                await self.terminal.detach(target.id)
+                await asyncio.gather(task, return_exceptions=True)
+        else:
+            await self.terminal.write(target.id, payload)
 
     async def _maybe_finalize(self, root: Node) -> None:
         """Mark a settled project complete after direct filesystem execution."""
@@ -822,11 +980,6 @@ class Runner:
         command: list[str] | None = None
         if not persistent_exists:
             session_id = node.agent.session_id if node.agent else None
-            if not session_id:
-                for run in reversed(await self.store.get_runs(node_id)):
-                    if run.session_id:
-                        session_id = run.session_id
-                        break
             command = self._reconnect_command(node, cwd, session_id) if cwd and session_id else None
             if not command:
                 return False

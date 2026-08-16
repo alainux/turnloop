@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import base64
+import json
 from pathlib import Path
 
 import httpx
@@ -35,12 +36,29 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
     app.state.runner = runner
     app.state.events = runner.events
     app.state.test_mode = True
+    from turn.workers.harnesses import harness_capabilities
+    app.state.capabilities = harness_capabilities()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         caps = (await client.get("/api/capabilities")).json()
         assert {h["id"] for h in caps["harnesses"]} == {"codex", "claude", "opencode", "pi"}
         assert all(h["reasoning_profiles"] for h in caps["harnesses"])
         assert all(item["future"] for item in caps["output_types"])
+        settings_payload = (await client.get("/api/settings")).json()
+        assert set(settings_payload["agent_defaults"]) == {"planner", "executor", "integrator", "verifier"}
+        original_defaults = json.loads(json.dumps(settings_payload["agent_defaults"]))
+        changed_defaults = json.loads(json.dumps(original_defaults))
+        changed_defaults["planner"]["model"] = "planner-test-model"
+        changed_defaults["executor"]["model"] = "executor-test-model"
+        changed_defaults["integrator"]["model"] = "integrator-test-model"
+        changed_defaults["verifier"]["model"] = "verifier-test-model"
+        updated = await client.post("/api/settings", json={"agent_defaults": changed_defaults})
+        assert updated.status_code == 200, updated.text
+        stored_defaults = (await client.get("/api/settings")).json()["agent_defaults"]
+        assert stored_defaults["planner"]["model"] == "planner-test-model"
+        assert stored_defaults["executor"]["model"] == "executor-test-model"
+        assert stored_defaults["integrator"]["model"] == "integrator-test-model"
+        assert stored_defaults["verifier"]["model"] == "verifier-test-model"
         invalid = await client.post("/api/projects", json={
             "prompt": "Must not create a repository",
             "agent": {"harness": "codex", "model": "fast-mini", "reasoning": "xhigh"},
@@ -77,8 +95,15 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert renamed.status_code == 200
         renamed_root = renamed.json()["project"]
         assert renamed_root["project_name"] == "Renamed demo"
-        assert renamed_root["objective"] == "Renamed demo"
+        assert renamed_root["objective"] == "Inspectable demo"
         assert renamed_root["generated_prompt"] == "Build an inspectable demo"
+        derived = await store.create_project(
+            "Build a **scoped** project",
+            repo_path=str(tmp_path / "projects" / "derived"),
+        )
+        assert derived.project_name is None
+        assert derived.objective == "Build a **scoped** project"
+        await store.delete_project(derived.id)
         root_node = await store.get_node(uuid.UUID(pid))
         run = await store.create_run(root_node, "echo")
         await store.update_run(run.id, session_id="live-session")
@@ -120,5 +145,6 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert node["ui_state"] == "paused"
         await runner.close_project_workspace(root_node.id)
         await store.delete_project(root_node.id)
+        await client.post("/api/settings", json={"agent_defaults": original_defaults})
     await runner.stop()
     await store.dispose()

@@ -15,10 +15,30 @@ import sys
 from typing import Any, Awaitable, Callable
 
 from turn.contracts.dag import plan_handoff_example
+from turn.domain.schemas import VerificationResult
 from turn.workers.terminal import TerminalResult
+from turn.skills.library import materialize
 
 
-def _new_codex_session_id(cwd: str, started_at: float) -> str | None:
+def format_verification_result(result: VerificationResult) -> str:
+    """Render the exact submitted verification payload for human inspection.
+
+    The PTY transcript is an execution trace, not the verifier's result.  It
+    contains prompts, terminal control sequences, and provider UI chrome, so
+    it must not be used as the verification artifact shown in the inspector.
+    """
+    return json.dumps(
+        result.model_dump(mode="json"),
+        indent=2,
+        ensure_ascii=False,
+    ) + "\n"
+
+
+def _new_codex_session_id(
+    cwd: str,
+    started_at: float,
+    session_marker: str | None = None,
+) -> str | None:
     """Find the session file Codex creates for a newly launched TUI.
 
     Codex does not print its conversation id in the native screen, but it
@@ -43,12 +63,28 @@ def _new_codex_session_id(cwd: str, started_at: float) -> str | None:
                 break
             with path.open() as handle:
                 first = json.loads(handle.readline())
-            payload = first.get("payload") if isinstance(first, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            if os.path.realpath(str(payload.get("cwd") or "")) != target:
-                continue
-            identifier = payload.get("session_id")
+                payload = first.get("payload") if isinstance(first, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if os.path.realpath(str(payload.get("cwd") or "")) != target:
+                    continue
+                if session_marker:
+                    # Concurrent native workers share a cwd.  mtime alone is
+                    # not an identity signal because Codex touches another
+                    # session's rollout while it is active.  The worker puts
+                    # a unique node marker in its first user prompt; only
+                    # accept the rollout whose early transcript contains it.
+                    found_marker = False
+                    for _ in range(12):
+                        line = handle.readline()
+                        if not line:
+                            break
+                        if session_marker in line:
+                            found_marker = True
+                            break
+                    if not found_marker:
+                        continue
+                identifier = payload.get("session_id")
             if isinstance(identifier, str) and identifier:
                 return identifier
         except (OSError, ValueError, json.JSONDecodeError):
@@ -76,6 +112,9 @@ def agent_environment(
     protocol. They let a harness adapter or a project-local wrapper configure
     skills, tools, and MCP servers without inspecting terminal output.
     """
+    skill_ids = list(dict.fromkeys(getattr(agent, "skill_ids", None) or []))
+    scoped_skills = materialize(skill_ids, cwd) if skill_ids else {}
+
     def csv(name: str) -> str:
         return ",".join(str(value) for value in (getattr(agent, name, None) or []))
 
@@ -99,7 +138,9 @@ def agent_environment(
         "TURN_HARNESS": str(getattr(getattr(agent, "harness", None), "value", "") or ""),
         "TURN_AGENT_MODEL": str(getattr(agent, "model", None) or ""),
         "TURN_AGENT_REASONING": str(getattr(getattr(agent, "reasoning", None), "value", "") or ""),
-        "TURN_AGENT_SKILLS": csv("skills"),
+        "TURN_AGENT_SKILLS": ",".join(str(path) for path in scoped_skills.values()),
+        "TURN_AGENT_SKILL_IDS": ",".join(skill_ids),
+        "TURN_AGENT_SKILL_ROOT": str(Path(cwd) / "turn" / "skills"),
         "TURN_AGENT_TOOLS": csv("tools"),
         "TURN_AGENT_MCP_SERVERS": csv("mcp_servers"),
     }
@@ -143,7 +184,10 @@ async def run_until_result(
     idle_reap: float | None = None,
     session_callback=None,
     session_probe: Callable[[], Awaitable[str | None]] | None = None,
+    session_marker: str | None = None,
+    harness_name: str | None = None,
     initial_input: str | None = None,
+    initial_input_mode: str = "native",
     environment: dict[str, str] | None = None,
 ):
     """Keep a native TUI alive until it submits its result file.
@@ -191,6 +235,7 @@ async def run_until_result(
                 )
             await asyncio.sleep(0.05)
 
+    started_at = time.time()
     try:
         if getattr(transport, "supports_inject", False):
             # The persistent session is a plain shell. Launch the harness by typing
@@ -200,7 +245,14 @@ async def run_until_result(
             # shell. Do not create a second outer attachment: LocalPtyTransport
             # stores one client per node and a second one used to replace the
             # browser client, yielding a misleading "[terminated]" panel.
-            if transport.snapshot(node_id).get("active"):
+            active = bool(transport.snapshot(node_id).get("active"))
+            harness_attached = False
+            if active and harness_name:
+                reader = getattr(transport, "foreground_process_names", None)
+                if reader is not None:
+                    names = await reader(node_id)
+                    harness_attached = harness_name.rsplit("/", 1)[-1] in names
+            if active:
                 owns_attachment = False
             else:
                 task = asyncio.create_task(
@@ -214,13 +266,14 @@ async def run_until_result(
                     )
                 )
             await wait_for_attachment()
-            injected = await transport.inject_command(
-                node_id,
-                " ".join(shlex.quote(part) for part in command),
-                environment=environment,
-            )
-            if not injected:
-                raise RuntimeError("Turn could not inject the harness command into Herdr")
+            if not harness_attached:
+                injected = await transport.inject_command(
+                    node_id,
+                    " ".join(shlex.quote(part) for part in command),
+                    environment=environment,
+                )
+                if not injected:
+                    raise RuntimeError("Turn could not inject the harness command into Herdr")
         else:
             task = asyncio.create_task(
                 transport.run(
@@ -257,43 +310,57 @@ async def run_until_result(
                     # TUI is still negotiating capabilities is indistinguishable
                     # from a user typing into a half-started terminal and is flaky
                     # across harnesses.
-                    await asyncio.sleep(2.5)
+                    # Herdr first echoes the shell launch command and only
+                    # then transfers the pane's foreground process to the
+                    # harness. The shell echo is not a readiness signal;
+                    # allow the native harness enough time to claim the PTY
+                    # before sending the first prompt.
+                    await asyncio.sleep(6.0 if getattr(transport, "supports_inject", False) else 2.5)
                     break
                 await asyncio.sleep(0.1)
             if task is None or not task.done():
-                # Keep the submit key as a separate PTY event. Codex renders a
-                # long first message as pasted content; appending Enter to that
-                # same write can leave the message in the composer instead of
-                # submitting it.
-                # This is ordinary PTY input. Preserve line breaks and spacing so
-                # the harness receives exactly the same instruction the user
-                # selected in Turn; the transport does not parse it.
-                # Deliver the instruction as a standard terminal bracketed paste,
-                # in bounded chunks. A single large write can overflow the PTY's
-                # canonical input buffer (and has caused native TUIs to crash),
-                # while bracketed paste preserves newlines without submitting
-                # them as separate messages. The transport still treats every
-                # byte as opaque terminal input.
-                paste = f"\x1b[200~{initial_input}\x1b[201~"
-                for offset in range(0, len(paste), 512):
-                    sent = await transport.write(node_id, paste[offset : offset + 512])
+                if initial_input_mode == "stdin":
+                    # Non-interactive harnesses launched through Herdr read the
+                    # prompt from stdin. Sending it as a shell argument is not
+                    # safe: embedded newlines are interpreted by the shell
+                    # before the harness process owns the PTY. Send the bytes
+                    # only after the sentinel command has started, then close
+                    # stdin with EOF.
+                    payload = initial_input
+                    if not payload.endswith(("\n", "\r")):
+                        payload += "\n"
+                    for offset in range(0, len(payload), 512):
+                        sent = await transport.write(node_id, payload[offset : offset + 512])
+                        if getattr(transport, "supports_inject", False) and not sent:
+                            raise RuntimeError("Turn could not inject the harness prompt into Herdr")
+                        await asyncio.sleep(0.01)
+                    sent = await transport.write(node_id, "\x04")
                     if getattr(transport, "supports_inject", False) and not sent:
-                        raise RuntimeError("Turn could not inject the harness prompt into Herdr")
-                    await asyncio.sleep(0.01)
-                await asyncio.sleep(0.25)
-                sent = await transport.write(node_id, "\r")
-                if getattr(transport, "supports_inject", False) and not sent:
-                    raise RuntimeError("Turn could not submit the harness prompt in Herdr")
+                        raise RuntimeError("Turn could not close the harness prompt input in Herdr")
+                else:
+                    # Keep the submit key as a separate PTY event. Codex renders
+                    # a long first message as pasted content; appending Enter to
+                    # that same write can leave the message in the composer
+                    # instead of submitting it.
+                    paste = f"\x1b[200~{initial_input}\x1b[201~"
+                    for offset in range(0, len(paste), 512):
+                        sent = await transport.write(node_id, paste[offset : offset + 512])
+                        if getattr(transport, "supports_inject", False) and not sent:
+                            raise RuntimeError("Turn could not inject the harness prompt into Herdr")
+                        await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.25)
+                    sent = await transport.write(node_id, "\r")
+                    if getattr(transport, "supports_inject", False) and not sent:
+                        raise RuntimeError("Turn could not submit the harness prompt in Herdr")
     except BaseException:
         await abort_owned_attachment()
         raise
-    started_at = time.time()
     discovered_session: str | None = None
     last_probe = 0.0
     try:
         while task is None or not task.done():
             if session_callback is not None and discovered_session is None:
-                discovered_session = _new_codex_session_id(cwd, started_at)
+                discovered_session = _new_codex_session_id(cwd, started_at, session_marker)
                 if discovered_session:
                     await session_callback(discovered_session)
             if session_probe is not None and discovered_session is None:
@@ -333,7 +400,7 @@ async def run_until_result(
         raise
 
 
-def result_handoff(*, plan: bool = False) -> str:
+def result_handoff(*, plan: bool = False, verification: bool = False) -> str:
     """Prompt fragment for the harness-neutral Turn control plane."""
     turn_cli = shutil.which("turn")
     if not turn_cli:
@@ -341,17 +408,21 @@ def result_handoff(*, plan: bool = False) -> str:
             "Turn CLI is not installed; install the project package before launching workers"
         )
     turn_cli = shlex.quote(turn_cli)
-    if plan:
+    if verification:
+        shape = '{"decision":"APPROVE","summary":"What was verified","findings":[],"required_changes":[],"evidence_refs":[]}'
+    elif plan:
         shape = plan_handoff_example()
     else:
         shape = '{"outcome":"COMPLETE","summary":"What happened","missing_inputs":[]}'
-    kind = "plan" if plan else "result"
+    kind = "verification" if verification else "plan" if plan else "result"
     completion = (
-        "When the plan is complete, submit it and let Turn continue."
+        "When the verification is complete, submit the decision and let Turn route it."
+        if verification
+        else "When the plan is complete, submit it and let Turn continue."
         if plan
         else "When the work is complete, submit the result through the Turn CLI. Keep the terminal available for follow-up conversation after submission."
     )
-    artifact_guidance = "" if plan else """
+    artifact_guidance = "" if plan or verification else """
 For execution results, include only a small `artifacts` array of repo-relative
 files or directories that represent the work. Do not list every changed file;
 one directory is better for a large area. Turn will not infer artifacts from
@@ -374,7 +445,7 @@ For the final {kind}, submit one JSON object matching this shape through the
 Turn CLI. The CLI is the only submission interface and writes Turn's internal
 record. Do not use filesystem output as a protocol:
 {shape}
-  {turn_cli} agent submit --kind {kind} --payload '<JSON_OBJECT>'
+  {turn_cli} agent {'verify' if verification else 'submit --kind ' + kind} --payload '<JSON_OBJECT>'
 Replace `<JSON_OBJECT>` with the actual single-line JSON object.
 {artifact_guidance}
 

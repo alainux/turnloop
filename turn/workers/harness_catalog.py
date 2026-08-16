@@ -78,6 +78,7 @@ class HarnessCommandFactory:
         *,
         resume: bool = False,
         native: bool = False,
+        prompt_via_stdin: bool = False,
     ) -> list[str]:
         model = agent.model
         reasoning = agent.reasoning.value
@@ -98,7 +99,7 @@ class HarnessCommandFactory:
                 cmd += ["--permission-mode", "acceptEdits"]
             if agent.tools:
                 cmd += ["--allowedTools", *agent.tools]
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if harness == HarnessKind.OPENCODE:
             cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
             if session:
@@ -109,7 +110,7 @@ class HarnessCommandFactory:
                 cmd += ["--variant", reasoning]
             if agent.permission.value != "ask":
                 cmd.append("--auto")
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if harness == HarnessKind.PI:
             cmd = ["pi"] if native else ["pi", "-p", "--mode", "json"]
             if session:
@@ -122,11 +123,12 @@ class HarnessCommandFactory:
                 cmd.append("--approve")
             if agent.tools:
                 cmd += ["--tools", ",".join(agent.tools)]
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         raise ValueError(f"unsupported generic harness: {harness}")
 
     def planner_command(
-        self, agent: AgentConfig, prompt: str, *, cwd: str, native: bool, resume: bool
+        self, agent: AgentConfig, prompt: str, *, cwd: str, native: bool, resume: bool,
+        prompt_via_stdin: bool = False,
     ) -> list[str]:
         if agent.harness == HarnessKind.OPENCODE:
             cmd = ["opencode", cwd] if native else ["opencode", "run", "--auto"]
@@ -138,7 +140,7 @@ class HarnessCommandFactory:
                 cmd += ["--variant", agent.reasoning.value]
             if native:
                 cmd.append("--auto")
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if agent.harness == HarnessKind.PI:
             cmd = ["pi"] if native else ["pi", "--print", "--mode", "text", "--approve"]
             if agent.session_id:
@@ -149,7 +151,7 @@ class HarnessCommandFactory:
                 cmd += ["--thinking", agent.reasoning.value]
             if native:
                 cmd.append("--approve")
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if agent.harness == HarnessKind.CLAUDE:
             cmd = ["claude"] if native else ["claude", "--print", "--output-format", "text", "--permission-mode", "acceptEdits"]
             if agent.session_id:
@@ -158,7 +160,7 @@ class HarnessCommandFactory:
                 cmd += ["--model", model]
             if agent.reasoning.value != "default":
                 cmd += ["--effort", agent.reasoning.value]
-            return cmd if native else [*cmd, prompt]
+            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         raise ValueError(f"planner harness '{agent.harness.value}' is unsupported")
 
     def reconnect_command(self, agent: AgentConfig, cwd: str, session_id: str) -> list[str] | None:

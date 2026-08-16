@@ -14,7 +14,7 @@ import uuid
 from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from turn.db.store import Store
@@ -79,16 +79,13 @@ class SettingsUpdate(BaseModel):
     default_auto_run: Optional[bool] = None
     theme: Optional[str] = None
     density: Optional[str] = None
-    default_harness: Optional[str] = None
-    default_model: Optional[str] = None
-    reasoning: Optional[str] = None
-    permission: Optional[str] = None
     timeout_seconds: Optional[float] = Field(default=None, gt=0, le=86400)
     stall_timeout_seconds: Optional[float] = Field(default=None, gt=0, le=3600)
     max_retries: Optional[int] = Field(default=None, ge=0, le=20)
     retry_backoff_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     delay_between_jobs_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     retry_choked_models: Optional[bool] = None
+    agent_defaults: Optional[dict[str, dict[str, str]]] = None
 
 
 class BranchAction(BaseModel):
@@ -222,24 +219,25 @@ async def create_project(body: CreateProject, request: Request):
     if body.agent is None:
         from turn.config import settings as app_settings
         from turn.domain.schemas import HarnessKind, PermissionMode, ReasoningLevel
+        defaults = app_settings.agent_defaults["planner"]
 
         try:
-            harness = HarnessKind(await store.get_setting("default_harness", app_settings.default_executor))
+            harness = HarnessKind(defaults["harness"])
         except ValueError as error:
             raise HTTPException(500, "stored default harness is not supported by the served app") from error
         if harness.value not in REAL_HARNESSES:
             raise HTTPException(500, "stored default harness is test-only and cannot be used by the served app")
         try:
-            reasoning = ReasoningLevel(await store.get_setting("reasoning", app_settings.default_reasoning))
+            reasoning = ReasoningLevel(defaults["reasoning"])
         except ValueError as error:
             raise HTTPException(500, "stored reasoning level is not supported") from error
         try:
-            permission = PermissionMode(await store.get_setting("permission", app_settings.default_permission))
+            permission = PermissionMode(defaults["permission"])
         except ValueError as error:
             raise HTTPException(500, "stored permission mode is not supported") from error
         body.agent = AgentConfig(
             harness=harness,
-            model=(await store.get_setting("default_model", app_settings.codex_model or "")) or None,
+            model=defaults["model"] or None,
             reasoning=reasoning,
             permission=permission,
         )
@@ -293,15 +291,12 @@ async def get_settings(request: Request):
     raw = await store.get_setting("default_auto_run", "0")
     default_auto_run = str(raw) not in ("0", "false", "False", "")
     from turn.config import settings as app_settings
-    keys = {
-        "theme": "dark", "density": "comfortable", "default_harness": app_settings.default_executor,
-        "default_model": app_settings.codex_model or "", "reasoning": app_settings.default_reasoning,
-        "permission": app_settings.default_permission,
-    }
+    keys = {"theme": "dark", "density": "comfortable"}
     persisted = {k: await store.get_setting(k, v) for k, v in keys.items()}
     return {
         "default_auto_run": default_auto_run,
         **persisted,
+        "agent_defaults": app_settings.agent_defaults,
         "timeout_seconds": app_settings.default_run_timeout_seconds,
         "stall_timeout_seconds": app_settings.stall_timeout_seconds,
         "max_retries": app_settings.max_retries,
@@ -318,35 +313,27 @@ async def update_settings(body: SettingsUpdate, request: Request):
     store: Store = request.app.state.store
     from turn.config import settings as app_settings, test_modes_enabled
     from turn.workers.harnesses import reasoning_levels_for
-    effective_harness = body.default_harness or await store.get_setting("default_harness", app_settings.default_executor)
-    if effective_harness not in REAL_HARNESSES and not test_modes_enabled():
-        raise HTTPException(
-            422,
-            f"harness '{effective_harness}' is test-only and is not available in the served app",
-        )
-    effective_model = body.default_model if body.default_model is not None else await store.get_setting("default_model", app_settings.codex_model or "")
-    effective_reasoning = body.reasoning or await store.get_setting("reasoning", app_settings.default_reasoning)
-    supported = reasoning_levels_for(effective_harness, effective_model)
-    if effective_reasoning not in supported:
-        raise HTTPException(
-            422,
-            f"reasoning '{effective_reasoning}' is not supported by {effective_harness} model "
-            f"'{effective_model or 'default'}'; choose one of: {', '.join(supported)}",
-        )
+    if body.agent_defaults is not None:
+        expected_roles = {"planner", "executor", "integrator", "verifier"}
+        if set(body.agent_defaults) != expected_roles:
+            raise HTTPException(422, "agent_defaults must define planner, executor, integrator, and verifier")
+        for role, value in body.agent_defaults.items():
+            required = {"harness", "model", "reasoning", "permission"}
+            if set(value) != required:
+                raise HTTPException(422, f"agent_defaults.{role} must define harness, model, reasoning, and permission")
+            if value["harness"] not in REAL_HARNESSES and not test_modes_enabled():
+                raise HTTPException(422, f"agent_defaults.{role}.harness is not available in the served app")
+            supported = reasoning_levels_for(value["harness"], value["model"] or None)
+            if value["reasoning"] not in supported:
+                raise HTTPException(422, f"agent_defaults.{role}.reasoning is not supported by {value['harness']} model '{value['model'] or 'default'}'")
+        await store.set_setting("agent_defaults", json.dumps(body.agent_defaults, sort_keys=True))
+        app_settings.agent_defaults = body.agent_defaults
     if body.default_auto_run is not None:
         await store.set_setting("default_auto_run", "1" if body.default_auto_run else "0")
-    for key in ("theme", "density", "default_harness", "default_model", "reasoning", "permission"):
+    for key in ("theme", "density"):
         value = getattr(body, key)
         if value is not None:
             await store.set_setting(key, str(value))
-    if body.default_harness is not None:
-        app_settings.default_executor = body.default_harness
-    if body.default_model is not None:
-        app_settings.codex_model = body.default_model or None
-    if body.reasoning is not None:
-        app_settings.default_reasoning = body.reasoning
-    if body.permission is not None:
-        app_settings.default_permission = body.permission
     live_fields = {
         "timeout_seconds": "default_run_timeout_seconds",
         "stall_timeout_seconds": "stall_timeout_seconds",
@@ -364,34 +351,17 @@ async def update_settings(body: SettingsUpdate, request: Request):
 
 
 @router.get("/api/capabilities")
-async def capabilities():
-    from turn.config import settings as app_settings, test_modes_enabled
-    from turn.workers.harnesses import harness_capabilities
-
-    harnesses = await asyncio.to_thread(
-        harness_capabilities,
-        {"codex": app_settings.codex_model or ""},
-        {"codex": app_settings.codex_binary},
-    )
-    if test_modes_enabled():
-        harnesses.append({
-            "id": "echo", "label": "Echo · offline", "binary": "internal",
-            "reasoning": ["default"],
-            "models": [{
-                "id": "deterministic",
-                "label": "Deterministic",
-                "reasoning": ["default"],
-                "source": "internal",
-            }],
-            "supports_sessions": False, "supports_tools": False,
-            "accepts_custom_models": False, "reasoning_profiles": [],
-            "available": True,
-        })
+async def capabilities(request: Request):
+    harnesses = getattr(request.app.state, "capabilities", None)
+    if harnesses is None:
+        raise HTTPException(503, "capabilities are not initialized; start the Turn server runtime")
     return {
         "harnesses": harnesses,
         "agent_types": [
             {"id": "planner", "label": "Planner"},
             {"id": "executor", "label": "Executor"},
+            {"id": "integrator", "label": "Integrator"},
+            {"id": "verifier", "label": "Verifier"},
         ],
         # This describes a registry seam, not selectable/rendered output types
         # in the current MVP. Keep that boundary machine-readable so clients
@@ -454,9 +424,9 @@ async def rename_project(project_id: str, body: RenameProject, request: Request)
     if node is None or node.parent_id is not None:
         raise HTTPException(404, "project not found")
     node.project_name = body.name.strip()
-    # The root card is the project identity; the authored intent remains
-    # untouched in generated_prompt.
-    node.objective = node.project_name
+    # Keep the authored objective and generated prompt intact. The explicit
+    # project_name is the only user override; when it is absent the UI may use
+    # the planner-scoped document title.
     node = await store._save_node(node)
     await request.app.state.events.publish(
         {"type": "node.updated", "project_id": str(node.project_id), "data": _dump(node)}
@@ -543,6 +513,23 @@ async def get_graph(project_id: str, request: Request):
     store: Store = request.app.state.store
     pid = uuid.UUID(project_id)
     return await _serialize_graph(store, pid, request.app.state.runner)
+
+
+@router.get("/api/projects/{project_id}/concept-images/{image_path:path}")
+async def get_concept_image(project_id: str, image_path: str, request: Request):
+    """Serve only planner-declared project-local concept image files."""
+    store: Store = request.app.state.store
+    root = store.project_path(uuid.UUID(project_id))
+    if root is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    candidate = (root / image_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="concept image not found") from error
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="concept image not found")
+    return FileResponse(candidate)
 
 
 @router.get("/api/projects/{project_id}/stream")

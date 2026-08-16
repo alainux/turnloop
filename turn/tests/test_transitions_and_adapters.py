@@ -156,7 +156,7 @@ async def _runtime(tmp_path, worker: Worker):
 def test_plan_contract_rejects_missing_references_and_cycles():
     with pytest.raises(ValidationError, match="unknown dependency key"):
         PlanResult(nodes=[NodeSpec(key="a", objective="a", depends_on=["missing"])])
-    with pytest.raises(ValidationError, match="acyclic"):
+    with pytest.raises(ValidationError, match="cycle"):
         PlanResult(
             nodes=[NodeSpec(key="a", objective="a"), NodeSpec(key="b", objective="b")],
             edges=[
@@ -395,6 +395,33 @@ async def test_runtime_session_survives_run_creation_and_agent_config_save(tmp_p
 
     run = await store.create_run(preserved, "codex")
     assert run.session_id == "session-keep-me"
+    await store.dispose()
+
+
+async def test_reconnect_requires_the_node_session_not_run_history(tmp_path):
+    store = Store(tmp_path / "session-state")
+    await store.init()
+    root = await store.create_project(
+        "node-owned reconnect",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    run = await store.create_run(root, "codex")
+    await store.update_run(run.id, session_id="history-only-session")
+    transport = FakeTerminalTransport()
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=transport,
+    )
+
+    # A run record is history, not an addressable live conversation.  Without
+    # the session stored on this node, reconnect must refuse to guess—even if
+    # another session id happens to be present in the node's run history.
+    assert await runner.reconnect(root.id) is False
+    assert runner._reconnect_tasks == {}
     await store.dispose()
 
 
@@ -889,6 +916,18 @@ def test_planner_treats_subplanners_as_rare_exceptions():
     assert "visible at a glance" in prompt
 
 
+def test_planner_requires_skill_research_and_visual_references_when_relevant():
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a visual interactive game",
+        generated_prompt="Create a coherent playable visual experience.",
+    )
+    prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
+    assert "turn skills show find-skills" in prompt
+    assert "architecture_spec.concept_images" in prompt
+    assert "turn/concepts/" in prompt
+
+
 def test_codex_choked_output_is_not_a_false_success():
     from turn.workers.codex_worker import CodexWorker
 
@@ -1077,14 +1116,13 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
     await store.dispose()
 
 
-async def test_disconnected_terminal_output_is_durable_after_release(tmp_path):
-    store = Store(tmp_path / "terminal-transcript")
+async def test_disconnected_terminal_output_is_not_persisted_after_release(tmp_path):
+    store = Store(tmp_path / "terminal-output")
     await store.init()
     root = await store.create_project("root", repo_path=str(tmp_path / "project"))
     runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
-    # This test exercises raw transcript persistence, not the server-backed
-    # Herdr lifecycle. Keep it on the direct PTY transport so a short-lived
-    # command is observed byte-for-byte without a persistent pane repaint.
+    # The live terminal may contain output while it is attached, but that
+    # output belongs to Herdr's session log, not Turn's graph state.
     runner.terminal = LocalPtyTransport()
 
     await runner.terminal.run(
@@ -1097,13 +1135,10 @@ async def test_disconnected_terminal_output_is_durable_after_release(tmp_path):
         cwd=str(tmp_path),
         timeout=5,
     )
-    await runner._persist_terminal_transcript(root.id, root.id)
     assert runner.terminal.release(root.id)
 
     artifacts = await store.get_artifacts(root.id)
-    transcript = next(a.content for a in artifacts if a.name == "transcript")
-    assert "colored output" in transcript
-    assert "\x1b[32m" in transcript
+    assert all(a.name not in {"transcript", "codex-output"} for a in artifacts)
     await store.dispose()
 
 

@@ -20,7 +20,14 @@ from turn.workers.filesystem import init_project_directory
 
 
 class TurnCore:
-    def __init__(self, settings: Settings = default_settings, *, test_mode: bool = False):
+    def __init__(
+        self,
+        settings: Settings = default_settings,
+        *,
+        test_mode: bool = False,
+        herdr_adapter=None,
+        terminal_transport=None,
+    ):
         self.settings = settings
         self.store = Store(settings.data_dir)
         self.events = EventBus()
@@ -30,6 +37,8 @@ class TurnCore:
             self.events,
             settings,
             get_execution_adapter(settings),
+            herdr_adapter=herdr_adapter,
+            terminal_transport=terminal_transport,
         )
 
     async def __aenter__(self):

@@ -1,6 +1,11 @@
 import { useMemo } from "react";
 import type { Edge, GraphNode, Usage } from "../domain";
-import { primaryNodeAction, tokens } from "../domain";
+import {
+  displayNodeTitle,
+  primaryNodeAction,
+  skillTooltip,
+  tokens,
+} from "../domain";
 import {
   layoutDendrogram,
   NODE_HEIGHT,
@@ -113,12 +118,14 @@ export function Graph({
         const runnable = node.allowed_actions.includes("run");
         const running = node.status === "RUNNING";
         const primaryAction = primaryNodeAction(node);
+        const title = displayNodeTitle(node);
+        const skillRefs = node.agent?.skill_ids ?? [];
         const finalNode = p.depth === finalDepth && finalStageNodeCount === 1;
         return (
           <article
             key={node.id}
             data-node-id={node.id}
-            className={`gnode ${node.ui_state} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
+            className={`gnode ${node.ui_state} ${(runnable || running) ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
             onContextMenu={(event) => {
               event.preventDefault();
               onSelect(node.id);
@@ -133,17 +140,10 @@ export function Graph({
             <button
               className="node-main"
               onClick={() => onSelect(node.id)}
-              aria-label={`${node.objective}, ${nodeStatusLabel(node)}`}
+              aria-label={`${title}, ${nodeStatusLabel(node)}`}
             >
-              <span className="node-glyph">
-                <Icon
-                  name={
-                    node.agent?.type_id === "planner" ? "git-branch" : "bot"
-                  }
-                />
-              </span>
               <span className="node-copy">
-                <strong title={node.objective}>{node.objective}</strong>
+                <strong title={title}>{title}</strong>
                 <small className={node.status === "RUNNING" && node.agent_message?.trim() ? "node-working-message" : undefined}>
                   {nodeStatusLabel(node)}
                 </small>
@@ -155,6 +155,28 @@ export function Graph({
                     : "—"}
                 </small>
               </span>
+              <span className="node-icons" aria-hidden={skillRefs.length === 0 ? true : undefined}>
+                <span className="node-glyph">
+                  <Icon
+                    name={
+                      node.agent?.type_id === "planner"
+                        ? "git-branch"
+                        : node.agent?.type_id === "verifier"
+                          ? "check"
+                          : "bot"
+                    }
+                  />
+                </span>
+                {skillRefs.length > 0 && (
+                  <span
+                    className="node-skill-indicator"
+                    title={skillTooltip(skillRefs)}
+                    aria-label={skillTooltip(skillRefs)}
+                  >
+                    <Icon name="file" />
+                  </span>
+                )}
+              </span>
             </button>
             {(runnable || running) && primaryAction && (
               <button
@@ -162,8 +184,8 @@ export function Graph({
                 onClick={() => onRun(node, running ? "cancel" : "run")}
                 aria-label={
                   running
-                    ? `Stop ${node.objective}`
-                    : `Run ${node.objective}`
+                    ? `Stop ${title}`
+                    : `Run ${title}`
                 }
                 title={
                   running
@@ -181,7 +203,7 @@ export function Graph({
                 onSelect(node.id);
                 onContextMenu(node, rect.right, rect.bottom);
               }}
-              aria-label={`Actions for ${node.objective}`}
+              aria-label={`Actions for ${title}`}
               title="Node actions"
             >
               <Icon name="ellipsis" />

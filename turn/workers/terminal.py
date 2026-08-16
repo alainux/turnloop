@@ -531,7 +531,23 @@ class HerdrPtyTransport(LocalPtyTransport):
         async with self._metadata_lock:
             record = self._projects.get(project_key)
             if isinstance(record, dict) and record.get("workspace_id"):
-                return record
+                workspace_id = record["workspace_id"]
+                try:
+                    await self.adapter.get_workspace(workspace_id)
+                except HerdrResourceNotFound:
+                    # Herdr is authoritative for externally closed spaces.
+                    # Drop only this project's stale mapping before creating a
+                    # new one; never reuse a workspace id from another node or
+                    # project.
+                    for node_id in record.get("panes", {}):
+                        try:
+                            self._node_projects.pop(uuid.UUID(node_id), None)
+                        except (TypeError, ValueError):
+                            pass
+                    self._projects.pop(project_key, None)
+                    await self._save_metadata()
+                else:
+                    return record
 
             created = await self.adapter.create_workspace(
                 cwd=cwd,
@@ -658,6 +674,15 @@ class HerdrPtyTransport(LocalPtyTransport):
             return None
         value = (self._projects.get(project_key, {}).get("panes") or {}).get(str(node_id))
         return value if isinstance(value, str) else None
+
+    async def foreground_process_names(self, node_id: uuid.UUID) -> tuple[str, ...]:
+        pane_id = self.pane_id(node_id)
+        if pane_id is None:
+            return ()
+        reader = getattr(self.adapter, "foreground_process_names", None)
+        if reader is None:
+            return ()
+        return await reader(pane_id)
 
     def _control_command(self, pane_id: str, cols: int = 80, rows: int = 24) -> list[str]:
         return self.adapter.terminal_control_command(
@@ -905,21 +930,37 @@ class HerdrPtyTransport(LocalPtyTransport):
         # partially typed command from the previous attempt. Interrupt that
         # line and accept an empty line before typing the new command so the
         # shell cannot concatenate stale input with the fresh invocation.
+        lines = [b"\x03\r"]
         if environment:
-            assignments = " ".join(
-                f"{key}={shlex.quote(str(value))}"
+            # Keep each export below the PTY's line-buffer limit. A single
+            # `env ... command` line can be truncated by Herdr while it is
+            # being echoed, leaving the shell with a half-written command.
+            lines.extend(
+                (
+                    f"export {key}={shlex.quote(str(value))}\r"
+                ).encode()
                 for key, value in environment.items()
                 if value is not None
             )
-            command = f"env {assignments} {command}"
-        input_bytes = b"\x03\r" + (command + "\r").encode()
-        return await self._send_control(
-            node_id,
-            {
-                "type": "terminal.input",
-                "bytes": base64.b64encode(input_bytes).decode(),
-            },
-        )
+        lines.append((command + "\r").encode())
+        # Herdr's terminal bridge accepts input in bounded PTY-sized chunks.
+        # Send complete short shell lines in order, with a small settling gap
+        # so zsh processes each export before the next line arrives.
+        for line in lines:
+            for offset in range(0, len(line), 256):
+                chunk = line[offset : offset + 256]
+                sent = await self._send_control(
+                    node_id,
+                    {
+                        "type": "terminal.input",
+                        "bytes": base64.b64encode(chunk).decode(),
+                    },
+                )
+                if not sent:
+                    return False
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+        return True
 
     async def write(self, node_id: uuid.UUID, data: str | bytes) -> bool:
         payload = data if isinstance(data, bytes) else data.encode()

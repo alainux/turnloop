@@ -14,6 +14,7 @@ const node = (id: string, parent_id: string | null): GraphNode =>
     repo_path: null,
     executor: "codex",
     agent: null,
+    verification: null,
     status: "COMPLETE",
     paused: false,
     auto_run: false,
@@ -59,5 +60,24 @@ describe("document specification ordering", () => {
     const nodes = [node("root", null), node("narrative", "root"), node("choices", "narrative")];
     expect(orderDocumentNodes(nodes, [], "root").map((item) => item.id)).toEqual(["narrative"]);
     expect(orderDocumentNodes(nodes, [], "narrative").map((item) => item.id)).toEqual(["choices"]);
+  });
+
+  it("projects a verifier below its dependency without changing graph semantics", () => {
+    const nodes = [
+      node("root", null),
+      node("implementation", "root"),
+      node("verification", "root"),
+      node("integrator", "root"),
+    ];
+    nodes[2].agent = { type_id: "verifier" } as NonNullable<GraphNode["agent"]>;
+    const edges = [edge("implementation", "verification"), edge("verification", "integrator")];
+
+    expect(orderDocumentNodes(nodes, edges, "root").map((item) => item.id)).toEqual([
+      "implementation",
+      "integrator",
+    ]);
+    expect(orderDocumentNodes(nodes, edges, "implementation").map((item) => item.id)).toEqual([
+      "verification",
+    ]);
   });
 });

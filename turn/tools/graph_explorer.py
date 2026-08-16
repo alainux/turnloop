@@ -93,6 +93,7 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 session_id=node.agent.session_id if node.agent else None,
                 agent_state=node.agent_state,
                 agent_message=node.agent_message,
+                verification=node.verification,
                 paused=node.paused,
                 auto_run=node.auto_run,
                 run_policy=node.run_policy,
@@ -159,6 +160,9 @@ def _summary(item: dict) -> str:
         line += f"  parent={item['parent_id']}"
     if item.get("depends_on"):
         line += "\n  depends_on: " + ", ".join(item["depends_on"])
+    if item.get("verification"):
+        decision = item["verification"].get("decision", "unknown")
+        line += f"\n  verification: {decision} — {item['verification'].get('summary', '')}"
     line += f"\n  execution: paused={item['paused']}, auto_run={item['auto_run']}"
     if item.get("run_policy"):
         line += "\n  run_policy: " + json.dumps(item["run_policy"], sort_keys=True)

@@ -269,6 +269,20 @@ class HerdrCliAdapter:
             self._raise_command_error(detail, ("pane", "read", pane_id))
         return stdout.decode(errors="replace")
 
+    async def foreground_process_names(self, pane_id: str) -> tuple[str, ...]:
+        result = self._result(await self._run("pane", "process-info", "--pane", pane_id))
+        info = result.get("process_info")
+        processes = info.get("foreground_processes") if isinstance(info, dict) else None
+        if not isinstance(processes, list):
+            return ()
+        names: list[str] = []
+        for process in processes:
+            if isinstance(process, dict):
+                name = process.get("name") or process.get("argv0")
+                if isinstance(name, str) and name:
+                    names.append(name.rsplit("/", 1)[-1])
+        return tuple(dict.fromkeys(names))
+
     def terminal_control_command(
         self, pane_id: str, *, cols: int = 80, rows: int = 24
     ) -> list[str]:

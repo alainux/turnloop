@@ -80,7 +80,7 @@ class NodeAction(str, Enum):
 
 
 class EdgeType(str, Enum):
-    """The only two relationships in a WorkGraph."""
+    """Graph relationships used for hierarchy and workflow ordering."""
 
     CONTAINS = "CONTAINS"      # decomposition / visual hierarchy / inherited context
     DEPENDS_ON = "DEPENDS_ON"  # genuine left-to-right stage / integration join
@@ -157,6 +157,22 @@ class AgentType(str, Enum):
     PLANNER = "planner"
     EXECUTOR = "executor"
     INTEGRATOR = "integrator"
+    VERIFIER = "verifier"
+
+
+class VerificationDecision(str, Enum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+
+
+class VerificationResult(BaseModel):
+    """Evidence-backed decision emitted by a verifier through the CLI."""
+
+    decision: VerificationDecision
+    summary: str = Field(min_length=1)
+    findings: list[str] = Field(default_factory=list)
+    required_changes: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
@@ -164,11 +180,35 @@ def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
     key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
     root = Path(__file__).resolve().parent.parent / "agents" / "skills"
     paths = {
-        AgentType.PLANNER.value: [root / "planner" / "turn-planning.md"],
-        AgentType.EXECUTOR.value: [root / "executor" / "turn-executing.md"],
-        AgentType.INTEGRATOR.value: [root / "integrator" / "turn-integrating.md"],
+        AgentType.PLANNER.value: [
+            root / "planner" / "turn-planning.md",
+            root / "planner" / "imagegen.md",
+            root / "planner" / "find-skills.md",
+        ],
+        AgentType.EXECUTOR.value: [
+            root / "executor" / "turn-executing.md",
+        ],
+        AgentType.INTEGRATOR.value: [
+            root / "integrator" / "turn-integrating.md",
+        ],
+        AgentType.VERIFIER.value: [
+            root / "verifier" / "turn-verifying.md",
+        ],
     }
     return [str(path) for path in paths.get(key, [])]
+
+
+def skill_ids_for_agent_type(agent_type: AgentType | str) -> list[str]:
+    """Stable library ids assigned to every built-in agent specialization."""
+    key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
+    return {
+        AgentType.PLANNER.value: [
+            "turn-planning", "imagegen", "find-skills"
+        ],
+        AgentType.EXECUTOR.value: ["turn-executing"],
+        AgentType.INTEGRATOR.value: ["turn-integrating"],
+        AgentType.VERIFIER.value: ["turn-verifying"],
+    }.get(key, [])
 
 
 class Agent(BaseModel):
@@ -187,15 +227,26 @@ class Agent(BaseModel):
     model: Optional[str] = None
     reasoning: ReasoningLevel = ReasoningLevel.DEFAULT
     permission: PermissionMode = PermissionMode.WORKSPACE
+    # ``skills`` is the materialized filesystem view used by harness adapters.
+    # ``skill_ids`` is the stable graph/library contract and is project-scoped
+    # into the project's turn/skills directory before a harness is launched.
     skills: list[str] = Field(default_factory=list)
+    skill_ids: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
     mcp_servers: list[str] = Field(default_factory=list)
     session_id: Optional[str] = None
 
     @model_validator(mode="after")
     def attach_type_skills(self) -> "Agent":
+        from turn.skills.library import validate_skill_reference
+
         required = skill_paths_for_agent_type(self.type_id)
+        required_ids = skill_ids_for_agent_type(self.type_id)
         object.__setattr__(self, "skills", list(dict.fromkeys([*required, *self.skills])))
+        references = list(dict.fromkeys([*required_ids, *self.skill_ids]))
+        for reference in references:
+            validate_skill_reference(reference)
+        object.__setattr__(self, "skill_ids", references)
         return self
 
     def as_type(self, agent_type: AgentType | str) -> "Agent":
@@ -207,18 +258,24 @@ class Agent(BaseModel):
             for path in skill_paths_for_agent_type(kind)
         }
         custom_skills = [skill for skill in self.skills if skill not in built_in]
-        agent_model = (
-            Planner
-            if target is AgentType.PLANNER
-            else Integrator
-            if target is AgentType.INTEGRATOR
-            else Executor
-        )
+        built_in_ids = {
+            skill_id
+            for kind in AgentType
+            for skill_id in skill_ids_for_agent_type(kind)
+        }
+        custom_skill_ids = [skill_id for skill_id in self.skill_ids if skill_id not in built_in_ids]
+        agent_model = {
+            AgentType.PLANNER: Planner,
+            AgentType.INTEGRATOR: Integrator,
+            AgentType.VERIFIER: Verifier,
+            AgentType.EXECUTOR: Executor,
+        }[target]
         return agent_model.model_validate(
             {
                 **self.model_dump(mode="python"),
                 "type_id": target,
                 "skills": [*skill_paths_for_agent_type(target), *custom_skills],
+                "skill_ids": [*skill_ids_for_agent_type(target), *custom_skill_ids],
             }
         )
 
@@ -243,6 +300,12 @@ class Integrator(Agent):
     """Specialized agent type carrying the turn-integrating skill."""
 
     type_id: AgentType = AgentType.INTEGRATOR
+
+
+class Verifier(Agent):
+    """Specialized agent that approves or rejects a predecessor's work."""
+
+    type_id: AgentType = AgentType.VERIFIER
 
 
 class RunPolicy(BaseModel):
@@ -298,7 +361,10 @@ class ArchitectureDecision(BaseModel):
     title: str
     decision: str
     rationale: str
-    consequences: list[str] = Field(default_factory=list)
+    # This is explanatory prose, not another structured worklist. Keeping it
+    # as one optional text field prevents planners from having to manufacture
+    # an array for a single sentence.
+    consequences: str = ""
 
 
 class ArchitectureRisk(BaseModel):
@@ -338,7 +404,7 @@ class ArchitectureDiagram(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    title: str
+    title: str = "Diagram"
     description: Optional[str] = None
     direction: Literal["LR", "TB"] = "LR"
     nodes: list[ArchitectureDiagramNode] = Field(default_factory=list)
@@ -369,6 +435,18 @@ class ArchitectureSection(BaseModel):
     subsections: list["ArchitectureSection"] = Field(default_factory=list)
 
 
+class ArchitectureConceptImage(BaseModel):
+    """A planner-selected visual reference stored in or linked from the project."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title: str
+    source: str
+    alt: str
+    caption: Optional[str] = None
+
+
 class ArchitectureSpec(BaseModel):
     """The planner-authored architectural contract for a project or branch.
 
@@ -385,6 +463,13 @@ class ArchitectureSpec(BaseModel):
     executive_summary: str = Field(min_length=1)
     approach: Optional[str] = None
     strategy: Optional[str] = None
+    # A concise, repo-relative tree gives every worker the same composition
+    # boundary without pretending that the architecture document is a second
+    # filesystem handoff.
+    filesystem_structure: Optional[str] = None
+    # URLs consulted during planning. Keeping these in graph metadata makes
+    # research inspectable by the user and by every downstream worker.
+    research_sources: list[str] = Field(default_factory=list)
     architecture_principles: list[str] = Field(default_factory=list)
     requirements: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
@@ -393,6 +478,7 @@ class ArchitectureSpec(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     sections: list[ArchitectureSection] = Field(default_factory=list)
     diagrams: list[ArchitectureDiagram] = Field(default_factory=list)
+    concept_images: list[ArchitectureConceptImage] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_document_references(self) -> "ArchitectureSpec":
@@ -441,6 +527,7 @@ class Node(BaseModel):
 
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
     agent: Optional[Agent] = None
+    verification: Optional[VerificationResult] = None
     status: NodeStatus = NodeStatus.PENDING
     paused: bool = False
     # Project-level execution mode: True = auto-run ready nodes (default);
@@ -600,9 +687,15 @@ class NodeSpec(BaseModel):
     agent_type: Optional[AgentType] = None
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
+    # Local library ids or HTTP(S) URLs requested for this worker; the server
+    # materializes them into the current project's turn/skills scope.
+    skills: list[str] = Field(default_factory=list)
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
+    # Workflow sequencing is deliberately independent from containment. A
+    # verifier is a normal sibling in the graph and names the work it checks
+    # only through this ordinary prerequisite relation.
     depends_on: list[str] = Field(default_factory=list)  # prior left-to-right stage keys
     # When True (or executor == "planner") the created node is itself a
     # sub-planner: the runner will decompose it again on its next turn instead
@@ -646,20 +739,41 @@ class PlanResult(BaseModel):
         if len(keys) != len(known):
             raise ValueError("plan node keys must be unique")
 
+        containment: dict[str, set[str]] = {key: set() for key in keys}
+        dependencies: dict[str, set[str]] = {key: set() for key in keys}
         adjacency: dict[str, set[str]] = {key: set() for key in keys}
         for node in self.nodes:
+            if node.skills:
+                from turn.skills.library import validate_skill_reference
+
+                for reference in node.skills:
+                    validate_skill_reference(reference)
             if node.parent_key:
                 if node.parent_key not in known:
                     raise ValueError(f"unknown parent key: {node.parent_key}")
                 if node.parent_key == node.key:
                     raise ValueError(f"node {node.key} cannot contain itself")
+                containment[node.parent_key].add(node.key)
                 adjacency[node.parent_key].add(node.key)
             for dependency in node.depends_on:
                 if dependency not in known:
                     raise ValueError(f"unknown dependency key: {dependency}")
                 if dependency == node.key:
                     raise ValueError(f"node {node.key} cannot depend on itself")
+                dependencies[dependency].add(node.key)
                 adjacency[dependency].add(node.key)
+            requested_type = node.agent_type or (
+                node.agent.type_id if node.agent is not None else None
+            )
+            if requested_type is AgentType.VERIFIER:
+                if node.parent_key:
+                    raise ValueError(
+                        f"verifier node {node.key} must use depends_on, not parent_key"
+                    )
+                if len(node.depends_on) != 1:
+                    raise ValueError(
+                        f"verifier node {node.key} must depend on exactly one target"
+                    )
 
         for edge in self.edges:
             if edge.src not in known or edge.dst not in known:
@@ -669,22 +783,49 @@ class PlanResult(BaseModel):
                 raise ValueError(f"node {edge.src} cannot link to itself")
             adjacency[edge.src].add(edge.dst)
 
-        visiting: set[str] = set()
-        visited: set[str] = set()
+        def cycle_path(graph: dict[str, set[str]]) -> list[str] | None:
+            visiting: list[str] = []
+            active = set()
+            visited: set[str] = set()
 
-        def visit(key: str) -> None:
-            if key in visiting:
-                raise ValueError("plan graph must be acyclic")
-            if key in visited:
-                return
-            visiting.add(key)
-            for child in adjacency[key]:
-                visit(child)
-            visiting.remove(key)
-            visited.add(key)
+            def visit(key: str) -> list[str] | None:
+                if key in active:
+                    return [*visiting[visiting.index(key):], key]
+                if key in visited:
+                    return None
+                active.add(key)
+                visiting.append(key)
+                for child in sorted(graph[key]):
+                    found = visit(child)
+                    if found:
+                        return found
+                visiting.pop()
+                active.remove(key)
+                visited.add(key)
+                return None
 
-        for key in keys:
-            visit(key)
+            for key in keys:
+                found = visit(key)
+                if found:
+                    return found
+            return None
+
+        containment_cycle = cycle_path(containment)
+        if containment_cycle:
+            raise ValueError(
+                "containment cycle: " + " -> ".join(containment_cycle)
+            )
+        dependency_cycle = cycle_path(dependencies)
+        if dependency_cycle:
+            raise ValueError(
+                "dependency cycle: " + " -> ".join(dependency_cycle)
+            )
+        combined_cycle = cycle_path(adjacency)
+        if combined_cycle:
+            raise ValueError(
+                "graph cycle across containment/dependency edges: "
+                + " -> ".join(combined_cycle)
+            )
         return self
 
 
@@ -724,3 +865,4 @@ class WorkerResult(BaseModel):
     executor_notes: Optional[str] = None
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
+    verification: Optional[VerificationResult] = None

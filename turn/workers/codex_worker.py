@@ -10,6 +10,7 @@ from pathlib import Path
 from turn.config import settings
 from turn.contracts.dag import parse_result
 from turn.domain.schemas import (
+    AgentType,
     ArchitectureSpec,
     ArtifactKind,
     ArtifactSpec,
@@ -22,11 +23,13 @@ from turn.domain.schemas import (
     PlanResult,
     PermissionMode,
     ReasoningLevel,
+    VerificationResult,
     WorkerResult,
 )
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers.interactive import (
     agent_environment,
+    format_verification_result,
     prepare_result_file,
     read_result_file,
     result_handoff,
@@ -58,10 +61,17 @@ class CodexWorker(Worker):
         transport = ctx.terminal or LocalPtyTransport()
         native = isinstance(transport, LocalPtyTransport)
         agent = ctx.node.agent
-        result_path = prepare_result_file(cwd, ctx.node.id, "result")
-        environment = agent_environment(cwd, ctx.node.id, "result", result_path, agent)
+        verification = bool(agent and agent.type_id is AgentType.VERIFIER)
+        protocol_kind = "verification" if verification else "result"
+        result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
+        environment = agent_environment(cwd, ctx.node.id, protocol_kind, result_path, agent)
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
-        prompt = self._build_prompt(ctx, cwd=cwd, result_path=result_path)
+        prompt = self._build_prompt(
+            ctx,
+            cwd=cwd,
+            result_path=result_path,
+            verification=verification,
+        )
 
         permission = agent.permission if agent else PermissionMode.WORKSPACE
         configured_bypass = any("bypass" in a for a in self.s.codex_args)
@@ -114,14 +124,16 @@ class CodexWorker(Worker):
             # Continue the same conversation when the runner resumes a node.
             # Resume has a deliberately smaller flag surface than a fresh exec.
             resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else permission_flags
+            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
-                *resume_permissions, "-C", cwd, session_id, prompt,
+                *resume_permissions, "-C", cwd, session_id, prompt_arg,
             ]
         else:
+            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags, *permission_flags,
-                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt,
+                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt_arg,
             ]
 
         structured_text = ""
@@ -138,7 +150,27 @@ class CodexWorker(Worker):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    session_marker=str(ctx.node.id),
+                    harness_name=self.s.codex_binary,
                     initial_input=prompt,
+                    environment=environment,
+                )
+            elif getattr(transport, "supports_inject", False):
+                terminal = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    session_marker=str(ctx.node.id),
+                    harness_name=self.s.codex_binary,
+                    initial_input=prompt,
+                    initial_input_mode="stdin" if not native else "native",
                     environment=environment,
                 )
             else:
@@ -160,11 +192,6 @@ class CodexWorker(Worker):
                     error="detached idle terminal",
                     retry_recommended=False,
                     session_id=discovered_session,
-                    artifacts=[ArtifactSpec(
-                        kind=ArtifactKind.TEXT,
-                        name="transcript",
-                        content=terminal.display_output.decode(errors="replace"),
-                    )],
                 )
             if terminal.stalled:
                 return WorkerResult(
@@ -172,7 +199,6 @@ class CodexWorker(Worker):
                     summary=f"Codex stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                     error="stalled terminal output",
                     retry_recommended=False,
-                    artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace"))],
                 )
             submitted = read_result_file(result_path)
             if submitted is not None:
@@ -202,24 +228,48 @@ class CodexWorker(Worker):
                 except OSError:
                     pass
 
+        if verification:
+            if not structured_text:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary="Codex verifier stopped without a Turn decision",
+                    error="missing verification submission",
+                    retry_recommended=False,
+                    session_id=discovered_session or session_id,
+                )
+            try:
+                decision = VerificationResult.model_validate(json.loads(structured_text))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary="Codex verifier returned an invalid verification",
+                    error=str(error),
+                    retry_recommended=False,
+                    session_id=discovered_session or session_id,
+                )
+            return WorkerResult(
+                outcome=Outcome.COMPLETE,
+                summary=decision.summary,
+                verification=decision,
+                session_id=discovered_session or session_id,
+                artifacts=[ArtifactSpec(
+                    kind=ArtifactKind.TEXT,
+                    name="verification-result",
+                    content=format_verification_result(decision),
+                )],
+            )
+
         text = structured_text
         result = self._parse_result(text)
         result.session_id = discovered_session or session_id
-        # Preserve the unaltered PTY stream as a durable artifact after the
-        # live terminal transport has closed.
-        transcript = (
-            terminal.output.decode(errors="replace")
-            if native
-            else terminal.display_output.decode(errors="replace")
+        result.artifacts.insert(
+            0,
+            ArtifactSpec(
+                kind=ArtifactKind.JSON,
+                name="result-submission",
+                content=json.loads(text),
+            ),
         )
-        if transcript.strip():
-            result.artifacts.append(
-                ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=transcript)
-            )
-        else:
-            result.artifacts.append(
-                ArtifactSpec(kind=ArtifactKind.TEXT, name="codex-output", content=text[:8000])
-            )
         return result
 
     # -- prompt ----------------------------------------------------------
@@ -229,6 +279,7 @@ class CodexWorker(Worker):
         ctx: NodeExecutionContext,
         cwd=None,
         result_path: Path | None = None,
+        verification: bool = False,
     ) -> str:
         gp = ctx.node.generated_prompt or "Complete the objective above using the available tools."
         # The prompt and worker both point at the same assigned project path.
@@ -261,7 +312,11 @@ must supply — something no automated step or your own tools can produce. If yo
 can proceed using the objective, the provided context, and your tools, do so
 and return "COMPLETE".
 """
-        return f"{prompt}\n\n{result_handoff()}" if result_path else prompt
+        return (
+            f"{prompt}\n\n{result_handoff(verification=verification)}"
+            if result_path
+            else prompt
+        )
 
     # -- parsing ---------------------------------------------------------
 

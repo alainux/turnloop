@@ -10,6 +10,7 @@ from turn.__main__ import discover_project_state
 from turn.config import Settings
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, RunPolicy
+from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 
 
 def test_cli_exposes_headless_commands_and_policy_flags():
@@ -46,7 +47,12 @@ async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
     cfg.planner = "heuristic"
     cfg.default_executor = "echo"
     cfg.runner_tick_seconds = 0.001
-    async with TurnCore(cfg, test_mode=True) as core:
+    async with TurnCore(
+        cfg,
+        test_mode=True,
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=FakeTerminalTransport(),
+    ) as core:
         project = await core.create_project(
             "Create a compact deterministic demo",
             agent=AgentConfig(harness=HarnessKind.ECHO),

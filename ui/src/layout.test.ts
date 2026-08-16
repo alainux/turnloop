@@ -19,6 +19,7 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   repo_path: null,
   executor: null,
   agent: null,
+  verification: null,
   status: "RUNNABLE",
   run_policy: null,
   ui_state: "ready",
@@ -83,8 +84,54 @@ describe("dendrogram", () => {
     expect(layout.positions.get("prerequisite")!.x).toBeLessThan(
       layout.positions.get("dependent")!.x,
     );
-    expect(layout.positions.get("prerequisite")!.y).toBeLessThan(
+    expect(layout.positions.get("prerequisite")!.y).toBe(
       layout.positions.get("dependent")!.y,
+    );
+  });
+
+  it("keeps a verifier after its executor when dependency relations are duplicated", () => {
+    const nodes = [
+      node("root", null),
+      node("executor", "root"),
+      node("verifier", "root"),
+    ];
+    const edges: Edge[] = [
+      ["root", "executor"],
+      ["root", "verifier"],
+    ].map(([src, dst]) => ({
+      id: `contains-${src}-${dst}`,
+      src,
+      dst,
+      type: "CONTAINS" as const,
+      created_at: "",
+    }));
+    edges.push(
+      {
+        id: "executor-verifier-dependency",
+        src: "executor",
+        dst: "verifier",
+        type: "DEPENDS_ON",
+        created_at: "",
+      },
+      {
+        id: "executor-verifier-dependency-duplicate",
+        src: "executor",
+        dst: "verifier",
+        type: "DEPENDS_ON",
+        created_at: "",
+      },
+    );
+
+    const shown = displayEdges(nodes, edges);
+    expect(
+      shown.filter((edge) => edge.type === "DEPENDS_ON").map((edge) => `${edge.src}->${edge.dst}`),
+    ).toEqual(["executor->verifier"]);
+    const layout = layoutDendrogram(nodes, edges);
+    expect(layout.positions.get("verifier")!.depth).toBeGreaterThan(
+      layout.positions.get("executor")!.depth,
+    );
+    expect(layout.positions.get("verifier")!.y).toBe(
+      layout.positions.get("executor")!.y,
     );
   });
 

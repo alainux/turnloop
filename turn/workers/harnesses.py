@@ -28,9 +28,10 @@ from turn.domain.schemas import (
     InputSpec,
     Outcome,
     Usage,
+    AgentType,
     WorkerResult,
 )
-from turn.contracts.dag import parse_result
+from turn.contracts.dag import parse_result, parse_verification
 from turn.config import settings
 from turn.workers import parsing
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
@@ -45,6 +46,7 @@ from turn.workers.interactive import (
     opencode_session_ids,
     prepare_result_file,
     read_result_file,
+    format_verification_result,
     result_handoff,
     run_until_result,
 )
@@ -276,6 +278,7 @@ def harness_capabilities(
     return results
 def _structured_prompt(ctx: NodeExecutionContext, result_path: Path) -> str:
     task = ctx.node.generated_prompt or "Complete the objective using the available tools."
+    verification = bool(ctx.node.agent and ctx.node.agent.type_id is AgentType.VERIFIER)
     prompt = f"""{render_context_block(ctx)}
 OBJECTIVE:
 {ctx.node.objective}
@@ -285,8 +288,10 @@ TASK:
 
 Use BLOCK only for genuinely external human input. Continue the existing
 session when a node is rerun; preserve prior context and files.
-"""
-    return f"{prompt}\n\n{result_handoff()}"
+    """
+    if verification:
+        prompt += "\n\nVERIFICATION TARGET: this verifier runs after its single dependency. Use `turn graph` to inspect that prerequisite node, its files, and its run history before deciding."
+    return f"{prompt}\n\n{result_handoff(verification=verification)}"
 
 
 def _json_text_and_session(raw: str) -> tuple[str, str | None, Usage]:
@@ -370,9 +375,16 @@ class CLIHarnessWorker(Worker):
         *,
         resume: bool = False,
         native: bool = False,
+        prompt_via_stdin: bool = False,
     ) -> list[str]:
         return self.commands.worker_command(
-            self.harness, agent, prompt, cwd, resume=resume, native=native
+            self.harness,
+            agent,
+            prompt,
+            cwd,
+            resume=resume,
+            native=native,
+            prompt_via_stdin=prompt_via_stdin,
         )
 
     async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
@@ -406,8 +418,10 @@ class CLIHarnessWorker(Worker):
             # supplied by a later reconnect implementation.
             if self.harness == HarnessKind.PI and not agent.session_id:
                 agent.session_id = str(uuid.uuid4())
-        result_path = prepare_result_file(cwd, ctx.node.id, "result")
-        environment = agent_environment(cwd, ctx.node.id, "result", result_path, agent)
+        verification = bool(agent.type_id is AgentType.VERIFIER)
+        protocol_kind = "verification" if verification else "result"
+        result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
+        environment = agent_environment(cwd, ctx.node.id, protocol_kind, result_path, agent)
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         resume = had_session
         if not agent.session_id and self.harness == HarnessKind.CLAUDE:
@@ -451,7 +465,12 @@ class CLIHarnessWorker(Worker):
 
         prompt = _structured_prompt(ctx, result_path)
         cmd = self._command(
-            agent, prompt, cwd, resume=resume, native=native
+            agent,
+            prompt,
+            cwd,
+            resume=resume,
+            native=native,
+            prompt_via_stdin=bool(getattr(transport, "supports_inject", False)),
         )
         try:
             if native:
@@ -467,7 +486,28 @@ class CLIHarnessWorker(Worker):
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
                     session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
+                    session_marker=str(ctx.node.id),
+                    harness_name=binary,
                     initial_input=prompt,
+                    environment=environment,
+                )
+            elif getattr(transport, "supports_inject", False):
+                terminal = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    cmd,
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=stream_live,
+                    timeout=ctx.timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
+                    session_marker=str(ctx.node.id),
+                    harness_name=binary,
+                    initial_input=prompt,
+                    initial_input_mode="stdin",
                     environment=environment,
                 )
             else:
@@ -495,11 +535,6 @@ class CLIHarnessWorker(Worker):
                 error="detached idle terminal",
                 retry_recommended=False,
                 session_id=observed_session or agent.session_id,
-                artifacts=[ArtifactSpec(
-                    kind=ArtifactKind.TEXT,
-                    name="transcript",
-                    content=terminal.display_output.decode(errors="replace") or raw_out,
-                )],
             )
         if terminal.stalled:
             return WorkerResult(
@@ -507,11 +542,38 @@ class CLIHarnessWorker(Worker):
                 summary=f"{self.name} stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                 error="stalled terminal output",
                 retry_recommended=False,
-                artifacts=[ArtifactSpec(kind=ArtifactKind.TEXT, name="transcript", content=terminal.display_output.decode(errors="replace") or raw_out)],
             )
         submitted = read_result_file(result_path)
-        text = json.dumps(submitted) if submitted is not None else ""
         session = observed_session or agent.session_id
+        if verification:
+            if submitted is None:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary=f"{self.name} verifier stopped without a Turn decision",
+                    error="missing verification submission",
+                    session_id=session or agent.session_id,
+                )
+            try:
+                decision = parse_verification(submitted)
+            except (TypeError, ValueError) as error:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary=f"{self.name} returned an invalid verification",
+                    error=str(error),
+                    session_id=session or agent.session_id,
+                )
+            return WorkerResult(
+                outcome=Outcome.COMPLETE,
+                summary=decision.summary,
+                verification=decision,
+                session_id=session or agent.session_id,
+                artifacts=[ArtifactSpec(
+                    kind=ArtifactKind.TEXT,
+                    name="verification-result",
+                    content=format_verification_result(decision),
+                )],
+            )
+        text = json.dumps(submitted) if submitted is not None else ""
         usage = Usage()
         data = parsing.first_result_json(text) or {}
         if terminal.returncode != 0 and not data:
@@ -531,13 +593,6 @@ class CLIHarnessWorker(Worker):
                 retry_recommended=False,
                 session_id=session or agent.session_id,
                 usage=usage,
-                artifacts=[
-                    ArtifactSpec(
-                        kind=ArtifactKind.TEXT,
-                        name="transcript",
-                        content=raw_out,
-                    )
-                ],
             )
         try:
             result = parse_result(data)
@@ -553,16 +608,12 @@ class CLIHarnessWorker(Worker):
         result.summary = parsing.clean_summary(result.summary)
         result.session_id = session or agent.session_id
         result.usage = usage
-        display_out = (
-            terminal.output.decode(errors="replace")
-            if native
-            else terminal.display_output.decode(errors="replace")
-        )
-        result.artifacts.append(
+        result.artifacts.insert(
+            0,
             ArtifactSpec(
-                kind=ArtifactKind.TEXT,
-                name="transcript",
-                content=display_out or text,
-            )
+                kind=ArtifactKind.JSON,
+                name="result-submission",
+                content=data,
+            ),
         )
         return result

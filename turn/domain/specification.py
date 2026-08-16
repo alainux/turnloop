@@ -10,6 +10,17 @@ def architecture_spec_text(spec: ArchitectureSpec) -> str:
     for title, value in (("Approach", spec.approach), ("Strategy", spec.strategy)):
         if value:
             lines.extend(["", f"## {title}", value])
+    if spec.filesystem_structure:
+        lines.extend([
+            "",
+            "## Project filesystem structure",
+            "```text",
+            spec.filesystem_structure.strip(),
+            "```",
+        ])
+    if spec.research_sources:
+        lines.extend(["", "## Research sources"])
+        lines.extend(f"- {source}" for source in spec.research_sources)
     _bullets(lines, "Architecture principles", spec.architecture_principles)
     _bullets(lines, "Requirements", spec.requirements)
     _bullets(lines, "Constraints", spec.constraints)

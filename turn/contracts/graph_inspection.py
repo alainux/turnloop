@@ -17,6 +17,7 @@ from turn.domain.schemas import (
     Outcome,
     RunPolicy,
     RunStatus,
+    VerificationResult,
 )
 
 
@@ -65,6 +66,7 @@ class GraphInspectionNode(BaseModel):
     session_id: Optional[str] = None
     agent_state: Optional[str] = None
     agent_message: Optional[str] = None
+    verification: Optional[VerificationResult] = None
     paused: bool = False
     auto_run: bool = True
     run_policy: Optional[RunPolicy] = None
@@ -83,7 +85,7 @@ class GraphInspection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 2
+    schema_version: int = 4
     project_id: uuid.UUID
     nodes: list[GraphInspectionNode] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

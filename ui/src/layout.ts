@@ -85,12 +85,20 @@ export function displayEdges(nodes: GraphNode[], edges: Edge[]): Edge[] {
             ...edge,
             id: `${edge.id}:terminal:${source}`,
             src: source,
-          },
+        },
     ),
   );
-  const reducedDependencies = expandedDependencies.filter(
+  // Older state files may contain the same dependency twice. Collapse
+  // duplicate workflow edges before transitive reduction; otherwise each
+  // duplicate looks like an alternative path and both get removed.
+  const uniqueDependencies = [
+    ...new Map(
+      expandedDependencies.map((edge) => [`${edge.src}:${edge.dst}`, edge]),
+    ).values(),
+  ];
+  const reducedDependencies = uniqueDependencies.filter(
     (edge) =>
-      !hasAlternativePath(edge.src, edge.dst, expandedDependencies, edge.id),
+      !hasAlternativePath(edge.src, edge.dst, uniqueDependencies, edge.id),
   );
   const dependencyTargets = new Set(
     reducedDependencies.map((edge) => edge.dst),
@@ -255,6 +263,76 @@ export function layoutDendrogram(nodes: GraphNode[], edges: Edge[] = []): Layout
   nodes.forEach((node) => {
     if (!positions.has(node.id)) place(node.id);
   });
+
+  // Keep every stage on one visual center line. The recursive placement above
+  // is still responsible for meaningful branch spacing, but independently
+  // sized stages otherwise make a single final node drift into a zig-zag.
+  // Aligning stage bounds preserves branch structure while making the
+  // left-to-right sequence readable at a glance.
+  if (positions.size > 0) {
+    const stageBounds = new Map<number, { min: number; max: number }>();
+    let graphMin = Number.POSITIVE_INFINITY;
+    let graphMax = Number.NEGATIVE_INFINITY;
+    positions.forEach((position) => {
+      graphMin = Math.min(graphMin, position.y);
+      graphMax = Math.max(graphMax, position.y);
+      const bounds = stageBounds.get(position.depth);
+      if (bounds) {
+        bounds.min = Math.min(bounds.min, position.y);
+        bounds.max = Math.max(bounds.max, position.y);
+      } else {
+        stageBounds.set(position.depth, { min: position.y, max: position.y });
+      }
+    });
+    const graphCenter = (graphMin + graphMax + NODE_HEIGHT) / 2;
+    positions.forEach((position) => {
+      const bounds = stageBounds.get(position.depth)!;
+      const stageCenter = (bounds.min + bounds.max + NODE_HEIGHT) / 2;
+      position.y += graphCenter - stageCenter;
+    });
+  }
+
+  // A one-to-one implementation → verification sequence is one visual row.
+  // Verification remains a later stage and an ordinary dependency, but
+  // aligning the pair prevents the graph from becoming a ladder when several
+  // independent branches each have their own verifier.
+  const incomingDependencies = new Map<string, string[]>();
+  const outgoingDependencies = new Map<string, string[]>();
+  visibleEdges.forEach((edge) => {
+    if (edge.type !== "DEPENDS_ON") return;
+    incomingDependencies.set(edge.dst, [
+      ...(incomingDependencies.get(edge.dst) ?? []),
+      edge.src,
+    ]);
+    outgoingDependencies.set(edge.src, [
+      ...(outgoingDependencies.get(edge.src) ?? []),
+      edge.dst,
+    ]);
+  });
+  const occupied = new Map<number, number[]>();
+  positions.forEach((position) => {
+    occupied.set(position.depth, [
+      ...(occupied.get(position.depth) ?? []),
+      position.y,
+    ]);
+  });
+  for (const node of nodes) {
+    if (node.agent?.type_id !== "verifier") continue;
+    const sources = incomingDependencies.get(node.id) ?? [];
+    if (sources.length !== 1) continue;
+    const source = byId.get(sources[0]);
+    const sourceDependents = outgoingDependencies.get(sources[0]) ?? [];
+    const sourcePosition = positions.get(sources[0]);
+    const targetPosition = positions.get(node.id);
+    if (!source || sourceDependents.length !== 1 || !sourcePosition || !targetPosition) continue;
+    const peers = (occupied.get(targetPosition.depth) ?? []).filter(
+      (y) => Math.abs(y - sourcePosition.y) > 1,
+    );
+    if (peers.some((y) => Math.abs(y - sourcePosition.y) < NODE_HEIGHT + 18)) continue;
+    targetPosition.y = sourcePosition.y;
+    occupied.set(targetPosition.depth, [...peers, targetPosition.y]);
+  }
+
   let width = NODE_WIDTH,
     height = NODE_HEIGHT,
     maxDepth = 0;
@@ -269,7 +347,7 @@ export function layoutDendrogram(nodes: GraphNode[], edges: Edge[] = []): Layout
 export function pathBetween(
   a: Position,
   b: Position,
-  _type: "CONTAINS" | "DEPENDS_ON" = "CONTAINS",
+  _type: Edge["type"] = "CONTAINS",
 ): string {
   const ax = a.x + GRAPH_PADDING,
     ay = a.y + GRAPH_PADDING,

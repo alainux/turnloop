@@ -64,6 +64,15 @@ def parser() -> argparse.ArgumentParser:
     payload = submit.add_mutually_exclusive_group(required=True)
     payload.add_argument("--payload", help="JSON object supplied to the Turn protocol")
     payload.add_argument("--stdin", action="store_true", help="read the JSON object from stdin")
+    verify = agent_sub.add_parser("verify", help="approve or reject the predecessor's work")
+    verification_payload = verify.add_mutually_exclusive_group(required=True)
+    verification_payload.add_argument("--payload", help="verification JSON object")
+    verification_payload.add_argument("--stdin", action="store_true", help="read verification JSON from stdin")
+    skills = sub.add_parser("skills", help="inspect the project-scoped skill library")
+    skills_sub = skills.add_subparsers(dest="skills_command", required=True)
+    skills_sub.add_parser("list", help="list available skill ids")
+    show_skill = skills_sub.add_parser("show", help="print one skill")
+    show_skill.add_argument("skill_id")
     sub.add_parser("doctor", help="show available coding harnesses")
     return root
 
@@ -128,23 +137,24 @@ def agent_command(args) -> int:
             "message": args.message,
         })
         return 0
+    kind = "verification" if args.agent_command == "verify" else args.kind
     value = _read_agent_object(args)
     try:
-        validate_agent_submission(args.kind, value)
+        validate_agent_submission(kind, value)
     except (TypeError, ValueError) as error:
         detail = (
             compact_validation_error(error)
             if isinstance(error, ValidationError)
             else str(error)
         )
-        raise SystemExit(f"invalid {args.kind} submission: {detail}") from error
-    target = _agent_protocol_path(args.kind)
+        raise SystemExit(f"invalid {kind} submission: {detail}") from error
+    target = _agent_protocol_path(kind)
     _write_agent_json(target, value)
     status_path = os.getenv("TURN_STATUS_FILE")
     if status_path:
         _write_agent_json(Path(status_path), {
             "node_id": os.getenv("TURN_NODE_ID"),
-            "state": "complete" if args.kind == "result" else "working",
+            "state": "complete" if kind in {"result", "verification"} else "working",
             "message": "submission received",
         })
     return 0
@@ -216,6 +226,23 @@ async def async_main(args) -> int:
         from turn.workers.harnesses import harness_capabilities
 
         print(json.dumps({"harnesses": harness_capabilities()}, indent=2))
+        return 0
+    if args.command == "skills":
+        from turn.skills.library import get_skill, list_skills
+
+        if args.skills_command == "list":
+            print(json.dumps([
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "description": item.description,
+                    "source_url": item.source_url,
+                }
+                for item in list_skills()
+            ], indent=2))
+            return 0
+        item = get_skill(args.skill_id)
+        print(item.source_path.read_text(encoding="utf-8"))
         return 0
     async with TurnCore(settings) as core:
         if args.command == "projects":

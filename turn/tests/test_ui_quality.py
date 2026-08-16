@@ -47,6 +47,23 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "<g transform=" not in graph
     assert "align-items: flex-start" in css
     assert "align-self: flex-start" in css
+    assert "node-icons" in graph and "bottom-right" not in graph
+
+
+def test_planner_document_and_role_defaults_are_first_class():
+    app = source("App.tsx")
+    document = source("components", "DocumentView.tsx")
+    css = (UI / "style.css").read_text()
+    api = (ROOT / "turn" / "server" / "api.py").read_text()
+    assert 'id: "planner"' in app and 'id: "verifier"' in app
+    assert "agent_defaults" in app
+    assert "Project directory structure" in document
+    assert "documentParentMap" in document
+    assert "agent_defaults" in api
+    assert ".architecture-filesystem" in css
+    for role in ("planner", "executor", "integrator", "verifier"):
+        assert f'id: "{role}"' in app
+    assert "agent-default-role" in app
 
 
 def test_terminal_is_a_raw_dom_pty_view():
@@ -72,7 +89,9 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "--output-last-message" not in worker
     assert "--output-schema" not in worker
     assert "\"--json\"" not in worker
-    assert "terminal.output" in worker and "terminal.display_output" in worker
+    # Provider output stays in Herdr's session log; Turn persists only the
+    # structured submission, never a copied terminal transcript.
+    assert "terminal.output" not in worker and "terminal.display_output" not in worker
 
 
 def test_inspector_prioritizes_markdown_instructions_without_legacy_review_surfaces():
@@ -143,12 +162,17 @@ def test_only_readme_and_design_are_product_markdown_documents():
 
 def test_authoring_starts_central_and_sidebar_is_collapsed():
     app = source("App.tsx")
+    css = (UI / "style.css").read_text()
     assert "useState(false)" in app
     assert 'sidebar ? "" : "sidebar-collapsed"' in app
     assert 'aria-label="Project objective"' in app
     assert 'aria-label="Attach files"' in app
     assert 'aria-label="Choose project directory"' in app
     assert "directory-selection" in app and "attachment-chip" in app
+    assert 'type="file"' in app and 'multiple' in app
+    assert "composer-config-panel" in app
+    assert "form.composer:has(.composer-config-panel)" in css
+    assert "flex: 0 0 145px" in css
 
 
 def test_object_context_menus_edges_and_theme_are_wired_to_real_actions():
@@ -173,3 +197,8 @@ def test_document_view_is_a_read_only_spec_projection():
     assert "ReactMarkdown" in document
     assert "<button" not in document and "<input" not in document
     assert ".document-children" in css and ".document-node-summary" in css
+    assert "#app-shell .document-view" in css
+    assert "#app-shell .document-view *" in css
+    assert "user-select: text" in css
+    assert "className=\"project-path\"" in app
+    assert "#app-shell .project-title small.project-path" in css

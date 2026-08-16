@@ -56,6 +56,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    project_id_for_cleanup: str | None = None
     try:
         _wait(f"http://127.0.0.1:{port}/")
         with playwright.sync_playwright() as pw:
@@ -97,10 +98,41 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             assert page.get_by_label("Model").input_value() == "Deterministic"
             attachment = tmp_path / "brief.txt"
             attachment.write_text("All commands must be deterministic and offline.")
+            second_attachment = tmp_path / "constraints.md"
+            second_attachment.write_text("The public launch command must remain stable.")
             page.get_by_role("button", name="Attach files").click()
-            page.locator('input[type="file"]').set_input_files(str(attachment))
+            page.locator('input[type="file"]').set_input_files([
+                str(attachment),
+                str(second_attachment),
+            ])
             page.get_by_text("brief.txt", exact=False).wait_for()
+            page.get_by_text("constraints.md", exact=False).wait_for()
             page.get_by_role("button", name="Remove brief.txt").wait_for()
+            page.get_by_role("button", name="Remove brief.txt").click()
+            assert page.get_by_role("button", name="Remove brief.txt").count() == 0
+            page.get_by_role("button", name="Remove constraints.md").wait_for()
+            selector = page.get_by_label("Harness")
+            selector_width = selector.evaluate("node => node.getBoundingClientRect().width")
+            selector.click()
+            page.get_by_role("option", name="Echo · offline").wait_for()
+            assert abs(selector.evaluate("node => node.getBoundingClientRect().width") - selector_width) < 1
+            page.keyboard.press("Escape")
+            composer = page.locator("form.composer")
+            composer_height = composer.evaluate("node => node.getBoundingClientRect().height")
+            page.get_by_role("button", name="Project and run configuration").click()
+            assert abs(composer.evaluate("node => node.getBoundingClientRect().height") - composer_height) < 1
+            page.get_by_role("button", name="Project and run configuration").click()
+            page.route(
+                "**/api/system/pick-directory",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body='{"path":null}',
+                ),
+            )
+            page.get_by_role("button", name="Choose project directory").click()
+            assert page.get_by_role("button", name="Use current directory").count() == 0
+            page.unroute("**/api/system/pick-directory")
             page.route(
                 "**/api/system/pick-directory",
                 lambda route: route.fulfill(
@@ -122,6 +154,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
                 "async objective => (await (await fetch('/api/projects')).json()).projects.find(p => p.generated_prompt === objective)",
                 objective,
             )
+            project_id_for_cleanup = root["id"]
             assert len(root["objective"]) <= 72 and root["generated_prompt"] == objective
             root_play = page.get_by_role("button", name=f"Run {root['objective']}")
             root_play.wait_for()
@@ -177,6 +210,16 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             assert not console_errors
             browser.close()
     finally:
+        if project_id_for_cleanup is not None:
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/projects/{project_id_for_cleanup}",
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(request, timeout=3):
+                    pass
+            except Exception:
+                pass
         process.terminate()
         try:
             process.wait(timeout=5)

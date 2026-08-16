@@ -13,6 +13,8 @@ import type {
   UsageResponse,
 } from "./domain";
 import {
+  displayPath,
+  displayProjectTitle,
   isGraph,
   primaryNodeAction,
   primaryNodeActionLabel,
@@ -44,12 +46,45 @@ const emptyAgent: Agent = {
   reasoning: "default",
   permission: "workspace",
   skills: [],
+  skill_ids: [],
   tools: [],
   mcp_servers: [],
   session_id: null,
 };
 
 type ResizeTarget = "sidebar" | "inspector";
+type AgentRole = "planner" | "executor" | "integrator" | "verifier";
+type AgentDefault = {
+  harness: HarnessId;
+  model: string;
+  reasoning: Reasoning;
+  permission: string;
+};
+
+const AGENT_ROLES: Array<{ id: AgentRole; label: string }> = [
+  { id: "planner", label: "Planner" },
+  { id: "executor", label: "Executor" },
+  { id: "integrator", label: "Integrator" },
+  { id: "verifier", label: "Verifier" },
+];
+
+function agentDefaultsFromSettings(settings: Record<string, unknown>): Record<AgentRole, AgentDefault> {
+  const raw = settings.agent_defaults;
+  const defaults = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  return Object.fromEntries(
+    AGENT_ROLES.map(({ id }) => {
+      const value = defaults[id] && typeof defaults[id] === "object"
+        ? defaults[id] as Record<string, unknown>
+        : {};
+      return [id, {
+        harness: String(value.harness ?? "codex") as HarnessId,
+        model: String(value.model ?? ""),
+        reasoning: String(value.reasoning ?? "default") as Reasoning,
+        permission: String(value.permission ?? "workspace"),
+      }];
+    }),
+  ) as Record<AgentRole, AgentDefault>;
+}
 
 function usePanelResize() {
   const [sidebarWidth, setSidebarWidth] = useState(236);
@@ -344,10 +379,13 @@ export default function App() {
               <div className="project-title">
                 <div className="project-title-copy">
                   <strong>
-                    {projectTitle?.project_name || projectTitle?.objective || "Loading project…"}
+                    {projectTitle ? displayProjectTitle(projectTitle) : "Loading project…"}
                   </strong>
-                  <small className="project-path" title="Project directory">
-                    {projectTitle?.repo_path || "Current directory"}
+                  <small
+                    className="project-path"
+                    title={projectTitle?.repo_path || "Current directory"}
+                  >
+                    {displayPath(projectTitle?.repo_path)}
                   </small>
                 </div>
               </div>
@@ -417,6 +455,7 @@ export default function App() {
                   nodes={graph!.nodes}
                   edges={graph!.edges}
                   architectureSpec={graph!.architecture_spec}
+                  projectId={projectId}
                 />
               ) : (
                 <div id="graph" className="graph">
@@ -607,7 +646,7 @@ function Projects({
     };
   }, [menu]);
   const openMenu = (node: Project, x: number, y: number) => {
-    setDraftName(node.project_name || node.objective);
+    setDraftName(displayProjectTitle(node));
     setRenaming(false);
     setMenu({ node, x, y });
   };
@@ -615,9 +654,7 @@ function Projects({
     if (!menu) return;
     try {
       if (action === "delete") {
-        if (
-          !confirm(`Delete “${menu.node.project_name || menu.node.objective}”?`)
-        )
+        if (!confirm(`Delete “${displayProjectTitle(menu.node)}”?`))
           return;
         await api(`/api/projects/${menu.node.id}`, { method: "DELETE" });
         onDeleted(menu.node.id);
@@ -636,7 +673,7 @@ function Projects({
     }
   };
   const visible = projects.filter((node) =>
-    (node.project_name || node.objective)
+    displayProjectTitle(node)
       .toLowerCase()
       .includes(filter.toLowerCase()),
   );
@@ -666,13 +703,13 @@ function Projects({
               onClick={() => onSelect(node.id)}
             >
               <span className="project-copy">
-                <strong>{node.project_name || node.objective}</strong>
+                <strong>{displayProjectTitle(node)}</strong>
                 <small>{node.agent?.harness ?? "agent"}</small>
               </span>
             </button>
             <button
               className="quiet-icon project-menu"
-              aria-label={`Options for ${node.project_name || node.objective}`}
+              aria-label={`Options for ${displayProjectTitle(node)}`}
               onClick={(event) => {
                 const rect = event.currentTarget.getBoundingClientRect();
                 openMenu(node, rect.right, rect.bottom);
@@ -755,16 +792,17 @@ function Author({
     if (capabilitiesLoading || !workspaceSettings) return;
     const first = capabilities.harnesses.find((item) => item.available);
     if (!first) return;
-    const configuredHarness = String(workspaceSettings.default_harness ?? "");
+    const plannerDefaults = agentDefaultsFromSettings(workspaceSettings).planner;
+    const configuredHarness = plannerDefaults.harness;
     const harness =
       capabilities.harnesses.find(
         (item) => item.available && item.id === configuredHarness,
       ) ?? first;
-    const configuredModel = String(workspaceSettings.default_model ?? "");
+    const configuredModel = plannerDefaults.model;
     const model =
       harness.models.find((item) => item.id === configuredModel) ??
       harness.models[0];
-    const configuredReasoning = String(workspaceSettings.reasoning ?? "default");
+    const configuredReasoning = plannerDefaults.reasoning;
     const reasoning =
       model?.reasoning?.some((level) => level === configuredReasoning)
         ? configuredReasoning
@@ -774,6 +812,7 @@ function Author({
       harness: harness.id,
       model: model?.id ?? value.model,
       reasoning: reasoning as Reasoning,
+      permission: plannerDefaults.permission as Agent["permission"],
     }));
     // New projects must inherit the workspace defaults exposed by Settings.
     // Previously only the agent defaults were applied, so changing the
@@ -1050,7 +1089,7 @@ function Settings({
       </aside>
     );
   const dirty = JSON.stringify(settings) !== initial;
-  const harness = String(settings.default_harness ?? "codex") as HarnessId;
+  const defaults = agentDefaultsFromSettings(settings);
   return (
     <aside className="side-panel">
       <form
@@ -1099,30 +1138,34 @@ function Settings({
         </section>
         <section className="settings-section">
           <h3>Agent defaults</h3>
-          <div className="form-grid">
-            <ModelControl
-              harness={harness}
-              model={String(settings.default_model ?? "")}
-              reasoning={String(settings.reasoning ?? "default") as Reasoning}
-              capabilities={capabilities.harnesses}
-              onHarness={(value) => {
-                const model = capabilities.harnesses.find(
-                  (item) => item.id === value,
-                )?.models[0];
-                setSettings({
-                  ...settings,
-                  default_harness: value,
-                  default_model: model?.id ?? "",
-                  reasoning: model?.reasoning?.[0] ?? "default",
-                });
-              }}
-              onModel={(value) =>
-                setSettings({ ...settings, default_model: value })
-              }
-              onReasoning={(value) =>
-                setSettings({ ...settings, reasoning: value })
-              }
-            />
+          <p className="settings-hint">Defaults are assigned by role when a new agent is created.</p>
+          <div className="agent-defaults-list">
+            {AGENT_ROLES.map(({ id, label }) => {
+              const value = defaults[id];
+              const update = (next: Partial<AgentDefault>) => {
+                const nextDefaults = { ...defaults, [id]: { ...value, ...next } };
+                setSettings({ ...settings, agent_defaults: nextDefaults });
+              };
+              return (
+                <section className="agent-default-role" key={id}>
+                  <h4>{label}</h4>
+                  <div className="agent-default-controls">
+                    <ModelControl
+                      harness={value.harness}
+                      model={value.model}
+                      reasoning={value.reasoning}
+                      capabilities={capabilities.harnesses}
+                      onHarness={(harness) => {
+                        const model = capabilities.harnesses.find((item) => item.id === harness)?.models[0];
+                        update({ harness, model: model?.id ?? "", reasoning: model?.reasoning?.[0] ?? "default" });
+                      }}
+                      onModel={(model) => update({ model })}
+                      onReasoning={(reasoning) => update({ reasoning })}
+                    />
+                  </div>
+                </section>
+              );
+            })}
           </div>
         </section>
         <div className="panel-actions">

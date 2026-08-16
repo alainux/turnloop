@@ -3,16 +3,19 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
   ArchitectureDiagram,
+  ArchitectureConceptImage,
   ArchitectureSection,
   ArchitectureSpec,
   Edge,
   GraphNode,
 } from "../domain";
+import { displayNodeTitle, stripMarkdown } from "../domain";
 
 interface Props {
   nodes: GraphNode[];
   edges: Edge[];
   architectureSpec?: ArchitectureSpec | null;
+  projectId?: string;
 }
 
 /**
@@ -25,21 +28,35 @@ export function orderDocumentNodes(
   edges: Edge[],
   parentId: string | null,
 ): GraphNode[] {
-  const siblings = nodes.filter((node) => node.parent_id === parentId);
+  const parentOf = documentParentMap(nodes, edges);
+  const siblings = nodes.filter((node) => parentOf.get(node.id) === parentId);
   const siblingIds = new Set(siblings.map((node) => node.id));
   const position = new Map(siblings.map((node, index) => [node.id, index]));
   const outgoing = new Map<string, string[]>();
   const indegree = new Map(siblings.map((node) => [node.id, 0]));
   for (const edge of edges) {
-    if (
-      edge.type !== "DEPENDS_ON" ||
-      !siblingIds.has(edge.src) ||
-      !siblingIds.has(edge.dst)
-    ) {
-      continue;
-    }
-    outgoing.set(edge.src, [...(outgoing.get(edge.src) ?? []), edge.dst]);
-    indegree.set(edge.dst, (indegree.get(edge.dst) ?? 0) + 1);
+    if (edge.type !== "DEPENDS_ON") continue;
+
+    // Dependencies can cross a projected child boundary. Compare the direct
+    // children of this document section so an integrator remains after the
+    // complete implementation → verifier subtree.
+    const directChild = (id: string): string | null => {
+      let current = id;
+      const visited = new Set<string>();
+      while (parentOf.has(current) && parentOf.get(current) !== parentId) {
+        if (visited.has(current)) return null;
+        visited.add(current);
+        const parent = parentOf.get(current);
+        if (!parent) return null;
+        current = parent;
+      }
+      return siblingIds.has(current) ? current : null;
+    };
+    const source = directChild(edge.src);
+    const target = directChild(edge.dst);
+    if (!source || !target || source === target) continue;
+    outgoing.set(source, [...(outgoing.get(source) ?? []), target]);
+    indegree.set(target, (indegree.get(target) ?? 0) + 1);
   }
   const compare = (a: string, b: string) =>
     (position.get(a) ?? 0) - (position.get(b) ?? 0);
@@ -63,6 +80,31 @@ export function orderDocumentNodes(
   return ids.map((id) => byId.get(id)!).filter(Boolean);
 }
 
+/**
+ * Project verification into the document hierarchy without changing the
+ * graph. A verifier is still an ordinary DEPENDS_ON node for scheduling; in
+ * the read-only specification it is shown beneath the implementation it
+ * inspects so the sequence is legible.
+ */
+export function documentParentMap(nodes: GraphNode[], edges: Edge[]): Map<string, string | null> {
+  const parentOf = new Map<string, string | null>();
+  for (const node of nodes) {
+    parentOf.set(node.id, node.parent_id);
+  }
+  // A verifier is a normal dependency in the graph, never a special graph
+  // relation. The document projection nests it below the work item it
+  // verifies so the specification reads as implementation → verification.
+  // This changes presentation only; scheduling and graph edges stay intact.
+  for (const node of nodes) {
+    if (node.agent?.type_id !== "verifier") continue;
+    const target = edges.find(
+      (edge) => edge.type === "DEPENDS_ON" && edge.dst === node.id,
+    )?.src;
+    if (target && parentOf.has(target)) parentOf.set(node.id, target);
+  }
+  return parentOf;
+}
+
 function statusLabel(node: GraphNode): string {
   if (node.status === "RUNNING") {
     return node.agent_message?.trim()
@@ -73,7 +115,7 @@ function statusLabel(node: GraphNode): string {
 }
 
 function dependencyLabels(node: GraphNode, nodes: GraphNode[], edges: Edge[]): string[] {
-  const names = new Map(nodes.map((item) => [item.id, item.objective]));
+  const names = new Map(nodes.map((item) => [item.id, displayNodeTitle(item)]));
   return edges
     .filter((edge) => edge.type === "DEPENDS_ON" && edge.dst === node.id)
     .map((edge) => names.get(edge.src))
@@ -258,15 +300,63 @@ function ArchitectureSectionView({
 
 function MetadataList({ title, values }: { title: string; values: string[] }) {
   if (!values.length) return null;
+  const renderValue = (value: string) => {
+    const trimmed = value.trim();
+    if (/^https?:\/\/\S+$/i.test(trimmed)) {
+      return (
+        <a href={trimmed} target="_blank" rel="noreferrer">
+          {value}
+        </a>
+      );
+    }
+    return value;
+  };
   return (
     <section className="architecture-metadata-list">
       <h3>{title}</h3>
-      <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul>
+      <ul>{values.map((value) => <li key={value}>{renderValue(value)}</li>)}</ul>
     </section>
   );
 }
 
-function ArchitectureMetadata({ spec }: { spec: ArchitectureSpec }) {
+function ConceptImages({
+  images,
+  projectId,
+}: {
+  images: ArchitectureConceptImage[];
+  projectId?: string;
+}) {
+  if (!images.length || !projectId) return null;
+  const sourceFor = (source: string) => {
+    if (/^https?:\/\//i.test(source)) return source;
+    const encoded = source.split("/").map((part) => encodeURIComponent(part)).join("/");
+    return "/api/projects/" + encodeURIComponent(projectId) + "/concept-images/" + encoded;
+  };
+  return (
+    <section className="architecture-concept-images">
+      <h3>Concept references</h3>
+      <div className="architecture-concept-image-grid">
+        {images.map((image) => (
+          <figure key={image.id} className="architecture-concept-image">
+            <img src={sourceFor(image.source)} alt={image.alt} />
+            <figcaption>
+              <strong>{image.title}</strong>
+              {image.caption && <span>{image.caption}</span>}
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ArchitectureMetadata({
+  spec,
+  projectId,
+}: {
+  spec: ArchitectureSpec;
+  projectId?: string;
+}) {
   const diagrams = new Map(spec.diagrams.map((diagram) => [diagram.id, diagram]));
   const attachedDiagramIds = new Set<string>();
   const collectAttachedDiagrams = (sections: ArchitectureSection[]) => {
@@ -295,6 +385,14 @@ function ArchitectureMetadata({ spec }: { spec: ArchitectureSpec }) {
       <MetadataList title="Architecture principles" values={spec.architecture_principles} />
       <MetadataList title="Requirements" values={spec.requirements} />
       <MetadataList title="Constraints" values={spec.constraints} />
+      {spec.filesystem_structure && (
+        <section className="architecture-filesystem">
+          <h3>Project directory structure</h3>
+          <pre>{spec.filesystem_structure}</pre>
+        </section>
+      )}
+      <MetadataList title="Research sources" values={spec.research_sources} />
+      <ConceptImages images={spec.concept_images} projectId={projectId} />
       {spec.decisions.length > 0 && (
         <section className="architecture-cards">
           <h3>Decisions</h3>
@@ -303,7 +401,7 @@ function ArchitectureMetadata({ spec }: { spec: ArchitectureSpec }) {
               <h4>{decision.title}</h4>
               <p>{decision.decision}</p>
               <small>Rationale: {decision.rationale}</small>
-              {decision.consequences.length > 0 && <ul>{decision.consequences.map((item) => <li key={item}>{item}</li>)}</ul>}
+              {decision.consequences && <p>{decision.consequences}</p>}
             </article>
           ))}
         </section>
@@ -357,8 +455,12 @@ function DocumentNode({
     >
       <summary className="document-node-summary">
         <span className="document-sequence">{path.join(".")}</span>
-        <span className="document-node-copy">
-          <strong>{node.objective}</strong>
+        <span
+          className="document-node-copy"
+          role="heading"
+          aria-level={Math.min(path.length + 1, 6)}
+        >
+          <strong>{displayNodeTitle(node)}</strong>
           <small>{statusLabel(node)}</small>
         </span>
         <span className="document-agent">
@@ -395,7 +497,7 @@ function DocumentNode({
   );
 }
 
-export function DocumentView({ nodes, edges, architectureSpec }: Props) {
+export function DocumentView({ nodes, edges, architectureSpec, projectId }: Props) {
   const root = nodes.find((node) => node.parent_id === null);
   if (!root) {
     return <div className="document-empty">No specification is available.</div>;
@@ -405,14 +507,17 @@ export function DocumentView({ nodes, edges, architectureSpec }: Props) {
     <div className="document-view" aria-label="Read-only specification">
       <article className="document-spec">
         <div className="document-kicker">Read-only graph specification</div>
-        <h1>{architectureSpec?.title ?? root.architecture_spec?.title ?? root.objective}</h1>
+        <h1>{stripMarkdown(architectureSpec?.title ?? root.architecture_spec?.title ?? root.objective)}</h1>
         <div className="document-meta">
           <span className={`badge ${root.ui_state}`}>{statusLabel(root)}</span>
           <span>{nodes.length} work items</span>
           <span>Sequence follows dependencies</span>
         </div>
         {(architectureSpec ?? root.architecture_spec) ? (
-          <ArchitectureMetadata spec={(architectureSpec ?? root.architecture_spec)!} />
+          <ArchitectureMetadata
+            spec={(architectureSpec ?? root.architecture_spec)!}
+            projectId={projectId ?? root.project_id}
+          />
         ) : root.generated_prompt?.trim() ? (
           <div className="document-intent document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>

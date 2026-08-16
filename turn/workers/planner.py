@@ -26,6 +26,7 @@ from turn.domain.schemas import (
     ArchitectureDiagramNode,
     ArchitectureSection,
     ArchitectureSpec,
+    AgentType,
     EdgeSpec,
     EdgeType,
     HarnessKind,
@@ -255,6 +256,26 @@ ARCHITECTURAL METADATA — the graph is also the durable project specification:
 - Use typed `diagrams` when a relationship, data flow, system boundary, or
   execution topology is clearer visually. A diagram has nodes with stable ids
   and edges using those ids; do not submit decorative or generic diagrams.
+- For a visual, spatial, game, brand, or interaction-heavy outcome, use the
+  project-scoped imagegen skill to create at least one purposeful concept
+  reference when it would reduce implementation ambiguity. Store the image
+  under turn/concepts/ and include it in architecture_spec.concept_images with exactly
+  {{id,title,source,alt,caption}}. source is the project-relative path or a
+  direct HTTPS URL. Do not invent a concept image entry for a non-visual
+  objective. Concept images are references for workers and verifiers, not
+  substitutes for runnable deliverables. The worker that creates or changes
+  the image reports its path through the normal Turn CLI artifact workflow.
+- Include `filesystem_structure` as a concise plain-text tree for the project
+  (for example `src/`, `tests/`, and the domain/application boundaries). This
+  is graph metadata shared with workers, not a second plan handoff. It must
+  name the real application/package entry point, test locations, asset or
+  concept locations where relevant, and the integration boundary that a clean
+  checkout will launch. Every concrete node prompt must respect this tree.
+- Include `research_sources` with the direct URLs actually consulted while
+  planning. Use the harness's web/search facility when available, and also
+  use `turn skills show find-skills`, `npx skills find`, skills.sh, Agency
+  Agents, and authoritative project documentation as appropriate. Do not
+  fabricate sources or rely only on intuition for a broad product.
 - Keep the metadata specific to this request. Do not pad it with generic
   headings. Every work node must map to a meaningful section or boundary in
   the spec, and every integrator must be accountable for the acceptance
@@ -263,14 +284,16 @@ ARCHITECTURAL METADATA — the graph is also the durable project specification:
   is automatically shown to every descendant worker. Do not write a separate
   architecture document to the filesystem as a Turn protocol handoff.
 - The architecture metadata is strict JSON. Use only the fields in the exact
-  example below; do not invent aliases or extra fields. Omit optional arrays
-  when they are not useful. A section is only `id`, `title`, Markdown `content`,
-  and optional nested `subsections`; do not put decisions, risks, or diagram
-  objects inside a section. Diagrams, when useful, live in the top-level
-  `diagrams` array. For a simple plan, use one or two text sections and no
-  diagrams.
+  example below; do not invent aliases or extra fields. A minimal valid spec
+  has only `title`, `executive_summary`, `approach`, `strategy`, and text
+  `sections`; all other fields are optional and should be omitted when they do
+  not materially help. In particular, do not emit `decisions`, `risks`, or
+  `diagrams` just to fill a template. If you do emit them, complete every
+  required field exactly as documented below—never submit a half-shaped item.
+  A section is only `id`, `title`, Markdown `content`, and optional nested
+  `subsections`; do not put decisions, risks, or diagram objects inside it.
 - If you use `decisions`, each item is exactly `{{id,title,decision,rationale,
-  consequences}}`. If you use `risks`, each item is exactly
+  consequences}}`, where `consequences` is one short text string. If you use `risks`, each item is exactly
   `{{id,title,description,mitigation}}`. Diagram nodes are exactly
   `{{id,label,kind}}` and diagram edges are exactly `{{src,dst,label}}`. Do not
   add `id`-like keys to a section or invent alternate names such as `choice`,
@@ -388,6 +411,38 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   result lives. An integrator must preserve or reconcile those contracts. Do
   not assume every objective is software; use equivalent concepts for books,
   research, operations, design, or other kinds of generation.
+- SKILLS: before submitting, run `turn skills show find-skills`, search for
+  guidance separately for each concrete executor, integrator, and verifier,
+  inspect the candidate, and choose the narrowest useful match. Every such
+  node must declare the selected references in its `skills` array; do not omit
+  the field or rely on the server to infer it. A local built-in skill is valid
+  when it fits. An external reference must be a direct HTTP(S) URL to the
+  skill document. If no suitable skill exists, author a concise
+  `turn/skills/<slug>/SKILL.md` with YAML `name` and `description` frontmatter
+  and reference it as `project:<slug>`. Do not paste skill bodies into prompts.
+  Record the sources actually consulted in `architecture_spec.research_sources`.
+  Every concrete executor, integrator, and verifier must declare the
+  project skill references it needs in the node's `skills` array. A reference
+  is either a local library id or a direct HTTP(S) URL to the selected skill
+  document. Use the planner's `find-skills` guidance to research candidates
+  (including skills.sh, agency-agents, `npx skills find`, and GitHub's
+  agent-skills topic), then choose only skills that materially improve the
+  assigned work. The server installs URL references into the current project's
+  `turn/skills` directory. Do not paste skill bodies into the prompt. Planners
+  automatically have only `turn-planning`, `imagegen`, and `find-skills`; all
+  domain, architecture, QA, and product skills must be deliberately selected
+  for the relevant worker. Use the image skill whenever a visual reference
+  will guide implementation or QA.
+- VERIFICATION: almost every concrete executor or integrator should be
+  followed by a verifier when its output has meaningful code, visual, runtime,
+  or contract risk. A verifier is an ordinary sibling at this planning
+  boundary: set `agent_type` to `verifier`, omit `parent_key`, and put exactly
+  the implementation key it checks in `depends_on`. This is the only graph
+  relationship for verification. It makes the verifier appear immediately
+  after the work it inspects without inventing containment or a VERIFIES edge.
+  A verifier must receive explicit criteria in its prompt and inspect real
+  evidence before approving. Rejection feedback is a runtime Herdr
+  conversation with that one predecessor; it is not additional graph data.
 - INTEGRATORS: if a node's job is to combine or integrate its
   prerequisites (objective names 'assemble', 'merge', 'integrate', 'combine',
   'stitch'), its generated_prompt MUST tell it to READ the files those
@@ -417,6 +472,32 @@ ORDER & SAFETY:
   is already the coordinator.
 - Every child is a DIRECT child of this node (parent_key must be null). A
   later planning turn can give a nested planner its own direct children.
+- If the user asks to revise an already-expanded plan, return the complete
+  replacement subtree for this planning boundary using fresh local `key`
+  values. Do not put persisted UUIDs in `parent_key`, `depends_on`, or any
+  invented target field. Existing descendants are replaced as one graph
+  operation; the current planning node remains the boundary and its session
+  remains the conversation context.
+
+FINAL RESEARCH AND SKILL CHECK:
+- Before submission, actually run `turn skills show find-skills`, inspect the
+  repository and live graph, and perform the relevant web/search or skills.sh
+  queries. Do not claim a source you did not consult.
+- For broad engineering work, investigate the domain before choosing nodes.
+  `turn skills show turn-architecture-research` is an optional architecture
+  reference to inspect when it fits; it is not automatically assigned to this
+  planner. A game plan that only names an engine and a story is incomplete
+  unless the request genuinely has no other product boundary.
+- Record each direct URL consulted in `architecture_spec.research_sources`.
+- Every concrete executor, integrator, and verifier must have a non-empty
+  `skills` array containing the selected local id, direct skill URL, or a
+  `project:<slug>` skill you authored under `turn/skills/<slug>/SKILL.md`.
+- For each selected skill, make the node prompt state the contract it improves
+  and make sure the file will exist in the project scope before that worker
+  launches. Do not paste skill text into the prompt.
+- For a visual or interactive product, include a purposeful concept reference
+  when it clarifies the result, and make the final acceptance path test one
+  coherent product rather than isolated modules.
 
 Before finishing, submit the plan object through the Turn CLI. The CLI is the
 only submission interface and writes Turn's internal handoff record. Do not
@@ -484,16 +565,18 @@ use filesystem output as a protocol. Use `TURN_CLI agent submit --kind plan --pa
                 ]
         elif session_id:
             resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else sandbox_flags
+            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
-                *reasoning_flags, *resume_permissions, "-C", cwd, session_id, prompt,
+                *reasoning_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
             ]
         else:
+            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
                 *sandbox_flags, "-C", cwd,
                 *[a for a in self.s.codex_args if "bypass" not in a],
-                prompt,
+                prompt_arg,
             ]
         structured = ""
         try:
@@ -508,7 +591,10 @@ use filesystem output as a protocol. Use `TURN_CLI agent submit --kind plan --pa
                 idle_warning=self.s.terminal_idle_warning_seconds,
                 idle_reap=self.s.terminal_idle_reap_seconds,
                 session_callback=remember_session,
-                initial_input=prompt if native else None,
+                session_marker=str(node_id),
+                harness_name=agent.harness.value,
+                initial_input=prompt if getattr(transport, "supports_inject", False) else (prompt if native else None),
+                initial_input_mode="stdin" if (not native and getattr(transport, "supports_inject", False)) else "native",
                 environment=environment,
             )
             if result.stalled:
@@ -578,6 +664,7 @@ class AgentPlanner(Planner):
         cwd: str | None = None,
         native: bool = False,
         resume: bool = False,
+        prompt_via_stdin: bool = False,
     ) -> list[str]:
         return self.commands.planner_command(
             agent,
@@ -585,6 +672,7 @@ class AgentPlanner(Planner):
             cwd=cwd or os.getcwd(),
             native=native,
             resume=resume,
+            prompt_via_stdin=prompt_via_stdin,
         )
 
     async def _call_harness(
@@ -647,7 +735,34 @@ class AgentPlanner(Planner):
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
                     session_probe=probe_session if agent.harness == HarnessKind.OPENCODE else None,
+                    session_marker=str(ctx.node.id),
+                    harness_name=agent.harness.value,
                     initial_input=native_prompt,
+                    environment=environment,
+                )
+            elif getattr(transport, "supports_inject", False):
+                result = await run_until_result(
+                    transport,
+                    ctx.node.id,
+                    self._command(
+                        agent,
+                        native_prompt,
+                        cwd=cwd,
+                        native=False,
+                        resume=resume,
+                        prompt_via_stdin=True,
+                    ),
+                    cwd=cwd,
+                    result_path=result_path,
+                    stream=ctx.stream,
+                    timeout=ctx.timeout_seconds or self.s.default_run_timeout_seconds,
+                    idle_warning=self.s.terminal_idle_warning_seconds,
+                    idle_reap=self.s.terminal_idle_reap_seconds,
+                    session_callback=remember_session,
+                    session_marker=str(ctx.node.id),
+                    harness_name=agent.harness.value,
+                    initial_input=native_prompt,
+                    initial_input_mode="stdin",
                     environment=environment,
                 )
             else:
@@ -706,6 +821,7 @@ class AgentPlanner(Planner):
                     for i in n.get("required_inputs", [])
                 ],
                 resource_refs=list(n.get("resource_refs", [])),
+                skills=list(n.get("skills", [])),
                 parent_key=n.get("parent_key"),
                 depends_on=list(n.get("depends_on", [])),
                 plan=bool(n.get("plan", False)),
@@ -754,13 +870,30 @@ class AgentPlanner(Planner):
             ]
 
         architecture_spec = data.get("architecture_spec")
+        parsed_architecture = (
+            ArchitectureSpec.model_validate(architecture_spec)
+            if architecture_spec is not None
+            else None
+        )
+        if parsed_architecture is not None and len(nodes) > 1:
+            concrete = [
+                node for node in nodes
+                if not node.plan and node.agent_type is not AgentType.PLANNER
+            ]
+            missing_skills = [node.key for node in concrete if not node.skills]
+            if missing_skills:
+                raise ValueError(
+                    "broad plan must declare selected skills for every concrete node; "
+                    f"missing: {', '.join(missing_skills)}"
+                )
+            if not parsed_architecture.research_sources:
+                raise ValueError(
+                    "broad plan must record the direct research URLs consulted in "
+                    "architecture_spec.research_sources"
+                )
         return PlanResult(
             nodes=nodes,
-            architecture_spec=(
-                ArchitectureSpec.model_validate(architecture_spec)
-                if architecture_spec is not None
-                else None
-            ),
+            architecture_spec=parsed_architecture,
             edges=[],
             notes=data.get("notes"),
         )

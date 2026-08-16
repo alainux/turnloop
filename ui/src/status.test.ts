@@ -13,6 +13,7 @@ const base: GraphNode = {
   repo_path: null,
   executor: null,
   agent: null,
+  verification: null,
   status: "RUNNING",
   run_policy: null,
   ui_state: "running",

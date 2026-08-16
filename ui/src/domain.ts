@@ -2,6 +2,7 @@ import type {
   Agent,
   AgentType,
   ArchitectureDecision,
+  ArchitectureConceptImage,
   ArchitectureDiagram,
   ArchitectureDiagramEdge,
   ArchitectureDiagramNode,
@@ -26,6 +27,7 @@ export type {
   Agent,
   AgentType,
   ArchitectureDecision,
+  ArchitectureConceptImage,
   ArchitectureDiagram,
   ArchitectureDiagramEdge,
   ArchitectureDiagramNode,
@@ -57,6 +59,59 @@ export type HarnessId = HarnessKind;
 export type Permission = PermissionMode;
 export type Reasoning = ReasoningLevel;
 export type UIState = NodeUIState;
+
+/** Remove lightweight Markdown syntax from labels while preserving intent. */
+export function stripMarkdown(value: string): string {
+  return value
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/`{1,3}([^`]+)`{1,3}/g, "$1")
+    .replace(/<[^>]+>/g, "")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/^\s*[-+*]\s+/gm, "")
+    .replace(/(?:\*\*|__|~~|\*|_)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The project tile follows an explicit name, then the scoped graph title. */
+export function displayProjectTitle(node: Project): string {
+  return stripMarkdown(
+    node.project_name?.trim() ||
+      node.architecture_spec?.title?.trim() ||
+      node.objective,
+  );
+}
+
+/** Node cards never expose Markdown punctuation in their title label. */
+export function displayNodeTitle(node: GraphNode): string {
+  return stripMarkdown(node.objective);
+}
+
+/** Keep skill references readable without hiding their source in a tooltip. */
+export function skillReferenceLabel(reference: string): string {
+  if (!/^https?:\/\//i.test(reference)) return reference;
+  const path = reference.split(/[?#]/, 1)[0];
+  const segment = path.split("/").filter(Boolean).pop();
+  return segment ? decodeURIComponent(segment) : reference;
+}
+
+export function skillTooltip(references: string[]): string {
+  return `Skills (${references.length})\n${references
+    .map(skillReferenceLabel)
+    .join("\n")}`;
+}
+
+/** Show local absolute paths with a portable home-directory prefix. */
+export function displayPath(path: string | null | undefined): string {
+  if (!path) return "Current directory";
+  const normalized = path.replaceAll("\\", "/");
+  const home = normalized.match(/^(?:\/Users|\/home)\/[^/]+(\/.*)?$/);
+  if (home) return `~${home[1] ?? ""}`;
+  const windowsHome = normalized.match(/^[A-Za-z]:\/Users\/[^/]+(\/.*)?$/i);
+  return windowsHome ? `~${windowsHome[1] ?? ""}` : normalized;
+}
 
 export type PrimaryNodeAction = "run" | "retry" | "regenerate" | "cancel";
 

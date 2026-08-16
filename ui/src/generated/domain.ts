@@ -8,19 +8,28 @@ export interface Agent {
   reasoning: ReasoningLevel;
   permission: PermissionMode;
   skills: Array<string>;
+  skill_ids: Array<string>;
   tools: Array<string>;
   mcp_servers: Array<string>;
   session_id: string | null;
 }
 
-export type AgentType = "planner" | "executor" | "integrator";
+export type AgentType = "planner" | "executor" | "integrator" | "verifier";
+
+export interface ArchitectureConceptImage {
+  id: string;
+  title: string;
+  source: string;
+  alt: string;
+  caption: string | null;
+}
 
 export interface ArchitectureDecision {
   id: string;
   title: string;
   decision: string;
   rationale: string;
-  consequences: Array<string>;
+  consequences: string;
 }
 
 export interface ArchitectureDiagram {
@@ -65,6 +74,8 @@ export interface ArchitectureSpec {
   executive_summary: string;
   approach: string | null;
   strategy: string | null;
+  filesystem_structure: string | null;
+  research_sources: Array<string>;
   architecture_principles: Array<string>;
   requirements: Array<string>;
   constraints: Array<string>;
@@ -73,6 +84,7 @@ export interface ArchitectureSpec {
   acceptance_criteria: Array<string>;
   sections: Array<ArchitectureSection>;
   diagrams: Array<ArchitectureDiagram>;
+  concept_images: Array<ArchitectureConceptImage>;
 }
 
 export interface Artifact {
@@ -118,6 +130,7 @@ export interface Executor {
   reasoning: ReasoningLevel;
   permission: PermissionMode;
   skills: Array<string>;
+  skill_ids: Array<string>;
   tools: Array<string>;
   mcp_servers: Array<string>;
   session_id: string | null;
@@ -142,6 +155,7 @@ export interface GraphNodeView {
   repo_path: string | null;
   executor: string | null;
   agent: Agent | null;
+  verification: VerificationResult | null;
   status: NodeStatus;
   paused: boolean;
   auto_run: boolean;
@@ -188,6 +202,7 @@ export interface Integrator {
   reasoning: ReasoningLevel;
   permission: PermissionMode;
   skills: Array<string>;
+  skill_ids: Array<string>;
   tools: Array<string>;
   mcp_servers: Array<string>;
   session_id: string | null;
@@ -204,6 +219,7 @@ export interface Node {
   repo_path: string | null;
   executor: string | null;
   agent: Agent | null;
+  verification: VerificationResult | null;
   status: NodeStatus;
   paused: boolean;
   auto_run: boolean;
@@ -229,6 +245,7 @@ export interface NodeSpec {
   agent_type: AgentType | null;
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
+  skills: Array<string>;
   parent_key: string | null;
   depends_on: Array<string>;
   plan: boolean;
@@ -259,6 +276,7 @@ export interface Planner {
   reasoning: ReasoningLevel;
   permission: PermissionMode;
   skills: Array<string>;
+  skill_ids: Array<string>;
   tools: Array<string>;
   mcp_servers: Array<string>;
   session_id: string | null;
@@ -303,6 +321,30 @@ export interface Usage {
   cost_usd: number | null;
 }
 
+export type VerificationDecision = "APPROVE" | "REJECT";
+
+export interface VerificationResult {
+  decision: VerificationDecision;
+  summary: string;
+  findings: Array<string>;
+  required_changes: Array<string>;
+  evidence_refs: Array<string>;
+}
+
+export interface Verifier {
+  id: string;
+  type_id: AgentType;
+  harness: HarnessKind;
+  model: string | null;
+  reasoning: ReasoningLevel;
+  permission: PermissionMode;
+  skills: Array<string>;
+  skill_ids: Array<string>;
+  tools: Array<string>;
+  mcp_servers: Array<string>;
+  session_id: string | null;
+}
+
 export interface WorkerResult {
   outcome: Outcome;
   summary: string;
@@ -314,4 +356,5 @@ export interface WorkerResult {
   executor_notes: string | null;
   usage: Usage;
   session_id: string | null;
+  verification: VerificationResult | null;
 }

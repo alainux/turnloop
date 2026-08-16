@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.store = components.store
     app.state.events = components.events
     app.state.runner = components.runner
+    app.state.capabilities = components.capabilities
     app.state.test_mode = components.test_mode
     try:
         yield

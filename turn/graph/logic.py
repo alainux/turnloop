@@ -54,6 +54,16 @@ def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
     return out
 
 
+def _execution_container_ids(idx: Indexes) -> set:
+    """Return every node that contains graph children.
+
+    Verification has no special containment semantics. A verifier is a
+    sibling at its planning boundary and becomes ordered solely by its
+    ordinary DEPENDS_ON edge.
+    """
+    return set(idx.children)
+
+
 def is_runnable(
     node_id,
     idx: Indexes,
@@ -159,13 +169,13 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
     # container, but its completion is derived from its descendant leaves.
     # Compute that projection before checking dependency joins so an ordinary
     # integrator can depend on a completed architectural branch.
-    container_ids = set(idx.children)
+    container_ids = _execution_container_ids(idx)
     for n in nodes:
         if n.id not in container_ids:
             status[n.id] = n.status
             continue
         desc = _collect_descendants(idx, n.id)
-        leaves = [d for d in desc if d.id not in idx.children]
+        leaves = [d for d in desc if d.id not in container_ids]
         active_leaves = [d for d in leaves if d.status != NodeStatus.CANCELLED]
         done = [
             d for d in active_leaves
@@ -205,10 +215,10 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
 
     # derive container progress + completion from descendants
     for n in nodes:
-        if n.id not in idx.children:
+        if n.id not in container_ids:
             continue
         desc = _collect_descendants(idx, n.id)
-        leaves = [d for d in desc if d.id not in idx.children]
+        leaves = [d for d in desc if d.id not in container_ids]
         active_leaves = [d for d in leaves if d.status != NodeStatus.CANCELLED]
         done = [
             d for d in active_leaves
