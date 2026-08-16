@@ -229,7 +229,7 @@ class Agent(BaseModel):
     permission: PermissionMode = PermissionMode.WORKSPACE
     # ``skills`` is the materialized filesystem view used by harness adapters.
     # ``skill_ids`` is the stable graph/library contract and is project-scoped
-    # into the project's turn/skills directory before a harness is launched.
+    # into the project's .turn/skills directory before a harness is launched.
     skills: list[str] = Field(default_factory=list)
     skill_ids: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
@@ -688,7 +688,7 @@ class NodeSpec(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     # Local library ids or HTTP(S) URLs requested for this worker; the server
-    # materializes them into the current project's turn/skills scope.
+    # materializes them into the current project's .turn/skills scope.
     skills: list[str] = Field(default_factory=list)
 
     # placement within the generated graph

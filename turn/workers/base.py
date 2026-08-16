@@ -99,13 +99,13 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             lines.append(f"- MCP servers available at launch: {', '.join(agent.mcp_servers)}")
         lines.append(
             "- Use `turn skills list` and `turn skills show <id>` for local skills; "
-            "external references are installed under `turn/skills` and their "
+            "external references are installed under `.turn/skills` and their "
             "paths are listed in TURN_AGENT_SKILLS. Skill text is delivered "
             "through the project filesystem, not appended to this initial prompt."
         )
         lines.append(
             "- Project-authored skills use `project:<slug>` and live at "
-            "`turn/skills/<slug>/SKILL.md`; read them from the project filesystem."
+            "`.turn/skills/<slug>/SKILL.md`; read them from the project filesystem."
         )
         lines.append(
             "- Before acting, read every selected skill file from `TURN_AGENT_SKILLS` "

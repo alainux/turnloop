@@ -116,9 +116,9 @@ documented skills catalog for each concrete executor, integrator, and verifier;
 do not invent a plan from intuition alone. Inspect the candidate, select the
 smallest useful local id or direct HTTP(S) skill URL, and put that reference in
 the node's `skills` array. If no suitable skill exists, author a concise,
-frontmatter-valid `turn/skills/<slug>/SKILL.md` and reference it as
+frontmatter-valid `.turn/skills/<slug>/SKILL.md` and reference it as
 `project:<slug>`. The server installs URL references into the current project's
-`turn/skills` directory before launch. Do not paste skill bodies into prompts.
+`.turn/skills` directory before launch. Do not paste skill bodies into prompts.
 Record the sources actually consulted in `architecture_spec.research_sources`.
 
 Treat this as a submission gate, not a suggestion: every concrete executor,

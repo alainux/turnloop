@@ -434,7 +434,7 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   the field or rely on the server to infer it. A local built-in skill is valid
   when it fits. An external reference must be a direct HTTP(S) URL to the
   skill document. If no suitable skill exists, author a concise
-  `turn/skills/<slug>/SKILL.md` with YAML `name` and `description` frontmatter
+  `.turn/skills/<slug>/SKILL.md` with YAML `name` and `description` frontmatter
   and reference it as `project:<slug>`. Do not paste skill bodies into prompts.
   Record the sources actually consulted in `architecture_spec.research_sources`.
   Every concrete executor, integrator, and verifier must declare the
@@ -444,7 +444,7 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   (including skills.sh, agency-agents, `npx skills find`, and GitHub's
   agent-skills topic), then choose only skills that materially improve the
   assigned work. The server installs URL references into the current project's
-  `turn/skills` directory. Do not paste skill bodies into the prompt. Planners
+  `.turn/skills` directory. Do not paste skill bodies into the prompt. Planners
   automatically have only `turn-planning`, `imagegen`, and `find-skills`; all
   domain, architecture, QA, and product skills must be deliberately selected
   for the relevant worker. Use the image skill whenever a visual reference
@@ -507,7 +507,7 @@ FINAL RESEARCH AND SKILL CHECK:
 - Record each direct URL consulted in `architecture_spec.research_sources`.
 - Every concrete executor, integrator, and verifier must have a non-empty
   `skills` array containing the selected local id, direct skill URL, or a
-  `project:<slug>` skill you authored under `turn/skills/<slug>/SKILL.md`.
+  `project:<slug>` skill you authored under `.turn/skills/<slug>/SKILL.md`.
 - For each selected skill, make the node prompt state the contract it improves
   and make sure the file will exist in the project scope before that worker
   launches. Do not paste skill text into the prompt.

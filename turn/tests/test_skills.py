@@ -129,7 +129,7 @@ def test_unknown_skill_reference_is_rejected():
 
 
 def test_project_authored_skill_is_resolved_without_copying_or_network(tmp_path: Path):
-    path = tmp_path / "turn" / "skills" / "game-design" / "SKILL.md"
+    path = tmp_path / ".turn" / "skills" / "game-design" / "SKILL.md"
     path.parent.mkdir(parents=True)
     path.write_text(
         "---\nname: game-design\ndescription: Design playable game loops.\n---\n\n"
@@ -147,7 +147,7 @@ def test_project_authored_skill_is_resolved_without_copying_or_network(tmp_path:
 
 
 def test_project_authored_skill_requires_frontmatter(tmp_path: Path):
-    path = tmp_path / "turn" / "skills" / "bad" / "SKILL.md"
+    path = tmp_path / ".turn" / "skills" / "bad" / "SKILL.md"
     path.parent.mkdir(parents=True)
     path.write_text("# Missing metadata\n")
 
@@ -155,14 +155,15 @@ def test_project_authored_skill_requires_frontmatter(tmp_path: Path):
         materialize(["project:bad"], tmp_path)
 
 
-def test_external_skill_is_fetched_once_into_project_turn_directory(tmp_path: Path):
+def test_external_skill_is_fetched_once_into_hidden_project_turn_directory(tmp_path: Path):
     url = "https://example.test/skills/visual-qa/SKILL.md"
     fetcher = FakeSkillFetcher(b"# Visual QA\nInspect the real rendered screen.\n")
 
     installed = materialize(["turn-executing", url], tmp_path, fetcher=fetcher)
     assert installed["turn-executing"].is_file()
     external_path = installed[url]
-    assert external_path == tmp_path / "turn" / "skills" / external_path.parent.name / "SKILL.md"
+    assert external_path == tmp_path / ".turn" / "skills" / external_path.parent.name / "SKILL.md"
+    assert not (tmp_path / "turn" / "skills").exists()
     assert external_path.read_text() == "# Visual QA\nInspect the real rendered screen.\n"
     assert fetcher.urls == [url]
 

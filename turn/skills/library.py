@@ -2,7 +2,7 @@
 
 Built-in skills are addressed by stable ids. A planner may also select a
 specific HTTPS/HTTP skill URL; the server fetches it once into the current
-project's ``turn/skills`` directory. Fetching is behind a small port so tests
+project's ``.turn/skills`` directory. Fetching is behind a small port so tests
 can use deterministic content without network access.
 """
 from __future__ import annotations
@@ -130,7 +130,7 @@ def _project_skill_path(reference: str, project_root: str | Path) -> Path:
     match = _PROJECT_SKILL_PATTERN.fullmatch(reference)
     if match is None:
         raise ValueError(f"invalid project skill reference: {reference!r}")
-    return Path(project_root) / "turn" / "skills" / match.group(1) / "SKILL.md"
+    return Path(project_root) / ".turn" / "skills" / match.group(1) / "SKILL.md"
 
 
 def _external_install_key(url: str) -> str:
@@ -169,7 +169,7 @@ def materialize(
     fetcher: SkillFetcher | None = None,
 ) -> dict[str, Path]:
     """Install selected skills into this project only, returning their paths."""
-    destination = Path(project_root) / "turn" / "skills"
+    destination = Path(project_root) / ".turn" / "skills"
     external_fetcher = fetcher or UrlSkillFetcher()
     resolved: dict[str, Path] = {}
     for reference in dict.fromkeys(skill_ids):

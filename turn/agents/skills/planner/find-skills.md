@@ -19,7 +19,7 @@ deliverable (for example `3D web game runtime`, `terminal game design`, or
 smallest useful match. Prefer a local library id when Turn already provides
 the skill. Otherwise reference the direct HTTP(S) URL of the skill document in
 that node's `skills` array. The server installs external references into the
-current project's `turn/skills` directory before launching the agent; do not
+current project's `.turn/skills` directory before launching the agent; do not
 paste the skill body into the prompt.
 
 Search in two passes: first look for domain and product guidance (for example
@@ -31,7 +31,7 @@ path. Record the direct source URL and the reason it was selected in the
 architecture research notes so downstream workers can audit the choice.
 
 If the search finds no suitable skill, author a concise project-scoped
-`turn/skills/<slug>/SKILL.md` before submitting the plan. It must have YAML
+`.turn/skills/<slug>/SKILL.md` before submitting the plan. It must have YAML
 frontmatter with `name` and `description`, contain only reusable instructions,
 and be referenced by `project:<slug>` in the node's `skills` array. This is a
 real project deliverable, not a Turn status or result handoff.
