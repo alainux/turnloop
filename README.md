@@ -1,124 +1,143 @@
-# Turn
+<p align="center">
+  <img src="docs/assets/banner.png" alt="Turn adaptive workgraph banner">
+</p>
 
-Turn is a local-first agentic development environment built around an adaptive
-workgraph. A prompt becomes a visible top-down decomposition; independent
-domain branches run in parallel; ordinary executor nodes recombine their
-outputs from left to right; and human inputs, artifacts, costs, and recovery
-remain inspectable throughout the project.
+<h1 align="center">Turn</h1>
 
-The kernel is intentionally small: a versioned graph of `Node`, `Edge`, `Run`,
-and `Artifact` records, a scheduler, and replaceable planner/worker adapters. The
-IDE-like web UI and the headless CLI are clients of that same core.
+<p align="center">
+  <strong>Adaptive development, made visible.</strong><br>
+  Turn turns an outcome into an inspectable workgraph, then helps you execute it one deliberate step at a time.
+</p>
 
-## What Turn currently includes
+<p align="center">
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11 or newer"></a>
+  <a href="turn/server"><img src="https://img.shields.io/badge/FastAPI-REST%20%2B%20SSE-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI REST and SSE"></a>
+  <a href="ui"><img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=111827" alt="React 19"></a>
+  <a href="turn/tests"><img src="https://img.shields.io/badge/tested%20with-pytest-0A9EDC?style=flat-square&logo=pytest&logoColor=white" alt="Tested with pytest"></a>
+  <a href="https://github.com/alainux/turnloop"><img src="https://img.shields.io/github/stars/alainux/turnloop?style=flat-square&label=GitHub%20stars" alt="GitHub stars"></a>
+</p>
 
-This section describes Turn's currently implemented capabilities. It is not a
-reduced delivery bar for projects created through Turn: unless a user asks
-for an MVP, POC, prototype, or other limited slice, project plans target the
-complete requested product.
+<p align="center">
+  <a href="#why-turn">Why Turn</a> ·
+  <a href="#product-surface">Product surface</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#run-locally">Run locally</a> ·
+  <a href="#verification">Verification</a>
+</p>
 
-- Prompt-first project authoring and opening, a collapsible project explorer,
-  graph canvas, inspector, real PTY-backed xterm terminal, light/dark themes,
-  compact density, attachments, and responsive panels.
-- A normalized semantic design system with a quiet wordmark, professional
-  vendored Lucide icons, keyboard-aware tooltips, graph context menus, and
-  contextual help. The product deliberately ships without decorative imagery.
-- A deterministic left-to-right dendrogram: containment and genuine workflow
-  stages share the same grey orthogonal edges, with parallel domain branches
-  and explicit integration points visible in the graph.
-- Server-owned node/UI states with guarded transitions for run, step, pause,
-  resume, cancel, retry, input, branch regeneration, and
-  forks.
-- Per-project execution policy: auto/step, parallel dispatch, inter-job delay,
-  timeout, retry/backoff, and choked-model retry.
-- Codex, Claude Code, OpenCode, and Pi harness adapters with automatic local
-  availability detection, editable model selectors, and model-dependent
-  reasoning options. Deterministic Echo and heuristic planning exist only in
-  tests and are never exposed by the served application.
-- Persistent agent session IDs so reruns can continue the same agent context
-  and project directory.
-- Agent-, branch-, and project-level token/cost reporting when a harness emits
-  usage telemetry.
-- A headless Python facade and `turn` CLI.
-- Unit, API, runner-transition, browser end-to-end, generated-screenshot, and
-  three-domain full-run persistence/log acceptance tests.
+## Why Turn
 
-The visual and interaction contract is in [DESIGN.md](DESIGN.md). This README
-is the sole product, architecture, scope, operation, and verification guide.
+Most agent workflows begin with a prompt and quickly become a stream of opaque
+tool calls. Turn keeps the plan, execution, and evidence in one visible control
+surface:
 
-## Architecture and current boundary
+- **Start with intent.** Describe the outcome instead of manually inventing a task list.
+- **See the decomposition.** Turn renders containment, dependencies, parallel branches, and integration points as a workgraph.
+- **Run with control.** Choose step-by-step or auto-run execution, pause between stages, retry failures, and provide human input when needed.
+- **Inspect the work.** Open the document view, terminal, logs, artifacts, costs, and durable agent sessions from the same project.
+- **Keep ownership local.** Project state lives on disk, while planner and worker adapters keep harness-specific behavior replaceable.
+
+Turn is designed for complex software, games, books, and other outcomes where
+the path matters as much as the final artifact.
+
+## Product surface
+
+| Surface | What it gives you |
+| --- | --- |
+| Project authoring | Prompt-first creation, project explorer, attachments, and working-directory selection |
+| Workgraph | A deterministic left-to-right graph with parallel branches and explicit dependencies |
+| Execution | Auto/step policies, retries, timeouts, cancellation, recovery, and human-input gates |
+| Agent workspace | Durable PTY-backed terminals, reconnectable sessions, and provider-neutral transport |
+| Evidence | Document view, logs, artifacts, diffs, token/cost usage, and server-projected UI state |
+| Harnesses | Codex, Claude Code, OpenCode, and Pi adapters with local availability detection |
+
+Deterministic Echo workers and heuristic planning are test-only fixtures; they
+are not exposed by the served application.
+
+## Screenshots
+
+The screenshots below show the authoring surface, harness selection, graph and
+terminal inspection, document view, and workspace preferences.
+
+<table>
+  <tr>
+    <td><img src="docs/assets/screenshot1.png" alt="Turn project authoring screen"></td>
+    <td><img src="docs/assets/screenshot2.png" alt="Turn harness selection menu"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/assets/screenshot3.png" alt="Turn workgraph and terminal inspector"></td>
+    <td><img src="docs/assets/screenshot4.png" alt="Turn document view"></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/assets/screenshot5.png" alt="Turn light theme and workspace preferences"></td>
+  </tr>
+</table>
+
+## Architecture
 
 The graph is the source of truth. `PlanResult` and `WorkerResult` are strict
 domain contracts; the runner owns transitions; the store owns durable local
-project files; UI and CLI are clients. A node owns intent and an `AgentConfig`, while
-harness-specific flags remain inside replaceable planner/worker adapters:
-`graph → node → agent → type/harness`.
+project files; the UI and CLI are clients.
 
-For broad requests, a `PlanResult` also carries graph-owned architectural
-metadata: an executive summary, approach and strategy, typed sections,
-decisions, risks, acceptance criteria, and optional diagrams. The document view
-renders that metadata alongside the dependency graph, and every worker receives
-the same root/branch metadata through its graph context. It is not a second
-document store or a filesystem handoff protocol.
+```text
+prompt
+  │
+  ▼
+planner ──▶ PlanResult ──▶ workgraph ──▶ runner ──▶ harness adapter
+                                      │              ├─ Codex
+                                      │              ├─ Claude Code
+                                      │              ├─ OpenCode
+                                      │              └─ Pi
+                                      ▼
+                              logs · artifacts · diffs · usage
+```
 
-The React client is strict TypeScript and mirrors the Python domain vocabulary.
-  It consumes server-projected `ui_state`, `allowed_actions`, and
-and `generation_active`; it does not guess workflow state. A provider-neutral
-terminal transport separates raw machine events used for schema parsing from
-the ANSI presentation stream used by a Shadow DOM xterm. Codex final structured
-results are submitted through the Turn CLI instead of leaking JSONL into the
-human terminal. Code diffs are durable artifacts rendered in the
-inspector.
+For broad requests, a plan can carry an executive summary, approach, typed
+sections, decisions, risks, acceptance criteria, and optional diagrams. The
+document view renders that metadata alongside the dependency graph, and worker
+nodes receive the same graph-owned context.
 
-Current scope includes local POSIX PTYs, local harness discovery, provider
-sessions, model-dependent
-reasoning controls, attachments, direct filesystem project execution, recovery
-policies, usage accounting, CLI/headless execution, and the tested web UI.
+The main boundaries are deliberately small:
 
-Future-ready seams—not implemented product claims—include remote/cloud terminal
-transports, Windows ConPTY, authenticated remote service mode, custom type and
-output registries, shared chats/A2A, composable validation/optimization loops,
-promoted decomposition specs, and signed native bundles. The open graph,
-artifact, registry, transport, and policy contracts are intentionally placed
-for that work.
+- `turn/domain/` — schemas, state transitions, and UI-state projection
+- `turn/db/` — local project-file persistence
+- `turn/graph/` — pure graph evaluation
+- `turn/runner/` — scheduling, recovery, events, and terminal lifecycle
+- `turn/workers/` — planner, worker, and harness adapters
+- `turn/server/` — REST, SSE, security, and static UI boundary
+- `ui/` — strict TypeScript client and interaction state
 
 ## Run locally
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js and npm
+- Herdr for project terminals
+- At least one supported coding harness installed locally for real runs
+
+### Install and start
 
 ```bash
 python -m pip install -e ".[dev]"
 npm install
 npm run build
-playwright install chromium       # once, for browser tests
-herdr                                  # start/attach the default Herdr service
-./scripts/run.sh                       # real Codex planner + workers
+herdr                    # start or attach the default Herdr service
+./scripts/run.sh         # start Turn at http://127.0.0.1:8000
 ```
 
-Turn requires Herdr for project terminals, but the server can run outside the
-Herdr UI. By default Turn uses the default Herdr service, so each project
-workspace is visible directly when you type `herdr`. Set `HERDR_SESSION` only
-when intentionally using a separately named Herdr service. Each project
-becomes one Herdr workspace, and each node gets a durable pane inside that
-workspace; browser connections are temporary control streams into those panes.
-
-Open <http://127.0.0.1:8000>. For real coding agents, select an installed
-harness in the authoring surface or set `TURN_DEFAULT_EXECUTOR`.
-
-## Verification
+Turn uses the repo-local `projects/` directory by default. Override it when
+needed:
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-pytest -q
+TURN_PROJECTS_DIR=/path/to/projects ./scripts/run.sh
 ```
 
-The acceptance suite covers test-only deterministic software/story/book runs,
-browser authoring and inspection, PTY ANSI/input/resize/stall behavior,
-state transitions, persisted logs/artifacts/diffs, and server security.
-Model-backed demonstrations are intentionally separate from those tests: they
-prove installed-harness integration but are not deterministic quality scores.
+Open <http://127.0.0.1:8000>, describe an outcome, choose an installed harness,
+and create the workgraph. Step mode is the safe default; execution is always an
+explicit product action.
 
-## Headless CLI
+### Headless CLI
 
 ```bash
 turn doctor
@@ -129,27 +148,31 @@ turn run PROJECT_UUID
 turn serve --port 8000
 ```
 
-When run from a project directory, `turn create` uses that current directory
-as the project directory. The UI/server default is the repo-local `projects/`
-directory; override it explicitly with `TURN_PROJECTS_DIR` when needed.
+When run from a project directory, `turn create` uses that current directory as
+the project directory. The UI/server uses `TURN_PROJECTS_DIR` for its default
+project root.
 
-`turn run` is an explicit execution request, so it temporarily drives a project
-even when it was authored in step mode. It exits when the graph settles, fails,
-or requires human input.
-
-## Tests
+## Verification
 
 ```bash
-python -m pytest -q
+npm run typecheck
 npm test
+npm run build
+python -m pytest -q
 ```
 
-Browser tests start isolated servers and exercise onboarding, graph menus,
-inspector, real terminal transport, themes, responsive screenshots, and three
-complete software/game/book workflows. They then inspect each project's local
-state file, runs, artifacts, and server log. In restricted sandboxes these tests skip when
-local listener sockets are prohibited; run them in a normal local shell for the
-full check.
+The test suite covers:
+
+- domain schemas, transitions, graph invariants, and storage
+- REST, SSE, security, and project lifecycle behavior
+- harness capability detection and adapter contracts
+- PTY ANSI/input/resize/stall behavior
+- browser authoring, graph inspection, terminal transport, themes, and responsive layouts
+- deterministic full-run persistence for software, story, and book-shaped workflows
+- installed-Herdr integration, durable panes, and cleanup boundaries
+
+Model-backed demonstrations prove installed-harness integration; they are kept
+separate from deterministic quality scores.
 
 ## Project layout
 
@@ -162,7 +185,8 @@ turn/runner/                 scheduling, transitions, recovery, events
 turn/workers/                planner and harness adapters
 turn/server/                 REST, SSE, and static UI boundary
 turn/tests/                  unit, integration, API, and browser tests
-ui/                          dependency-free IDE shell and UI state reducer
+ui/                          dependency-free IDE shell and UI reducer
+docs/assets/                 product screenshots and social/GitHub banner
 ```
 
 ## Design constraint
@@ -170,3 +194,6 @@ ui/                          dependency-free IDE shell and UI state reducer
 The store never guesses planner intent. It validates keys, references, and graph
 acyclicity, then preserves valid objectives and topology exactly—without hidden
 child caps, semantic deduplication, title truncation, or domain-specific nodes.
+
+The visual and interaction contract lives in [DESIGN.md](DESIGN.md). This README
+is the product, architecture, scope, operation, and verification guide.
