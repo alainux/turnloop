@@ -201,3 +201,28 @@ class HarnessCommandFactory:
                 command += ["--permission-mode", "acceptEdits"]
             return command
         return None
+
+    def conversation_delete_command(
+        self, harness: HarnessKind, session_id: str
+    ) -> list[str] | None:
+        """Build the provider-supported command for deleting one conversation.
+
+        This is intentionally separate from worker/reconnect commands. A
+        project deletion must use the harness's public session-management
+        surface; it must never infer or edit a provider's private storage.
+        ``None`` means that the installed harness has no supported
+        non-interactive operation for this lifecycle action.
+        """
+        if harness == HarnessKind.CODEX:
+            return [self.codex_binary, "delete", session_id, "--force"]
+        if harness == HarnessKind.OPENCODE:
+            return ["opencode", "session", "delete", session_id]
+        return None
+
+    def conversation_archive_command(
+        self, harness: HarnessKind, session_id: str
+    ) -> list[str] | None:
+        """Build a supported archive command used when deletion is unavailable."""
+        if harness == HarnessKind.CODEX:
+            return [self.codex_binary, "archive", session_id]
+        return None

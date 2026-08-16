@@ -40,6 +40,12 @@ async def test_herdr_project_space_contract(tmp_path: Path):
     # the test intentionally exercises that real boundary rather than using a
     # fake path the daemon cannot open.
     project_root = Path(__file__).resolve().parents[2] / "projects"
+    # Herdr is permissioned to this repository-owned root, so keep the real
+    # daemon boundary while isolating every project path to this test run.
+    project_paths = [
+        project_root / f".turn-test-herdr-contract-{uuid.uuid4().hex}",
+        project_root / f".turn-test-herdr-external-{uuid.uuid4().hex}",
+    ]
     settings = Settings(
         data_dir=str(tmp_path / "turn-state"),
         projects_dir=str(project_root),
@@ -70,7 +76,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
                     "prompt": "Exercise the Herdr project-space contract",
                     "agent": {"harness": "echo", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
-                    "working_dir": str(project_root),
+                    "working_dir": str(project_paths[0]),
                 },
             )
             assert created.status_code == 200, created.text
@@ -123,7 +129,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
                     "prompt": "Verify reverse lifecycle reconciliation",
                     "agent": {"harness": "echo", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
-                    "working_dir": str(project_root),
+                    "working_dir": str(project_paths[1]),
                 },
             )
             assert created_again.status_code == 200, created_again.text
@@ -140,7 +146,17 @@ async def test_herdr_project_space_contract(tmp_path: Path):
             )
             assert str(external_id) not in metadata
     finally:
-        for project in await store.list_projects():
-            await runner.close_project_workspace(project.id)
-        await runner.stop()
-        await store.dispose()
+        try:
+            for project in await store.list_projects():
+                await runner.close_project_workspace(project.id)
+        finally:
+            try:
+                await runner.stop()
+            finally:
+                try:
+                    await store.dispose()
+                finally:
+                    for project_path in project_paths:
+                        if project_path.exists():
+                            shutil.rmtree(project_path)
+                        assert not project_path.exists()

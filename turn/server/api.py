@@ -11,6 +11,7 @@ import json
 import mimetypes
 from pathlib import Path
 import re
+import shutil
 import uuid
 from typing import Awaitable, Callable, Optional
 
@@ -25,6 +26,11 @@ from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker
 from turn.contracts.schema import public_schema
 from turn.runner.runner import Runner
+from turn.workers.conversations import (
+    ConversationProgress,
+    cleanup_conversations,
+    conversation_refs,
+)
 
 
 router = APIRouter()
@@ -99,6 +105,13 @@ class ProjectPolicyUpdate(BaseModel):
 
 class RenameProject(BaseModel):
     name: str = Field(min_length=1, max_length=72)
+
+
+class DeleteProjectOptions(BaseModel):
+    """Explicit opt-ins for destructive project deletion side effects."""
+
+    delete_files: bool = False
+    delete_conversations: bool = False
 
 
 def _validate_served_agent(agent: AgentConfig, request: Request) -> None:
@@ -402,16 +415,175 @@ async def clear_projects(request: Request):
     return {"ok": True}
 
 
+def _project_directory_for_deletion(
+    store: Store, project_id: uuid.UUID, repo_path: str | None,
+) -> Path:
+    """Resolve exactly one validated project root, never a provider data store."""
+    raw_path = repo_path or (str(store.project_path(project_id)) if store.project_path(project_id) else None)
+    if not raw_path:
+        raise RuntimeError("project directory is not known")
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_symlink():
+        raise RuntimeError("refusing to delete a symlink used as a project directory")
+    resolved = candidate.resolve()
+    protected = {
+        Path(resolved.anchor),
+        Path.home().resolve(),
+        store.data_dir.resolve(),
+        store.projects_dir.resolve(),
+    }
+    if resolved in protected:
+        raise RuntimeError(f"refusing to delete protected directory {resolved}")
+    if resolved.exists() and not resolved.is_dir():
+        raise RuntimeError(f"project path is not a directory: {resolved}")
+    return resolved
+
+
+async def _delete_project_directory(path: Path) -> None:
+    """Remove the already validated project root."""
+    if not path.exists():
+        return
+    try:
+        await asyncio.to_thread(shutil.rmtree, path)
+    except FileNotFoundError:
+        # An external cleanup may have won the race after validation. The
+        # requested filesystem state is already satisfied in that case.
+        return
+
+
 @router.delete("/api/projects/{project_id}")
-async def delete_project(project_id: str, request: Request):
-    store: Store = request.app.state.store
+async def delete_project(
+    project_id: str,
+    request: Request,
+    body: DeleteProjectOptions | None = None,
+):
     runner: Runner = request.app.state.runner
     pid = uuid.UUID(project_id)
+    if not runner.begin_project_deletion(pid):
+        raise HTTPException(409, "project deletion is already in progress")
+    try:
+        return await _delete_project(pid, project_id, request, body)
+    finally:
+        runner.end_project_deletion(pid)
+
+
+async def _delete_project(
+    pid: uuid.UUID,
+    project_id: str,
+    request: Request,
+    body: DeleteProjectOptions | None,
+):
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    options = body or DeleteProjectOptions()
+    root = await store.get_node(pid)
+    if root is None or root.parent_id is not None:
+        raise HTTPException(404, "project not found")
     await runner.cancel_project_runs(pid)
-    await runner.close_project_workspace(pid)
+
+    cleanup = None
+    if options.delete_conversations:
+        nodes, _, _ = await store.get_workgraph(pid)
+        runs = await store.get_project_runs(pid)
+        refs = conversation_refs(nodes, runs)
+
+        async def report(progress: ConversationProgress) -> None:
+            await request.app.state.events.publish({
+                "type": "project.deletion_progress",
+                "project_id": project_id,
+                "phase": "conversations",
+                "completed": progress.completed,
+                "total": progress.total,
+                "harness": progress.harness,
+                "status": progress.status,
+                "message": progress.message,
+            })
+
+        cleanup = await cleanup_conversations(
+            refs,
+            cwd=Path(root.repo_path).expanduser() if root.repo_path else store.project_path(pid),
+            commands=runner.harness_commands,
+            on_progress=report,
+        )
+        await request.app.state.events.publish({
+            "type": "project.deletion_progress",
+            "project_id": project_id,
+            "phase": "conversations",
+            "completed": cleanup.total,
+            "total": cleanup.total,
+            "status": "complete" if cleanup.ok else "failed",
+            "message": (
+                f"Conversation cleanup complete: {cleanup.deleted} deleted, "
+                f"{cleanup.archived} archived"
+                if cleanup.ok
+                else "Conversation cleanup did not complete"
+            ),
+        })
+        if not cleanup.ok:
+            await request.app.state.events.publish({
+                "type": "project.deletion_failed",
+                "project_id": project_id,
+                "phase": "conversations",
+                "message": "Conversation cleanup failed; the project was not removed.",
+                "cleanup": cleanup.as_dict(),
+            })
+            raise HTTPException(
+                status_code=409,
+                detail="Conversation cleanup failed; the project was not removed.",
+            )
+
+    if options.delete_files:
+        try:
+            project_directory = _project_directory_for_deletion(store, pid, root.repo_path)
+        except (OSError, RuntimeError) as error:
+            raise HTTPException(409, f"Project files could not be deleted: {error}") from error
+        await runner.close_project_workspace(pid)
+        await request.app.state.events.publish({
+            "type": "project.deletion_progress",
+            "project_id": project_id,
+            "phase": "files",
+            "completed": 0,
+            "total": 1,
+            "status": "deleting",
+            "message": "Deleting project files",
+        })
+        try:
+            await _delete_project_directory(project_directory)
+        except (OSError, RuntimeError) as error:
+            try:
+                await runner.ensure_node_terminal(pid)
+            except Exception:
+                pass
+            raise HTTPException(409, f"Project files could not be deleted: {error}") from error
+        await request.app.state.events.publish({
+            "type": "project.deletion_progress",
+            "project_id": project_id,
+            "phase": "files",
+            "completed": 1,
+            "total": 1,
+            "status": "deleted",
+            "message": "Project files deleted",
+        })
+    else:
+        await runner.close_project_workspace(pid)
+
     await store.delete_project(pid)
+    await request.app.state.events.publish({
+        "type": "project.deleted",
+        "project_id": project_id,
+        "data": {
+            "delete_files": options.delete_files,
+            "delete_conversations": options.delete_conversations,
+            "conversation_cleanup": cleanup.as_dict() if cleanup is not None else None,
+        },
+    })
     runner.wake()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "delete_files": options.delete_files,
+        "delete_conversations": options.delete_conversations,
+        "conversation_cleanup": cleanup.as_dict() if cleanup is not None else None,
+    }
 
 
 @router.patch("/api/projects/{project_id}")

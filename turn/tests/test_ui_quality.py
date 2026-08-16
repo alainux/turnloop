@@ -209,6 +209,23 @@ def test_object_context_menus_edges_and_theme_are_wired_to_real_actions():
     assert "Next stage" in app and "Auto-run" in app
 
 
+def test_project_deletion_requires_explicit_destructive_options_and_reports_progress():
+    app = source("App.tsx")
+    css = (UI / "style.css").read_text()
+    api = (ROOT / "turn" / "server" / "api.py").read_text()
+    conversations = (ROOT / "turn" / "workers" / "conversations.py").read_text()
+    assert "project-delete-dialog" in app
+    assert 'Delete files from disk' in app and 'Delete conversations' in app
+    assert "setDeleteFiles(false)" in app and "setDeleteConversations(false)" in app
+    assert 'json("DELETE"' in app
+    assert "project.deletion_progress" in app and 'aria-live="polite"' in app
+    assert ".modal-scrim" in css and ".delete-option" in css
+    assert "DeleteProjectOptions" in api
+    assert "conversation_refs" in api and "cleanup_conversations" in api
+    assert "conversation_delete_command" in conversations
+    assert "does not support non-interactive conversation deletion" in conversations
+
+
 def test_document_view_is_a_read_only_spec_projection():
     app = source("App.tsx")
     document = source("components", "DocumentView.tsx")

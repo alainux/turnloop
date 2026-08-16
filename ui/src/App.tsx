@@ -628,6 +628,19 @@ function Projects({
   } | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [deleteFiles, setDeleteFiles] = useState(false);
+  const [deleteConversations, setDeleteConversations] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteProgress, setDeleteProgress] = useState<{
+    phase: string;
+    completed: number;
+    total: number;
+    status: string;
+    message: string;
+  } | null>(null);
+  const cancelDeleteRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (!menu) return;
     const close = () => {
@@ -644,31 +657,106 @@ function Projects({
       removeEventListener("keydown", key);
     };
   }, [menu]);
+  useEffect(() => {
+    if (!deleteTarget) return;
+    cancelDeleteRef.current?.focus();
+    const stream = new EventSource(`/api/projects/${deleteTarget.id}/stream`);
+    stream.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as {
+          type?: string;
+          phase?: string;
+          completed?: number;
+          total?: number;
+          status?: string;
+          message?: string;
+        };
+        if (message.type === "project.deletion_progress") {
+          setDeleteProgress({
+            phase: message.phase ?? "deletion",
+            completed: message.completed ?? 0,
+            total: message.total ?? 0,
+            status: message.status ?? "working",
+            message: message.message ?? "Working…",
+          });
+        }
+        if (message.type === "project.deletion_failed") {
+          setDeleteError(message.message ?? "Project deletion failed");
+        }
+      } catch {
+        /* ignore malformed external event */
+      }
+    };
+    return () => stream.close();
+  }, [deleteTarget]);
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const key = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || deleteBusy) return;
+      event.preventDefault();
+      setDeleteTarget(null);
+      setDeleteError(null);
+      setDeleteProgress(null);
+    };
+    addEventListener("keydown", key);
+    return () => removeEventListener("keydown", key);
+  }, [deleteTarget, deleteBusy]);
   const openMenu = (node: Project, x: number, y: number) => {
     setDraftName(displayProjectTitle(node));
     setRenaming(false);
     setMenu({ node, x, y });
   };
-  const updateProject = async (action: "rename" | "delete") => {
+  const renameProject = async () => {
     if (!menu) return;
     try {
-      if (action === "delete") {
-        if (!confirm(`Delete “${displayProjectTitle(menu.node)}”?`))
-          return;
-        await api(`/api/projects/${menu.node.id}`, { method: "DELETE" });
-        onDeleted(menu.node.id);
-      } else {
-        if (!draftName.trim()) return;
-        await api(
-          `/api/projects/${menu.node.id}`,
-          json("PATCH", { name: draftName.trim() }),
-        );
-      }
+      if (!draftName.trim()) return;
+      await api(
+        `/api/projects/${menu.node.id}`,
+        json("PATCH", { name: draftName.trim() }),
+      );
       setMenu(null);
       setRenaming(false);
       await onChanged();
     } catch (error) {
       notify(String(error));
+    }
+  };
+  const openDeleteDialog = () => {
+    if (!menu) return;
+    setDeleteTarget(menu.node);
+    setDeleteFiles(false);
+    setDeleteConversations(false);
+    setDeleteBusy(false);
+    setDeleteError(null);
+    setDeleteProgress(null);
+    setMenu(null);
+    setRenaming(false);
+  };
+  const closeDeleteDialog = () => {
+    if (deleteBusy) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+    setDeleteProgress(null);
+  };
+  const deleteProject = async () => {
+    if (!deleteTarget || deleteBusy) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await api(`/api/projects/${deleteTarget.id}`, json("DELETE", {
+        delete_files: deleteFiles,
+        delete_conversations: deleteConversations,
+      }));
+      const deletedId = deleteTarget.id;
+      setDeleteTarget(null);
+      setDeleteProgress(null);
+      onDeleted(deletedId);
+      await onChanged();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDeleteError(message);
+      notify(message);
+      setDeleteBusy(false);
     }
   };
   const visible = projects.filter((node) =>
@@ -732,7 +820,7 @@ function Projects({
               className="popover-rename"
               onSubmit={(event) => {
                 event.preventDefault();
-                void updateProject("rename");
+                void renameProject();
               }}
             >
               <input
@@ -755,10 +843,89 @@ function Projects({
           <button
             role="menuitem"
             className="danger-option"
-            onClick={() => void updateProject("delete")}
+            onClick={openDeleteDialog}
           >
             <Icon name="trash-2" /> Delete project
           </button>
+        </div>
+      )}
+      {deleteTarget && (
+        <div className="modal-scrim">
+          <div
+            className="confirm-dialog project-delete-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-project-title"
+            aria-describedby="delete-project-description"
+          >
+            <div className="confirm-dialog-content">
+              <div className="confirm-icon"><Icon name="alert-triangle" /></div>
+              <div>
+                <h2 id="delete-project-title">Delete project?</h2>
+                <p id="delete-project-description">
+                  Delete “{displayProjectTitle(deleteTarget)}”. This cannot be undone.
+                </p>
+              </div>
+              <div className="delete-options" aria-label="Additional deletion options">
+                <label className="delete-option">
+                  <input
+                    type="checkbox"
+                    checked={deleteFiles}
+                    disabled={deleteBusy}
+                    onChange={(event) => setDeleteFiles(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Delete files from disk</strong>
+                    <small>Removes the entire project directory.</small>
+                  </span>
+                </label>
+                <label className="delete-option">
+                  <input
+                    type="checkbox"
+                    checked={deleteConversations}
+                    disabled={deleteBusy}
+                    onChange={(event) => setDeleteConversations(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Delete conversations</strong>
+                    <small>Deletes or archives each harness conversation using its standard command.</small>
+                  </span>
+                </label>
+              </div>
+              {deleteBusy && (
+                <div className="delete-progress" aria-live="polite">
+                  <strong>
+                    {deleteProgress?.phase === "files"
+                      ? "Deleting project files…"
+                      : deleteProgress
+                        ? `Deleting conversations · ${deleteProgress.completed} of ${deleteProgress.total}`
+                        : "Preparing deletion…"}
+                  </strong>
+                  <span>{deleteProgress?.message ?? "Destructive changes are being applied."}</span>
+                </div>
+              )}
+              {deleteError && (
+                <p className="delete-error" role="alert">{deleteError}</p>
+              )}
+              <div className="confirm-actions-row">
+                <button
+                  ref={cancelDeleteRef}
+                  className="button"
+                  disabled={deleteBusy}
+                  onClick={closeDeleteDialog}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="button danger"
+                  disabled={deleteBusy}
+                  onClick={() => void deleteProject()}
+                >
+                  <Icon name="trash-2" /> Delete project
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </aside>

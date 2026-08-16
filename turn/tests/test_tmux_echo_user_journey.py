@@ -29,6 +29,7 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
     if shutil.which("herdr") is None:
         pytest.skip("Herdr is required for Turn terminal sessions")
     project_root = Path(__file__).resolve().parents[2] / "projects"
+    project_path = project_root / f".turn-test-echo-journey-{uuid.uuid4().hex}"
     settings = Settings(
         data_dir=f"/private/tmp/turn-echo-journey-{uuid.uuid4().hex[:8]}",
         projects_dir=str(project_root),
@@ -42,13 +43,14 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
     registry.register_planner(HeuristicPlanner("echo"))
     runner = Runner(store, registry, EventBus(), settings)
     agent = AgentConfig(harness=HarnessKind.ECHO, type_id="planner")
-    root = await store.create_project(
-        "Build an echo-backed puzzle-room demo",
-        repo_path=str(project_root / "echo-room"),
-        agent=agent,
-        run_policy=RunPolicy(auto_run=False),
-    )
+    root = None
     try:
+        root = await store.create_project(
+            "Build an echo-backed puzzle-room demo",
+            repo_path=str(project_path),
+            agent=agent,
+            run_policy=RunPolicy(auto_run=False),
+        )
         # Creation allocates a durable Herdr shell. Opening, resizing, and
         # detaching it must preserve the same node session.
         assert await runner.ensure_node_terminal(root.id)
@@ -115,9 +117,19 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
         await store._save_node(root)
         assert (await store.get_node(root.id)).project_name == "Renamed echo journey"
     finally:
-        nodes, _, _ = await store.get_workgraph(root.id)
-        for node in nodes:
-            await runner.close_shell(node.id)
-        await runner.stop()
-        await store.delete_project(root.id)
-        await store.dispose()
+        try:
+            if root is not None:
+                nodes, _, _ = await store.get_workgraph(root.id)
+                for node in nodes:
+                    await runner.close_shell(node.id)
+                await store.delete_project(root.id)
+        finally:
+            try:
+                await runner.stop()
+            finally:
+                try:
+                    await store.dispose()
+                finally:
+                    if project_path.exists():
+                        shutil.rmtree(project_path)
+                    assert not project_path.exists()

@@ -99,6 +99,7 @@ class Runner:
         self.shell = self.terminal
         self._shell_tasks: dict[uuid.UUID, asyncio.Task] = {}
         self._status_watchers: dict[uuid.UUID, asyncio.Task] = {}
+        self._deleting_projects: set[uuid.UUID] = set()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -109,6 +110,7 @@ class Runner:
         self._stop = True
         self._wake.set()
         self._manual_stages.clear()
+        self._deleting_projects.clear()
         for t in self._running.values():
             t.cancel()
         for t in self._reconnect_tasks.values():
@@ -142,6 +144,16 @@ class Runner:
             return True
         reconnect = self._reconnect_tasks.get(node_id)
         return reconnect is not None and not reconnect.done()
+
+    def begin_project_deletion(self, project_id: uuid.UUID) -> bool:
+        """Reserve a project so the scheduler cannot relaunch it mid-delete."""
+        if project_id in self._deleting_projects:
+            return False
+        self._deleting_projects.add(project_id)
+        return True
+
+    def end_project_deletion(self, project_id: uuid.UUID) -> None:
+        self._deleting_projects.discard(project_id)
 
     async def ensure_node_terminal(self, node_id: uuid.UUID) -> bool:
         """Allocate a node's idle Herdr pane without opening a control client."""
@@ -179,6 +191,8 @@ class Runner:
             self._last_workspace_reconcile_at = now
             projects = await self.store.list_projects()
         for p in projects:
+            if p.id in self._deleting_projects:
+                continue
             try:
                 await self._schedule_project(p.id)
             except Exception as e:  # pragma: no cover
@@ -186,6 +200,7 @@ class Runner:
 
     async def _reconcile_project_workspaces(self, projects: list[Node]) -> None:
         """Reflect externally deleted Turn-owned Herdr spaces in project state."""
+        projects = [project for project in projects if project.id not in self._deleting_projects]
         await self.terminal.close_orphaned_project_workspaces(
             {str(project.id) for project in projects}
         )
@@ -217,6 +232,8 @@ class Runner:
         return root.repo_path
 
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
+        if project_id in self._deleting_projects:
+            return
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return
@@ -337,6 +354,8 @@ class Runner:
             if candidate.id in ev.runnable
         ]
         for nid in runnable_order:
+            if project_id in self._deleting_projects:
+                return
             if nid in self._running:
                 continue
             snapshot = node_by_id.get(nid)
@@ -1243,6 +1262,8 @@ class Runner:
         exposed until every node in this batch settles, so a fast branch cannot
         cause downstream work to start while its siblings are still in flight.
         """
+        if project_id in self._deleting_projects:
+            return []
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return []
@@ -1278,6 +1299,9 @@ class Runner:
 
         self._manual_stages[project_id] = {node.id for node in stage_nodes}
         for node in stage_nodes:
+            if project_id in self._deleting_projects:
+                self._manual_stages.pop(project_id, None)
+                return []
             self._running[node.id] = asyncio.create_task(
                 self._execute_node(node, project_id)
             )
@@ -1288,6 +1312,8 @@ class Runner:
         """Manually execute a specific node regardless of auto-run mode."""
         node = await self.store.get_node(node_id)
         if node is None:
+            return None
+        if node.project_id in self._deleting_projects:
             return None
         if node.id in self._running:
             return None
@@ -1303,6 +1329,8 @@ class Runner:
             await self.store.set_status(node_id, NodeStatus.RUNNABLE)
         if node.paused:
             await self.store.set_paused(node_id, False)
+        if node.project_id in self._deleting_projects:
+            return None
         self._running[node.id] = asyncio.create_task(
             self._execute_node(node, node.project_id)
         )
