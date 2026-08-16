@@ -37,7 +37,7 @@
 - No useless components, status indicators next to a status word, self-labeling.
 - No repeated UI, every element appears only once.
 - No pretend or cosmetic UI. Everything is functional.
-- No dishonest animations or states, if something is active, the it is really active.
+- No dishonest animations or states, if something is active, it is really active.
 - Proper tooltips and hints to guide the user.
 
 ## Tech requirements

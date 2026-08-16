@@ -905,16 +905,141 @@ def test_planner_honors_editable_planning_instructions():
     assert "Use two nested planning branches" in prompt
 
 
-def test_planner_treats_subplanners_as_rare_exceptions():
+def test_initial_setup_planner_chooses_a_domain_appropriate_board():
+    root = Node(
+        project_id=uuid.uuid4(),
+        objective="Launch a small software product",
+        generated_prompt="Build a product for a clearly defined audience.",
+    )
+    root_prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=root))
+
+    assert "setup planner" in root_prompt
+    for phrase in (
+        "Set up the board",
+        "interpreting the user's actual request",
+        "smallest sufficient",
+        "top-level PlanResult field",
+        "preserve it and do not",
+        "lean MVP or demo",
+        "book-writing workflow",
+        "routine\n  automation",
+        "find-skills",
+        "stack- and runtime-specific architecture",
+        "Do not name, reserve, or register files",
+        "Stop at each nested planner",
+        "never invent, replace, or edit its future",
+    ):
+        assert phrase in root_prompt
+    for future_filename in ("MARKET_RESEARCH.md", "DESIGN.md", "ARCHITECTURE.md", "DISTRIBUTION_PLAN.md"):
+        assert future_filename not in root_prompt
+    for phrase in (
+        "one\n  focused worker",
+        "broad product",
+        "research, design, engineering",
+        "This is a\n  decision, not a mandatory pipeline",
+        "Do not assume a generic\n  architecture skill is needed",
+        "INFORMATION-FLOW AUDIT",
+        "discovery and product/design work precede architecture",
+        "not a mandatory pipeline",
+    ):
+        assert phrase in root_prompt
+
+    nested = Node(
+        project_id=root.project_id,
+        parent_id=root.id,
+        objective="Development architecture",
+        generated_prompt="Turn the validated product direction into an implementation plan.",
+    )
+    nested_prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=nested))
+    assert "scoped planner" in nested_prompt
+    assert "SCOPED PLANNING" in nested_prompt
+    assert "SETUP — this is the project-root setup planner:" not in nested_prompt
+    assert "ancestor-owned edges" in nested_prompt
+    assert "sibling stages" in nested_prompt and "later stages" in nested_prompt
+    assert "board owner" in nested_prompt
+
+
+def test_setup_plan_shape_preserves_stage_handoffs():
+    payload = {
+        "project_name": "Software Product",
+        "nodes": [
+            {
+                "key": "market_research",
+                "objective": "Research the market",
+                "executor": "codex",
+                "agent_type": "executor",
+                "skills": ["turn-research"],
+            },
+            {
+                "key": "market_validation",
+                "objective": "Validate market research",
+                "executor": "codex",
+                "agent_type": "verifier",
+                "depends_on": ["market_research"],
+            },
+            {
+                "key": "ui_ux_design",
+                "objective": "Design the experience",
+                "executor": "codex",
+                "agent_type": "executor",
+                "depends_on": ["market_validation"],
+                "skills": ["turn-product-design"],
+            },
+            {
+                "key": "development_architecture",
+                "objective": "Plan development",
+                "executor": "planner",
+                "agent_type": "planner",
+                "plan": True,
+                "depends_on": ["ui_ux_design"],
+                "skills": ["turn-architecture-research"],
+            },
+            {
+                "key": "distribution_planning",
+                "objective": "Plan distribution",
+                "executor": "planner",
+                "agent_type": "planner",
+                "plan": True,
+                "depends_on": ["development_architecture"],
+                "skills": ["turn-plan-distribution"],
+            },
+        ],
+    }
+    plan = AgentPlanner._parse_plan(json.dumps(payload), "Launch a software product")
+
+    assert plan is not None
+    assert plan.project_name == "Software Product"
+    assert [node.key for node in plan.nodes] == [
+        "market_research",
+        "market_validation",
+        "ui_ux_design",
+        "development_architecture",
+        "distribution_planning",
+    ]
+    assert plan.nodes[1].agent_type is AgentType.VERIFIER
+    assert plan.nodes[3].agent_type is AgentType.PLANNER and plan.nodes[3].plan
+    assert plan.nodes[4].depends_on == ["development_architecture"]
+    assert plan.document_refs == []
+    assert all(not node.artifacts for node in plan.nodes)
+    assert [node.skills for node in plan.nodes] == [
+        ["turn-research"],
+        [],
+        ["turn-product-design"],
+        ["turn-architecture-research"],
+        ["turn-plan-distribution"],
+    ]
+
+
+def test_initial_setup_planner_can_use_nested_planners_for_broad_stages():
     node = Node(
         project_id=uuid.uuid4(),
         objective="Build a product",
         generated_prompt="Build a product for one user request.",
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
-    assert "exception, not the normal shape" in prompt
-    assert "multi-organization" in prompt
-    assert "visible at a glance" in prompt
+    assert "setup planner" in prompt
+    assert "broad domain needs its own evolving subtree" in prompt
+    assert "nested planners" in prompt
     assert "complete finished product" in prompt
     assert "Do not silently convert it into an MVP" in prompt
 
@@ -928,6 +1053,7 @@ def test_planner_only_uses_limited_delivery_scope_when_user_requests_it():
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
     assert "complete finished product" in prompt
     assert "If a limited scope is explicitly requested" in prompt
+    assert "Keep explicitly small work small" in prompt
 
 
 def test_planner_requires_skill_research_and_visual_references_when_relevant():
@@ -993,6 +1119,20 @@ def test_bare_schema_plan_is_accepted_and_explicit_edges_follow_domain_direction
     assert plan is not None
     assert plan.nodes[0].depends_on == []
     assert plan.nodes[1].depends_on == ["a"]
+
+
+def test_plan_parser_preserves_dependencies_when_nodes_are_not_topologically_ordered():
+    payload = {
+        "nodes": [
+            {"key": "development", "objective": "Plan development", "depends_on": ["research"]},
+            {"key": "research", "objective": "Research the product"},
+        ]
+    }
+
+    plan = AgentPlanner._parse_plan(json.dumps(payload))
+
+    assert plan is not None
+    assert plan.nodes[0].depends_on == ["research"]
 
 
 def test_agent_plan_parser_preserves_specializations_and_nested_planners():

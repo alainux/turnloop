@@ -526,6 +526,11 @@ async def _delete_project(
         })
         raise HTTPException(status_code=409, detail=message)
     await runner.cancel_project_runs(pid)
+    # Provider conversations may still be attached to Turn-owned Herdr panes
+    # after their run tasks are cancelled. Close the project workspace before
+    # invoking the harness lifecycle command so providers can release those
+    # sessions through their public delete/archive surface.
+    await runner.close_project_workspace(pid)
 
     cleanup = None
     if options.delete_conversations:
@@ -579,7 +584,6 @@ async def _delete_project(
             project_directory = _project_directory_for_deletion(store, pid, root.repo_path)
         except (OSError, RuntimeError) as error:
             raise HTTPException(409, f"Project files could not be deleted: {error}") from error
-        await runner.close_project_workspace(pid)
         await request.app.state.events.publish({
             "type": "project.deletion_progress",
             "project_id": project_id,
@@ -606,9 +610,6 @@ async def _delete_project(
             "status": "deleted",
             "message": "Project files deleted",
         })
-    else:
-        await runner.close_project_workspace(pid)
-
     await store.delete_project(pid)
     await request.app.state.events.publish({
         "type": "project.deleted",

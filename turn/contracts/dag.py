@@ -79,10 +79,10 @@ def plan_handoff_example() -> str:
 
     Sections intentionally contain only a title and Markdown text (plus
     optional nesting). Substantial prose belongs in an ordinary project
-    document referenced by ``document_refs``; the structured index is
-    deliberately small. Dependencies belong in node ``depends_on``; omitting
-    the redundant top-level ``edges`` field avoids a second enum-shaped way
-    for planners to describe the same relationship.
+    document submitted as an artifact by the worker that creates it; the
+    structured index is deliberately small. Dependencies belong in node
+    ``depends_on``; omitting the redundant top-level ``edges`` field avoids a
+    second enum-shaped way for planners to describe the same relationship.
     """
     return json.dumps(
         {
@@ -97,8 +97,7 @@ def plan_handoff_example() -> str:
                     "depends_on": [],
                 }
             ],
-            "document_refs": ["docs/project-plan.md"],
-            "artifacts": [{"kind": "file", "name": "project-plan.md", "ref": "docs/project-plan.md"}],
+            "project_name": "Short project name",
         },
         separators=(",", ":"),
     )

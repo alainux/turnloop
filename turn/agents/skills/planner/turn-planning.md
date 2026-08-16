@@ -52,29 +52,44 @@ workers.
 
 Every child must contribute directly to that outcome. Use parallel branches
 only when the work is genuinely independent, and add dependencies whenever a
-later worker needs an earlier worker's files, contracts, or decisions. A final
-integration must make the assembled result actually satisfy the original
-request and must fail visibly if it only produced a framework or partial
-implementation.
+later worker needs an earlier worker's files, contracts, or decisions. For a
+product, research or product/design decisions commonly determine what
+engineering should build; make that handoff explicit when it is true. This is
+an information-flow rule, not a fixed product pipeline, and it should not add
+stages that the request does not justify. A final integration must make the
+assembled result actually satisfy the original request and must fail visibly if
+it only produced a framework or partial implementation.
 
-For a broad product or system request, prefer creating `ARCHITECTURE.md` in
-the assigned project directory and submit it through the Turn CLI as a file
-artifact. Reference it from the plan's generic `document_refs` array. More than one
-Markdown file is valid, including nested imports, and individual prompts or
-large verifier reports may use the same mechanism when inline text becomes
-unwieldy. The architecture document is one coherent implementation-ready
-block, not a fixed list of required subsections. Shape it with the outline
-that this product needs: outcome, boundaries, approach, contracts, decisions,
-risks, delivery, and acceptance criteria are useful possibilities, not a
-schema checklist. The document is ordinary project content; the graph stores
-only its reference and never interprets its headings, diagrams, or sections.
+For a broad product or system request, the planner may instruct its assigned
+worker to create an architecture document in the project directory. The
+worker that actually creates a file submits it through the Turn CLI as a file
+artifact at handoff. Do not put a future worker's filename in the plan's
+`document_refs` or `artifacts` arrays: those fields are not reservations and
+must not announce work that has not happened. More than one Markdown file is
+valid, including nested imports, and individual prompts or large verifier
+reports may use the same mechanism when inline text becomes unwieldy. The
+architecture document is one coherent implementation-ready block, not a fixed
+list of required subsections. Shape it with the outline that this product
+needs: outcome, boundaries, approach, contracts, decisions, risks, delivery,
+and acceptance criteria are useful possibilities, not a schema checklist. The
+document is ordinary project content; the graph stores only references to
+documents that are already available or submitted in the same handoff.
 
 Include a concise filesystem tree in the project document when it helps workers
 share a composition boundary, and record actual research URLs in that document.
 Use Markdown diagrams or images when a real relationship or data flow is clearer
-visually. Every linked or created file that belongs to the submission must
-also appear in the submission's `artifacts` array. Store references, not file
+visually. Every file actually created or linked by the current submission must
+appear in that submission's `artifacts` array. Store references, not file
 contents, in graph state so documents remain dynamic and explicitly readable.
+Requirements for future files belong in the worker's prompt or selected skill,
+not in a planner-created artifact or document reference.
+
+Handoff shape is exact: an artifact may be a relative path string such as
+`"ARCHITECTURE.md"`, or an object with `kind`, `name`, and `ref` (and optional
+`content`). `path` is not an artifact field. A document reference is a relative
+path string or an object with `ref`. Include only files that already exist and
+were created or linked in this submission; never use these arrays to reserve
+future outputs.
 Every descendant worker receives the paths from the graph and can open them
 when needed.
 
@@ -82,13 +97,14 @@ Project documentation is optional for a genuinely atomic request. It is not
 optional merely because the planner wants to avoid doing the architectural
 thinking for a broad request.
 
-For a broad software product, make the first-level plan visibly modular: give
-at least two genuinely independent product domains an empty `depends_on` list
-when they can begin from the user request and stable interfaces. Do not put
-every branch behind a content or architecture branch merely to make the graph
-look orderly; use a dependency only when the branch truly cannot start
-without that sibling's concrete output. The final integrator is where those
-independent modules are reconciled and made runnable.
+For a broad product, make the first-level plan visibly modular while preserving
+information flow. Give a child an empty `depends_on` list only when it can
+begin from the user request and stable existing interfaces. If engineering,
+distribution, or another stage needs research, product definition, design, or
+other sibling decisions, make that prerequisite explicit. Do not put unrelated
+work behind a branch merely to make the graph look orderly, and do not call
+work independent merely because it is a separate domain. The final integrator
+is where the resulting outputs are reconciled and made runnable.
 
 Keep the first specification visible at the current planning boundary. For a
 single user request, prefer direct concrete executors and one final integrator

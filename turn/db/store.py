@@ -22,8 +22,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlsplit
-
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
@@ -43,7 +41,7 @@ from turn.domain.schemas import (
     RunPolicy,
     RunStatus,
     Usage,
-    flatten_document_refs,
+    SETUP_SKILL_ID,
 )
 from turn.graph.logic import GraphWalker
 
@@ -77,25 +75,6 @@ def _merge_document_refs(existing: list[DocumentRef], incoming: list[DocumentRef
         seen.add(ref.ref)
         merged.append(ref)
     return merged
-
-
-def _document_artifact_specs(refs: list[DocumentRef]) -> list[ArtifactSpec]:
-    """Project document references into concise file/link artifacts."""
-    specs: list[ArtifactSpec] = []
-    seen: set[str] = set()
-    for document in flatten_document_refs(refs):
-        if document.ref in seen:
-            continue
-        seen.add(document.ref)
-        parsed = urlsplit(document.ref)
-        path = parsed.path.rstrip("/")
-        name = document.title or (Path(path).name if path else document.ref)
-        specs.append(ArtifactSpec(
-            kind=ArtifactKind.LINK if parsed.scheme else ArtifactKind.FILE,
-            name=name,
-            ref=document.ref,
-        ))
-    return specs
 
 
 class Store:
@@ -327,9 +306,25 @@ class Store:
         auto_run_default = str(raw) not in ("0", "false", "False", "")
         root_id = id or uuid.uuid4()
         policy = run_policy or RunPolicy(auto_run=auto_run_default)
-        root_agent = (agent.model_copy(deep=True) if agent else AgentConfig()).as_type(
-            AgentType.PLANNER
-        )
+        root_config = agent.model_copy(deep=True) if agent else AgentConfig()
+        # Initial setup is a root-project concern. Keep it as an explicit
+        # selection so nested planner nodes receive only their normal planner
+        # contract plus the domain skills chosen for their subtree.
+        root_config.skill_ids = list(dict.fromkeys([
+            *root_config.skill_ids,
+            SETUP_SKILL_ID,
+        ]))
+        root_agent = root_config.as_type(AgentType.PLANNER)
+        # The root setup agent interprets the request and chooses the board; it
+        # does not need the planner-only conceptual image-generation skill.
+        # Nested planners are specialized through ``as_type`` below and retain
+        # the normal planner contract when their scope needs it.
+        root_agent.skill_ids = [
+            skill_id for skill_id in root_agent.skill_ids if skill_id != "imagegen"
+        ]
+        root_agent.skills = [
+            path for path in root_agent.skills if Path(path).name != "imagegen.md"
+        ]
         root_agent.session_id = None
         explicit_name = name.strip() if name and name.strip() else None
         display_name = explicit_name or _concise_title(prompt)
@@ -350,6 +345,19 @@ class Store:
             run_policy=policy,
             repo_path=repo_path,
         )
+        # Node validation restores type defaults, so apply the root setup
+        # contract once more after construction before persisting the node.
+        if node.agent is not None:
+            object.__setattr__(
+                node.agent,
+                "skill_ids",
+                [skill_id for skill_id in node.agent.skill_ids if skill_id != "imagegen"],
+            )
+            object.__setattr__(
+                node.agent,
+                "skills",
+                [path for path in node.agent.skills if Path(path).name != "imagegen.md"],
+            )
         project_path = Path(repo_path).expanduser().resolve() if repo_path else self.data_dir / "projects" / f"proj-{root_id.hex[:8]}"
         project_path.mkdir(parents=True, exist_ok=True)
         self._project_paths[root_id] = project_path
@@ -618,6 +626,13 @@ class Store:
             parent.document_refs,
             plan.document_refs,
         )
+        # A root setup planner may supply a concise navigation name when the
+        # user left the project unnamed. Explicit user names remain authoritative
+        # and nested planners can never rename the project root.
+        if parent.parent_id is None and parent.project_name is None and plan.project_name:
+            candidate_name = plan.project_name.strip()
+            if candidate_name:
+                parent.project_name = candidate_name
         parent_id = parent.id
         if not plan.nodes:
             parent.status = NodeStatus.COMPLETE
@@ -626,7 +641,7 @@ class Store:
             self._append_artifacts(
                 state,
                 parent_id,
-                [*plan.artifacts, *_document_artifact_specs(parent.document_refs)],
+                plan.artifacts,
             )
             await self._persist_project(parent.project_id)
             return []
@@ -649,6 +664,12 @@ class Store:
             parent_id = keys_to_ids[spec.parent_key] if spec.parent_key else parent.id
             executor = PLANNER_EXECUTOR if (spec.plan or spec.executor == PLANNER_EXECUTOR) else (spec.executor or "codex")
             inherited_agent = parent.agent.model_copy(deep=True) if parent.agent else None
+            if inherited_agent:
+                inherited_agent.skill_ids = [
+                    skill_id
+                    for skill_id in inherited_agent.skill_ids
+                    if skill_id != SETUP_SKILL_ID
+                ]
             generic_leaf = executor != PLANNER_EXECUTOR and executor == "codex"
             if generic_leaf and inherited_agent:
                 executor = inherited_agent.harness.value
@@ -686,7 +707,7 @@ class Store:
             self._append_artifacts(
                 state,
                 node.id,
-                [*spec.artifacts, *_document_artifact_specs(spec.document_refs)],
+                spec.artifacts,
             )
             created.append(node)
             if not spec.parent_key:
@@ -704,7 +725,7 @@ class Store:
         self._append_artifacts(
             state,
             parent.id,
-            [*plan.artifacts, *_document_artifact_specs(parent.document_refs)],
+            plan.artifacts,
         )
         await self._persist_project(parent.project_id)
         return [node.model_copy(deep=True) for node in created]
@@ -852,7 +873,12 @@ class Store:
         return [artifact.model_copy(deep=True) for artifact in artifacts]
 
     async def add_document_refs(self, node_id: uuid.UUID, refs: list[DocumentRef]) -> list[Artifact]:
-        """Attach dynamic refs and expose each new ref as a file/link artifact."""
+        """Attach dynamic refs without pretending that the target exists.
+
+        A document reference is coordination metadata. A worker must submit an
+        explicit file or link artifact when the referenced output is actually
+        available; storing a ref alone must never create a placeholder artifact.
+        """
         found = self._project_for_node(node_id)
         if not found:
             return []
@@ -861,12 +887,9 @@ class Store:
         node = state["nodes"].get(node_id)
         if node is None:
             return []
-        before = {ref.ref for ref in node.document_refs}
         node.document_refs = _merge_document_refs(node.document_refs, refs)
-        new_refs = [ref for ref in flatten_document_refs(refs) if ref.ref not in before]
-        artifacts = self._append_artifacts(state, node_id, _document_artifact_specs(new_refs))
         await self._persist_project(project_id)
-        return [artifact.model_copy(deep=True) for artifact in artifacts]
+        return []
 
     async def get_artifacts(self, node_id: uuid.UUID) -> list[Artifact]:
         found = self._project_for_node(node_id)

@@ -50,6 +50,9 @@ def test_agent_handoff_prompt_uses_shell_safe_cli_stdin_submission():
         assert "--payload" not in prompt
         assert "TURN_CLI agent" not in prompt
         assert ".turn/" not in prompt
+        if plan:
+            assert '"artifacts":["ARCHITECTURE.md"]' in prompt
+            assert "`path` is not a" in prompt
 
 
 def test_worker_environment_uses_the_inherited_turn_command(tmp_path):

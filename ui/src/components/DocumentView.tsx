@@ -125,7 +125,7 @@ function dependencyLabels(node: GraphNode, nodes: GraphNode[], edges: Edge[]): s
     .filter((name): name is string => Boolean(name));
 }
 
-function DocumentLinks({
+export function DocumentLinks({
   refs,
   projectId,
   onOpenDocument,

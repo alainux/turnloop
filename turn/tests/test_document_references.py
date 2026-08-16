@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 from turn.contracts.dag import parse_plan, parse_result
 from turn.db.store import Store
-from turn.domain.schemas import DocumentRef, NodeSpec, PlanResult
+from turn.domain.schemas import ArtifactKind, ArtifactSpec, DocumentRef, NodeSpec, PlanResult
 from turn.server.api import router
 from turn.tools.graph_explorer import _query
 
@@ -51,9 +51,18 @@ def test_plan_and_result_accept_file_reference_shorthand():
         "document_refs": ["reports/verification.md"],
     }).document_refs[0].ref == "reports/verification.md"
 
+    handoff = parse_plan({
+        "nodes": [],
+        "document_refs": ["ARCHITECTURE.md"],
+        "artifacts": ["ARCHITECTURE.md"],
+    })
+    assert handoff.document_refs[0].ref == "ARCHITECTURE.md"
+    assert handoff.artifacts[0].name == "ARCHITECTURE.md"
+    assert handoff.artifacts[0].ref == "ARCHITECTURE.md"
+
 
 @pytest.mark.asyncio
-async def test_store_keeps_references_dynamic_and_projects_them_to_artifacts(tmp_path):
+async def test_store_keeps_references_dynamic_until_a_worker_submits_the_artifact(tmp_path):
     store = Store(tmp_path / "state")
     await store.init()
     root = await store.create_project("Build a documented feature")
@@ -83,11 +92,17 @@ async def test_store_keeps_references_dynamic_and_projects_them_to_artifacts(tmp
     ]
     assert [ref.ref for ref in child.document_refs] == ["docs/prompt.md"]
     refs = {artifact.ref for artifact in graph.artifacts if artifact.ref}
-    assert {"ARCHITECTURE.md", "docs/plan.md", "docs/runtime.md", "docs/contracts.md", "docs/prompt.md"} <= refs
-    assert any(
-        artifact.ref == "https://example.com/reference" and artifact.kind.value == "link"
-        for artifact in graph.artifacts
+    assert refs == {"ARCHITECTURE.md"}
+    assert not any(artifact.ref == "docs/plan.md" for artifact in graph.artifacts)
+    assert not any(artifact.ref == "https://example.com/reference" for artifact in graph.artifacts)
+
+    await store.add_artifacts(
+        child.id,
+        [ArtifactSpec(kind=ArtifactKind.FILE, name="prompt.md", ref="docs/prompt.md")],
     )
+    graph = await store.get_graph(root.id)
+    refs = {artifact.ref for artifact in graph.artifacts if artifact.ref}
+    assert refs == {"ARCHITECTURE.md", "docs/prompt.md"}
     state_path = store.project_path(root.id) / ".turn" / "state.json"
     raw = json.loads(state_path.read_text())
     assert "contents" not in json.dumps(raw)
@@ -95,6 +110,19 @@ async def test_store_keeps_references_dynamic_and_projects_them_to_artifacts(tmp
     nodes, _ = await _query(str(state_path), str(root.id))
     inspected = next(item for item in nodes if item["id"] == str(child.id))
     assert inspected["document_refs"][0]["ref"] == "docs/prompt.md"
+
+
+@pytest.mark.asyncio
+async def test_adding_document_refs_never_creates_placeholder_artifacts(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project("Keep planned documents optional")
+
+    assert await store.add_document_refs(root.id, [DocumentRef(ref="future.md")]) == []
+    graph = await store.get_graph(root.id)
+
+    assert [ref.ref for ref in graph.nodes[0].document_refs] == ["future.md"]
+    assert graph.artifacts == []
 
 
 @pytest.mark.asyncio

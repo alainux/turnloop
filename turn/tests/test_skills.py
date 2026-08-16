@@ -5,8 +5,15 @@ import json
 
 import pytest
 
-from turn.domain.schemas import AgentConfig, AgentType, NodeSpec, PlanResult
-from turn.skills.library import materialize, validate_skill_reference
+from turn.db.store import Store
+from turn.domain.schemas import (
+    AgentConfig,
+    AgentType,
+    NodeSpec,
+    SETUP_SKILL_ID,
+    PlanResult,
+)
+from turn.skills.library import SKILLS, materialize, validate_skill_reference
 from turn.workers.planner import AgentPlanner
 
 
@@ -32,11 +39,78 @@ class FakeBundleFetcher(FakeSkillFetcher):
 
 def test_find_skills_is_a_planner_skill():
     planner = AgentConfig(type_id=AgentType.PLANNER)
-    assert planner.skill_ids == ["turn-planning", "imagegen", "find-skills"]
+    assert planner.skill_ids == [
+        "turn-planning", "imagegen", "find-skills",
+    ]
     assert any(path.endswith("planner/find-skills.md") for path in planner.skills)
     assert any(path.endswith("planner/turn-planning.md") for path in planner.skills)
+    assert SETUP_SKILL_ID not in planner.skill_ids
+    assert not any(path.endswith("planner/turn-setup.md") for path in planner.skills)
     assert any(path.endswith("planner/imagegen.md") for path in planner.skills)
     assert not any(path.endswith("turn-architecture-research.md") for path in planner.skills)
+
+
+@pytest.mark.asyncio
+async def test_only_the_project_root_gets_the_setup_skill(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project("Set up a small workflow")
+
+    assert SETUP_SKILL_ID in root.agent.skill_ids
+    assert "imagegen" not in root.agent.skill_ids
+    assert not any(path.endswith("planner/imagegen.md") for path in root.agent.skills)
+
+    created = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(
+            key="architect",
+            objective="Plan application architecture",
+            executor="planner",
+            plan=True,
+            skills=["turn-architecture-research"],
+        )]),
+    )
+    architect = created[0]
+    assert architect.agent is not None
+    assert architect.agent.type_id is AgentType.PLANNER
+    assert SETUP_SKILL_ID not in architect.agent.skill_ids
+    assert "imagegen" in architect.agent.skill_ids
+    assert "turn-architecture-research" in architect.agent.skill_ids
+
+
+@pytest.mark.asyncio
+async def test_root_setup_name_is_ingested_without_overriding_user_name(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+
+    unnamed = await store.create_project("Build a tiny checklist")
+    await store.apply_plan(
+        unnamed,
+        PlanResult(nodes=[], project_name="Daily Checklist"),
+    )
+    stored_unnamed = await store.get_node(unnamed.id)
+    assert stored_unnamed is not None
+    assert stored_unnamed.project_name == "Daily Checklist"
+
+    named = await store.create_project("Build another checklist", name="My Checklist")
+    await store.apply_plan(
+        named,
+        PlanResult(nodes=[], project_name="Planner Replacement"),
+    )
+    stored_named = await store.get_node(named.id)
+    assert stored_named is not None
+    assert stored_named.project_name == "My Checklist"
+
+    renamed = await store.create_project("Build a renamed checklist")
+    renamed.project_name = "User Renamed Checklist"
+    await store._save_node(renamed)
+    await store.apply_plan(
+        renamed,
+        PlanResult(nodes=[], project_name="Planner Replacement"),
+    )
+    stored_renamed = await store.get_node(renamed.id)
+    assert stored_renamed is not None
+    assert stored_renamed.project_name == "User Renamed Checklist"
 
 
 def test_worker_receives_role_base_skills_and_planner_selected_additions():
@@ -48,6 +122,17 @@ def test_worker_receives_role_base_skills_and_planner_selected_additions():
         "turn-executing",
         "turn-architecture-research",
     ]
+
+
+def test_research_and_distribution_skills_are_available_to_assignments():
+    for skill_id in (
+        "turn-research",
+        "turn-product-design",
+        "turn-plan-distribution",
+    ):
+        assert skill_id in SKILLS
+        assert SKILLS[skill_id].source_path.is_file()
+    assert "turn-organization-validation" not in SKILLS
 
 
 @pytest.mark.parametrize(

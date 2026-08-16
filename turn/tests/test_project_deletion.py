@@ -221,6 +221,53 @@ async def test_project_delete_captures_session_ids_before_cancelling_runs(tmp_pa
         await store.dispose()
 
 
+async def test_project_delete_closes_workspace_before_conversation_cleanup(tmp_path, monkeypatch):
+    app, store, runner = await _app(tmp_path)
+    order: list[str] = []
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            created = await client.post("/api/projects", json={
+                "prompt": "Close the project workspace before deleting its conversation",
+                "agent": {
+                    "harness": "codex",
+                    "type_id": "planner",
+                    "session_id": "codex-session-1",
+                },
+                "working_dir": str(tmp_path / "close-before-cleanup"),
+                "run_policy": {"auto_run": False},
+            })
+            assert created.status_code == 200, created.text
+            project_id = uuid.UUID(created.json()["project_id"])
+
+            async def record_cancel(_project_id):
+                order.append("cancel")
+
+            async def record_close(_project_id):
+                order.append("workspace")
+                return True
+
+            async def record_cleanup(refs, *, cwd, commands, on_progress):
+                del cwd, commands, on_progress
+                order.append("cleanup")
+                return ConversationCleanup(len(refs), len(refs), 0, 0, 0, ())
+
+            monkeypatch.setattr(runner, "cancel_project_runs", record_cancel)
+            monkeypatch.setattr(runner, "close_project_workspace", record_close)
+            monkeypatch.setattr(server_api, "cleanup_conversations", record_cleanup)
+
+            response = await client.request(
+                "DELETE",
+                f"/api/projects/{project_id}",
+                json={"delete_files": False, "delete_conversations": True},
+            )
+
+            assert response.status_code == 200, response.text
+            assert order == ["cancel", "workspace", "cleanup"]
+    finally:
+        await runner.stop()
+        await store.dispose()
+
+
 async def test_project_delete_fails_closed_when_a_harness_session_is_untracked(tmp_path, monkeypatch):
     app, store, runner = await _app(tmp_path)
     cancelled = False

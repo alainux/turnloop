@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { orderDocumentNodes } from "./DocumentView";
-import type { Edge, GraphNode } from "../domain";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { DocumentLinks, orderDocumentNodes } from "./DocumentView";
+import type { DocumentRef, Edge, GraphNode } from "../domain";
 
 const node = (id: string, parent_id: string | null): GraphNode =>
   ({
@@ -42,6 +44,22 @@ const edge = (src: string, dst: string): Edge => ({
 });
 
 describe("document specification ordering", () => {
+  it("keeps unresolved references visible for diagnosis", () => {
+    const reference: DocumentRef = {
+      ref: "future.md",
+      title: null,
+      media_type: null,
+      imports: [],
+    };
+
+    const rendered = renderToStaticMarkup(
+      createElement(DocumentLinks, { refs: [reference], projectId: "root" }),
+    );
+
+    expect(rendered).toContain("future.md");
+    expect(rendered).toContain("/api/projects/root/documents/future.md");
+  });
+
   it("puts explicit prerequisites above their integrator", () => {
     const nodes = [
       node("root", null),

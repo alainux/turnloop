@@ -39,6 +39,10 @@ SKILLS: dict[str, SkillDefinition] = {
         "turn-planning", "Turn planning", _ROOT / "planner" / "turn-planning.md",
         "Graph decomposition, project documents, contracts, and orchestration.",
     ),
+    "turn-setup": SkillDefinition(
+        "turn-setup", "Turn setup", _ROOT / "planner" / "turn-setup.md",
+        "Interpret a user request and set up the smallest sufficient workgraph.",
+    ),
     "turn-architecture-research": SkillDefinition(
         "turn-architecture-research", "Architecture research", _ROOT / "planner" / "turn-architecture-research.md",
         "Evidence-led product architecture, modular decomposition, and executable filesystem structure.",
@@ -51,6 +55,14 @@ SKILLS: dict[str, SkillDefinition] = {
         "turn-executing", "Turn execution", _ROOT / "executor" / "turn-executing.md",
         "Concrete implementation work and CLI result handoff.",
     ),
+    "turn-research": SkillDefinition(
+        "turn-research", "Research", _ROOT / "executor" / "turn-research.md",
+        "Evidence-led market and audience research for an assigned initiative.",
+    ),
+    "turn-product-design": SkillDefinition(
+        "turn-product-design", "Product design", _ROOT / "executor" / "turn-product-design.md",
+        "Product, UI, UX, and design-system definition from validated research.",
+    ),
     "turn-integrating": SkillDefinition(
         "turn-integrating", "Turn integration", _ROOT / "integrator" / "turn-integrating.md",
         "Recompose prerequisite work into the real user-facing product.",
@@ -58,6 +70,10 @@ SKILLS: dict[str, SkillDefinition] = {
     "turn-verifying": SkillDefinition(
         "turn-verifying", "Turn verification", _ROOT / "verifier" / "turn-verifying.md",
         "Code and visual inspection with approve/reject decisions.",
+    ),
+    "turn-plan-distribution": SkillDefinition(
+        "turn-plan-distribution", "Distribution planning", _ROOT / "planner" / "turn-plan-distribution.md",
+        "Go-to-market and adoption planning for an assigned product or initiative.",
     ),
     "imagegen": SkillDefinition(
         "imagegen", "Concept image generation", _ROOT / "planner" / "imagegen.md",

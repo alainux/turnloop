@@ -168,6 +168,9 @@ class AgentType(str, Enum):
     VERIFIER = "verifier"
 
 
+SETUP_SKILL_ID = "turn-setup"
+
+
 class VerificationDecision(str, Enum):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
@@ -621,6 +624,9 @@ class PlanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nodes: list[NodeSpec]
+    # Only the project-root setup planner may use this. The server ingests it
+    # as the navigation name when the user did not provide one at creation.
+    project_name: Optional[str] = Field(default=None, min_length=1, max_length=72)
     document_refs: list[DocumentRef] = Field(default_factory=list)
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
     edges: list[EdgeSpec] = Field(default_factory=list)

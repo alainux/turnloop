@@ -26,7 +26,10 @@ abstract components.
 ## Shape the graph
 
 - Make the first level a set of real product boundaries, not chronological
-  verbs. Separate independently buildable domains so they can run in parallel.
+  verbs. Separate independently buildable domains, but only run them in
+  parallel when they do not need another domain's decisions or artifacts. If
+  product research or design determines what the engineering boundary must
+  build, make that dependency explicit.
 - State the contract, invariants, durable namespace, tests, and acceptance
   evidence for every worker. Put integration after its prerequisites and make
   it own the real application/package entry point.
@@ -40,7 +43,10 @@ abstract components.
 
 Prefer a project-owned `ARCHITECTURE.md` as the durable architecture source.
 Submit its project-relative path as a document reference and as a file
-artifact. Additional Markdown documents and nested imports are valid when the
+artifact. In the handoff, use the simple string form, for example
+`"document_refs":["ARCHITECTURE.md"],"artifacts":["ARCHITECTURE.md"]`, or
+the explicit artifact object with `kind`, `name`, and `ref`. Do not use a
+`path` field. Additional Markdown documents and nested imports are valid when the
 architecture, prompts, or evidence are easier to maintain as separate files.
 The framework must not require a fixed set of section names: use a coherent
 outline appropriate to the product and keep any structured metadata as a

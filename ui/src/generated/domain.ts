@@ -207,6 +207,7 @@ export type PermissionMode = "ask" | "workspace" | "full";
 
 export interface PlanResult {
   nodes: Array<NodeSpec>;
+  project_name: string | null;
   document_refs: Array<DocumentRef>;
   artifacts: Array<ArtifactSpec>;
   edges: Array<EdgeSpec>;

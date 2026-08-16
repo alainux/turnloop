@@ -417,6 +417,14 @@ files or directories that represent the work. Do not list every changed file;
 one directory is better for a large area. Turn will not infer artifacts from
 git status or filesystem scans.
 """
+    plan_artifact_guidance = "" if not plan else """
+For a planning handoff, include `document_refs` or `artifacts` only for files
+that already exist and were created or linked during this planning turn. The
+simple canonical form is a relative path string, for example:
+`"document_refs":["ARCHITECTURE.md"],"artifacts":["ARCHITECTURE.md"]`.
+An explicit artifact object uses `kind`, `name`, and `ref`; `path` is not a
+schema field. Leave these arrays empty or omitted when no file was created.
+"""
     return f"""
 TURN CONTROL PLANE:
 This is an ordinary terminal session. Use the harness normally: type, run
@@ -442,6 +450,7 @@ own line:
 {shape}
 TURN_PAYLOAD
 {artifact_guidance}
+{plan_artifact_guidance}
 
 The CLI submission is the only completion signal. Do not finish by printing a
 fenced result block or by relying on provider output formatting.

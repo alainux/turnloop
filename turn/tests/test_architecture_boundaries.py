@@ -48,8 +48,10 @@ def test_canonical_plan_handoff_keeps_documents_generic_and_dynamic():
     plan = parse_plan(payload)
 
     assert "edges" not in payload
-    assert [ref.ref for ref in plan.document_refs] == ["docs/project-plan.md"]
-    assert plan.artifacts[0].ref == "docs/project-plan.md"
+    assert payload["project_name"] == "Short project name"
+    assert plan.project_name == "Short project name"
+    assert plan.document_refs == []
+    assert plan.artifacts == []
 
 
 async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
@@ -178,6 +180,7 @@ def test_planner_and_executor_are_agent_types_with_filesystem_skills():
         )
     )
     assert "turn-planning" in planner_context
+    assert "turn-setup" not in planner_context
     assert "turn-architecture-research" not in planner_context
     assert "turn-product-coherence" not in planner_context
     assert "find-skills" in planner_context
@@ -208,6 +211,7 @@ async def test_project_documents_are_persisted_as_dynamic_references_and_visible
 
     graph = await store.get_graph(root.id)
     assert [ref.ref for ref in graph.nodes[0].document_refs] == ["ARCHITECTURE.md"]
+    assert graph.artifacts == []
     state = (root.repo_path and Path(root.repo_path) / ".turn" / "state.json") or next(
         (tmp_path / "turn" / "projects").glob("*/.turn/state.json")
     )

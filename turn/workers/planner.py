@@ -164,6 +164,62 @@ class CodexPlanner(Planner):
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
         handoff_example = plan_handoff_example()
+        initial_setup = ctx.node.parent_id is None
+        planning_role = "setup planner" if initial_setup else "scoped planner"
+        setup_guidance = """
+SETUP — this is the project-root setup planner:
+- Set up the board by interpreting the user's actual request. Identify the
+  requested outcome, domain, users, constraints, runtime or delivery form,
+  quality bar, and explicit scope before choosing work.
+- Choose the smallest sufficient shape for this request: it might be one
+  focused worker, a lean MVP or demo, a book-writing workflow, a routine
+  automation, a broad product or system, or something else entirely. Do not
+  assume this is a venture, software product, or organization.
+- For a broad product, research, design, engineering, verification,
+  integration, launch or adoption, and operations stages may be useful, but
+  add only stages the prompt, risk, and delivery goal justify. This is a
+  decision, not a mandatory pipeline. Keep explicitly small work small.
+- Create only the direct agent nodes, real dependencies, selected skills, and
+  ownership boundaries that the chosen setup needs. The board is the handoff
+  to the next planners and workers.
+- Project name: if this root project has no user-provided name, choose a concise
+  navigation name and return it in the top-level PlanResult field
+  `project_name`. If the project already has a name, preserve it and do not
+  replace it. This name is project metadata, not a future document or artifact.
+- Use `find-skills` to search for narrow domain guidance for chosen agents. For
+  web or app architecture, procure a stack- and runtime-specific architecture
+  skill only when an architecture stage is warranted. Do not assume a generic
+  architecture skill is needed, and do not invent a placeholder skill.
+- The setup plan must not know, name, reserve, or register future documents.
+  Requirements for outputs belong only in the assigned skill and worker
+  prompt. The worker that creates a file submits its actual artifact.
+- Stop at each nested planner: never invent, replace, or edit its future
+  descendants. The next planner owns its own replacement subtree. Do not edit
+  sibling or later-stage graph content.
+""" if initial_setup else """
+SCOPED PLANNING — this node is owned by a parent planner:
+- This is not setup. Do not recreate the project-wide setup or treat yourself
+  as the board owner; work only inside this planner's boundary. The setup
+  planner already established the surrounding board.
+- Plan only this node's assigned domain and direct children. Read upstream
+  outputs and preserve their contracts, but do not edit ancestor-owned edges,
+  sibling stages, or later stages owned by another planner.
+- Return a complete replacement subtree for this planning boundary when
+  revising it; never reach across a nested planner boundary.
+"""
+        document_guidance = """
+DOCUMENTS AND ARTIFACTS — root setup boundary:
+- Define topology, ownership, dependencies, and skill assignment only.
+- Do not name, reserve, or register files that a later agent may create.
+- Requirements for concrete deliverables belong in the selected skill and
+  assigned worker prompt. A worker submits an artifact only after creating it.
+""" if initial_setup else """
+DOCUMENTS AND ARTIFACTS — scoped planning boundary:
+- Use upstream artifacts and references as available context.
+- Do not reserve outputs for descendant workers. If this planner creates a
+  file during this planning turn, submit that actual file as an artifact.
+- Requirements for descendant deliverables belong in their skills and prompts.
+"""
         return f"""{render_context_block(ctx)}
 THIS NODE'S OBJECTIVE:
 {ctx.node.objective}
@@ -171,11 +227,13 @@ THIS NODE'S OBJECTIVE:
 PLANNING INSTRUCTIONS FOR THIS NODE:
 {ctx.node.generated_prompt or "No additional planning instructions."}
 
-You are the architect decomposing THIS node into its direct children. Produce
+You are the {planning_role} decomposing THIS node into its direct children. Produce
 a complete workgraph that divides all of the actual labor required to
 accomplish the user's objective, using the smallest number of meaningful
 responsibilities. This is an orchestration effort, not a mere abstraction
 exercise or chronological checklist.
+
+{setup_guidance}
 
 DELIVERY BAR — preserve the requested product:
 - Unless the user explicitly requests an MVP, proof of concept, prototype,
@@ -191,13 +249,13 @@ DELIVERY BAR — preserve the requested product:
 - The final integrator must make the complete requested result runnable and
   usable, not merely prove that isolated modules or a demo shell exist.
 
-DOCUMENT REFERENCES — keep the graph composable and the documents authoritative:
-- The graph is the execution model. It stores references to project documents; it does not store a special architecture object or ingest file contents.
-- When the objective is broad product or system work, architecture planners should create `ARCHITECTURE.md` in the assigned project directory and submit it through the Turn CLI as a file artifact. Add `"document_refs":["ARCHITECTURE.md"]` to the plan so workers and users can open the live source.
-- The architecture skill guides the document's useful content, but the protocol does not require named sections, diagrams, research fields, or any other domain-specific metadata. Use ordinary Markdown headings, links, code blocks, and image embeds as the work requires.
-- Additional Markdown files may be linked through `document_refs` or Markdown links when the material is large or independently maintained. Keep references dynamic: submit paths/URLs, never copied contents.
-- For visual or spatial work, use the project-scoped imagegen skill when a concept reference will reduce ambiguity. Submit the image as a normal file artifact and link/embed it from the Markdown document; do not add a special graph image record.
-- Record research, decisions, risks, contracts, directory structure, and acceptance evidence in the relevant Markdown document when they matter. Do not duplicate that content in the plan payload.
+{document_guidance}
+
+VISUAL REFERENCES:
+- For visual or spatial work, use the image-generation skill when a concept
+  reference would reduce ambiguity. Submit any image you actually create as a
+  normal file artifact and use image embeds or links from the current output;
+  do not reserve future visual files.
 
 First preserve the requested outcome. State what must be runnable, usable,
 readable, or otherwise deliverable at the end. For software, account for the
@@ -214,16 +272,23 @@ investigate / plan / verify scaffolding.
 - BROAD container: if the objective is a wide effort (e.g. "build X",
 "create a game", "implement the system", "plan the project"), identify the
 genuinely distinct domains, modules, capabilities, or output sections that
-make up the result. Prefer 2–5 orthogonal direct children that can proceed in
-parallel. Name them in the vocabulary of the domain; do not turn milestones,
-tests, or generic approval steps into fake domains.
-- PARALLELISM AUDIT: for a broad software product, at least two direct product
-branches should normally have empty `depends_on` lists and be runnable from
-the user request plus stable interfaces. Do not serialize every branch behind
-one content or architecture branch just to impose order. Add that dependency
-only when the downstream branch truly cannot begin without the sibling's
-concrete files, contract, or decision; the final integrator reconciles the
-independent outputs.
+make up the result. Prefer 2–5 orthogonal direct children, then use
+`depends_on` to express their actual information flow. Name them in the
+vocabulary of the domain; do not turn milestones, tests, or generic approval
+steps into fake domains.
+- INFORMATION-FLOW AUDIT: for every child, ask what it must know or consume in
+  order to make a sound decision or produce its deliverable. A child may omit
+  `depends_on` only when it can work from the user request and stable existing
+  interfaces without another child's decisions, files, or contracts. When a
+  product direction, research result, design, requirements decision, or other
+  upstream output determines the scope of later engineering or delivery work,
+  add that real prerequisite. For a broad software product this often means
+  discovery and product/design work precede architecture or implementation
+  planning, and launch work follows the product direction; apply the same rule
+  using the domain's equivalent handoffs for books, automations, and other
+  work. This is an information dependency, not a mandatory pipeline: keep
+  genuinely independent research or domains parallel, and do not invent stages
+  just to create a sequence.
 - Prefer one well-specified child over generic multi-step scaffolding. A child
 that merely restates this objective is never useful — drop it. Never list the
 same sub-task twice, and do NOT create parallel sub-planners that cover the
@@ -251,11 +316,11 @@ in the plan. BEFORE you finalize the plan, use the GRAPH EXPLORATION TOOL in
   If you catch yourself writing more than a short title, STOP and move the
   rest into "generated_prompt".
 
-TOPOLOGY — arrange the children to express a left-to-right architectural flow:
+TOPOLOGY — arrange the children to express the information and delivery flow:
 - PARALLEL ONLY WHEN INDEPENDENT: children may omit depends_on only when they
-  can create their deliverables without reading another child's files or
-  contracts. Parallelism is useful, but it is never a substitute for a real
-  prerequisite.
+  can create their deliverables without reading another child's decisions,
+  files, or contracts. Parallelism is useful, but it is never a substitute for
+  a real prerequisite.
 - SEQUENCE CONTRACTS: if a child consumes a sibling's domain model, API,
   schema, fixtures, or files, add that sibling to depends_on. In software
   projects, tests that exercise implementation work depend on the relevant
@@ -268,11 +333,13 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   existing outputs. It must not create a special integration directory or
   regenerate prerequisite domain work.
 - SINGULAR PRODUCT: when THIS node represents one product, deliverable, or
-  end-to-end outcome, add exactly one final integrator to produce that
-  result. It must depend on every direct branch output, including nested
-  planner/container branches. That final node is the only terminal output at
-  this workflow boundary. Multiple terminal outputs are appropriate only when
-  the objective explicitly requests multiple products or independent outputs.
+  end-to-end outcome, the development planning boundary must add exactly one
+  final integrator to produce that result. It must depend on every direct branch
+  output, including nested planner/container branches. At the setup boundary,
+  do not add a root-level integrator merely to recombine stages that already
+  have responsible nested planners. Multiple terminal outputs are appropriate
+  only when the objective explicitly requests multiple products or independent
+  outputs.
 - FINAL INTEGRATION: name the singular-product node integrate, assemble,
   merge, or otherwise recombine, and make it the final stage after all branch
   integrators or major outputs. A nested planner is itself a direct branch
@@ -283,15 +350,11 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   explicit; never use them just to make a checklist or to order unrelated
   work.
 - NESTED PLANNERS: for a sub-domain that is itself broad, set "plan": true
-  and "executor": "planner". This is an exception, not the normal shape for
-  one user's request: prefer direct concrete executors and a final integrator
-  so the initial specification is visible at a glance. Use a nested planner
-  only for a genuinely huge or uncertain scope, such as a multi-organization
-  enterprise, many independently governed platforms, or a sub-system whose
-  architecture cannot responsibly be decided yet. If the work can be named
-  and assigned now, do that instead. Do not add a planner at every
-  bifurcation: a broad parent may directly create concrete executors and
-  integrators.
+  and "executor": "planner". At the setup boundary, use nested planners when
+  a broad domain needs its own evolving subtree and ownership boundary. In a
+  narrower plan, use a nested planner only for a genuinely huge or uncertain
+  scope whose architecture cannot responsibly be decided yet. Do not add a
+  planner at every bifurcation.
 - LEAF WORK: every node that actually does work (writing code, prose, files)
   gets "executor": "codex" and a concrete "generated_prompt". The generated_prompt
   MUST tell the worker to WRITE its deliverable to a domain-appropriate file,
@@ -319,10 +382,12 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   skill bodies into prompts. Role-base skills are supplied automatically, so a
   node may have an empty additional `skills` array when investigation finds no
   material addition; do not spend a resubmission correcting that omission.
-  Record sources actually consulted in `ARCHITECTURE.md` when a project
-  document is appropriate. Planners themselves have only
-  `turn-planning`, `imagegen`, and `find-skills`; domain, architecture, QA,
-  and product skills are selected for workers by this planning process.
+  Record sources actually consulted in the relevant project document when one
+  is appropriate. Scoped planners have
+  `turn-planning`, `imagegen`, and `find-skills`; the root setup planner has
+  `turn-planning`, `find-skills`, and `turn-setup`. Domain, architecture, QA,
+  and product skills are selected for workers or scoped planners by this
+  planning process.
 - VERIFICATION: almost every concrete executor or integrator should be
   followed by a verifier when its output has meaningful code, visual, runtime,
   or contract risk. A verifier is an ordinary sibling at this planning
@@ -772,12 +837,12 @@ class AgentPlanner(Planner):
                     n.parent_key = None  # reparent to this node
 
         nodes = [n for n in raw_nodes if n.key not in drop]
-        index = {n.key: i for i, n in enumerate(nodes)}
 
         # 2) Collect dependencies from both per-node depends_on and explicit
-        #    edges (domain convention: src is prerequisite, dst dependent). Then enforce a
-        #    DAG by keeping only a dependency whose prerequisite appears EARLIER
-        #    in the node list (the prompt asks Codex to list in execution order).
+        #    edges (domain convention: src is prerequisite, dst dependent).
+        #    Declaration order is presentation, not semantics. Preserve a
+        #    dependency even when the model listed its prerequisite later; the
+        #    PlanResult validator owns missing-reference and cycle errors.
         deps: dict[str, list[str]] = {
             n.key: list(dict.fromkeys(n.depends_on)) for n in nodes
         }
@@ -787,12 +852,11 @@ class AgentPlanner(Planner):
                 if s not in deps[d]:
                     deps[d].append(s)
         for n in nodes:
-            n.depends_on = [
-                d for d in deps[n.key] if d in index and index[d] < index[n.key]
-            ]
+            n.depends_on = list(dict.fromkeys(deps[n.key]))
 
         return PlanResult(
             nodes=nodes,
+            project_name=data.get("project_name"),
             document_refs=document_refs(data.get("document_refs")),
             artifacts=artifact_specs(data.get("artifacts")),
             edges=[],
