@@ -72,6 +72,15 @@ export interface Executor {
   session_id: string | null;
 }
 
+export interface FlowEdge {
+  id: string;
+  src: string;
+  dst: string;
+  type: FlowEdgeType;
+}
+
+export type FlowEdgeType = "RETURN";
+
 export interface Graph {
   project_id: string;
   nodes: Array<Node>;
@@ -113,6 +122,7 @@ export interface GraphView {
   project_id: string;
   nodes: Array<GraphNodeView>;
   edges: Array<Edge>;
+  flow_edges: Array<FlowEdge>;
   artifacts: Array<Artifact>;
 }
 

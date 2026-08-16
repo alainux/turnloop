@@ -10,7 +10,17 @@ from fastapi import FastAPI
 
 from turn.config import Settings
 from turn.db.store import Store
-from turn.domain.schemas import Outcome, RunStatus, Usage
+from turn.domain.schemas import (
+    AgentType,
+    NodeStatus,
+    NodeSpec,
+    Outcome,
+    PlanResult,
+    RunStatus,
+    Usage,
+    VerificationDecision,
+    VerificationResult,
+)
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server.api import router
@@ -86,6 +96,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert "run" in root["allowed_actions"]
         assert root["agent"]["harness"] == "echo"
         assert root["agent"]["type_id"] == "planner"
+        assert graph["flow_edges"] == []
         assert len(root["resource_refs"]) == 2
         assert {Path(ref).name for ref in root["resource_refs"]} == {"brief.txt", "brief-2.txt"}
         assert all(Path(ref).is_file() for ref in root["resource_refs"])
@@ -146,5 +157,66 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         await runner.close_project_workspace(root_node.id)
         await store.delete_project(root_node.id)
         await client.post("/api/settings", json={"agent_defaults": original_defaults})
+    await runner.stop()
+    await store.dispose()
+
+
+async def test_api_projects_transient_rejection_return_flow(tmp_path):
+    cfg = Settings()
+    cfg.projects_dir = str(tmp_path / "projects")
+    store = Store(tmp_path / "turn")
+    await store.init()
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=cfg,
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.state.store = store
+    app.state.runner = runner
+    app.state.events = runner.events
+    app.state.test_mode = True
+    from turn.workers.harnesses import harness_capabilities
+    app.state.capabilities = harness_capabilities()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/api/projects", json={
+            "prompt": "Build a verified product",
+            "agent": {"harness": "echo"},
+        })
+        assert created.status_code == 200, created.text
+        project_id = uuid.UUID(created.json()["project_id"])
+        root = await store.get_node(project_id)
+        created_nodes = await store.apply_plan(root, PlanResult(nodes=[
+            NodeSpec(key="work", objective="Build product", executor="echo"),
+            NodeSpec(
+                key="check", objective="Verify product", executor="echo",
+                agent_type=AgentType.VERIFIER, depends_on=["work"],
+            ),
+        ]))
+        work, verifier = created_nodes
+        verifier.verification = VerificationResult(
+            decision=VerificationDecision.REJECT,
+            summary="The product needs another pass",
+        )
+        verifier.status = NodeStatus.PENDING
+        await store._save_node(verifier)
+        await store.set_status(work.id, NodeStatus.RUNNABLE)
+
+        graph = (await client.get(f"/api/projects/{project_id}/graph")).json()
+        assert len(graph["flow_edges"]) == 1
+        assert graph["flow_edges"][0]["src"] == str(verifier.id)
+        assert graph["flow_edges"][0]["dst"] == str(work.id)
+        assert graph["flow_edges"][0]["type"] == "RETURN"
+        assert all(edge["type"] != "RETURN" for edge in graph["edges"])
+
+        await store.set_status(work.id, NodeStatus.COMPLETE)
+        restored = (await client.get(f"/api/projects/{project_id}/graph")).json()
+        assert restored["flow_edges"] == []
+
+        await runner.close_project_workspace(project_id)
+        await store.delete_project(project_id)
     await runner.stop()
     await store.dispose()

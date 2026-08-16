@@ -88,6 +88,12 @@ class EdgeType(str, Enum):
     DEPENDS_ON = "DEPENDS_ON"  # genuine left-to-right stage / integration join
 
 
+class FlowEdgeType(str, Enum):
+    """Transient workflow direction shown in addition to persistent edges."""
+
+    RETURN = "RETURN"
+
+
 class Outcome(str, Enum):
     """The four-outcome execution contract. Every worker returns exactly one."""
 
@@ -460,6 +466,15 @@ class Edge(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class FlowEdge(BaseModel):
+    """A derived, non-persistent edge describing the current flow direction."""
+
+    id: uuid.UUID
+    src: uuid.UUID
+    dst: uuid.UUID
+    type: FlowEdgeType
+
+
 # --------------------------------------------------------------------------
 # Run
 # --------------------------------------------------------------------------
@@ -536,6 +551,7 @@ class GraphView(BaseModel):
     project_id: uuid.UUID
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
+    flow_edges: list[FlowEdge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
 
 

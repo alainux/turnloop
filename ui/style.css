@@ -1202,6 +1202,13 @@ form.composer:has(.composer-config-panel) {
 .edge-depends {
   stroke: var(--amber);
 }
+.edge-flow-return {
+  fill: none;
+  stroke: var(--red);
+  stroke-width: 1.5;
+  stroke-dasharray: 1 5;
+  stroke-linecap: round;
+}
 .graph-stage-labels {
   position: absolute;
   inset: 0;

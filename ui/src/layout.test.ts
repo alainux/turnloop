@@ -6,6 +6,7 @@ import {
   NODE_HEIGHT,
   NODE_WIDTH,
   pathBetween,
+  returnPathBetween,
 } from "./layout";
 import type { Edge, GraphNode } from "./domain";
 const node = (id: string, parent_id: string | null): GraphNode => ({
@@ -66,6 +67,16 @@ describe("dendrogram", () => {
       ),
     );
     expect(path.endsWith(`H${child.x + GRAPH_PADDING}`)).toBe(true);
+  });
+
+  it("curves a return flow from the verifier back into the executor", () => {
+    const verifier = { x: 278, y: 20, depth: 1 };
+    const executor = { x: 0, y: 20, depth: 0 };
+    const path = returnPathBetween(verifier, executor);
+
+    expect(path).toMatch(/^M326 68Q299 44/);
+    expect(path).toMatch(/272 68$/);
+    expect(path).toContain("Q");
   });
 
   it("orders sibling dependencies before their dependents", () => {

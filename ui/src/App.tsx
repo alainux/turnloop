@@ -20,7 +20,7 @@ import {
   primaryNodeActionLabel,
   tokens,
 } from "./domain";
-import { api, json } from "./api";
+import { api, ApiError, json } from "./api";
 import { Graph as GraphCanvas } from "./components/Graph";
 import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
@@ -240,7 +240,27 @@ export default function App() {
     if (!projectId) {
       return;
     }
-    void loadGraph();
+    const clearDeletedProject = () => {
+      setProjectId((current) => current === projectId ? null : current);
+      setSelected(null);
+      setGraph(null);
+      setUsage(null);
+      setConnected(false);
+      void loadProjects();
+    };
+    const refreshGraph = () => {
+      void loadGraph().catch((error: unknown) => {
+        // Deletion is observable through SSE, but a reconnect or a queued
+        // event must not leave a stale project polling forever. A missing
+        // graph is authoritative: clear the selection and return home.
+        if (error instanceof ApiError && error.status === 404) {
+          clearDeletedProject();
+          return;
+        }
+        notify(String(error));
+      });
+    };
+    refreshGraph();
     const stream = new EventSource(`/api/projects/${projectId}/stream`);
     stream.onopen = () => setConnected(true);
     stream.onerror = () => setConnected(false);
@@ -251,21 +271,17 @@ export default function App() {
           project_id?: string;
         };
         if (message.type === "project.deleted" && message.project_id === projectId) {
-          setProjectId(null);
-          setSelected(null);
-          setGraph(null);
-          setUsage(null);
-          void loadProjects();
+          clearDeletedProject();
           return;
         }
         if (message.type !== "heartbeat" && message.type !== "node.terminal")
-          void loadGraph();
+          refreshGraph();
       } catch {
         /* ignore malformed external event */
       }
     };
     return () => stream.close();
-  }, [projectId, loadGraph]);
+  }, [projectId, loadGraph, loadProjects, notify]);
   useEffect(() => {
     const interval = window.setInterval(() => {
       void loadProjects();
@@ -466,6 +482,7 @@ export default function App() {
                   <GraphCanvas
                     nodes={graph!.nodes}
                     edges={graph!.edges}
+                    flowEdges={graph!.flow_edges}
                     usage={usage?.by_node ?? {}}
                     selected={selected}
                     onSelect={setSelected}

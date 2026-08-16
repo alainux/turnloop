@@ -360,3 +360,25 @@ export function pathBetween(
     elbow = x1 + (x2 - x1) / 2;
   return `M${x1} ${y1}H${elbow}V${y2}H${x2}`;
 }
+
+/**
+ * Draw a transient backwards handoff without making it part of DAG layout.
+ * The source exits through its left edge and the target is entered through its
+ * right edge, so a verifier-to-executor return reads in the correct direction.
+ * A shallow upper bend keeps the return leg legible without competing with the
+ * ordinary dependency edge when cards are close.
+ */
+export function returnPathBetween(a: Position, b: Position): string {
+  const ax = a.x + GRAPH_PADDING,
+    ay = a.y + GRAPH_PADDING,
+    bx = b.x + GRAPH_PADDING,
+    by = b.y + GRAPH_PADDING;
+  const x1 = ax,
+    y1 = ay,
+    x2 = bx + NODE_WIDTH,
+    y2 = by;
+  const distance = Math.abs(x1 - x2);
+  const bend = Math.max(24, Math.min(42, distance * 0.42));
+  const midpoint = (x1 + x2) / 2;
+  return `M${x1} ${y1}Q${midpoint} ${Math.min(y1, y2) - bend} ${x2} ${y2}`;
+}

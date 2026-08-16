@@ -35,6 +35,7 @@ def test_professional_icons_and_accessible_icon_controls_are_componentized():
 
 def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     graph = source("components", "Graph.tsx")
+    app = source("App.tsx")
     css = (UI / "style.css").read_text()
     api = (ROOT / "turn" / "server" / "api.py").read_text()
     assert 'const runnable = node.allowed_actions.includes("run");' in graph
@@ -52,10 +53,17 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "displayEdges" in graph and "visibleEdges" in graph
     assert "GRAPH_PADDING" in graph
     assert "pathBetween(a, b, edge.type)" in graph
+    assert "returnPathBetween(a, b)" in graph
+    assert 'data-flow-edge="true"' in graph
+    assert "flow_edges" in app
+    assert ".edge-flow-return" in css
     assert "<g transform=" not in graph
     assert "align-items: flex-start" in css
     assert "align-self: flex-start" in css
     assert "node-icons" in graph and "bottom-right" not in graph
+    assert "error instanceof ApiError" in app
+    assert "error.status === 404" in app
+    assert "clearDeletedProject" in app
 
 
 def test_planner_document_and_role_defaults_are_first_class():

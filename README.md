@@ -54,6 +54,22 @@ the path matters as much as the final artifact.
 Deterministic Echo workers and heuristic planning are test-only fixtures; they
 are not exposed by the served application.
 
+### Current scope
+
+Turn currently provides a local-first workgraph for planning, running, and
+inspecting agent work. The shipped surface includes explicit step/auto
+execution, durable project state, reconnectable terminals, artifact and usage
+inspection, verifier decisions, and provider-specific harness adapters for
+Codex, Claude Code, OpenCode, and Pi.
+
+### Future-ready seams
+
+The storage, graph, runner, terminal, and harness boundaries are independent so
+new providers, scheduling policies, and evidence types can be added without
+making the UI own orchestration state. The graph also models derived flow
+edges, such as verifier rejection returns, separately from the durable
+dependency topology.
+
 ## Screenshots
 
 The screenshots below show the authoring surface, harness selection, graph and

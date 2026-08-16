@@ -7,9 +7,20 @@ without leaking orchestration concerns.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import uuid
 from typing import Optional
 
-from turn.domain.schemas import Edge, EdgeType, Graph, Node, NodeStatus
+from turn.domain.schemas import (
+    AgentType,
+    Edge,
+    EdgeType,
+    FlowEdge,
+    FlowEdgeType,
+    Graph,
+    Node,
+    NodeStatus,
+    VerificationDecision,
+)
 
 
 @dataclass
@@ -156,6 +167,57 @@ class GraphWalker:
 
     def topological(self) -> list[Node]:
         return topo_order(list(self.nodes), list(self.edges))
+
+
+def derive_flow_edges(
+    nodes: list[Node],
+    edges: list[Edge],
+    effective_status: dict | None = None,
+) -> list[FlowEdge]:
+    """Derive transient edges for a workflow whose next step changed.
+
+    Persistent graph edges describe dependency semantics and must remain a DAG.
+    A verifier rejection temporarily sends its dependency target back to the
+    worker, so that direction is represented separately as a render-only flow
+    edge. The edge is present only while that target is the next runnable or
+    active step; once the target completes, normal forward flow is restored and
+    this projection becomes empty.
+    """
+    indexes = build_indexes(nodes, edges)
+    statuses = effective_status or {node.id: node.status for node in nodes}
+    flow_edges: list[FlowEdge] = []
+    for verifier in nodes:
+        if verifier.agent is None or verifier.agent.type_id is not AgentType.VERIFIER:
+            continue
+        decision = verifier.verification
+        if decision is None or decision.decision is not VerificationDecision.REJECT:
+            continue
+        target_ids = list(dict.fromkeys(indexes.deps.get(verifier.id, [])))
+        targets = [
+            indexes.node_by_id[target_id]
+            for target_id in target_ids
+            if target_id in indexes.node_by_id
+        ]
+        if len(targets) != 1:
+            continue
+        target = targets[0]
+        if statuses.get(target.id, target.status) not in {
+            NodeStatus.RUNNABLE,
+            NodeStatus.RUNNING,
+        }:
+            continue
+        flow_edges.append(
+            FlowEdge(
+                id=uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"turn:flow:return:{verifier.id}:{target.id}",
+                ),
+                src=verifier.id,
+                dst=target.id,
+                type=FlowEdgeType.RETURN,
+            )
+        )
+    return flow_edges
 
 
 def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:

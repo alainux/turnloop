@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { Edge, GraphNode, Usage } from "../domain";
+import type { Edge, FlowEdge, GraphNode, Usage } from "../domain";
 import {
   displayNodeTitle,
   primaryNodeAction,
@@ -12,6 +12,7 @@ import {
   NODE_WIDTH,
   GRAPH_PADDING,
   pathBetween,
+  returnPathBetween,
   displayEdges,
 } from "../layout";
 import { Icon } from "./Icon";
@@ -19,6 +20,7 @@ import { Icon } from "./Icon";
 interface Props {
   nodes: GraphNode[];
   edges: Edge[];
+  flowEdges: FlowEdge[];
   usage: Record<string, Usage>;
   selected: string | null;
   onSelect: (id: string) => void;
@@ -36,6 +38,7 @@ export const nodeStatusLabel = (node: GraphNode) => {
 export function Graph({
   nodes,
   edges,
+  flowEdges,
   usage,
   selected,
   onSelect,
@@ -94,6 +97,18 @@ export function Graph({
           >
             <path d="M0,0 L6,3 L0,6 z" fill="var(--amber)" />
           </marker>
+          <marker
+            id="return-arrow"
+            viewBox="0 0 6 6"
+            refX="5"
+            refY="3"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto-start-reverse"
+            markerUnits="strokeWidth"
+          >
+            <path d="M0,0 L6,3 L0,6 z" fill="var(--red)" />
+          </marker>
         </defs>
         {visibleEdges.map((edge) => {
           const a = layout.positions.get(edge.src),
@@ -105,6 +120,20 @@ export function Graph({
               d={pathBetween(a, b, edge.type)}
               data-edge-type={edge.type}
               markerEnd={edge.type === "DEPENDS_ON" ? "url(#dependency-arrow)" : undefined}
+            />
+          ) : null;
+        })}
+        {flowEdges.map((edge) => {
+          const a = layout.positions.get(edge.src),
+            b = layout.positions.get(edge.dst);
+          return a && b ? (
+            <path
+              key={edge.id}
+              className="edge-flow-return"
+              d={returnPathBetween(a, b)}
+              data-edge-type={edge.type}
+              data-flow-edge="true"
+              markerEnd="url(#return-arrow)"
             />
           ) : null;
         })}

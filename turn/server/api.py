@@ -23,7 +23,7 @@ from turn.db.store import Store
 from turn.config import REAL_HARNESSES
 from turn.domain.schemas import AgentConfig, GraphView, InputSpec, Node, NodeStatus, RunPolicy
 from turn.domain.state_machine import present_node
-from turn.graph.logic import GraphWalker
+from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
 from turn.runner.runner import Runner
 from turn.workers.conversations import (
@@ -180,6 +180,10 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         "project_id": str(project_id),
         "nodes": serialized,
         "edges": [e.model_dump(mode="json") for e in edges],
+        "flow_edges": [
+            edge.model_dump(mode="json")
+            for edge in derive_flow_edges(nodes, edges, ev.status)
+        ],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
     }).model_dump(mode="json")
 
