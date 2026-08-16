@@ -30,6 +30,7 @@ from turn.workers.conversations import (
     ConversationProgress,
     cleanup_conversations,
     conversation_refs,
+    missing_conversation_sessions,
 )
 
 
@@ -479,14 +480,51 @@ async def _delete_project(
     root = await store.get_node(pid)
     if root is None or root.parent_id is not None:
         raise HTTPException(404, "project not found")
+
+    # Capture provider session ids before cancellation. Cancelling a live
+    # harness run intentionally clears the node's resumable session so a later
+    # retry starts fresh; deletion still needs the original provider id to
+    # invoke the harness's public delete/archive command.
+    nodes, _, _ = await store.get_workgraph(pid)
+    runs = await store.get_project_runs(pid)
+    refs = conversation_refs(nodes, runs)
+    missing = missing_conversation_sessions(nodes, runs)
+    if options.delete_conversations and missing:
+        message = (
+            "Conversation cleanup cannot proceed: one or more real harness runs "
+            "have no stored provider session id. The project was not removed."
+        )
+        await request.app.state.events.publish({
+            "type": "project.deletion_progress",
+            "project_id": project_id,
+            "phase": "conversations",
+            "completed": 0,
+            "total": len(refs) + len(missing),
+            "status": "failed",
+            "message": message,
+        })
+        await request.app.state.events.publish({
+            "type": "project.deletion_failed",
+            "project_id": project_id,
+            "phase": "conversations",
+            "message": message,
+            "cleanup": {
+                "total": len(refs) + len(missing),
+                "deleted": 0,
+                "archived": 0,
+                "failed": len(missing),
+                "unsupported": 0,
+                "errors": [
+                    f"{harness.value}: node {node_id} has no stored session id"
+                    for harness, node_id in missing
+                ],
+            },
+        })
+        raise HTTPException(status_code=409, detail=message)
     await runner.cancel_project_runs(pid)
 
     cleanup = None
     if options.delete_conversations:
-        nodes, _, _ = await store.get_workgraph(pid)
-        runs = await store.get_project_runs(pid)
-        refs = conversation_refs(nodes, runs)
-
         async def report(progress: ConversationProgress) -> None:
             await request.app.state.events.publish({
                 "type": "project.deletion_progress",

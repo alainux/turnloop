@@ -392,11 +392,15 @@ FINAL RESEARCH AND SKILL CHECK:
 
 Before finishing, submit the plan object through the Turn CLI. The CLI is the
 only submission interface and writes Turn's internal handoff record. Do not
-use filesystem output as a protocol. Use `TURN_CLI agent submit --kind plan --payload '<JSON_OBJECT>'`,
-    replacing the placeholder with the actual single-line JSON object. Do not
-    return a fenced `turn-plan` block or use provider JSON output mode. The CLI
-    submission is the only valid plan handoff:
-    {handoff_example}
+use filesystem output as a protocol or type `TURN_CLI` as a command. Use the
+installed `turn` command with stdin so apostrophes and other shell characters
+inside JSON remain safe:
+turn agent submit --kind plan --stdin <<'TURN_PAYLOAD'
+{handoff_example}
+TURN_PAYLOAD
+Replace the example with the actual single-line JSON object. Do not return a
+fenced `turn-plan` block or use provider JSON output mode. The CLI submission
+is the only valid plan handoff.
     """
 
     async def _call_codex(

@@ -122,11 +122,6 @@ def agent_environment(
     # the metadata only so the Turn CLI can publish into the control plane;
     # prompts explicitly forbid writing them directly.
     status = handoff.parent / f"{node_id}.status.json"
-    turn_cli = shutil.which("turn")
-    if not turn_cli:
-        raise RuntimeError(
-            "Turn CLI is not installed; install the project package before launching workers"
-        )
     return {
         "TURN_NODE_ID": str(node_id),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
@@ -134,7 +129,6 @@ def agent_environment(
         "TURN_HANDOFF_KIND": kind,
         "TURN_HANDOFF_FILE": str(handoff),
         "TURN_STATUS_FILE": str(status),
-        "TURN_CLI": turn_cli,
         "TURN_HARNESS": str(getattr(getattr(agent, "harness", None), "value", "") or ""),
         "TURN_AGENT_MODEL": str(getattr(agent, "model", None) or ""),
         "TURN_AGENT_REASONING": str(getattr(getattr(agent, "reasoning", None), "value", "") or ""),
@@ -402,12 +396,7 @@ async def run_until_result(
 
 def result_handoff(*, plan: bool = False, verification: bool = False) -> str:
     """Prompt fragment for the harness-neutral Turn control plane."""
-    turn_cli = shutil.which("turn")
-    if not turn_cli:
-        raise RuntimeError(
-            "Turn CLI is not installed; install the project package before launching workers"
-        )
-    turn_cli = shlex.quote(turn_cli)
+    turn_cli = "turn"
     if verification:
         shape = '{"decision":"APPROVE","summary":"What was verified","findings":[],"required_changes":[],"evidence_refs":[]}'
     elif plan:
@@ -434,8 +423,8 @@ This is an ordinary terminal session. Use the harness normally: type, run
 commands, inspect files, and communicate with the user here. Turn does not
 parse or summarize your terminal output, and the harness must not use a
 structured-output or JSON-output mode for this protocol.
-`TURN_CLI` is a single installed executable path; invoke it directly for all
-Turn status and handoff commands.
+The installed `turn` command is available on PATH; invoke `turn` directly for
+all Turn status and handoff commands. Do not type `TURN_CLI` as a command.
 
 Publish status when useful:
   {turn_cli} agent status --state working --message "..."
@@ -445,8 +434,13 @@ For the final {kind}, submit one JSON object matching this shape through the
 Turn CLI. The CLI is the only submission interface and writes Turn's internal
 record. Do not use filesystem output as a protocol:
 {shape}
-  {turn_cli} agent {'verify' if verification else 'submit --kind ' + kind} --payload '<JSON_OBJECT>'
-Replace `<JSON_OBJECT>` with the actual single-line JSON object.
+
+Submit through stdin using this shell-safe heredoc form. Replace the example
+object with the actual single-line JSON object and keep `TURN_PAYLOAD` on its
+own line:
+{turn_cli} agent {'verify' if verification else 'submit --kind ' + kind} --stdin <<'TURN_PAYLOAD'
+{shape}
+TURN_PAYLOAD
 {artifact_guidance}
 
 The CLI submission is the only completion signal. Do not finish by printing a

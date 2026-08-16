@@ -6,9 +6,7 @@ Neither owns Turn's data model — they only read context and emit results.
 """
 from __future__ import annotations
 
-import os
 import shlex
-import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -137,15 +135,10 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
                 lines.append(f"- {item.ref}")
                 pending.extend(item.imports)
         lines.append("")
-    # GRAPH EXPLORATION TOOL — expose the same installed Turn CLI that agents
-    # use for status and handoff. The agent is launched in the assigned project
-    # directory, so the project-local state path stays relative and no internal
-    # Python module path leaks into the agent protocol.
-    turn_cli = os.getenv("TURN_CLI") or shutil.which("turn")
-    if not turn_cli:
-        raise RuntimeError(
-            "Turn CLI is not installed; install the project package before launching workers"
-        )
+    # GRAPH EXPLORATION TOOL — use the normal installed Turn command. The
+    # agent inherits PATH from the harness launch environment, so do not bake
+    # in an absolute path resolved by the server process.
+    turn_cli = "turn"
     ge_pid = ctx.node.project_id
     lines.append("GRAPH EXPLORATION TOOL (query the live project graph at runtime):")
     lines.append("  Before you plan or write, explore what is already planned/built so you")
@@ -182,7 +175,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         lines.append("VERIFIER CONTRACT:")
         lines.append("  Inspect the target's actual deliverables, graph contracts, invariants, and user-facing behavior.")
         lines.append("  Approve only when the stated acceptance criteria are evidenced; otherwise reject with concrete findings.")
-        lines.append("  Submit exactly one APPROVE or REJECT decision through `turn agent verify --payload '<JSON_OBJECT>'`.")
+        lines.append("  Submit exactly one APPROVE or REJECT decision through `turn agent verify --stdin` using the shell-safe heredoc shown in TURN CONTROL PLANE.")
         lines.append("  Do not edit the target's work and do not write Turn protocol files directly.")
         lines.append("")
     return "\n".join(lines)

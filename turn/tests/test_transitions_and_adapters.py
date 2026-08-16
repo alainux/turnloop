@@ -804,7 +804,8 @@ async def test_graph_explorer_is_read_only_and_integrators_get_glue_contract(tmp
     root = await store.create_project("Assemble the adventure")
     ctx = NodeExecutionContext(node=root)
     block = render_context_block(ctx)
-    assert shlex.quote(shutil.which("turn")) in block
+    assert "    turn graph " in block
+    assert shutil.which("turn") is not None
     assert "graph_explorer.py" not in block
     assert "turn graph" in block
     assert "--state-file" not in block

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import os
 from pathlib import Path
 import uuid
 
@@ -130,6 +131,132 @@ async def test_conversation_cleanup_runs_one_by_one_and_falls_back_to_archive():
     assert result.archived == 1
     assert result.unsupported == 1
     assert not result.ok
+
+
+async def test_conversation_cleanup_executes_the_harness_commands(tmp_path, monkeypatch):
+    """The command contract must reach a subprocess, not only a mocked list."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "commands.log"
+    script = """#!/bin/sh
+printf '%s\\n' "$*" >> "$TURN_TEST_COMMAND_LOG"
+if [ "$1" = "delete" ]; then
+  exit 1
+fi
+exit 0
+"""
+    for name in ("codex", "opencode"):
+        binary = bin_dir / name
+        binary.write_text(script)
+        binary.chmod(0o755)
+    monkeypatch.setenv("TURN_TEST_COMMAND_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    result = await cleanup_conversations(
+        [
+            ConversationRef(HarnessKind.CODEX, "c-1", uuid.uuid4()),
+            ConversationRef(HarnessKind.OPENCODE, "o-1", uuid.uuid4()),
+        ],
+        cwd=tmp_path,
+        commands=HarnessCommandFactory(),
+    )
+
+    assert result.deleted == 1
+    assert result.archived == 1
+    assert result.failed == 0
+    assert log.read_text().splitlines() == [
+        "delete c-1 --force",
+        "archive c-1",
+        "session delete o-1",
+    ]
+
+
+async def test_project_delete_captures_session_ids_before_cancelling_runs(tmp_path, monkeypatch):
+    app, store, runner = await _app(tmp_path)
+    observed: list[tuple[HarnessKind, str]] = []
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            created = await client.post("/api/projects", json={
+                "prompt": "Preserve the provider id during deletion",
+                "agent": {
+                    "harness": "codex",
+                    "type_id": "planner",
+                    "session_id": "codex-session-1",
+                },
+                "working_dir": str(tmp_path / "capture-session"),
+                "run_policy": {"auto_run": False},
+            })
+            assert created.status_code == 200, created.text
+            project_id = uuid.UUID(created.json()["project_id"])
+            node = await store.get_node(project_id)
+            assert node is not None and node.agent is not None
+            node.agent.session_id = "codex-session-1"
+            await store._save_node(node)  # type: ignore[attr-defined]
+
+            async def clear_session_before_cleanup(project_id):
+                node = await store.get_node(project_id)
+                assert node is not None and node.agent is not None
+                node.agent.session_id = None
+                await store._save_node(node)  # type: ignore[attr-defined]
+
+            monkeypatch.setattr(runner, "cancel_project_runs", clear_session_before_cleanup)
+
+            async def fake_cleanup(refs, *, cwd, commands, on_progress):
+                del cwd, commands
+                observed.extend((ref.harness, ref.session_id) for ref in refs)
+                await on_progress(ConversationProgress(1, len(refs), "codex", "codex-session-1", "deleted", "done"))
+                return ConversationCleanup(len(refs), len(refs), 0, 0, 0, ())
+
+            monkeypatch.setattr(server_api, "cleanup_conversations", fake_cleanup)
+            response = await client.request(
+                "DELETE",
+                f"/api/projects/{project_id}",
+                json={"delete_files": False, "delete_conversations": True},
+            )
+
+            assert response.status_code == 200, response.text
+            assert observed == [(HarnessKind.CODEX, "codex-session-1")]
+    finally:
+        await runner.stop()
+        await store.dispose()
+
+
+async def test_project_delete_fails_closed_when_a_harness_session_is_untracked(tmp_path, monkeypatch):
+    app, store, runner = await _app(tmp_path)
+    cancelled = False
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            created = await client.post("/api/projects", json={
+                "prompt": "Do not silently orphan a conversation",
+                "agent": {"harness": "codex", "type_id": "planner"},
+                "working_dir": str(tmp_path / "untracked-session"),
+                "run_policy": {"auto_run": False},
+            })
+            assert created.status_code == 200, created.text
+            project_id = uuid.UUID(created.json()["project_id"])
+            node = await store.get_node(project_id)
+            assert node is not None
+            await store.create_run(node, "planner")
+
+            async def should_not_cancel(_project_id):
+                nonlocal cancelled
+                cancelled = True
+
+            monkeypatch.setattr(runner, "cancel_project_runs", should_not_cancel)
+            response = await client.request(
+                "DELETE",
+                f"/api/projects/{project_id}",
+                json={"delete_files": True, "delete_conversations": True},
+            )
+
+            assert response.status_code == 409
+            assert "no stored provider session id" in response.json()["detail"]
+            assert not cancelled
+            assert await store.get_node(project_id) is not None
+            assert Path(created.json()["repo_path"]).exists()
+    finally:
+        await runner.stop()
+        await store.dispose()
 
 
 @pytest.mark.parametrize("payload", [None, {"delete_files": False, "delete_conversations": False}])

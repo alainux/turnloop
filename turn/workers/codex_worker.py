@@ -293,9 +293,9 @@ OBJECTIVE:
 TASK:
 {gp}
 
-When you finish, submit the result through `TURN_CLI agent submit --payload '<JSON_OBJECT>'`,
-replacing the placeholder with the actual single-line JSON object. The CLI is
-the only submission interface; do not use filesystem output as a protocol.
+When you finish, submit the result through the installed `turn` command using
+the shell-safe stdin/heredoc form in the TURN CONTROL PLANE instructions below.
+Do not type `TURN_CLI` as a command or use filesystem output as a protocol.
 Include a small `artifacts` array containing repo-relative files or directories
 that represent the work.
 If the task is too broad to complete directly, use outcome `EXPAND` and put

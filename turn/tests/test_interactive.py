@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import subprocess
 import uuid
 
@@ -35,28 +36,30 @@ async def test_injected_command_clears_partial_shell_input(tmp_path, monkeypatch
     assert raw == b"\x03\rexport TURN_PROJECT_ID=project\rcodex --model test\r"
 
 
-def test_agent_handoff_prompt_uses_only_cli_payload_submission():
+def test_agent_handoff_prompt_uses_shell_safe_cli_stdin_submission():
     for plan in (False, True):
         prompt = result_handoff(plan=plan)
         assert "agent submit" in prompt
-        assert "--payload '<JSON_OBJECT>'" in prompt
+        assert "agent submit --kind" in prompt
+        assert "--stdin <<'TURN_PAYLOAD'" in prompt
+        assert "TURN_PAYLOAD\n" in prompt
         assert "filesystem output as a protocol" in prompt
         assert "TURN_HANDOFF_FILE" not in prompt
         assert "TURN_STATUS_FILE" not in prompt
         assert "--file" not in prompt
-        assert "--stdin" not in prompt
+        assert "--payload" not in prompt
+        assert "TURN_CLI agent" not in prompt
         assert ".turn/" not in prompt
 
 
-def test_worker_environment_points_to_installed_turn_cli(tmp_path):
+def test_worker_environment_uses_the_inherited_turn_command(tmp_path):
     node_id = uuid.uuid4()
     handoff = prepare_result_file(str(tmp_path), node_id, "result")
     environment = agent_environment(str(tmp_path), node_id, "result", handoff)
-    cli = environment["TURN_CLI"]
 
-    assert cli.endswith("/turn")
+    assert "TURN_CLI" not in environment
     completed = subprocess.run(
-        [cli, "agent", "--help"],
+        ["turn", "agent", "--help"],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -74,9 +77,39 @@ def test_verifier_environment_uses_verification_handoff(tmp_path):
     assert environment["TURN_HANDOFF_KIND"] == "verification"
     assert environment["TURN_HANDOFF_FILE"] == str(handoff)
     prompt = result_handoff(verification=True)
-    assert "agent verify --payload '<JSON_OBJECT>'" in prompt
+    assert "agent verify --stdin <<'TURN_PAYLOAD'" in prompt
     assert "agent submit --kind verification" not in prompt
-    assert "verify --stdin" not in prompt
+    assert "TURN_CLI agent" not in prompt
+
+
+def test_stdin_handoff_prompt_is_safe_for_apostrophes(tmp_path):
+    handoff = tmp_path / "node.result.json"
+    environment = os.environ.copy()
+    environment.update({
+        "TURN_HANDOFF_FILE": str(handoff),
+        "TURN_STATUS_FILE": str(tmp_path / "status.json"),
+        "TURN_NODE_ID": str(uuid.uuid4()),
+    })
+    command = """turn agent submit --kind result --stdin <<'TURN_PAYLOAD'
+{"outcome":"COMPLETE","summary":"agent's result is valid","missing_inputs":[]}
+TURN_PAYLOAD
+"""
+
+    completed = subprocess.run(
+        ["sh", "-c", command],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(handoff.read_text()) == {
+        "outcome": "COMPLETE",
+        "summary": "agent's result is valid",
+        "missing_inputs": [],
+    }
 
 
 def test_new_codex_session_id_matches_node_marker_not_latest_mtime(tmp_path, monkeypatch):
@@ -120,7 +153,7 @@ async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeyp
     async def fake_run_until_result(_transport, _node_id, _command, **kwargs):
         assert kwargs["environment"]["TURN_HANDOFF_KIND"] == "verification"
         assert kwargs["result_path"].name.endswith(".verification.json")
-        assert "agent verify --payload" in kwargs["initial_input"]
+        assert "agent verify --stdin" in kwargs["initial_input"]
         kwargs["result_path"].write_text(
             '{"decision":"REJECT","summary":"The game is not playable",'
             '"findings":["The launch command fails"],'

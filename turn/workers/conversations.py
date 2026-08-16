@@ -18,6 +18,14 @@ from turn.domain.schemas import HarnessKind, Node, Run
 from turn.workers.harness_catalog import HarnessCommandFactory
 
 
+_CONVERSATION_HARNESSES = frozenset({
+    HarnessKind.CODEX,
+    HarnessKind.CLAUDE,
+    HarnessKind.OPENCODE,
+    HarnessKind.PI,
+})
+
+
 @dataclass(frozen=True)
 class ConversationRef:
     harness: HarnessKind
@@ -83,6 +91,28 @@ def conversation_refs(nodes: Sequence[Node], runs: Sequence[Run]) -> list[Conver
     for run in runs:
         add(node_by_id.get(run.node_id), run.session_id)
     return refs
+
+
+def missing_conversation_sessions(
+    nodes: Sequence[Node], runs: Sequence[Run],
+) -> list[tuple[HarnessKind, uuid.UUID]]:
+    """Find real harness runs for which no provider session id was persisted.
+
+    Turn cannot safely guess a provider session or inspect provider storage.
+    Callers should fail closed when this returns anything instead of claiming
+    that conversation cleanup completed.
+    """
+    node_by_id = {node.id: node for node in nodes}
+    missing: list[tuple[HarnessKind, uuid.UUID]] = []
+    for run in runs:
+        if run.session_id:
+            continue
+        node = node_by_id.get(run.node_id)
+        if node is None or node.agent is None:
+            continue
+        if node.agent.harness in _CONVERSATION_HARNESSES:
+            missing.append((node.agent.harness, node.id))
+    return missing
 
 
 async def _default_command_runner(
