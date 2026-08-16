@@ -33,6 +33,7 @@ from turn.domain.schemas import (
     EdgeType,
     Graph,
     InputSpec,
+    MCPServerAccess,
     Node,
     NodeStatus,
     Outcome,
@@ -696,6 +697,13 @@ class Store:
                     AgentType.PLANNER if executor == PLANNER_EXECUTOR else AgentType.EXECUTOR
                 )
             node_agent.skill_ids = list(dict.fromkeys([*node_agent.skill_ids, *spec.skills]))
+            assigned_mcp: dict[str, MCPServerAccess] = {
+                server.name: server for server in [
+                    *node_agent.mcp_servers,
+                    *spec.mcp_servers,
+                ]
+            }
+            node_agent.mcp_servers = list(assigned_mcp.values())
             node = Node(
                 id=node_id, project_id=parent.project_id, parent_id=parent_id,
                 objective=spec.objective, generated_prompt=spec.generated_prompt,

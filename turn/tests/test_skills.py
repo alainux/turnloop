@@ -40,9 +40,10 @@ class FakeBundleFetcher(FakeSkillFetcher):
 def test_find_skills_is_a_planner_skill():
     planner = AgentConfig(type_id=AgentType.PLANNER)
     assert planner.skill_ids == [
-        "turn-planning", "imagegen", "find-skills",
+        "turn-planning", "imagegen", "find-skills", "find-mcps",
     ]
     assert any(path.endswith("planner/find-skills.md") for path in planner.skills)
+    assert any(path.endswith("planner/find-mcps.md") for path in planner.skills)
     assert any(path.endswith("planner/turn-planning.md") for path in planner.skills)
     assert SETUP_SKILL_ID not in planner.skill_ids
     assert not any(path.endswith("planner/turn-setup.md") for path in planner.skills)

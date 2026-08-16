@@ -30,6 +30,7 @@ from turn.domain.schemas import (
     HarnessKind,
     InputKind,
     InputSpec,
+    MCPServerAccess,
     NodeSpec,
     PlanResult,
     PermissionMode,
@@ -39,6 +40,7 @@ from turn.domain.schemas import (
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
 from turn.workers.harnesses import recover_session_id
 from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.mcp.runtime import codex_mcp_overrides
 from turn.workers.interactive import (
     agent_environment,
     opencode_session_ids,
@@ -190,6 +192,19 @@ SETUP — this is the project-root setup planner:
   web or app architecture, procure a stack- and runtime-specific architecture
   skill only when an architecture stage is warranted. Do not assume a generic
   architecture skill is needed, and do not invent a placeholder skill.
+- Use `find-mcps` to research external tools and data sources when a worker
+  materially needs one. Put the researched access object in that worker's
+  `mcp_servers` array, including its source website and native transport
+  configuration when known. Use `transport: "configured"` for a server the
+  user already manages in the selected harness. Never claim credentials,
+  local applications, or server processes are installed.
+- Fit MCP procurement to the target worker's declared harness capabilities:
+  first name the capability the worker needs, then subtract the capabilities
+  already provided by that harness. Do not assign an MCP merely to duplicate a
+  harness capability such as browser or computer use. Procure an MCP when it
+  fills a missing capability, provides a specialized service or data source,
+  or is explicitly requested by the user. The harness profile is a declared
+  adapter view for now and may later be replaced by active capability discovery.
 - The setup plan must not know, name, reserve, or register future documents.
   Requirements for outputs belong only in the assigned skill and worker
   prompt. The worker that creates a file submits its actual artifact.
@@ -384,8 +399,9 @@ TOPOLOGY — arrange the children to express the information and delivery flow:
   material addition; do not spend a resubmission correcting that omission.
   Record sources actually consulted in the relevant project document when one
   is appropriate. Scoped planners have
-  `turn-planning`, `imagegen`, and `find-skills`; the root setup planner has
-  `turn-planning`, `find-skills`, and `turn-setup`. Domain, architecture, QA,
+  `turn-planning`, `imagegen`, `find-skills`, and `find-mcps`; the root setup
+  planner has `turn-planning`, `find-skills`, `find-mcps`, and `turn-setup`.
+  Domain, architecture, QA,
   and product skills are selected for workers or scoped planners by this
   planning process.
 - VERIFICATION: almost every concrete executor or integrator should be
@@ -435,7 +451,8 @@ ORDER & SAFETY:
   remains the conversation context.
 
 FINAL RESEARCH AND SKILL CHECK:
-- Before submission, actually run `turn skills show find-skills`, inspect the
+- Before submission, actually run `turn skills show find-skills` and `turn
+  skills show find-mcps`, inspect the
   repository and live graph, and perform the relevant web/search or skills.sh
   queries. Do not claim a source you did not consult.
 - For broad engineering work, investigate the domain before choosing nodes.
@@ -445,6 +462,11 @@ FINAL RESEARCH AND SKILL CHECK:
   unless the request genuinely has no other product boundary.
 - Record each direct URL consulted in the project document when research is
   part of the plan. Do not add research metadata to the graph payload.
+- MCP CHECK: when a node has a non-empty `mcp_servers` array, include a
+  `source_url` for every entry and record the selected server's source and
+  user-owned setup requirements in the relevant project document. Use only
+  the smallest set of servers needed by that node. A plan that names an MCP
+  without a source URL or a concrete reason is incomplete.
 - Give every concrete executor, integrator, and verifier a non-empty `skills`
   array when the investigation found a material project-specific addition;
   the server supplies the role base skill and accepts an empty additional list.
@@ -496,6 +518,11 @@ is the only valid plan handoff.
         reasoning_flags = [] if reasoning == "default" else [
             "-c", f'model_reasoning_effort="{reasoning}"'
         ]
+        mcp_flags = [
+            item
+            for override in codex_mcp_overrides(agent or AgentConfig(harness=HarnessKind.CODEX))
+            for item in ("-c", override)
+        ]
         session_id = agent.session_id if agent else None
         observed_session = session_id
 
@@ -514,13 +541,13 @@ is the only valid plan handoff.
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *sandbox_flags, "--no-alt-screen", "-C", cwd,
+                    *mcp_flags, *sandbox_flags, "--no-alt-screen", "-C", cwd,
                     *native_args, session_id,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *sandbox_flags, "--no-alt-screen", "-C", cwd,
+                    *mcp_flags, *sandbox_flags, "--no-alt-screen", "-C", cwd,
                     *native_args,
                 ]
         elif session_id:
@@ -528,13 +555,13 @@ is the only valid plan handoff.
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
-                *reasoning_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
+                *reasoning_flags, *mcp_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *sandbox_flags, "-C", cwd,
+                *mcp_flags, *sandbox_flags, "-C", cwd,
                 *[a for a in self.s.codex_args if "bypass" not in a],
                 prompt_arg,
             ]
@@ -625,6 +652,7 @@ class AgentPlanner(Planner):
         native: bool = False,
         resume: bool = False,
         prompt_via_stdin: bool = False,
+        mcp_config: str | None = None,
     ) -> list[str]:
         return self.commands.planner_command(
             agent,
@@ -633,6 +661,7 @@ class AgentPlanner(Planner):
             native=native,
             resume=resume,
             prompt_via_stdin=prompt_via_stdin,
+            mcp_config=mcp_config,
         )
 
     async def _call_harness(
@@ -686,6 +715,7 @@ class AgentPlanner(Planner):
                         cwd=cwd,
                         native=True,
                         resume=resume,
+                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
                     ),
                     cwd=cwd,
                     result_path=result_path,
@@ -711,6 +741,7 @@ class AgentPlanner(Planner):
                         native=False,
                         resume=resume,
                         prompt_via_stdin=True,
+                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
                     ),
                     cwd=cwd,
                     result_path=result_path,
@@ -728,7 +759,12 @@ class AgentPlanner(Planner):
             else:
                 result = await transport.run(
                     ctx.node.id,
-                    self._command(agent, native_prompt),
+                    self._command(
+                        agent,
+                        native_prompt,
+                        cwd=cwd,
+                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
+                    ),
                     cwd=cwd,
                     environment=environment,
                     stream=ctx.stream,
@@ -809,6 +845,7 @@ class AgentPlanner(Planner):
                 document_refs=document_refs(n.get("document_refs")),
                 artifacts=artifact_specs(n.get("artifacts")),
                 skills=list(n.get("skills", [])),
+                mcp_servers=[MCPServerAccess.model_validate(item) for item in n.get("mcp_servers", [])],
                 parent_key=n.get("parent_key"),
                 depends_on=list(n.get("depends_on", [])),
                 plan=bool(n.get("plan", False)),

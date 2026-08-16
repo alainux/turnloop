@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { Edge, FlowEdge, GraphNode, Usage } from "../domain";
 import {
   displayNodeTitle,
+  mcpTooltip,
   primaryNodeAction,
   skillTooltip,
   tokens,
@@ -151,6 +152,7 @@ export function Graph({
         const primaryAction = primaryNodeAction(node);
         const title = displayNodeTitle(node);
         const skillRefs = node.agent?.skill_ids ?? [];
+        const mcpServers = node.agent?.mcp_servers ?? [];
         const finalNode = p.depth === finalDepth && finalStageNodeCount === 1;
         return (
           <article
@@ -186,7 +188,7 @@ export function Graph({
                     : "—"}
                 </small>
               </span>
-              <span className="node-icons" aria-hidden={skillRefs.length === 0 ? true : undefined}>
+              <span className="node-icons" aria-hidden={skillRefs.length === 0 && mcpServers.length === 0 ? true : undefined}>
                 <span className="node-glyph">
                   <Icon
                     name={
@@ -207,6 +209,15 @@ export function Graph({
                     aria-label={skillTooltip(skillRefs)}
                   >
                     <Icon name="file" />
+                  </span>
+                )}
+                {mcpServers.length > 0 && (
+                  <span
+                    className="node-mcp-indicator"
+                    title={mcpTooltip(mcpServers)}
+                    aria-label={mcpTooltip(mcpServers)}
+                  >
+                    <Icon name="plug" />
                   </span>
                 )}
               </span>

@@ -12,6 +12,8 @@ import {
   displayNodeTitle,
   primaryNodeAction,
   primaryNodeActionLabel,
+  mcpServerLabel,
+  skillSourceHref,
   skillReferenceLabel,
 } from "../domain";
 import { api, json } from "../api";
@@ -148,6 +150,7 @@ function Overview({
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const primaryAction = primaryNodeAction(node);
   const skillRefs = agent?.skill_ids ?? [];
+  const mcpServers = agent?.mcp_servers ?? [];
   useEffect(() => {
     setPrompt(node.generated_prompt ?? "");
     setObjective(node.objective);
@@ -307,22 +310,22 @@ function Overview({
           <div className="agent-resources">
             <span>{skillRefs.length} skills</span>
             <span>{agent.tools.length} tools</span>
-            <span>{agent.mcp_servers.length} MCP</span>
+            <span>{mcpServers.length} MCP</span>
           </div>
           {skillRefs.length > 0 && (
             <div className="agent-skill-list" aria-label="Skills">
               <span className="agent-skill-heading">Skills</span>
               {skillRefs.map((reference) => {
-                const external = /^https?:\/\//i.test(reference);
+                const sourceHref = skillSourceHref(reference);
                 const label = skillReferenceLabel(reference);
-                return external ? (
+                return sourceHref ? (
                   <a
                     className="agent-skill"
-                    href={reference}
+                    href={sourceHref}
                     target="_blank"
                     rel="noreferrer"
                     key={reference}
-                    title={reference}
+                    title={sourceHref}
                   >
                     <Icon name="file" />
                     <span>{label}</span>
@@ -330,6 +333,32 @@ function Overview({
                 ) : (
                   <div className="agent-skill" key={reference} title={reference}>
                     <Icon name="file" />
+                    <span>{label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {mcpServers.length > 0 && (
+            <div className="agent-skill-list agent-mcp-list" aria-label="MCP servers">
+              <span className="agent-skill-heading">MCP servers</span>
+              {mcpServers.map((server) => {
+                const label = mcpServerLabel(server);
+                return server.source_url ? (
+                  <a
+                    className="agent-skill"
+                    href={server.source_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    key={server.name}
+                    title={server.source_url}
+                  >
+                    <Icon name="plug" />
+                    <span>{label}</span>
+                  </a>
+                ) : (
+                  <div className="agent-skill" key={server.name} title="Configured in the selected harness">
+                    <Icon name="plug" />
                     <span>{label}</span>
                   </div>
                 );

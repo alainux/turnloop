@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable
 
 from turn.contracts.dag import plan_handoff_example
 from turn.domain.schemas import VerificationResult
+from turn.mcp.runtime import prepare_runtime
 from turn.workers.terminal import TerminalResult
 from turn.skills.library import materialize
 
@@ -114,15 +115,19 @@ def agent_environment(
     """
     skill_ids = list(dict.fromkeys(getattr(agent, "skill_ids", None) or []))
     scoped_skills = materialize(skill_ids, cwd) if skill_ids else {}
+    mcp_runtime = prepare_runtime(cwd, node_id, agent)
 
     def csv(name: str) -> str:
-        return ",".join(str(value) for value in (getattr(agent, name, None) or []))
+        return ",".join(
+            str(getattr(value, "name", value))
+            for value in (getattr(agent, name, None) or [])
+        )
 
     # These paths are private server-owned protocol locations. Agents receive
     # the metadata only so the Turn CLI can publish into the control plane;
     # prompts explicitly forbid writing them directly.
     status = handoff.parent / f"{node_id}.status.json"
-    return {
+    environment = {
         "TURN_NODE_ID": str(node_id),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
         "TURN_REPO": str(Path(cwd).resolve()),
@@ -138,6 +143,8 @@ def agent_environment(
         "TURN_AGENT_TOOLS": csv("tools"),
         "TURN_AGENT_MCP_SERVERS": csv("mcp_servers"),
     }
+    environment.update(mcp_runtime.environment)
+    return environment
 
 
 def read_result_file(path: Path) -> dict[str, Any] | None:

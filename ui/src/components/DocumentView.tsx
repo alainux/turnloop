@@ -12,6 +12,9 @@ import {
   documentReferenceHref,
   documentReferenceLabel,
   isExternalDocumentReference,
+  mcpServerLabel,
+  skillReferenceLabel,
+  skillSourceHref,
   stripMarkdown,
 } from "../domain";
 
@@ -207,6 +210,73 @@ function projectPathHref(path: string, projectId: string): string {
   );
 }
 
+export function DocumentCapabilities({ node }: { node: GraphNode }) {
+  const skills = node.agent?.skill_ids ?? [];
+  const mcpServers = node.agent?.mcp_servers ?? [];
+  if (!skills.length && !mcpServers.length) return null;
+
+  return (
+    <section className="document-capabilities" aria-label="Agent capabilities">
+      {skills.length > 0 && (
+        <div className="document-capability-group">
+          <span className="document-capability-label">Skills</span>
+          <div className="document-capability-list">
+            {skills.map((reference) => {
+              const href = skillSourceHref(reference);
+              const label = skillReferenceLabel(reference);
+              return href ? (
+                <a
+                  className="document-capability-link"
+                  href={href}
+                  target={/^https?:\/\//i.test(href) ? "_blank" : undefined}
+                  rel={/^https?:\/\//i.test(href) ? "noreferrer" : undefined}
+                  key={reference}
+                  title={href}
+                >
+                  {label}
+                </a>
+              ) : (
+                <span className="document-capability-value" key={reference} title={reference}>
+                  {label}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {mcpServers.length > 0 && (
+        <div className="document-capability-group">
+          <span className="document-capability-label">MCP servers</span>
+          <div className="document-capability-list">
+            {mcpServers.map((server) => (
+              server.source_url ? (
+                <a
+                  className="document-capability-link"
+                  href={server.source_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  key={server.name}
+                  title={server.source_url}
+                >
+                  {mcpServerLabel(server)}
+                </a>
+              ) : (
+                <span
+                  className="document-capability-value"
+                  key={server.name}
+                  title="Configured in the selected harness"
+                >
+                  {mcpServerLabel(server)}
+                </span>
+              )
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function MarkdownContent({
   content,
   baseReference,
@@ -344,7 +414,9 @@ function DocumentNode({
   projectId?: string;
   onOpenDocument?: (reference: DocumentRef) => void;
 }) {
-  const [open, setOpen] = useState(path.length < 2);
+  const [open, setOpen] = useState(
+    path.length < 2 || (node.agent?.mcp_servers.length ?? 0) > 0,
+  );
   const children = orderDocumentNodes(nodes, edges, node.id);
   const dependencies = dependencyLabels(node, nodes, edges);
   const prompt = node.generated_prompt?.trim();
@@ -375,6 +447,7 @@ function DocumentNode({
             <span>Depends on</span> {dependencies.join(" · ")}
           </p>
         )}
+        <DocumentCapabilities node={node} />
         <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
         {prompt && (
           <div className="document-markdown">

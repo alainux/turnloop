@@ -43,6 +43,7 @@ from turn.workers.base import NodeExecutionContext, Worker
 from turn.workers.herdr import HerdrAdapter
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.mcp.runtime import prepare_runtime
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
 
@@ -989,7 +990,13 @@ class Runner:
         agent = node.agent
         if agent is None:
             return None
-        return self.harness_commands.reconnect_command(agent, cwd, session_id)
+        runtime = prepare_runtime(cwd, node.id, agent)
+        return self.harness_commands.reconnect_command(
+            agent,
+            cwd,
+            session_id,
+            mcp_config=runtime.claude_config,
+        )
 
     async def reconnect(self, node_id: uuid.UUID) -> bool:
         """Reopen the last provider conversation without rerunning the node."""
@@ -1128,6 +1135,8 @@ class Runner:
         return bool(await close_persistent(node_id)) if close_persistent is not None else False
 
     async def _run_reconnect(self, node: Node, command: list[str], cwd: str, stream) -> None:
+        runtime = prepare_runtime(cwd, node.id, node.agent)
+        environment = {"TURN_PROJECT_ID": str(node.project_id), **runtime.environment}
         try:
             if getattr(self.terminal, "supports_inject", False):
                 # The persistent pane is a plain shell. Attach it; if it did
@@ -1139,7 +1148,7 @@ class Runner:
                     self.terminal.ensure_session(
                         node.id,
                         cwd=cwd,
-                        environment={"TURN_PROJECT_ID": str(node.project_id)},
+                        environment=environment,
                         stream=stream,
                         idle_warning=self.s.terminal_idle_warning_seconds,
                         idle_reap=self.s.terminal_idle_reap_seconds,
@@ -1156,7 +1165,7 @@ class Runner:
                     await self.terminal.inject_command(
                         node.id,
                         " ".join(shlex.quote(part) for part in command),
-                        environment={"TURN_PROJECT_ID": str(node.project_id)},
+                        environment=environment,
                     )
                 await task
             else:
@@ -1164,6 +1173,7 @@ class Runner:
                     node.id,
                     command,
                     cwd=cwd,
+                    environment=environment,
                     stream=stream,
                     timeout=None,
                     stall_timeout=None,

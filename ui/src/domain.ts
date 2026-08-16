@@ -8,6 +8,7 @@ import type {
   GraphNodeView,
   GraphView,
   HarnessKind,
+  MCPServerAccess,
   Node,
   NodeUIState,
   PermissionMode,
@@ -27,6 +28,7 @@ export type {
   GraphNodeView,
   GraphView,
   HarnessKind,
+  MCPServerAccess,
   InputSpec,
   Node,
   NodeAction,
@@ -80,13 +82,46 @@ export function displayNodeTitle(node: GraphNode): string {
 export function skillReferenceLabel(reference: string): string {
   if (!/^https?:\/\//i.test(reference)) return reference;
   const path = reference.split(/[?#]/, 1)[0];
-  const segment = path.split("/").filter(Boolean).pop();
-  return segment ? decodeURIComponent(segment) : reference;
+  const segments = path.split("/").filter(Boolean);
+  const segment = segments.pop();
+  const displaySegment = segment?.toLowerCase() === "skill.md"
+    ? segments.pop()
+    : segment;
+  return displaySegment ? decodeURIComponent(displaySegment) : reference;
 }
 
 export function skillTooltip(references: string[]): string {
   return `Skills (${references.length})\n${references
     .map(skillReferenceLabel)
+    .join("\n")}`;
+}
+
+/** Resolve skill references to an inspectable source.
+ *
+ * Built-in Turn skills are served from their actual local files. Only a
+ * planner-selected HTTP(S) skill reference points outside the application.
+ */
+export function skillSourceHref(reference: string): string | null {
+  if (/^https?:\/\//i.test(reference)) return reference;
+  if (
+    reference === "imagegen" ||
+    reference === "find-skills" ||
+    reference === "find-mcps" ||
+    reference.startsWith("turn-")
+  ) {
+    return `/api/skills/${encodeURIComponent(reference)}`;
+  }
+  return null;
+}
+
+/** Keep MCP references readable while preserving their researched source. */
+export function mcpServerLabel(server: MCPServerAccess): string {
+  return server.name;
+}
+
+export function mcpTooltip(servers: MCPServerAccess[]): string {
+  return `MCP servers (${servers.length})\n${servers
+    .map(mcpServerLabel)
     .join("\n")}`;
 }
 
@@ -159,6 +194,7 @@ export interface HarnessCapability {
   id: HarnessId;
   label: string;
   available: boolean;
+  capabilities: string[];
   models: ModelCapability[];
   reasoning: Reasoning[];
   accepts_custom_models: boolean;

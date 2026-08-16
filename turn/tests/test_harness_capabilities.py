@@ -37,6 +37,10 @@ def test_capability_payload_is_data_driven_and_extensible():
     assert {item["id"] for item in capabilities} == {"codex", "claude", "opencode", "pi"}
     assert all(item["accepts_custom_models"] for item in capabilities)
     assert all(item["reasoning_profiles"] for item in capabilities)
+    by_id = {item["id"]: item for item in capabilities}
+    assert by_id["codex"]["capabilities"] == ["browser", "computer-use"]
+    assert by_id["claude"]["capabilities"] == ["browser", "computer-use"]
+    assert by_id["pi"]["capabilities"] == []
 
 
 def test_model_discovery_uses_configured_binary_when_not_on_path(monkeypatch):

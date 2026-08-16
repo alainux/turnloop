@@ -161,6 +161,16 @@ class PermissionMode(str, Enum):
     FULL = "full"
 
 
+class MCPTransport(str, Enum):
+    """MCP connection shape understood by the harness adapters."""
+
+    CONFIGURED = "configured"
+    STDIO = "stdio"
+    HTTP = "http"
+    SSE = "sse"
+    WS = "ws"
+
+
 class AgentType(str, Enum):
     PLANNER = "planner"
     EXECUTOR = "executor"
@@ -169,6 +179,60 @@ class AgentType(str, Enum):
 
 
 SETUP_SKILL_ID = "turn-setup"
+
+
+class MCPServerAccess(BaseModel):
+    """A researched MCP assignment and optional launch configuration.
+
+    ``source_url`` is the human-auditable website the planner inspected.
+    ``configured`` means the user has already installed/configured the server
+    in the harness; Turn only carries the assignment into the prompt and
+    environment. Explicit transports are rendered by the selected adapter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128)
+    source_url: Optional[str] = None
+    transport: MCPTransport = MCPTransport.CONFIGURED
+    command: Optional[str] = None
+    args: list[str] = Field(default_factory=list)
+    url: Optional[str] = None
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    bearer_token_env_var: Optional[str] = None
+    enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_reference(cls, value: Any) -> Any:
+        """Migrate the original string-only ``mcp_servers`` field."""
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                raise ValueError("MCP server names must not be empty")
+            if urlsplit(candidate).scheme in {"http", "https"} and urlsplit(candidate).netloc:
+                name = urlsplit(candidate).path.rstrip("/").split("/")[-1] or urlsplit(candidate).netloc
+                return {"name": name, "source_url": candidate}
+            return {"name": candidate}
+        return value
+
+    @model_validator(mode="after")
+    def validate_runtime_shape(self) -> "MCPServerAccess":
+        if self.source_url:
+            parsed_source = urlsplit(self.source_url)
+            if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
+                raise ValueError("MCP source_url must be an absolute http(s) URL")
+        if self.transport is MCPTransport.STDIO and not self.command:
+            raise ValueError(f"stdio MCP server {self.name!r} requires command")
+        if self.transport in {MCPTransport.HTTP, MCPTransport.SSE, MCPTransport.WS}:
+            if not self.url:
+                raise ValueError(f"{self.transport.value} MCP server {self.name!r} requires url")
+            parsed_url = urlsplit(self.url)
+            allowed_schemes = {"ws", "wss"} if self.transport is MCPTransport.WS else {"http", "https"}
+            if parsed_url.scheme not in allowed_schemes or not parsed_url.netloc:
+                raise ValueError("MCP url must be an absolute network URL")
+        return self
 
 
 class VerificationDecision(str, Enum):
@@ -195,6 +259,7 @@ def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
             root / "planner" / "turn-planning.md",
             root / "planner" / "imagegen.md",
             root / "planner" / "find-skills.md",
+            root / "planner" / "find-mcps.md",
         ],
         AgentType.EXECUTOR.value: [
             root / "executor" / "turn-executing.md",
@@ -214,7 +279,7 @@ def skill_ids_for_agent_type(agent_type: AgentType | str) -> list[str]:
     key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
     return {
         AgentType.PLANNER.value: [
-            "turn-planning", "imagegen", "find-skills"
+            "turn-planning", "imagegen", "find-skills", "find-mcps"
         ],
         AgentType.EXECUTOR.value: ["turn-executing"],
         AgentType.INTEGRATOR.value: ["turn-integrating"],
@@ -244,7 +309,7 @@ class Agent(BaseModel):
     skills: list[str] = Field(default_factory=list)
     skill_ids: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
-    mcp_servers: list[str] = Field(default_factory=list)
+    mcp_servers: list[MCPServerAccess] = Field(default_factory=list)
     session_id: Optional[str] = None
 
     @model_validator(mode="after")
@@ -596,6 +661,9 @@ class NodeSpec(BaseModel):
     # Local library ids or HTTP(S) URLs requested for this worker; the server
     # materializes them into the current project's .turn/skills scope.
     skills: list[str] = Field(default_factory=list)
+    # Researched MCP assignments. The server preserves source_url for audit
+    # and renders explicit runtime definitions through the selected harness.
+    mcp_servers: list[MCPServerAccess] = Field(default_factory=list)
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)

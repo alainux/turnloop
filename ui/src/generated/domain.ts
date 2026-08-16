@@ -10,7 +10,7 @@ export interface Agent {
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   session_id: string | null;
 }
 
@@ -68,7 +68,7 @@ export interface Executor {
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   session_id: string | null;
 }
 
@@ -148,9 +148,24 @@ export interface Integrator {
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   session_id: string | null;
 }
+
+export interface MCPServerAccess {
+  name: string;
+  source_url: string | null;
+  transport: MCPTransport;
+  command: string | null;
+  args: Array<string>;
+  url: string | null;
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  bearer_token_env_var: string | null;
+  enabled: boolean;
+}
+
+export type MCPTransport = "configured" | "stdio" | "http" | "sse" | "ws";
 
 export interface Node {
   id: string;
@@ -192,6 +207,7 @@ export interface NodeSpec {
   document_refs: Array<DocumentRef>;
   artifacts: Array<ArtifactSpec>;
   skills: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   parent_key: string | null;
   depends_on: Array<string>;
   plan: boolean;
@@ -226,7 +242,7 @@ export interface Planner {
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   session_id: string | null;
 }
 
@@ -289,7 +305,7 @@ export interface Verifier {
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<string>;
+  mcp_servers: Array<MCPServerAccess>;
   session_id: string | null;
 }
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from turn.config import settings
 from turn.contracts.dag import parse_result
 from turn.domain.schemas import (
+    AgentConfig,
     AgentType,
     ArtifactKind,
     ArtifactSpec,
@@ -37,6 +38,7 @@ from turn.workers.interactive import (
 )
 from turn.workers import parsing
 from turn.workers.terminal import LocalPtyTransport
+from turn.mcp.runtime import codex_mcp_overrides
 
 logger = logging.getLogger("turn.worker.codex")
 
@@ -90,6 +92,11 @@ class CodexWorker(Worker):
         reasoning_flags = []
         if agent and agent.reasoning != ReasoningLevel.DEFAULT:
             reasoning_flags = ["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
+        mcp_flags = [
+            item
+            for override in codex_mcp_overrides(agent or AgentConfig(harness="codex"))
+            for item in ("-c", override)
+        ]
         session_id = ctx.node.agent.session_id if ctx.node.agent else None
         discovered_session = session_id
 
@@ -111,13 +118,13 @@ class CodexWorker(Worker):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *permission_flags, "--no-alt-screen", "-C", cwd,
+                    *mcp_flags, *permission_flags, "--no-alt-screen", "-C", cwd,
                     *native_args, session_id,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *permission_flags, "--no-alt-screen", "-C", cwd,
+                    *mcp_flags, *permission_flags, "--no-alt-screen", "-C", cwd,
                     *native_args,
                 ]
         elif session_id:
@@ -127,13 +134,13 @@ class CodexWorker(Worker):
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
-                *resume_permissions, "-C", cwd, session_id, prompt_arg,
+                *mcp_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags, *permission_flags,
-                "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt_arg,
+                *mcp_flags, "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt_arg,
             ]
 
         structured_text = ""

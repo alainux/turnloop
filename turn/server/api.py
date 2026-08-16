@@ -43,6 +43,20 @@ async def schema():
     return public_schema()
 
 
+@router.get("/api/skills/{skill_id}")
+async def get_skill_source(skill_id: str):
+    """Serve a built-in skill's actual source file for UI inspection."""
+    from turn.skills.library import get_skill
+
+    try:
+        skill = get_skill(skill_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="skill not found") from error
+    if not skill.source_path.is_file():
+        raise HTTPException(status_code=404, detail="skill source not found")
+    return FileResponse(skill.source_path, media_type="text/markdown")
+
+
 # -- request bodies --------------------------------------------------------
 
 

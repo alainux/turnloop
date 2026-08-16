@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { DocumentLinks, orderDocumentNodes } from "./DocumentView";
+import { DocumentCapabilities, DocumentLinks, orderDocumentNodes } from "./DocumentView";
 import type { DocumentRef, Edge, GraphNode } from "../domain";
 
 const node = (id: string, parent_id: string | null): GraphNode =>
@@ -58,6 +58,38 @@ describe("document specification ordering", () => {
 
     expect(rendered).toContain("future.md");
     expect(rendered).toContain("/api/projects/root/documents/future.md");
+  });
+
+  it("shows clickable skills and MCP sources in document nodes", () => {
+    const capabilityNode = node("build", "root");
+    capabilityNode.agent = {
+      type_id: "verifier",
+      skill_ids: ["turn-verifying", "https://raw.example.test/game/SKILL.md"],
+      mcp_servers: [{
+        name: "playwright",
+        source_url: "https://github.com/microsoft/playwright-mcp",
+        transport: "stdio",
+        command: "npx",
+        args: [],
+        url: null,
+        env: {},
+        headers: {},
+        bearer_token_env_var: null,
+        enabled: true,
+      }],
+    } as unknown as NonNullable<GraphNode["agent"]>;
+
+    const rendered = renderToStaticMarkup(
+      createElement(DocumentCapabilities, { node: capabilityNode }),
+    );
+
+    expect(rendered).toContain("Skills");
+    expect(rendered).toContain("turn-verifying");
+    expect(rendered).toContain("game");
+    expect(rendered).toContain("/api/skills/turn-verifying");
+    expect(rendered).toContain("MCP servers");
+    expect(rendered).toContain("playwright");
+    expect(rendered).toContain("https://github.com/microsoft/playwright-mcp");
   });
 
   it("puts explicit prerequisites above their integrator", () => {

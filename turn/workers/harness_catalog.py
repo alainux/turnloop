@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from turn.domain.schemas import AgentConfig, HarnessKind
+from turn.mcp.runtime import codex_mcp_overrides
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,10 @@ class HarnessDefinition:
     label: str
     binary: str
     reasoning: tuple[str, ...]
+    # Capabilities supplied by the harness itself, independent of procured
+    # MCPs. This is a small declared profile today; runtime discovery can
+    # replace it later without changing planner procurement semantics.
+    capabilities: tuple[str, ...] = ()
     supports_sessions: bool = True
     supports_tools: bool = True
 
@@ -38,6 +43,7 @@ class HarnessCatalog:
                 "label": definition.label,
                 "binary": definition.binary,
                 "reasoning": list(definition.reasoning),
+                "capabilities": list(definition.capabilities),
                 "supports_sessions": definition.supports_sessions,
                 "supports_tools": definition.supports_tools,
             }
@@ -47,8 +53,14 @@ class HarnessCatalog:
 
 REAL_HARNESS_CATALOG = HarnessCatalog(
     (
-        HarnessDefinition("codex", "Codex", "codex", ("default", "low", "medium", "high", "xhigh", "max")),
-        HarnessDefinition("claude", "Claude Code", "claude", ("default", "low", "medium", "high", "xhigh", "max")),
+        HarnessDefinition(
+            "codex", "Codex", "codex", ("default", "low", "medium", "high", "xhigh", "max"),
+            capabilities=("browser", "computer-use"),
+        ),
+        HarnessDefinition(
+            "claude", "Claude Code", "claude", ("default", "low", "medium", "high", "xhigh", "max"),
+            capabilities=("browser", "computer-use"),
+        ),
         HarnessDefinition("opencode", "OpenCode", "opencode", ("default", "low", "medium", "high", "max")),
         HarnessDefinition("pi", "Pi", "pi", ("default", "low", "medium", "high", "xhigh", "max")),
     )
@@ -79,12 +91,15 @@ class HarnessCommandFactory:
         resume: bool = False,
         native: bool = False,
         prompt_via_stdin: bool = False,
+        mcp_config: str | None = None,
     ) -> list[str]:
         model = agent.model
         reasoning = agent.reasoning.value
         session = agent.session_id
         if harness == HarnessKind.CLAUDE:
             cmd = ["claude"] if native else ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+            if mcp_config:
+                cmd += ["--mcp-config", mcp_config]
             if session:
                 cmd += ["--resume", session] if resume else ["--session-id", session]
             elif not native:
@@ -129,6 +144,7 @@ class HarnessCommandFactory:
     def planner_command(
         self, agent: AgentConfig, prompt: str, *, cwd: str, native: bool, resume: bool,
         prompt_via_stdin: bool = False,
+        mcp_config: str | None = None,
     ) -> list[str]:
         if agent.harness == HarnessKind.OPENCODE:
             cmd = ["opencode", cwd] if native else ["opencode", "run", "--auto"]
@@ -154,6 +170,8 @@ class HarnessCommandFactory:
             return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if agent.harness == HarnessKind.CLAUDE:
             cmd = ["claude"] if native else ["claude", "--print", "--output-format", "text", "--permission-mode", "acceptEdits"]
+            if mcp_config:
+                cmd += ["--mcp-config", mcp_config]
             if agent.session_id:
                 cmd += ["--resume", agent.session_id] if resume else ["--session-id", agent.session_id]
             if model := agent.model:
@@ -163,7 +181,19 @@ class HarnessCommandFactory:
             return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
         raise ValueError(f"planner harness '{agent.harness.value}' is unsupported")
 
-    def reconnect_command(self, agent: AgentConfig, cwd: str, session_id: str) -> list[str] | None:
+    def reconnect_command(
+        self,
+        agent: AgentConfig,
+        cwd: str,
+        session_id: str,
+        *,
+        mcp_config: str | None = None,
+    ) -> list[str] | None:
+        mcp_flags = [
+            item
+            for override in codex_mcp_overrides(agent)
+            for item in ("-c", override)
+        ]
         if agent.harness == HarnessKind.CODEX:
             permission = (
                 ["--dangerously-bypass-approvals-and-sandbox"]
@@ -180,7 +210,7 @@ class HarnessCommandFactory:
             model = ["--model", agent.model] if agent.model else []
             thinking = (["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
                         if agent.reasoning.value != "default" else [])
-            return [self.codex_binary, "resume", *model, *thinking, *permission,
+            return [self.codex_binary, "resume", *model, *thinking, *mcp_flags, *permission,
                     "--no-alt-screen", "-C", cwd, *native_args, session_id]
         if agent.harness == HarnessKind.PI:
             return ["pi", "--session", session_id, *(["--model", agent.model] if agent.model else [])]
@@ -193,6 +223,8 @@ class HarnessCommandFactory:
             return command
         if agent.harness == HarnessKind.CLAUDE:
             command = ["claude", "--resume", session_id]
+            if mcp_config:
+                command += ["--mcp-config", mcp_config]
             if agent.model:
                 command += ["--model", agent.model]
             if agent.permission.value == "full":

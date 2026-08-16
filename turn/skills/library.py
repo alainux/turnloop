@@ -85,6 +85,11 @@ SKILLS: dict[str, SkillDefinition] = {
         "Discover, evaluate, and reference project-specific agent skills.",
         source_url=_SKILLS_SH,
     ),
+    "find-mcps": SkillDefinition(
+        "find-mcps", "Find MCP servers", _ROOT / "planner" / "find-mcps.md",
+        "Discover, evaluate, and assign domain-specific MCP server access.",
+        source_url="https://glama.ai/mcp/servers",
+    ),
 }
 
 

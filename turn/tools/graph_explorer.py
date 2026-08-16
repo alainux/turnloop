@@ -182,7 +182,10 @@ def _summary(item: dict) -> str:
         if agent.get("tools"):
             line += "\n  tools: " + ", ".join(agent["tools"])
         if agent.get("mcp_servers"):
-            line += "\n  mcp_servers: " + ", ".join(agent["mcp_servers"])
+            line += "\n  mcp_servers: " + ", ".join(
+                item.get("name", "") if isinstance(item, dict) else str(item)
+                for item in agent["mcp_servers"]
+            )
     if item.get("instructions"):
         instructions = str(item["instructions"]).strip()
         line += "\n  instructions:\n" + "\n".join(f"    {part}" for part in instructions.splitlines())

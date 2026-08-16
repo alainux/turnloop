@@ -235,3 +235,18 @@ async def test_project_document_endpoint_is_scoped_and_serves_markdown(tmp_path)
             f"/api/projects/{root.id}/documents/%2E%2E/outside.md"
         )
         assert traversal.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_builtin_skill_endpoint_serves_the_actual_skill_file():
+    app = FastAPI()
+    app.include_router(router)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        served = await client.get("/api/skills/turn-executing")
+        assert served.status_code == 200
+        assert "# Turn executing skill" in served.text
+        missing = await client.get("/api/skills/not-a-skill")
+        assert missing.status_code == 404

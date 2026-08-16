@@ -6,6 +6,7 @@ import {
   documentReferenceContentHref,
   documentReferenceLabel,
   skillReferenceLabel,
+  skillSourceHref,
   skillTooltip,
   stripMarkdown,
 } from "./domain";
@@ -59,9 +60,17 @@ describe("display labels", () => {
 
   it("keeps local skill ids and makes URL skill references readable", () => {
     expect(skillReferenceLabel("turn-executing")).toBe("turn-executing");
-    expect(skillReferenceLabel("https://example.test/visual/SKILL.md?rev=1")).toBe("SKILL.md");
+    expect(skillReferenceLabel("https://example.test/visual/SKILL.md?rev=1")).toBe("visual");
+    expect(skillReferenceLabel("https://raw.example.test/game/vanilla-js-game-dev/SKILL.md"))
+      .toBe("vanilla-js-game-dev");
     expect(skillTooltip(["turn-executing", "https://example.test/visual/SKILL.md"]))
       .toContain("Skills (2)");
+    expect(skillSourceHref("find-mcps")).toBe("/api/skills/find-mcps");
+    expect(skillSourceHref("imagegen")).toBe("/api/skills/imagegen");
+    expect(skillSourceHref("turn-executing")).toBe("/api/skills/turn-executing");
+    expect(skillSourceHref("https://example.test/skill/SKILL.md")).toBe(
+      "https://example.test/skill/SKILL.md",
+    );
   });
 
   it("links local documents through the project endpoint and preserves external URLs", () => {

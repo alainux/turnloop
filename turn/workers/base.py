@@ -20,6 +20,7 @@ from turn.domain.schemas import (
     Resource,
     WorkerResult,
 )
+from turn.workers.harness_catalog import REAL_HARNESS_CATALOG
 
 
 class NodeExecutionContext(BaseModel):
@@ -80,6 +81,14 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             f"- harness: {agent.harness.value}; model: {agent.model or 'harness default'}; "
             f"reasoning: {agent.reasoning.value}; permission: {agent.permission.value}"
         )
+        try:
+            declared = REAL_HARNESS_CATALOG.definition(agent.harness).capabilities
+        except ValueError:
+            declared = ()
+        lines.append(
+            "- harness-provided capabilities (before MCP procurement): "
+            + (", ".join(declared) if declared else "none declared")
+        )
         if agent.skill_ids:
             lines.append(
                 "- skills available through the project-scoped Turn library: "
@@ -88,7 +97,17 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         if agent.tools:
             lines.append(f"- tools allowed at launch: {', '.join(agent.tools)}")
         if agent.mcp_servers:
-            lines.append(f"- MCP servers available at launch: {', '.join(agent.mcp_servers)}")
+            lines.append(
+                "- MCP servers assigned at launch: "
+                + ", ".join(server.name for server in agent.mcp_servers)
+            )
+            lines.append(
+                "- MCP source/setup references: "
+                + ", ".join(
+                    f"{server.name} ({server.source_url or 'user-configured'})"
+                    for server in agent.mcp_servers
+                )
+            )
         lines.append(
             "- Use `turn skills list` and `turn skills show <id>` for local skills; "
             "external references are installed under `.turn/skills` and their "

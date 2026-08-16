@@ -376,6 +376,7 @@ class CLIHarnessWorker(Worker):
         resume: bool = False,
         native: bool = False,
         prompt_via_stdin: bool = False,
+        mcp_config: str | None = None,
     ) -> list[str]:
         return self.commands.worker_command(
             self.harness,
@@ -385,6 +386,7 @@ class CLIHarnessWorker(Worker):
             resume=resume,
             native=native,
             prompt_via_stdin=prompt_via_stdin,
+            mcp_config=mcp_config,
         )
 
     async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
@@ -471,6 +473,7 @@ class CLIHarnessWorker(Worker):
             resume=resume,
             native=native,
             prompt_via_stdin=bool(getattr(transport, "supports_inject", False)),
+            mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
         )
         try:
             if native:
