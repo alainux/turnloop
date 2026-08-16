@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from turn.domain.schemas import (
     AgentConfig,
@@ -29,6 +30,7 @@ from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
     ArtifactSpec,
+    DocumentRef,
     Edge,
     EdgeType,
     Graph,
@@ -41,6 +43,7 @@ from turn.domain.schemas import (
     RunPolicy,
     RunStatus,
     Usage,
+    flatten_document_refs,
 )
 from turn.graph.logic import GraphWalker
 
@@ -64,6 +67,37 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _merge_document_refs(existing: list[DocumentRef], incoming: list[DocumentRef]) -> list[DocumentRef]:
+    """Merge references by URI while preserving their authored order."""
+    merged: list[DocumentRef] = []
+    seen: set[str] = set()
+    for ref in [*existing, *incoming]:
+        if ref.ref in seen:
+            continue
+        seen.add(ref.ref)
+        merged.append(ref)
+    return merged
+
+
+def _document_artifact_specs(refs: list[DocumentRef]) -> list[ArtifactSpec]:
+    """Project document references into concise file/link artifacts."""
+    specs: list[ArtifactSpec] = []
+    seen: set[str] = set()
+    for document in flatten_document_refs(refs):
+        if document.ref in seen:
+            continue
+        seen.add(document.ref)
+        parsed = urlsplit(document.ref)
+        path = parsed.path.rstrip("/")
+        name = document.title or (Path(path).name if path else document.ref)
+        specs.append(ArtifactSpec(
+            kind=ArtifactKind.LINK if parsed.scheme else ArtifactKind.FILE,
+            name=name,
+            ref=document.ref,
+        ))
+    return specs
+
+
 class Store:
     """Durable local-file store rooted at a filesystem directory."""
 
@@ -73,10 +107,16 @@ class Store:
         *,
         data_dir: str | Path | None = None,
         config_path: str | Path | None = None,
+        projects_dir: str | Path | None = None,
     ):
         raw = str(data_dir or location or (Path.cwd() / "turn"))
         self.data_dir = self._resolve_data_dir(raw)
         self.config_path = Path(config_path).expanduser().resolve() if config_path else self.data_dir / "config.json"
+        self.projects_dir = (
+            Path(projects_dir).expanduser().resolve()
+            if projects_dir
+            else self.data_dir / "projects"
+        )
         self._states: dict[uuid.UUID, dict[str, dict[uuid.UUID, Any]]] = {}
         self._project_paths: dict[uuid.UUID, Path] = {}
         self._settings: dict[str, str] = {}
@@ -90,6 +130,26 @@ class Store:
     @staticmethod
     def _state_path(project_path: Path) -> Path:
         return project_path / ".turn" / "state.json"
+
+    @staticmethod
+    def _project_id_from_state(raw: dict[str, Any]) -> uuid.UUID:
+        """Read the project identity from either current or project-local state.
+
+        Current state stores the id at the document root. Older project-local
+        state already stores the same identity on its root node, so discovery
+        can reconstruct the index without inspecting or rewriting graph data.
+        """
+        if raw.get("project_id"):
+            return uuid.UUID(str(raw["project_id"]))
+        roots = [
+            item
+            for item in raw.get("nodes", [])
+            if isinstance(item, dict) and item.get("parent_id") is None
+        ]
+        if len(roots) != 1:
+            raise KeyError("project_id")
+        root = roots[0]
+        return uuid.UUID(str(root.get("project_id") or root["id"]))
 
     @staticmethod
     def _empty_state() -> dict[str, dict[uuid.UUID, Any]]:
@@ -138,12 +198,12 @@ class Store:
                     continue
 
         # Also discover local projects if the config was copied or rebuilt.
-        projects_root = self.data_dir / "projects"
+        projects_root = self.projects_dir
         if projects_root.exists():
             for state_path in projects_root.glob("*/.turn/state.json"):
                 try:
                     data = json.loads(state_path.read_text(encoding="utf-8"))
-                    project_id = uuid.UUID(str(data["project_id"]))
+                    project_id = self._project_id_from_state(data)
                     self._project_paths.setdefault(project_id, state_path.parent.parent)
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     continue
@@ -154,15 +214,22 @@ class Store:
                 continue
             try:
                 raw = json.loads(state_path.read_text(encoding="utf-8"))
-                self._states[project_id] = self._decode_state(raw)
+                state, normalized = self._decode_state(raw)
+                self._states[project_id] = state
+                if normalized:
+                    await self._persist_project(project_id)
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
                 raise RuntimeError(f"could not read project state {state_path}: {error}") from error
         self._loaded = True
 
         await self._persist_config()
 
-    def _decode_state(self, raw: dict[str, Any]) -> dict[str, dict[uuid.UUID, Any]]:
+    def _decode_state(
+        self,
+        raw: dict[str, Any],
+    ) -> tuple[dict[str, dict[uuid.UUID, Any]], bool]:
         state = self._empty_state()
+        normalized = False
         edge_keys: set[tuple[uuid.UUID, uuid.UUID, EdgeType]] = set()
         for item in raw.get("nodes", []):
             node = Node.model_validate(item)
@@ -177,10 +244,32 @@ class Store:
         for item in raw.get("runs", []):
             run = Run.model_validate(item)
             state["runs"][run.id] = run
+        artifact_keys: set[tuple[Any, ...]] = set()
         for item in raw.get("artifacts", []):
             artifact = Artifact.model_validate(item)
+            content_key = json.dumps(artifact.content, sort_keys=True, default=str)
+            key = (
+                artifact.node_id,
+                "ref",
+                artifact.ref,
+            ) if artifact.ref else (
+                artifact.node_id,
+                "value",
+                artifact.kind,
+                artifact.name,
+                content_key,
+            )
+            if key in artifact_keys:
+                normalized = True
+                continue
+            artifact_keys.add(key)
             state["artifacts"][artifact.id] = artifact
-        return state
+        for node in state["nodes"].values():
+            filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state["artifacts"]]
+            if filtered != node.artifact_refs:
+                node.artifact_refs = filtered
+                normalized = True
+        return state, normalized
 
     def _encode_state(self, project_id: uuid.UUID) -> dict[str, Any]:
         state = self._states[project_id]
@@ -319,7 +408,6 @@ class Store:
         root = state["nodes"].get(project_id)
         return Graph(
             project_id=project_id,
-            architecture_spec=root.architecture_spec if root is not None else None,
             nodes=[node.model_copy(deep=True) for node in state["nodes"].values()],
             edges=[edge.model_copy(deep=True) for edge in state["edges"].values()],
             artifacts=[artifact.model_copy(deep=True) for artifact in state["artifacts"].values()],
@@ -526,11 +614,21 @@ class Store:
         return [item.id for item in descendants]
 
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
-        if plan.architecture_spec is not None:
-            parent.architecture_spec = plan.architecture_spec
+        parent.document_refs = _merge_document_refs(
+            parent.document_refs,
+            plan.document_refs,
+        )
+        parent_id = parent.id
         if not plan.nodes:
             parent.status = NodeStatus.COMPLETE
-            await self._save_node(parent)
+            state = self._state(parent.project_id)
+            state["nodes"][parent_id] = parent.model_copy(deep=True)
+            self._append_artifacts(
+                state,
+                parent_id,
+                [*plan.artifacts, *_document_artifact_specs(parent.document_refs)],
+            )
+            await self._persist_project(parent.project_id)
             return []
 
         keys_to_ids = {spec.key: uuid.uuid4() for spec in plan.nodes}
@@ -582,8 +680,14 @@ class Store:
                 objective=spec.objective, generated_prompt=spec.generated_prompt,
                 executor=executor, agent=node_agent, status=NodeStatus.PENDING,
                 required_inputs=spec.required_inputs, resource_refs=spec.resource_refs,
+                document_refs=spec.document_refs,
             )
             state["nodes"][node.id] = node
+            self._append_artifacts(
+                state,
+                node.id,
+                [*spec.artifacts, *_document_artifact_specs(spec.document_refs)],
+            )
             created.append(node)
             if not spec.parent_key:
                 add_edge(parent.id, node.id, EdgeType.CONTAINS)
@@ -597,6 +701,11 @@ class Store:
             add_edge(key[0], key[1], key[2])
         parent.status = NodeStatus.EXPANDED
         state["nodes"][parent.id] = parent.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
+        self._append_artifacts(
+            state,
+            parent.id,
+            [*plan.artifacts, *_document_artifact_specs(parent.document_refs)],
+        )
         await self._persist_project(parent.project_id)
         return [node.model_copy(deep=True) for node in created]
 
@@ -695,22 +804,68 @@ class Store:
 
     # -- artifacts --------------------------------------------------------
 
+    @staticmethod
+    def _append_artifacts(
+        state: dict[str, dict[uuid.UUID, Any]],
+        node_id: uuid.UUID,
+        specs: list[ArtifactSpec],
+    ) -> list[Artifact]:
+        """Append non-duplicate artifact identities to an in-memory state."""
+        existing = {
+            ("ref", artifact.ref) if artifact.ref else
+            ("value", artifact.kind, artifact.name, json.dumps(artifact.content, sort_keys=True, default=str))
+            for artifact in state["artifacts"].values()
+            if artifact.node_id == node_id
+        }
+        artifacts: list[Artifact] = []
+        for spec in specs:
+            key = (
+                ("ref", spec.ref) if spec.ref else
+                ("value", spec.kind, spec.name, json.dumps(spec.content, sort_keys=True, default=str))
+            )
+            if key in existing:
+                continue
+            artifact = Artifact(
+                id=uuid.uuid4(),
+                node_id=node_id,
+                kind=spec.kind,
+                name=spec.name,
+                content=spec.content,
+                ref=spec.ref,
+            )
+            state["artifacts"][artifact.id] = artifact
+            existing.add(key)
+            artifacts.append(artifact)
+        node = state["nodes"].get(node_id)
+        if node is not None and artifacts:
+            node.artifact_refs = [*node.artifact_refs, *(artifact.id for artifact in artifacts)]
+        return artifacts
+
     async def add_artifacts(self, node_id: uuid.UUID, specs: list[ArtifactSpec]) -> list[Artifact]:
         found = self._project_for_node(node_id)
         if not found:
             return []
         project_id, _ = found
         state = self._states[project_id]
-        artifacts: list[Artifact] = []
-        for spec in specs:
-            artifact = Artifact(id=uuid.uuid4(), node_id=node_id, kind=spec.kind, name=spec.name, content=spec.content, ref=spec.ref)
-            state["artifacts"][artifact.id] = artifact
-            artifacts.append(artifact)
+        artifacts = self._append_artifacts(state, node_id, specs)
         await self._persist_project(project_id)
-        node = await self.get_node(node_id)
-        if node is not None:
-            node.artifact_refs = list(node.artifact_refs) + [artifact.id for artifact in artifacts]
-            await self._save_node(node)
+        return [artifact.model_copy(deep=True) for artifact in artifacts]
+
+    async def add_document_refs(self, node_id: uuid.UUID, refs: list[DocumentRef]) -> list[Artifact]:
+        """Attach dynamic refs and expose each new ref as a file/link artifact."""
+        found = self._project_for_node(node_id)
+        if not found:
+            return []
+        project_id, _ = found
+        state = self._states[project_id]
+        node = state["nodes"].get(node_id)
+        if node is None:
+            return []
+        before = {ref.ref for ref in node.document_refs}
+        node.document_refs = _merge_document_refs(node.document_refs, refs)
+        new_refs = [ref for ref in flatten_document_refs(refs) if ref.ref not in before]
+        artifacts = self._append_artifacts(state, node_id, _document_artifact_specs(new_refs))
+        await self._persist_project(project_id)
         return [artifact.model_copy(deep=True) for artifact in artifacts]
 
     async def get_artifacts(self, node_id: uuid.UUID) -> list[Artifact]:

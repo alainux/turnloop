@@ -10,10 +10,11 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -36,7 +37,7 @@ _PROJECT_SKILL_PATTERN = re.compile(r"^project:([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-
 SKILLS: dict[str, SkillDefinition] = {
     "turn-planning": SkillDefinition(
         "turn-planning", "Turn planning", _ROOT / "planner" / "turn-planning.md",
-        "Graph decomposition, architecture metadata, contracts, and orchestration.",
+        "Graph decomposition, project documents, contracts, and orchestration.",
     ),
     "turn-architecture-research": SkillDefinition(
         "turn-architecture-research", "Architecture research", _ROOT / "planner" / "turn-architecture-research.md",
@@ -77,9 +78,18 @@ class SkillFetcher(Protocol):
     def fetch(self, url: str) -> bytes:
         ...
 
+    def fetch_files(self, url: str) -> dict[str, bytes]:
+        """Fetch a standard skill document and its optional support files."""
+        ...
+
 
 class UrlSkillFetcher:
-    """Network adapter for fetching a bounded skill document."""
+    """Network adapter for standard single- and multi-file skill sources.
+
+    A web page is never treated as a skill. Known repository/catalog URLs are
+    resolved to their Markdown source and support files; direct URLs must
+    themselves return a standards-shaped ``SKILL.md``.
+    """
 
     def fetch(self, url: str) -> bytes:
         request = Request(url, headers={"User-Agent": "turn-skill-installer/1.0"})
@@ -90,6 +100,104 @@ class UrlSkillFetcher:
         if not payload.strip():
             raise ValueError(f"skill at {url} is empty")
         return payload
+
+    def _json(self, url: str) -> object:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "turn-skill-installer/1.0",
+                "Accept": "application/vnd.github+json, application/json",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            payload = response.read(_MAX_SKILL_BYTES + 1)
+        if len(payload) > _MAX_SKILL_BYTES:
+            raise ValueError(f"skill source at {url} exceeds {_MAX_SKILL_BYTES} bytes")
+        return json.loads(payload.decode("utf-8"))
+
+    def fetch_files(self, url: str) -> dict[str, bytes]:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host == "github.com" or host.endswith(".github.com"):
+            return self._github_files(parsed)
+        if host == "skills.sh" or host.endswith(".skills.sh"):
+            return self._skills_sh_files(parsed)
+        return {"SKILL.md": self.fetch(url)}
+
+    def _github_files(self, parsed) -> dict[str, bytes]:
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 4 or parts[2] not in {"tree", "blob"}:
+            raise ValueError(
+                "GitHub skill references must target a /tree/<ref>/<skill-directory> "
+                "or /blob/<ref>/SKILL.md source"
+            )
+        owner, repo, kind, ref = parts[:4]
+        path = "/".join(parts[4:])
+        if kind == "blob":
+            if Path(path).name != "SKILL.md":
+                raise ValueError("GitHub skill files must be named SKILL.md")
+            raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{quote(ref, safe='')}/{quote(path, safe='/')}"
+            return {"SKILL.md": self.fetch(raw)}
+
+        api = f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contents"
+        if path:
+            api += "/" + quote(path, safe="/")
+        api += "?ref=" + quote(ref, safe="")
+        return self._github_directory(api, "")
+
+    def _github_directory(self, url: str, prefix: str) -> dict[str, bytes]:
+        listing = self._json(url)
+        if isinstance(listing, dict) and listing.get("type") == "file":
+            name = str(listing.get("name") or Path(urlparse(url).path).name)
+            if name != "SKILL.md":
+                raise ValueError("GitHub skill files must be named SKILL.md")
+            download = listing.get("download_url")
+            if not isinstance(download, str):
+                raise ValueError("GitHub skill file has no download URL")
+            return {prefix + name: self.fetch(download)}
+        if not isinstance(listing, list):
+            raise ValueError("GitHub skill directory response is not a file listing")
+        files: dict[str, bytes] = {}
+        for entry in listing:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if not name or name in {".git", ".github"}:
+                continue
+            entry_type = entry.get("type")
+            entry_url = entry.get("url")
+            relative = prefix + name
+            if entry_type == "dir" and isinstance(entry_url, str):
+                files.update(self._github_directory(entry_url, relative + "/"))
+            elif entry_type == "file":
+                download = entry.get("download_url")
+                if isinstance(download, str):
+                    files[relative] = self.fetch(download)
+        return files
+
+    def _skills_sh_files(self, parsed) -> dict[str, bytes]:
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 3 or parts[0] == "api":
+            raise ValueError("skills.sh references must identify a specific skill")
+        source = "/".join(parts[:2])
+        skill = "/".join(parts[2:])
+        endpoint = (
+            "https://skills.sh/api/v1/skills/"
+            f"{quote(source, safe='/')}/{quote(skill, safe='/')}"
+        )
+        payload = self._json(endpoint)
+        raw_files = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(raw_files, list):
+            raise ValueError("skills.sh response did not contain a file tree")
+        files: dict[str, bytes] = {}
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("name") or "")
+            content = item.get("content", item.get("contents"))
+            if path and isinstance(content, str):
+                files[path] = content.encode("utf-8")
+        return files
 
 
 def list_skills() -> tuple[SkillDefinition, ...]:
@@ -145,6 +253,8 @@ def _external_install_key(url: str) -> str:
 def _validate_project_skill_document(path: Path, payload: bytes) -> None:
     """Require the small frontmatter contract for planner-authored skills."""
     text = payload.decode("utf-8")
+    if re.match(r"\s*<(?:!doctype\s+html|html|head|body)\b", text, re.I):
+        raise ValueError(f"skill {path} resolved to HTML; provide its Markdown source")
     if not text.startswith("---\n"):
         raise ValueError(f"project skill {path} must start with YAML frontmatter")
     end = text.find("\n---\n", 4)
@@ -193,14 +303,48 @@ def materialize(
             install_key = _external_install_key(reference)
             target = destination / install_key / "SKILL.md"
             if target.is_file():
-                resolved[reference] = target
-                continue
-            payload = external_fetcher.fetch(reference)
+                try:
+                    _validate_project_skill_document(target, target.read_bytes())
+                except (UnicodeDecodeError, ValueError):
+                    # Replace an older invalid materialization, including the
+                    # raw HTML written by the previous installer.
+                    pass
+                else:
+                    resolved[reference] = target
+                    continue
+            fetch_files = getattr(external_fetcher, "fetch_files", None)
+            files = (
+                fetch_files(reference)
+                if callable(fetch_files)
+                else {"SKILL.md": external_fetcher.fetch(reference)}
+            )
+            if not files:
+                raise ValueError(f"skill source {reference} returned no files")
+            skill_paths = [path for path in files if Path(path).name == "SKILL.md"]
+            if len(skill_paths) != 1:
+                raise ValueError(
+                    f"skill source {reference} must resolve to exactly one SKILL.md"
+                )
+            skill_root = Path(skill_paths[0]).parent
+            normalized_files: dict[str, bytes] = {}
+            for relative, content in files.items():
+                relative_path = Path(relative)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise ValueError(f"skill source {reference} contains an unsafe path")
+                normalized = relative_path.relative_to(skill_root) if skill_root != Path(".") else relative_path
+                normalized_files[str(normalized)] = content
+            payload = normalized_files.get("SKILL.md")
+            if payload is None:
+                raise ValueError(f"skill source {reference} did not contain SKILL.md")
         target = destination / install_key / "SKILL.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         if reference in SKILLS:
             shutil.copyfile(SKILLS[reference].source_path, target)
         else:
-            target.write_bytes(payload)
+            _validate_project_skill_document(target, payload)
+            for relative, content in normalized_files.items():
+                output = target.parent / relative
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(content)
         resolved[reference] = target
     return resolved

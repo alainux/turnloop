@@ -1,15 +1,8 @@
 import type {
   Agent,
   AgentType,
-  ArchitectureDecision,
-  ArchitectureConceptImage,
-  ArchitectureDiagram,
-  ArchitectureDiagramEdge,
-  ArchitectureDiagramNode,
-  ArchitectureRisk,
-  ArchitectureSection,
-  ArchitectureSpec,
   Artifact,
+  DocumentRef,
   Edge,
   GraphNodeView,
   GraphView,
@@ -26,15 +19,8 @@ import type {
 export type {
   Agent,
   AgentType,
-  ArchitectureDecision,
-  ArchitectureConceptImage,
-  ArchitectureDiagram,
-  ArchitectureDiagramEdge,
-  ArchitectureDiagramNode,
-  ArchitectureRisk,
-  ArchitectureSection,
-  ArchitectureSpec,
   Artifact,
+  DocumentRef,
   Edge,
   GraphNodeView,
   GraphView,
@@ -79,7 +65,6 @@ export function stripMarkdown(value: string): string {
 export function displayProjectTitle(node: Project): string {
   return stripMarkdown(
     node.project_name?.trim() ||
-      node.architecture_spec?.title?.trim() ||
       node.objective,
   );
 }
@@ -101,6 +86,28 @@ export function skillTooltip(references: string[]): string {
   return `Skills (${references.length})\n${references
     .map(skillReferenceLabel)
     .join("\n")}`;
+}
+
+/** Render a document reference as a project-scoped link without reading it. */
+export function documentReferenceHref(reference: DocumentRef, projectId: string): string {
+  if (/^https?:\/\//i.test(reference.ref)) return reference.ref;
+  const match = /^([^?#]*)([?#].*)?$/.exec(reference.ref);
+  const path = match?.[1] ?? reference.ref;
+  const suffix = match?.[2] ?? "";
+  const encoded = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+  return `/api/projects/${encodeURIComponent(projectId)}/documents/${encoded}${suffix}`;
+}
+
+export function isExternalDocumentReference(reference: DocumentRef): boolean {
+  return /^https?:\/\//i.test(reference.ref);
+}
+
+export function documentReferenceContentHref(reference: DocumentRef, projectId: string): string {
+  return documentReferenceHref(reference, projectId).split(/[?#]/, 1)[0];
+}
+
+export function documentReferenceLabel(reference: DocumentRef): string {
+  return reference.title?.trim() || reference.ref;
 }
 
 /** Show local absolute paths with a portable home-directory prefix. */

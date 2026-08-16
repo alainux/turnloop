@@ -48,7 +48,7 @@ class TurnRuntime:
         test_mode: bool | None = None,
     ):
         self.settings = settings
-        self.store = store or Store(settings.data_dir)
+        self.store = store or Store(settings.data_dir, projects_dir=settings.projects_dir)
         self.events = events or EventBus()
         self._registry = registry
         self._execution_adapter = execution_adapter

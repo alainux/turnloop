@@ -1,13 +1,6 @@
 from .schemas import (  # noqa: F401
     Agent,
     AgentType,
-    ArchitectureDecision,
-    ArchitectureDiagram,
-    ArchitectureDiagramEdge,
-    ArchitectureDiagramNode,
-    ArchitectureRisk,
-    ArchitectureSection,
-    ArchitectureSpec,
     Artifact,
     ArtifactKind,
     ArtifactRef,

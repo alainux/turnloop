@@ -117,6 +117,8 @@ export function Graph({
         // a completed/cancelled PTY is being released.
         const runnable = node.allowed_actions.includes("run");
         const running = node.status === "RUNNING";
+        const preparing = node.ui_state === "preparing";
+        const active = running || preparing;
         const primaryAction = primaryNodeAction(node);
         const title = displayNodeTitle(node);
         const skillRefs = node.agent?.skill_ids ?? [];
@@ -125,7 +127,7 @@ export function Graph({
           <article
             key={node.id}
             data-node-id={node.id}
-            className={`gnode ${node.ui_state} ${(runnable || running) ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
+            className={`gnode ${node.ui_state} ${(runnable || active) ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
             onContextMenu={(event) => {
               event.preventDefault();
               onSelect(node.id);
@@ -159,7 +161,9 @@ export function Graph({
                 <span className="node-glyph">
                   <Icon
                     name={
-                      node.agent?.type_id === "planner"
+                      preparing
+                        ? "loader"
+                        : node.agent?.type_id === "planner"
                         ? "git-branch"
                         : node.agent?.type_id === "verifier"
                           ? "check"
@@ -178,22 +182,22 @@ export function Graph({
                 )}
               </span>
             </button>
-            {(runnable || running) && primaryAction && (
+            {(runnable || active) && primaryAction && (
               <button
-                className={`node-run ${running ? "running" : ""}`}
-                onClick={() => onRun(node, running ? "cancel" : "run")}
+                className={`node-run ${active ? "running" : ""}`}
+                onClick={() => onRun(node, active ? "cancel" : "run")}
                 aria-label={
-                  running
+                  active
                     ? `Stop ${title}`
                     : `Run ${title}`
                 }
                 title={
-                  running
+                  active
                     ? "Stop this node"
                     : "Run this node"
                 }
               >
-                <Icon name={running ? "stop" : "play"} />
+                <Icon name={active ? "stop" : "play"} />
               </button>
             )}
             <button

@@ -20,6 +20,16 @@ class FakeSkillFetcher:
         return self.payload
 
 
+class FakeBundleFetcher(FakeSkillFetcher):
+    def __init__(self, files: dict[str, bytes]):
+        super().__init__(files[next(path for path in files if Path(path).name == "SKILL.md")])
+        self.files = files
+
+    def fetch_files(self, url: str) -> dict[str, bytes]:
+        self.urls.append(url)
+        return self.files
+
+
 def test_find_skills_is_a_planner_skill():
     planner = AgentConfig(type_id=AgentType.PLANNER)
     assert planner.skill_ids == ["turn-planning", "imagegen", "find-skills"]
@@ -54,7 +64,7 @@ def test_workers_receive_only_their_role_base_skill(agent_type: AgentType, base_
     assert "turn-product-coherence" not in agent.skill_ids
 
 
-def test_broad_plan_requires_research_and_explicit_worker_skills():
+def test_broad_plan_allows_role_base_skills_when_research_finds_no_addition():
     base = {
         "nodes": [
             {"key": "build", "objective": "Build the product", "agent_type": "executor"},
@@ -65,14 +75,11 @@ def test_broad_plan_requires_research_and_explicit_worker_skills():
                 "depends_on": ["build"],
             },
         ],
-        "architecture_spec": {
-            "title": "Product architecture",
-            "executive_summary": "A coherent product.",
-            "research_sources": ["https://example.test/product-guidance"],
-        },
+        "document_refs": ["ARCHITECTURE.md"],
     }
-    with pytest.raises(ValueError, match="selected skills"):
-        AgentPlanner._parse_plan(json.dumps(base))
+    plan = AgentPlanner._parse_plan(json.dumps(base))
+    assert plan.nodes[0].skills == []
+    assert plan.nodes[1].skills == []
 
     base["nodes"][0]["skills"] = ["project:product-design"]
     base["nodes"][1]["skills"] = ["turn-integrating"]
@@ -81,7 +88,7 @@ def test_broad_plan_requires_research_and_explicit_worker_skills():
     assert plan.nodes[0].skills == ["project:product-design"]
 
 
-def test_broad_plan_requires_research_urls():
+def test_broad_plan_allows_sparse_research_metadata():
     payload = {
         "nodes": [
             {
@@ -98,13 +105,10 @@ def test_broad_plan_requires_research_urls():
                 "skills": ["turn-verifying"],
             },
         ],
-        "architecture_spec": {
-            "title": "Product architecture",
-            "executive_summary": "A coherent product.",
-        },
+        "document_refs": ["ARCHITECTURE.md"],
     }
-    with pytest.raises(ValueError, match="research URLs"):
-        AgentPlanner._parse_plan(json.dumps(payload))
+    plan = AgentPlanner._parse_plan(json.dumps(payload))
+    assert plan.nodes[0].skills == ["turn-executing"]
 
 
 def test_plan_accepts_local_ids_and_external_skill_urls():
@@ -157,15 +161,50 @@ def test_project_authored_skill_requires_frontmatter(tmp_path: Path):
 
 def test_external_skill_is_fetched_once_into_hidden_project_turn_directory(tmp_path: Path):
     url = "https://example.test/skills/visual-qa/SKILL.md"
-    fetcher = FakeSkillFetcher(b"# Visual QA\nInspect the real rendered screen.\n")
+    payload = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\n# Visual QA\nInspect the real rendered screen.\n"
+    fetcher = FakeSkillFetcher(payload)
 
     installed = materialize(["turn-executing", url], tmp_path, fetcher=fetcher)
     assert installed["turn-executing"].is_file()
     external_path = installed[url]
     assert external_path == tmp_path / ".turn" / "skills" / external_path.parent.name / "SKILL.md"
     assert not (tmp_path / "turn" / "skills").exists()
-    assert external_path.read_text() == "# Visual QA\nInspect the real rendered screen.\n"
+    assert external_path.read_bytes() == payload
     assert fetcher.urls == [url]
 
     materialize([url], tmp_path, fetcher=fetcher)
     assert fetcher.urls == [url]
+
+
+def test_external_skill_installs_a_standard_multifile_tree(tmp_path: Path):
+    url = "https://github.com/example/skills/tree/main/visual-qa"
+    skill = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\nUse browser evidence.\n"
+    fetcher = FakeBundleFetcher({
+        "visual-qa/SKILL.md": skill,
+        "visual-qa/references/checklist.md": b"# Checklist\n",
+        "visual-qa/scripts/check.py": b"print('ok')\n",
+    })
+
+    installed = materialize([url], tmp_path, fetcher=fetcher)
+    root = installed[url].parent
+    assert (root / "SKILL.md").read_bytes() == skill
+    assert (root / "references" / "checklist.md").read_text() == "# Checklist\n"
+    assert (root / "scripts" / "check.py").read_text() == "print('ok')\n"
+    assert not (tmp_path / "turn" / "skills").exists()
+
+
+def test_external_html_is_rejected_and_invalid_existing_install_is_replaced(tmp_path: Path):
+    url = "https://example.test/catalog/visual-qa"
+    target = tmp_path / ".turn" / "skills" / "external-visual-qa-placeholder" / "SKILL.md"
+    # The actual key is URL-derived; create the stale file after resolving it.
+    from turn.skills.library import _external_install_key
+    target = tmp_path / ".turn" / "skills" / _external_install_key(url) / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("<!doctype html><title>catalog</title>")
+    valid = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\nUse browser evidence.\n"
+    installed = materialize([url], tmp_path, fetcher=FakeSkillFetcher(valid))
+    assert installed[url].read_bytes() == valid
+
+    bad_url = "https://example.test/catalog/bad"
+    with pytest.raises(ValueError, match="HTML"):
+        materialize([bad_url], tmp_path, fetcher=FakeSkillFetcher(b"<!doctype html><body>catalog</body>"))

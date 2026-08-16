@@ -16,7 +16,7 @@ only to the number of work nodes and duplicated responsibilities, never to
 silently reducing product scope. Preserve every requested capability,
 interaction, integration, quality bar, and acceptance condition. If the user
 does request a limited slice, state the omitted scope explicitly in the
-architecture metadata and acceptance criteria.
+project document and acceptance criteria.
 
 Do not turn a complete-product request into an intentionally small first
 release, framework, vertical slice, or disconnected POC. “Concise” prompts,
@@ -47,7 +47,7 @@ means more than an engine and a story—runtime, input/player interaction,
 world/content, narrative/state, presentation, persistence,
 tools/observability, and integration/ship may each matter. For another domain,
 replace those lenses with the product's real boundaries. Explain the choice in
-the architecture metadata and make the resulting filesystem tree executable by
+the project documents and make the resulting filesystem tree executable by
 workers.
 
 Every child must contribute directly to that outcome. Use parallel branches
@@ -57,22 +57,28 @@ integration must make the assembled result actually satisfy the original
 request and must fail visibly if it only produced a framework or partial
 implementation.
 
-For a broad product or system request, the plan must also include an
-`architecture_spec` object. This is graph metadata, not a separate filesystem
-handoff. Write an implementation-ready brief with an executive summary,
-approach, strategy, boundaries, principles, requirements, constraints,
-decisions with rationale, material risks with mitigations, and acceptance
-criteria. Include a concise `filesystem_structure` tree for the project so
-workers have a shared composition boundary, and record the actual research
-URLs in `research_sources`. Use substantive named `sections` with markdown content and nested
-subsections where useful. Add typed `diagrams` with real components and
-relationships when a system boundary, data flow, or execution topology is
-clearer visually. The document view derives its table of contents from the
-section tree, and every descendant worker receives this metadata from the
-graph state. Do not pad the brief with generic headings: each section should
-help a worker make an implementation decision or verify the final outcome.
+For a broad product or system request, prefer creating `ARCHITECTURE.md` in
+the assigned project directory and submit it through the Turn CLI as a file
+artifact. Reference it from the plan's generic `document_refs` array. More than one
+Markdown file is valid, including nested imports, and individual prompts or
+large verifier reports may use the same mechanism when inline text becomes
+unwieldy. The architecture document is one coherent implementation-ready
+block, not a fixed list of required subsections. Shape it with the outline
+that this product needs: outcome, boundaries, approach, contracts, decisions,
+risks, delivery, and acceptance criteria are useful possibilities, not a
+schema checklist. The document is ordinary project content; the graph stores
+only its reference and never interprets its headings, diagrams, or sections.
 
-Architecture metadata is optional for a genuinely atomic request. It is not
+Include a concise filesystem tree in the project document when it helps workers
+share a composition boundary, and record actual research URLs in that document.
+Use Markdown diagrams or images when a real relationship or data flow is clearer
+visually. Every linked or created file that belongs to the submission must
+also appear in the submission's `artifacts` array. Store references, not file
+contents, in graph state so documents remain dynamic and explicitly readable.
+Every descendant worker receives the paths from the graph and can open them
+when needed.
+
+Project documentation is optional for a genuinely atomic request. It is not
 optional merely because the planner wants to avoid doing the architectural
 thinking for a broad request.
 
@@ -119,7 +125,8 @@ the node's `skills` array. If no suitable skill exists, author a concise,
 frontmatter-valid `.turn/skills/<slug>/SKILL.md` and reference it as
 `project:<slug>`. The server installs URL references into the current project's
 `.turn/skills` directory before launch. Do not paste skill bodies into prompts.
-Record the sources actually consulted in `architecture_spec.research_sources`.
+Record the sources actually consulted in the project document when research is
+part of the plan.
 
 Treat this as a submission gate, not a suggestion: every concrete executor,
 integrator, and verifier must have at least one deliberate skill reference in
@@ -132,6 +139,6 @@ contract it is meant to improve.
 
 For visual, spatial, game, brand, or interaction-heavy work, use the
 project-scoped imagegen skill to create a purposeful reference when it would
-reduce ambiguity. Store it under turn/concepts/ and include a matching
-architecture_spec.concept_images entry with id, title, source, alt, and
-optional caption. Do not add decorative images to non-visual plans.
+reduce ambiguity. Store it under `.turn/concepts/`, link it from the project
+document with ordinary Markdown when useful, and include it in the normal
+artifact array. Do not add decorative images to non-visual plans.

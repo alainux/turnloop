@@ -16,14 +16,12 @@ from typing import Any, Callable, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from turn.domain.schemas import (
-    ArchitectureSpec,
     ArtifactSpec,
     Node,
     PlanResult,
     Resource,
     WorkerResult,
 )
-from turn.domain.specification import architecture_spec_text
 
 
 class NodeExecutionContext(BaseModel):
@@ -34,10 +32,6 @@ class NodeExecutionContext(BaseModel):
     node: Node
     ancestry: list[Node] = Field(default_factory=list)  # root .. immediate parent
     resources: list[Resource] = Field(default_factory=list)
-    # The root project metadata and the nearest branch metadata are both
-    # available so nested planners cannot lose the original intent.
-    project_spec: Optional[ArchitectureSpec] = None
-    branch_spec: Optional[ArchitectureSpec] = None
     repo_path: Optional[str] = None
     purpose: str = "execute"
     # Optional live stream plus provider-neutral terminal transport. Local
@@ -127,22 +121,21 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             else:
                 lines.append(f"# {r.ref} (ref only)")
         lines.append("")
-    project_spec = ctx.project_spec
-    branch_spec = ctx.branch_spec
-    if project_spec is None or branch_spec is None:
-        for candidate in [*ctx.ancestry, ctx.node]:
-            if candidate.architecture_spec is None:
-                continue
-            if project_spec is None:
-                project_spec = candidate.architecture_spec
-            branch_spec = candidate.architecture_spec
-    if project_spec is not None:
-        lines.append("PROJECT GRAPH ARCHITECTURE METADATA (read-only):")
-        lines.append(architecture_spec_text(project_spec))
-        lines.append("")
-    if branch_spec is not None and branch_spec != project_spec:
-        lines.append("CURRENT BRANCH ARCHITECTURE METADATA (read-only):")
-        lines.append(architecture_spec_text(branch_spec))
+    document_refs = [*ctx.node.document_refs]
+    for ancestor in ctx.ancestry:
+        document_refs.extend(ancestor.document_refs)
+    if document_refs:
+        lines.append("PROJECT DOCUMENT REFERENCES (paths/URLs only; read explicitly when needed):")
+        seen: set[str] = set()
+        for reference in document_refs:
+            pending = [reference, *reference.imports]
+            while pending:
+                item = pending.pop(0)
+                if item.ref in seen:
+                    continue
+                seen.add(item.ref)
+                lines.append(f"- {item.ref}")
+                pending.extend(item.imports)
         lines.append("")
     # GRAPH EXPLORATION TOOL — expose the same installed Turn CLI that agents
     # use for status and handoff. The agent is launched in the assigned project

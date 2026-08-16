@@ -3,7 +3,7 @@
 
 ## Scope
 - The current project is a dynamic workflow orchestrator for agents where agents themselves scope and create the workflow DAG.
-- It assigns a terminal (via a multiplexer) to each agent node and uses the user's preferred harness to run the agent.
+- It assigns a terminal via a multiplexer with full event passthrough to each agent node, and uses the user's preferred harness to run the agent.
 - Agents are nodes in the graph, receive a specific portion of the workflow, and can inspect the global state.
 - The CLI is a dumb surface meant for communication with the server by agents in order to update statuses.
 - The server encapsulates orchestration and processes, and is meant to run as a global daemon.
@@ -13,6 +13,23 @@
 - Agent capabilities are defined by their skills, which are composable. The default agents are just pre-configured agents.
 - The graph can be run by an agent or by a human by running single nodes, auto-running, or stepping through stages of equal depth.
 - We are harness agnostic and support out of the box: Codex, Claude Code, Opencode and Pi.
+- All project state lives directly on disk within the project repository.
+
+## Architecture
+
+- Keep these concerns encapsulated:
+  - Storage port
+  - I/O and utils of state schema
+  - Workflow management and state machine
+  - Multiplexer adapter
+
+## Methodology
+
+- Native subagents in the harnesses are allowed. The lead agent should ensure that reporting is consistent.
+
+## Concepts
+
+- Large scale system: A system that is too large to be built by a single agent, like a complete game that goes beyond a simple demo, an entire book, a multi-team organization, or a complex multi-platform software system.
 
 ## UI & Visual requirements
 
@@ -21,7 +38,7 @@
 - No repeated UI, every element appears only once.
 - No pretend or cosmetic UI. Everything is functional.
 - No dishonest animations or states, if something is active, the it is really active.
-- Proper tooltips and hints
+- Proper tooltips and hints to guide the user.
 
 ## Tech requirements
 
@@ -32,12 +49,17 @@
 - You may use third party libraries if it makes the code simpler and more maintainable.
 - No fallbacks, no "legacy" support, no "just in case" code. If it is not needed, it is not there. And if it fails, it fails visibly.
 - Keep a good hygiene of the open workspaces, terminals, harnesses and sessions.
+- Avoid overfitting or hardcoding to specific conditions. Aim for framework-making, and seek generalizable, agnostic approaches.
 
-# How to work
+## How to work
 - The only definition of done for a feature is tests. 
-- Think ahead for things you implement, and considering edge cases. Code defensively.
+- Code defensively. Think ahead for things you implement, considering edge cases and adjacent problems.
 
-## Refereces
+## Success criteria
+
+- Agents are more effective at large scale system execution using Turn than they are using single-agent, native multi-agent or other orchestrators.
+
+## Refereces and resources
 
 - https://www.langchain.com/blog/the-art-of-loop-engineering
 - https://github.com/andyrewlee/awesome-agent-orchestrators
@@ -45,3 +67,6 @@
 - https://github.com/stablyai/orca
 - https://docs.dagu.sh/overview/
 - https://github.com/microsoft/conductor#fleet-manager-tui
+- https://github.com/public-apis/public-apis
+- https://github.com/msitarzewski/agency-agents
+- https://learn.chatgpt.com/docs/plugins

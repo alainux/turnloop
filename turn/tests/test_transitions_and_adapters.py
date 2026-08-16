@@ -937,8 +937,8 @@ def test_planner_requires_skill_research_and_visual_references_when_relevant():
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
     assert "turn skills show find-skills" in prompt
-    assert "architecture_spec.concept_images" in prompt
-    assert "turn/concepts/" in prompt
+    assert "image embeds" in prompt
+    assert "normal file artifact" in prompt
 
 
 def test_codex_choked_output_is_not_a_false_success():

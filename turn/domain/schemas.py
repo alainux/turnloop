@@ -20,8 +20,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -57,6 +58,7 @@ class NodeUIState(str, Enum):
     QUEUED = "queued"
     READY = "ready"
     RUNNING = "running"
+    PREPARING = "preparing"
     PAUSED = "paused"
     WAITING_INPUT = "waiting_input"
     WAITING_DEPENDENCY = "waiting_dependency"
@@ -347,162 +349,50 @@ class InputSpec(BaseModel):
     satisfied_by: Optional[uuid.UUID] = None
 
 
-# --------------------------------------------------------------------------
-# Architecture specification
-# --------------------------------------------------------------------------
+class DocumentRef(BaseModel):
+    """A dynamic project-relative or web document reference.
 
-
-class ArchitectureDecision(BaseModel):
-    """One deliberate architectural choice and the reason for it."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str
-    decision: str
-    rationale: str
-    # This is explanatory prose, not another structured worklist. Keeping it
-    # as one optional text field prevents planners from having to manufacture
-    # an array for a single sentence.
-    consequences: str = ""
-
-
-class ArchitectureRisk(BaseModel):
-    """A material risk that the implementation plan must account for."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str
-    description: str
-    mitigation: Optional[str] = None
-
-
-class ArchitectureDiagramNode(BaseModel):
-    """A typed node in a planner-authored architecture diagram."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    label: str
-    kind: str = "component"
-
-
-class ArchitectureDiagramEdge(BaseModel):
-    """A directed relationship in an architecture diagram."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    src: str
-    dst: str
-    label: Optional[str] = None
-
-
-class ArchitectureDiagram(BaseModel):
-    """A renderer-neutral diagram that the document view can lay out."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str = "Diagram"
-    description: Optional[str] = None
-    direction: Literal["LR", "TB"] = "LR"
-    nodes: list[ArchitectureDiagramNode] = Field(default_factory=list)
-    edges: list[ArchitectureDiagramEdge] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_references(self) -> "ArchitectureDiagram":
-        node_ids = [node.id for node in self.nodes]
-        known = set(node_ids)
-        if len(node_ids) != len(known):
-            raise ValueError(f"diagram {self.id} node ids must be unique")
-        for edge in self.edges:
-            if edge.src not in known or edge.dst not in known:
-                missing = edge.src if edge.src not in known else edge.dst
-                raise ValueError(f"diagram {self.id} references unknown node {missing}")
-        return self
-
-
-class ArchitectureSection(BaseModel):
-    """A collapsible, markdown-backed section of the architecture document."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str
-    content: str = ""
-    diagram_ids: list[str] = Field(default_factory=list)
-    subsections: list["ArchitectureSection"] = Field(default_factory=list)
-
-
-class ArchitectureConceptImage(BaseModel):
-    """A planner-selected visual reference stored in or linked from the project."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    title: str
-    source: str
-    alt: str
-    caption: Optional[str] = None
-
-
-class ArchitectureSpec(BaseModel):
-    """The planner-authored architectural contract for a project or branch.
-
-    The graph remains the execution model. This document explains why the
-    graph has its shape, what is being built, which choices are intentional,
-    and how the finished result will be accepted. The document is optional for
-    atomic work, but broad product/system plans are expected to provide it.
+    References deliberately identify files without embedding their contents in
+    graph state.  This keeps the graph composable and lets the file remain an
+    independently editable source of truth.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=1, ge=1)
-    title: str = Field(min_length=1)
-    executive_summary: str = Field(min_length=1)
-    approach: Optional[str] = None
-    strategy: Optional[str] = None
-    # A concise, repo-relative tree gives every worker the same composition
-    # boundary without pretending that the architecture document is a second
-    # filesystem handoff.
-    filesystem_structure: Optional[str] = None
-    # URLs consulted during planning. Keeping these in graph metadata makes
-    # research inspectable by the user and by every downstream worker.
-    research_sources: list[str] = Field(default_factory=list)
-    architecture_principles: list[str] = Field(default_factory=list)
-    requirements: list[str] = Field(default_factory=list)
-    constraints: list[str] = Field(default_factory=list)
-    decisions: list[ArchitectureDecision] = Field(default_factory=list)
-    risks: list[ArchitectureRisk] = Field(default_factory=list)
-    acceptance_criteria: list[str] = Field(default_factory=list)
-    sections: list[ArchitectureSection] = Field(default_factory=list)
-    diagrams: list[ArchitectureDiagram] = Field(default_factory=list)
-    concept_images: list[ArchitectureConceptImage] = Field(default_factory=list)
+    ref: str = Field(min_length=1)
+    title: Optional[str] = None
+    media_type: Optional[str] = None
+    imports: list["DocumentRef"] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_document_references(self) -> "ArchitectureSpec":
-        section_ids: list[str] = []
-        diagram_refs: list[str] = []
-
-        def collect(section: ArchitectureSection) -> None:
-            section_ids.append(section.id)
-            diagram_refs.extend(section.diagram_ids)
-            for child in section.subsections:
-                collect(child)
-
-        for section in self.sections:
-            collect(section)
-        if len(section_ids) != len(set(section_ids)):
-            raise ValueError("architecture section ids must be unique")
-        diagram_ids = [diagram.id for diagram in self.diagrams]
-        if len(diagram_ids) != len(set(diagram_ids)):
-            raise ValueError("architecture diagram ids must be unique")
-        known_diagrams = set(diagram_ids)
-        missing = [ref for ref in diagram_refs if ref not in known_diagrams]
-        if missing:
-            raise ValueError(f"architecture section references unknown diagram {missing[0]}")
+    def validate_reference(self) -> "DocumentRef":
+        parsed = urlsplit(self.ref)
+        if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+            raise ValueError("document references only support relative paths or http(s) URLs")
+        if parsed.scheme:
+            if not parsed.netloc:
+                raise ValueError("http(s) document references must include a host")
+            return self
+        if parsed.netloc:
+            raise ValueError("document references cannot use network-path URLs")
+        if not parsed.scheme:
+            path = parsed.path.replace("\\", "/")
+            if path.startswith("/") or Path(path).is_absolute() or PureWindowsPath(path).is_absolute():
+                raise ValueError("document references must be project-relative")
+            if any(part == ".." for part in path.split("/")):
+                raise ValueError("document references cannot escape the project")
+            if not path or path == ".":
+                raise ValueError("document references must identify a file")
         return self
+
+
+def flatten_document_refs(refs: list[DocumentRef]) -> list[DocumentRef]:
+    """Return a stable depth-first view of nested document imports."""
+    flattened: list[DocumentRef] = []
+    for ref in refs:
+        flattened.append(ref)
+        flattened.extend(flatten_document_refs(ref.imports))
+    return flattened
 
 
 class Node(BaseModel):
@@ -515,10 +405,6 @@ class Node(BaseModel):
     objective: str
     project_name: Optional[str] = None  # concise root-only navigation identity
     generated_prompt: Optional[str] = None  # prompt handed to the worker
-    # Planner-authored architecture for this project/branch. The root owns the
-    # project document; a nested planner may own a more focused branch spec.
-    architecture_spec: Optional[ArchitectureSpec] = None
-
     # --- repo (per-project working directory) ---------------------------
     # The absolute path assigned to every worker in THIS project (the directory
     # the user chose or Turn created). Non-root nodes leave this null and
@@ -540,6 +426,7 @@ class Node(BaseModel):
 
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
+    document_refs: list[DocumentRef] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -629,7 +516,6 @@ class Graph(BaseModel):
     """The extensible workgraph aggregate owned by the server."""
 
     project_id: uuid.UUID
-    architecture_spec: Optional[ArchitectureSpec] = None
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
@@ -648,7 +534,6 @@ class GraphView(BaseModel):
     """Serialized graph returned to the web client."""
 
     project_id: uuid.UUID
-    architecture_spec: Optional[ArchitectureSpec] = None
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
@@ -687,6 +572,8 @@ class NodeSpec(BaseModel):
     agent_type: Optional[AgentType] = None
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
+    document_refs: list[DocumentRef] = Field(default_factory=list)
+    artifacts: list["ArtifactSpec"] = Field(default_factory=list)
     # Local library ids or HTTP(S) URLs requested for this worker; the server
     # materializes them into the current project's .turn/skills scope.
     skills: list[str] = Field(default_factory=list)
@@ -718,9 +605,8 @@ class PlanResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nodes: list[NodeSpec]
-    # Present for broad/system planning; omitted for atomic requests where a
-    # full architecture document would add noise rather than clarity.
-    architecture_spec: Optional[ArchitectureSpec] = None
+    document_refs: list[DocumentRef] = Field(default_factory=list)
+    artifacts: list[ArtifactSpec] = Field(default_factory=list)
     edges: list[EdgeSpec] = Field(default_factory=list)
     notes: Optional[str] = None
     usage: Usage = Field(default_factory=Usage)
@@ -853,6 +739,7 @@ class WorkerResult(BaseModel):
     outcome: Outcome
     summary: str = ""
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
+    document_refs: list[DocumentRef] = Field(default_factory=list)
 
     # EXPAND
     children: Optional[PlanResult] = None

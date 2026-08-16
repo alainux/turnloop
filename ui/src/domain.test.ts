@@ -2,20 +2,24 @@ import { describe, expect, it } from "vitest";
 import {
   displayPath,
   displayProjectTitle,
+  documentReferenceHref,
+  documentReferenceContentHref,
+  documentReferenceLabel,
   skillReferenceLabel,
   skillTooltip,
   stripMarkdown,
 } from "./domain";
 import type { Project } from "./domain";
 
-const project = (overrides: Partial<Project> = {}): Project => ({
+const project = (overrides: Partial<Project> = {}): Project => {
+  const { document_refs, ...rest } = overrides;
+  return {
   id: "project",
   project_id: "project",
   parent_id: null,
   objective: "Build a **playable** game",
   project_name: null,
   generated_prompt: "Build a **playable** game",
-  architecture_spec: null,
   repo_path: "/Users/alain/Developer/ialan/turnloop/projects/proj-test",
   executor: "planner",
   agent: null,
@@ -32,8 +36,10 @@ const project = (overrides: Partial<Project> = {}): Project => ({
   progress: null,
   agent_state: null,
   agent_message: null,
-  ...overrides,
-});
+    document_refs: document_refs ?? [],
+    ...rest,
+  };
+};
 
 describe("display labels", () => {
   it("strips Markdown without changing the authored prompt", () => {
@@ -41,14 +47,9 @@ describe("display labels", () => {
       .toBe("Build a playable game");
   });
 
-  it("prefers an explicit name over the scoped architecture title", () => {
-    expect(displayProjectTitle(project({
-      project_name: "My **Game**",
-      architecture_spec: { title: "Scoped title" } as Project["architecture_spec"],
-    }))).toBe("My Game");
-    expect(displayProjectTitle(project({
-      architecture_spec: { title: "Scoped **title**" } as Project["architecture_spec"],
-    }))).toBe("Scoped title");
+  it("prefers an explicit project name over the objective", () => {
+    expect(displayProjectTitle(project({ project_name: "My **Game**" }))).toBe("My Game");
+    expect(displayProjectTitle(project({ project_name: null, objective: "Scoped **title**" }))).toBe("Scoped title");
   });
 
   it("renders home paths with a portable prefix", () => {
@@ -61,5 +62,23 @@ describe("display labels", () => {
     expect(skillReferenceLabel("https://example.test/visual/SKILL.md?rev=1")).toBe("SKILL.md");
     expect(skillTooltip(["turn-executing", "https://example.test/visual/SKILL.md"]))
       .toContain("Skills (2)");
+  });
+
+  it("links local documents through the project endpoint and preserves external URLs", () => {
+    const reference = {
+      ref: "docs/architecture.md#runtime",
+      title: "Runtime architecture",
+      media_type: null,
+      imports: [],
+    };
+    expect(documentReferenceHref(reference, "project/1")).toBe(
+      "/api/projects/project%2F1/documents/docs/architecture.md#runtime",
+    );
+    expect(documentReferenceLabel(reference)).toBe("Runtime architecture");
+    expect(documentReferenceHref({ ...reference, ref: "https://example.test/spec.md" }, "project"))
+      .toBe("https://example.test/spec.md");
+    expect(documentReferenceContentHref(reference, "project/1")).toBe(
+      "/api/projects/project%2F1/documents/docs/architecture.md",
+    );
   });
 });

@@ -87,6 +87,7 @@ class TerminalTransport(Protocol):
     ) -> TerminalResult: ...
 
     async def write(self, node_id: uuid.UUID, data: str | bytes) -> bool: ...
+    async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool: ...
     async def resize(self, node_id: uuid.UUID, cols: int, rows: int) -> bool: ...
     async def stop(self, node_id: uuid.UUID) -> bool: ...
     async def close_persistent_session(self, node_id: uuid.UUID) -> bool: ...
@@ -360,6 +361,12 @@ class LocalPtyTransport:
         except (BlockingIOError, OSError):
             return False
 
+    async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool:
+        if direction not in {"up", "down"}:
+            return False
+        sequence = b"\x1b[5~" if direction == "up" else b"\x1b[6~"
+        return await self.write(node_id, sequence * max(1, min(amount, 10)))
+
     async def stop(self, node_id: uuid.UUID) -> bool:
         session = self.sessions.get(node_id)
         if session is None or session.ended or session.process.returncode is not None:
@@ -390,8 +397,11 @@ class LocalPtyTransport:
         session = self.sessions.get(node_id)
         if session is None or session.ended:
             return False
-        session.cols = max(20, cols)
-        session.rows = max(4, rows)
+        # A tiny PTY causes full-screen prompts and box drawing to wrap one
+        # character at a time. Keep the browser and Herdr panes above the
+        # smallest usable geometry even during a resize race.
+        session.cols = max(40, cols)
+        session.rows = max(8, rows)
         self._window(session.master_fd, session.cols, session.rows)
         session.last_activity_at = time.monotonic()
         return True
@@ -687,8 +697,8 @@ class HerdrPtyTransport(LocalPtyTransport):
     def _control_command(self, pane_id: str, cols: int = 80, rows: int = 24) -> list[str]:
         return self.adapter.terminal_control_command(
             pane_id,
-            cols=cols,
-            rows=rows,
+            cols=max(40, cols),
+            rows=max(8, rows),
         )
 
     async def _start_control(
@@ -833,13 +843,16 @@ class HerdrPtyTransport(LocalPtyTransport):
         )
         return await task
 
-    async def refresh_snapshot_from_persistent_pane(self, node_id: uuid.UUID) -> None:
-        """Re-read Herdr's canonical recent buffer before a browser replay.
+    async def refresh_snapshot_from_persistent_pane(
+        self, node_id: uuid.UUID, *, source: str = "recent"
+    ) -> None:
+        """Re-read Herdr's canonical buffer before a browser replay.
 
         The browser terminal is a renderer, not a second source of terminal
         history. Herdr owns scrollback and its pane read gives reconnects a
-        stable, correctly-sized recent buffer instead of relying on whatever
-        partial redraw happened to arrive during control-stream takeover.
+        stable, correctly-sized buffer instead of relying on whatever partial
+        redraw happened to arrive during control-stream takeover. ``visible``
+        is used after a pane scroll so the presenter follows Herdr's viewport.
         """
         session = self.sessions.get(node_id)
         pane_id = self.pane_id(node_id)
@@ -847,10 +860,10 @@ class HerdrPtyTransport(LocalPtyTransport):
             return
         output = await self.adapter.read_pane(
             pane_id,
-            source="recent",
+            source=source,
             lines=max(2000, session.rows * 40),
         )
-        if output:
+        if output or source == "visible":
             session.output = bytearray(output.encode())
 
     async def run(
@@ -969,12 +982,32 @@ class HerdrPtyTransport(LocalPtyTransport):
             {"type": "terminal.input", "bytes": base64.b64encode(payload).decode()},
         )
 
+    async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool:
+        if direction not in {"up", "down"}:
+            return False
+        session = self.sessions.get(node_id)
+        if session is None or session.ended:
+            return False
+        # Scrollback is owned by Herdr's terminal-control session. Sending
+        # logical page keys to the pane would deliver them to the foreground
+        # shell/application, and Herdr intentionally rejects those aliases.
+        # Keep browser scrolling on the same control stream that owns the
+        # pane viewport so Herdr remains the single source of truth.
+        return await self._send_control(
+            node_id,
+            {
+                "type": "terminal.scroll",
+                "direction": direction,
+                "lines": max(1, min(amount, 10)),
+            },
+        )
+
     async def resize(self, node_id: uuid.UUID, cols: int, rows: int) -> bool:
         session = self.sessions.get(node_id)
         if session is None or session.ended:
             return False
-        session.cols = max(20, cols)
-        session.rows = max(4, rows)
+        session.cols = max(40, cols)
+        session.rows = max(8, rows)
         return await self._send_control(
             node_id,
             {"type": "terminal.resize", "cols": session.cols, "rows": session.rows},

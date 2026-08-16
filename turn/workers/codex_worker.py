@@ -11,9 +11,9 @@ from turn.config import settings
 from turn.contracts.dag import parse_result
 from turn.domain.schemas import (
     AgentType,
-    ArchitectureSpec,
     ArtifactKind,
     ArtifactSpec,
+    DocumentRef,
     EdgeType,
     EdgeSpec,
     InputKind,
@@ -381,14 +381,21 @@ and return "COMPLETE".
             EdgeSpec(type=EdgeType(e["type"]), src=e["src"], dst=e["dst"])
             for e in plan_json.get("edges", [])
         ]
-        architecture_spec = plan_json.get("architecture_spec")
         return PlanResult(
             nodes=nodes,
-            architecture_spec=(
-                ArchitectureSpec.model_validate(architecture_spec)
-                if architecture_spec is not None
-                else None
-            ),
+            document_refs=[
+                item if isinstance(item, DocumentRef) else DocumentRef(ref=item)
+                if isinstance(item, str) else DocumentRef.model_validate(item)
+                for item in plan_json.get("document_refs", [])
+            ],
+            artifacts=[
+                item if isinstance(item, ArtifactSpec) else ArtifactSpec(
+                    kind=ArtifactKind.FILE,
+                    name=item.rsplit("/", 1)[-1] or item,
+                    ref=item,
+                ) if isinstance(item, str) else ArtifactSpec.model_validate(item)
+                for item in plan_json.get("artifacts", [])
+            ],
             edges=edges,
             notes=plan_json.get("notes"),
         )

@@ -358,6 +358,10 @@ class Runner:
             if node.paused:
                 continue
             self._running[nid] = asyncio.create_task(self._execute_node(node, project_id))
+            # Surface the reservation before pane allocation and provider
+            # startup. The API projects this as `preparing` while the task is
+            # alive, so the UI does not appear idle during that interval.
+            await self._emit("node.updated", project_id, _dump(node))
             self._last_launch_at[project_id] = time.monotonic()
             if delay_ms:
                 break
@@ -589,14 +593,12 @@ class Runner:
     async def _handle_outcome(
         self, node: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
+        await self._persist_result_materials(node.id, project_id, result)
         if result.verification is not None:
             await self._handle_verification(node, run, project_id, result)
             return
         fresh = await self.store.get_node(node.id)
         if result.outcome == Outcome.COMPLETE:
-            arts = await self.store.add_artifacts(node.id, result.artifacts)
-            for a in arts:
-                await self._emit("artifact.created", project_id, _dump(a))
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.COMPLETE,
                 summary=result.summary, logs=result.executor_notes or result.summary or "",
@@ -606,9 +608,6 @@ class Runner:
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
-            arts = await self.store.add_artifacts(node.id, result.artifacts)
-            for a in arts:
-                await self._emit("artifact.created", project_id, _dump(a))
             created = await self.store.apply_plan(node, plan)
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.EXPAND,
@@ -661,6 +660,16 @@ class Runner:
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
         self.wake()
 
+    async def _persist_result_materials(
+        self, node_id: uuid.UUID, project_id: uuid.UUID, result: WorkerResult
+    ) -> list[Artifact]:
+        """Persist concise output identities without retaining terminal transcripts."""
+        linked = await self.store.add_document_refs(node_id, result.document_refs)
+        explicit = await self.store.add_artifacts(node_id, result.artifacts)
+        for artifact in [*linked, *explicit]:
+            await self._emit("artifact.created", project_id, _dump(artifact))
+        return [*linked, *explicit]
+
     async def _handle_verification(
         self, verifier: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
@@ -668,8 +677,6 @@ class Runner:
         decision = result.verification
         if decision is None:
             raise RuntimeError("verification outcome missing decision")
-        for artifact in await self.store.add_artifacts(verifier.id, result.artifacts):
-            await self._emit("artifact.created", project_id, _dump(artifact))
         current = await self.store.get_node(verifier.id)
         if current is None:
             return
@@ -1274,6 +1281,7 @@ class Runner:
             self._running[node.id] = asyncio.create_task(
                 self._execute_node(node, project_id)
             )
+            await self._emit("node.updated", project_id, _dump(node))
         return [node.id for node in stage_nodes]
 
     async def run_node(self, node_id: uuid.UUID) -> Optional[uuid.UUID]:
@@ -1298,6 +1306,7 @@ class Runner:
         self._running[node.id] = asyncio.create_task(
             self._execute_node(node, node.project_id)
         )
+        await self._emit("node.updated", node.project_id, _dump(node))
         return node.id
 
     async def set_mode(self, project_id: uuid.UUID, auto_run: bool) -> None:
@@ -1324,14 +1333,6 @@ class Runner:
         project_repo = await self._project_repo(node.project_id)
         root = await self.store.get_node(node.project_id)
         policy = root.run_policy if root else None
-        chain = [*ancestry, node]
-        project_spec = root.architecture_spec if root else None
-        branch_spec = next(
-            (candidate.architecture_spec for candidate in reversed(chain)
-             if candidate.architecture_spec is not None),
-            project_spec,
-        )
-
         # Wire a live terminal stream: the worker emits raw output chunks and we
         # fan them out over the project SSE bus as `node.terminal` events.
         pid = node.project_id
@@ -1343,8 +1344,6 @@ class Runner:
             node=node,
             ancestry=ancestry,
             resources=resources,
-            project_spec=project_spec,
-            branch_spec=branch_spec,
             repo_path=project_repo,
             stream=_stream,
             terminal=self.terminal,

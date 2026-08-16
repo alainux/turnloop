@@ -140,7 +140,7 @@ def agent_environment(
         "TURN_AGENT_REASONING": str(getattr(getattr(agent, "reasoning", None), "value", "") or ""),
         "TURN_AGENT_SKILLS": ",".join(str(path) for path in scoped_skills.values()),
         "TURN_AGENT_SKILL_IDS": ",".join(skill_ids),
-        "TURN_AGENT_SKILL_ROOT": str(Path(cwd) / "turn" / "skills"),
+        "TURN_AGENT_SKILL_ROOT": str(Path(cwd) / ".turn" / "skills"),
         "TURN_AGENT_TOOLS": csv("tools"),
         "TURN_AGENT_MCP_SERVERS": csv("mcp_servers"),
     }

@@ -50,11 +50,13 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
         "TURN_TEST_MODE": "1",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
+    server_log = tmp_path / "turn-server.log"
+    server_log_handle = server_log.open("w")
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "turn.server.app:app", "--host", "127.0.0.1", "--port", str(port)],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=server_log_handle,
+        stderr=subprocess.STDOUT,
     )
     project_id_for_cleanup: str | None = None
     try:
@@ -67,6 +69,28 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             page = browser.new_page(viewport={"width": 1440, "height": 960})
             page.set_default_timeout(9000)
             console_errors: list[str] = []
+            websocket_frames: list[str] = []
+            page.add_init_script(
+                """(() => {
+                    const NativeWebSocket = window.WebSocket;
+                    const sockets = [];
+                    Object.defineProperty(window, "__turnSockets", { value: sockets });
+                    window.WebSocket = new Proxy(NativeWebSocket, {
+                        construct(target, args) {
+                            const socket = Reflect.construct(target, args);
+                            sockets.push(socket);
+                            return socket;
+                        },
+                    });
+                })()"""
+            )
+
+            def capture_websocket(websocket) -> None:
+                # Playwright wraps Python callbacks; passing the bound list
+                # method directly is rejected by that wrapper.
+                websocket.on("framesent", lambda payload: websocket_frames.append(payload))
+
+            page.on("websocket", capture_websocket)
             page.on(
                 "console",
                 lambda message: console_errors.append(message.text)
@@ -192,6 +216,86 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             helper = page.locator(".terminal-shadow-host .xterm-helper-textarea")
             assert helper.is_enabled() and helper.get_attribute("tabindex") != "-1"
 
+            # Scrolling is a Herdr pane operation. Exercise the same browser
+            # websocket used by the xterm presenter and assert that the server
+            # returns the canonical pane snapshot after forwarding the request
+            # to Herdr, rather than maintaining a second local transcript.
+            try:
+                scroll_snapshot = page.evaluate(
+                    """() => new Promise((resolve, reject) => {
+                    const socket = window.__turnSockets?.find(
+                        candidate => candidate.url.includes('/shell') && candidate.readyState === WebSocket.OPEN
+                    );
+                    if (!socket) {
+                        reject(new Error(`no open Turn terminal websocket: ${JSON.stringify(
+                            window.__turnSockets?.map(candidate => ({ url: candidate.url, readyState: candidate.readyState }))
+                        )}`));
+                        return;
+                    }
+                    const onMessage = event => {
+                        try {
+                            const message = JSON.parse(event.data);
+                            if (message.type === 'snapshot') {
+                                socket.removeEventListener('message', onMessage);
+                                resolve(message);
+                            }
+                        } catch {}
+                    };
+                    socket.addEventListener('message', onMessage);
+                    socket.send(JSON.stringify({ type: 'scroll', direction: 'up', amount: 1 }));
+                    window.setTimeout(() => reject(new Error('scroll snapshot timeout')), 10000);
+                    })"""
+                )
+            except Exception as error:
+                server_log_handle.flush()
+                raise AssertionError(
+                    f"browser scroll exchange failed: {error}\n{server_log.read_text()}"
+                ) from error
+            assert scroll_snapshot["type"] == "snapshot"
+            sent_messages = [
+                frame for frame in websocket_frames
+                if isinstance(frame, str) and '"type":"scroll"' in frame
+            ]
+            assert any('"direction":"up"' in frame for frame in sent_messages)
+
+            # The visible xterm viewport must pass user wheel input to the
+            # node's Herdr pane. It must not scroll an independent browser
+            # transcript or rely on a synthetic page-level scroll position.
+            wheel_snapshot = page.evaluate(
+                """() => new Promise((resolve, reject) => {
+                const viewport = document.querySelector('.terminal-shadow-host .xterm-viewport');
+                const socket = window.__turnSockets?.find(
+                    candidate => candidate.url.includes('/shell') && candidate.readyState === WebSocket.OPEN
+                );
+                if (!viewport || !socket) {
+                    reject(new Error('terminal viewport or socket is unavailable'));
+                    return;
+                }
+                const onMessage = event => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        if (message.type === 'snapshot') {
+                            socket.removeEventListener('message', onMessage);
+                            resolve(message);
+                        }
+                    } catch {}
+                };
+                socket.addEventListener('message', onMessage);
+                viewport.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: -120,
+                    bubbles: true,
+                    cancelable: true,
+                }));
+                window.setTimeout(() => reject(new Error('wheel scroll snapshot timeout')), 10000);
+                })"""
+            )
+            assert wheel_snapshot["type"] == "snapshot"
+            sent_messages = [
+                frame for frame in websocket_frames
+                if isinstance(frame, str) and '"type":"scroll"' in frame
+            ]
+            assert any('"direction":"up"' in frame for frame in sent_messages)
+
             workspace = tmp_path / "workspace.png"
             page.screenshot(path=str(workspace))
             page.set_viewport_size({"width": 700, "height": 900})
@@ -225,3 +329,4 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+        server_log_handle.close()

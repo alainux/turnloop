@@ -177,9 +177,11 @@ function Overview({
       <h2 className="detail-title">{displayNodeTitle(node)}</h2>
       <div className="detail-meta">
         <span className={`badge ${node.ui_state}`}>
-          {node.generation_active
-            ? "generating"
-            : node.ui_state.replaceAll("_", " ")}
+          {node.ui_state === "preparing"
+            ? "preparing"
+            : node.generation_active
+              ? "generating"
+              : node.ui_state.replaceAll("_", " ")}
         </span>
       </div>
       {node.verification && (

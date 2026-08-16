@@ -98,6 +98,7 @@ export function TerminalView({ node }: Props) {
     let disposed = false;
     let sessionActive = false;
     let replaying = false;
+    let suppressScroll = false;
     let socket: WebSocket | null = null;
     let terminalWriteQueue = Promise.resolve();
     const queueTerminalWrite = (data: string) => {
@@ -107,8 +108,13 @@ export function TerminalView({ node }: Props) {
       // and make a perfectly live PTY appear blank. xterm.write itself keeps
       // the bytes in order, so the queue only needs to serialize calls.
       const write = terminalWriteQueue.then(() => {
-        terminal.write(data);
-        terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        suppressScroll = true;
+        try {
+          terminal.write(data);
+          terminal.refresh(0, Math.max(0, terminal.rows - 1));
+        } finally {
+          suppressScroll = false;
+        }
       });
       terminalWriteQueue = write.catch(() => undefined);
       return write;
@@ -123,7 +129,11 @@ export function TerminalView({ node }: Props) {
       }
       if (socket?.readyState === WebSocket.OPEN) {
         socket.send(
-          JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }),
+          JSON.stringify({
+            type: "resize",
+            cols: Math.max(40, terminal.cols),
+            rows: Math.max(8, terminal.rows),
+          }),
         );
       }
     };
@@ -190,7 +200,9 @@ export function TerminalView({ node }: Props) {
               terminal.resize(fitted.cols, fitted.rows);
             }
             replaying = false;
+            suppressScroll = true;
             terminal.scrollToBottom();
+            suppressScroll = false;
           }
         } else if (message.type === "output") {
           if (!sessionActive) activate(true);
@@ -253,9 +265,30 @@ export function TerminalView({ node }: Props) {
     terminal.onBinary((value) => sendTerminalInput(value, true));
     terminal.onResize(({ cols, rows }) => {
       if (!replaying && socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "resize", cols, rows }));
+        socket.send(JSON.stringify({
+          type: "resize",
+          cols: Math.max(40, cols),
+          rows: Math.max(8, rows),
+        }));
       }
     });
+    // Herdr owns terminal history and viewport position. Do not let xterm's
+    // local scrollback become a second history: forward the wheel gesture to
+    // the persistent Herdr pane, then redraw the returned snapshot.
+    const viewport = mount.querySelector<HTMLElement>(".xterm-viewport");
+    const forwardWheel = (event: WheelEvent) => {
+      if (!sessionActive || socket?.readyState !== WebSocket.OPEN) return;
+      const delta = event.deltaY || event.deltaX;
+      if (!delta) return;
+      event.preventDefault();
+      event.stopPropagation();
+      socket.send(JSON.stringify({
+        type: "scroll",
+        direction: delta < 0 ? "up" : "down",
+        amount: Math.min(10, Math.max(1, Math.round(Math.abs(delta) / 24))),
+      }));
+    };
+    viewport?.addEventListener("wheel", forwardWheel, { passive: false });
     const observer = new ResizeObserver(() => refitAfterLayout());
     observer.observe(mountHost);
     refitAfterLayout();
@@ -270,6 +303,7 @@ export function TerminalView({ node }: Props) {
       disposed = true;
       refitTimers.forEach((timer) => window.clearTimeout(timer));
       observer.disconnect();
+      viewport?.removeEventListener("wheel", forwardWheel);
       socket?.close();
       terminal.dispose();
     };

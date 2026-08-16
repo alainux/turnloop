@@ -36,14 +36,21 @@ frontmatter with `name` and `description`, contain only reusable instructions,
 and be referenced by `project:<slug>` in the node's `skills` array. This is a
 real project deliverable, not a Turn status or result handoff.
 
-Record the sources actually consulted in `architecture_spec.research_sources`
-as direct URLs. Do not claim research that was not performed.
+Record the sources actually consulted as direct URLs in the relevant project
+document. Do not claim research that was not performed.
 
-Record the selected skill reference in every concrete node's `skills` array.
-If the search finds no applicable guidance, author a small project skill rather
-than silently omitting the field. A skill is guidance, not a substitute for the
-node's objective, contracts, acceptance criteria, or evidence. Choose by fit,
-not by popularity or a broad name alone.
+Record a selected skill reference in a concrete node's `skills` array when the
+research finds guidance that materially improves that node. If the search
+finds no applicable guidance, the role-base skill is enough; do not invent a
+placeholder reference just to fill the field. A skill is guidance, not a
+substitute for the node's objective, contracts, acceptance criteria, or
+evidence. Choose by fit, not by popularity or a broad name alone.
+
+When a source is selected, resolve it to the standard Markdown source before
+the plan is submitted. A GitHub skill may be a directory containing
+`SKILL.md`, `references/`, `scripts/`, or `assets/`; a skills.sh result may
+return the same file tree. Never save an HTML catalog page as a skill.
+External material is installed under the project `.turn/skills` directory.
 
 After the plan is submitted, each worker reads the materialized skill from
 `TURN_AGENT_SKILL_ROOT` or the paths in `TURN_AGENT_SKILLS`; skill bodies are

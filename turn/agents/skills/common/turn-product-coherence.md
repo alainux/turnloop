@@ -10,7 +10,7 @@ surfaces, or interaction states.
 
 ## Read the real contract first
 
-- Read the graph, the current node's instructions, the architecture metadata,
+- Read the graph, the current node's instructions, the project documents,
   and the prerequisite outputs before changing files.
 - Treat the original user outcome as the acceptance contract. Do not replace a
   requested product with a framework, mock, disconnected demo, or collection of

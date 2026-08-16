@@ -29,11 +29,11 @@ RESULT_SCHEMA["$defs"]["ArtifactSpec"] = {
 
 
 def parse_plan(value: str | dict[str, Any]) -> PlanResult:
-    return PlanResult.model_validate(_decode(value))
+    return PlanResult.model_validate(_normalize_payload(_decode(value)))
 
 
 def parse_result(value: str | dict[str, Any]) -> WorkerResult:
-    return WorkerResult.model_validate(_normalize_result_payload(_decode(value)))
+    return WorkerResult.model_validate(_normalize_payload(_decode(value)))
 
 
 def parse_verification(value: str | dict[str, Any]) -> VerificationResult:
@@ -60,7 +60,7 @@ def validate_agent_submission(
 def compact_validation_error(error: ValidationError, *, limit: int = 8) -> str:
     """Render contract failures compactly enough for an agent to act on.
 
-    A malformed nested architecture document can otherwise produce hundreds
+    A malformed nested document reference can otherwise produce hundreds
     of repeated Pydantic lines in the PTY. The full payload remains available
     to server-side logs; the agent only needs the first actionable fields to
     correct and resubmit.
@@ -78,7 +78,9 @@ def plan_handoff_example() -> str:
     """Return the one canonical, minimal plan payload shown to agents.
 
     Sections intentionally contain only a title and Markdown text (plus
-    optional nesting). Dependencies belong in node ``depends_on``; omitting
+    optional nesting). Substantial prose belongs in an ordinary project
+    document referenced by ``document_refs``; the structured index is
+    deliberately small. Dependencies belong in node ``depends_on``; omitting
     the redundant top-level ``edges`` field avoids a second enum-shaped way
     for planners to describe the same relationship.
     """
@@ -95,50 +97,71 @@ def plan_handoff_example() -> str:
                     "depends_on": [],
                 }
             ],
-            "architecture_spec": {
-                "title": "Architecture title",
-                "executive_summary": "What will be built and why",
-                "approach": "How the work is shaped",
-                "strategy": "How delivery and risk are managed",
-                "filesystem_structure": "src/\n  feature/\ntests/",
-                "research_sources": ["https://example.com/relevant-guidance"],
-                "sections": [
-                    {
-                        "id": "overview",
-                        "title": "Overview",
-                        "content": "Markdown text only.",
-                        "subsections": [],
-                    }
-                ],
-            },
+            "document_refs": ["docs/project-plan.md"],
+            "artifacts": [{"kind": "file", "name": "project-plan.md", "ref": "docs/project-plan.md"}],
         },
         separators=(",", ":"),
     )
 
 
-def _normalize_result_payload(value: dict[str, Any]) -> dict[str, Any]:
+def _normalize_payload(value: dict[str, Any]) -> dict[str, Any]:
     payload = dict(value)
-    raw_artifacts = payload.get("artifacts")
-    if raw_artifacts is None:
-        return payload
-    if not isinstance(raw_artifacts, list):
-        return payload
+    payload["artifacts"] = _normalize_artifacts(payload.get("artifacts"))
+    payload["document_refs"] = _normalize_document_refs(payload.get("document_refs"))
+    nodes = payload.get("nodes")
+    if isinstance(nodes, list):
+        normalized_nodes = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                normalized_nodes.append(node)
+                continue
+            item = dict(node)
+            item["document_refs"] = _normalize_document_refs(item.get("document_refs"))
+            item["artifacts"] = _normalize_artifacts(item.get("artifacts"))
+            normalized_nodes.append(item)
+        payload["nodes"] = normalized_nodes
+    children = payload.get("children")
+    if isinstance(children, dict):
+        payload["children"] = _normalize_payload(children)
+    return payload
 
+
+def _normalize_artifacts(raw: Any) -> Any:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return raw
     artifacts: list[Any] = []
-    for item in raw_artifacts:
+    for item in raw:
         if isinstance(item, str):
             artifacts.append({
                 "kind": "file",
                 "name": item.rsplit("/", 1)[-1] or item,
                 "ref": item,
             })
-            continue
-        if isinstance(item, dict):
+        elif isinstance(item, dict):
             artifacts.append(dict(item))
-            continue
-        artifacts.append(item)
-    payload["artifacts"] = artifacts
-    return payload
+        else:
+            artifacts.append(item)
+    return artifacts
+
+
+def _normalize_document_refs(raw: Any) -> Any:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return raw
+    refs: list[Any] = []
+    for item in raw:
+        if isinstance(item, str):
+            refs.append({"ref": item})
+        elif isinstance(item, dict):
+            value = dict(item)
+            value["imports"] = _normalize_document_refs(value.get("imports")) or []
+            refs.append(value)
+        else:
+            refs.append(item)
+    return refs
 
 
 def _decode(value: str | dict[str, Any]) -> dict[str, Any]:

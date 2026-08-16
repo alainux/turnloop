@@ -27,9 +27,18 @@ def present_node(
     node: Node,
     *,
     blocked_reason: str | None = None,
+    preparing: bool = False,
 ) -> NodePresentation:
     """Project one node into a stable UI state and guarded action set."""
     common = (Action.EDIT, Action.REGENERATE)
+    if preparing and node.status not in {
+        NodeStatus.RUNNING,
+        NodeStatus.COMPLETE,
+        NodeStatus.FAILED,
+        NodeStatus.CANCELLED,
+        NodeStatus.EXPANDED,
+    }:
+        return NodePresentation(UIState.PREPARING, (Action.CANCEL,))
     if node.paused:
         return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
     if node.status == NodeStatus.RUNNING:

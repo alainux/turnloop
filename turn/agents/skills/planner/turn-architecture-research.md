@@ -38,17 +38,35 @@ abstract components.
 
 ## Make the metadata executable
 
-The architecture spec must include a concise project-relative
-`filesystem_structure` tree. It is a shared composition contract: every
-worker must place source, tests, assets, and integration entry points where
-the tree says they belong. Keep it small enough to follow and include the
-launch command and the location of the final user-facing path in the relevant
-section or acceptance criteria.
+Prefer a project-owned `ARCHITECTURE.md` as the durable architecture source.
+Submit its project-relative path as a document reference and as a file
+artifact. Additional Markdown documents and nested imports are valid when the
+architecture, prompts, or evidence are easier to maintain as separate files.
+The framework must not require a fixed set of section names: use a coherent
+outline appropriate to the product and keep any structured metadata as a
+compact plan. A concise project-relative filesystem tree is
+useful when it is a real composition contract: every worker must place
+source, tests, assets, and integration entry points where the tree says they
+belong. Keep it small enough to follow and include the launch command and the
+location of the final user-facing path in the relevant document or acceptance
+criteria.
 
 Record the direct research URLs and why each matters. Select narrow skills for
 each executor, integrator, and verifier; author a project `SKILL.md` when no
 maintained skill fits. Skills are installed into the project and read from
-the filesystem, never pasted into the initial prompt.
+the filesystem, never pasted into the initial prompt. Keep document references
+dynamic: graph inspection exposes paths, while workers explicitly open files
+when they need their current contents.
+
+## Software testability bar
+
+For software, the architecture must name the real launch command, clean-
+checkout path, automated test commands, observable browser or UI acceptance
+journey, fixture/seed strategy, and visible failure behavior. Every runtime,
+display, input, persistence, and integration claim must map to a deterministic
+test; visual claims must also have a browser or screenshot check when the
+runtime can render. The integrator must exercise the real entry point and
+reject placeholder screens, disconnected overlays, and module-only demos.
 
 ## Final coherence check
 

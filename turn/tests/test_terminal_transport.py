@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+from types import SimpleNamespace
 
 from turn.tests.fakes import FakeHerdrAdapter
 from turn.workers.herdr import HerdrCliAdapter
@@ -72,6 +73,45 @@ async def test_local_pty_preserves_ansi_accepts_input_and_resizes(tmp_path):
     assert b"\x1b[31mRED\x1b[0m" in result.output
     assert b"GOT:hello" in result.output
     assert transport.snapshot(node_id)["active"] is False
+
+
+async def test_local_resize_keeps_a_usable_terminal_geometry(tmp_path):
+    transport = LocalPtyTransport()
+    node_id = uuid.uuid4()
+    task = asyncio.create_task(
+        transport.run(
+            node_id,
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            cwd=str(tmp_path),
+            timeout=2,
+        )
+    )
+    for _ in range(100):
+        if transport.snapshot(node_id).get("active"):
+            break
+        await asyncio.sleep(0.01)
+    assert await transport.resize(node_id, 1, 1)
+    session = transport.sessions[node_id]
+    assert (session.cols, session.rows) == (40, 8)
+    await transport.stop(node_id)
+    await task
+
+
+async def test_local_scroll_forwards_bounded_page_keys_without_buffer_rewrite():
+    transport = LocalPtyTransport()
+    node_id = uuid.uuid4()
+    sent: list[bytes] = []
+
+    async def capture(_node_id, data):
+        sent.append(data if isinstance(data, bytes) else data.encode())
+        return True
+
+    transport.write = capture  # type: ignore[method-assign]
+    assert await transport.scroll(node_id, "up", amount=20)
+    assert sent == [b"\x1b[5~" * 10]
+    assert await transport.scroll(node_id, "down", amount=2)
+    assert sent[-1] == b"\x1b[6~" * 2
+    assert not await transport.scroll(node_id, "sideways")
 
 
 async def test_local_pty_keeps_provider_stream_raw_and_releases_completed_session(tmp_path):
@@ -204,6 +244,35 @@ async def test_herdr_replaces_an_externally_closed_workspace_mapping(tmp_path):
 
     assert replacement != created.workspace_id
     assert await adapter.get_workspace(replacement)
+
+
+async def test_herdr_scroll_targets_the_node_pane_not_the_control_stream(tmp_path):
+    adapter = FakeHerdrAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    node_id = uuid.uuid4()
+    assert await transport.ensure_persistent_shell(node_id, cwd=str(tmp_path))
+
+    commands: list[dict] = []
+
+    async def capture_control(_node_id, command):
+        commands.append(command)
+        return True
+
+    transport.sessions[node_id] = SimpleNamespace(ended=False)
+    transport._send_control = capture_control
+
+    assert await transport.scroll(node_id, "up", amount=2)
+    assert commands == [
+        {"type": "terminal.scroll", "direction": "up", "lines": 2}
+    ]
+
+    assert await transport.scroll(node_id, "down")
+    assert commands[-1] == {
+        "type": "terminal.scroll",
+        "direction": "down",
+        "lines": 1,
+    }
+
 
 
 async def test_local_pty_bounds_completed_reconnect_snapshots(tmp_path):

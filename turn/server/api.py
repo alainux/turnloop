@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
 from pathlib import Path
 import re
 import uuid
@@ -144,9 +145,13 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         ):
             effective_status = n.status
         effective = n.model_copy(update={"status": effective_status})
+        generation_active = bool(
+            runner is not None and runner.generation_active(n.id)
+        )
         p = present_node(
             effective,
             blocked_reason=ev.blocked_reason.get(n.id),
+            preparing=generation_active,
         )
         item = _dump(n)
         item["ui_state"] = p.state.value
@@ -155,17 +160,10 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         # A node shell and an agent harness share a persistent Herdr pane.
         # Only a runner-owned provider task is generation; an open user shell
         # must not animate a completed node as if the agent were still working.
-        item["generation_active"] = bool(
-            runner is not None and runner.generation_active(n.id)
-        )
+        item["generation_active"] = generation_active
         serialized.append(item)
     return GraphView.model_validate({
         "project_id": str(project_id),
-        "architecture_spec": (
-            root.architecture_spec.model_dump(mode="json")
-            if root is not None and root.architecture_spec is not None
-            else None
-        ),
         "nodes": serialized,
         "edges": [e.model_dump(mode="json") for e in edges],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
@@ -532,6 +530,24 @@ async def get_concept_image(project_id: str, image_path: str, request: Request):
     return FileResponse(candidate)
 
 
+@router.get("/api/projects/{project_id}/documents/{document_path:path}")
+async def get_project_document(project_id: str, document_path: str, request: Request):
+    """Serve one project-relative linked document without allowing traversal."""
+    store: Store = request.app.state.store
+    root = store.project_path(uuid.UUID(project_id))
+    if root is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    candidate = (root / document_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="document not found") from error
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="document not found")
+    media_type, _ = mimetypes.guess_type(candidate.name)
+    return FileResponse(candidate, media_type=media_type or "text/plain")
+
+
 @router.get("/api/projects/{project_id}/stream")
 async def stream(project_id: str, request: Request):
     events: object = request.app.state.events
@@ -581,6 +597,16 @@ async def _pty_socket(
         except (ValueError, TypeError):
             return b""
 
+    async def sync_visible_pane() -> None:
+        """Refresh the browser from Herdr after a pane-level scroll."""
+        refresh_snapshot = getattr(
+            transport, "refresh_snapshot_from_persistent_pane", None
+        )
+        if refresh_snapshot is None:
+            return
+        await refresh_snapshot(nid, source="visible")
+        await websocket.send_json({"type": "snapshot", **transport.snapshot(nid)})
+
     await websocket.accept()
     nid = uuid.UUID(node_id)
     queue = transport.subscribe(nid)
@@ -600,11 +626,18 @@ async def _pty_socket(
             message_type = first_message.get("type")
             if message_type == "resize":
                 requested_resize = (
-                    int(first_message.get("cols") or 80),
-                    int(first_message.get("rows") or 24),
+                    max(40, min(500, int(first_message.get("cols") or 80))),
+                    max(8, min(200, int(first_message.get("rows") or 24))),
                 )
             elif message_type == "input":
                 await transport.write(nid, input_bytes(first_message))
+            elif message_type == "scroll":
+                await transport.scroll(
+                    nid,
+                    str(first_message.get("direction") or "down"),
+                    int(first_message.get("amount") or 1),
+                )
+                await sync_visible_pane()
 
         if requested_resize is not None:
             await transport.resize(nid, *requested_resize)
@@ -650,9 +683,18 @@ async def _pty_socket(
             message = await websocket.receive_json()
             if message.get("type") == "input":
                 await transport.write(nid, input_bytes(message))
+            elif message.get("type") == "scroll":
+                await transport.scroll(
+                    nid,
+                    str(message.get("direction") or "down"),
+                    int(message.get("amount") or 1),
+                )
+                await sync_visible_pane()
             elif message.get("type") == "resize":
                 await transport.resize(
-                    nid, int(message.get("cols") or 80), int(message.get("rows") or 24)
+                    nid,
+                    max(40, min(500, int(message.get("cols") or 80))),
+                    max(8, min(200, int(message.get("rows") or 24))),
                 )
     except WebSocketDisconnect:
         pass

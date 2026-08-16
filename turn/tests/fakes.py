@@ -25,6 +25,8 @@ class FakeHerdrAdapter:
         self.closed: list[str] = []
         self._workspace_number = 0
         self._pane_number = 0
+        self.sent_keys: list[tuple[str, tuple[str, ...]]] = []
+        self.read_requests: list[tuple[str, str, int]] = []
 
     @property
     def available(self) -> bool:
@@ -76,8 +78,14 @@ class FakeHerdrAdapter:
     async def close_pane(self, pane_id: str) -> bool:
         return self.panes.pop(pane_id, None) is not None
 
+    async def send_keys(self, pane_id: str, keys: tuple[str, ...]) -> bool:
+        await self.get_pane(pane_id)
+        self.sent_keys.append((pane_id, keys))
+        return True
+
     async def read_pane(self, pane_id: str, *, source: str = "recent", lines: int = 2000) -> str:
         await self.get_pane(pane_id)
+        self.read_requests.append((pane_id, source, lines))
         return ""
 
     def terminal_control_command(self, pane_id: str, *, cols: int = 80, rows: int = 24):
@@ -127,6 +135,14 @@ class FakeTerminalTransport:
             return False
         state["output"] = str(state["output"]) + (data.decode() if isinstance(data, bytes) else data)
         return True
+
+    async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool:
+        if direction not in {"up", "down"}:
+            return False
+        return await self.write(
+            node_id,
+            (b"\x1b[5~" if direction == "up" else b"\x1b[6~") * max(1, amount),
+        )
 
     async def resize(self, node_id: uuid.UUID, cols: int, rows: int) -> bool:
         return bool(self._node(node_id)["active"])

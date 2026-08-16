@@ -454,7 +454,6 @@ export default function App() {
                 <DocumentView
                   nodes={graph!.nodes}
                   edges={graph!.edges}
-                  architectureSpec={graph!.architecture_spec}
                   projectId={projectId}
                 />
               ) : (

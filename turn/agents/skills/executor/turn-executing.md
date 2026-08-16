@@ -9,7 +9,7 @@ genuine external requirement.
 ## Required preparation
 
 1. Read the live graph with the Turn CLI and inspect the current node, its
-   architecture metadata, and every prerequisite artifact relevant to your
+   document references, and every prerequisite artifact relevant to your
    boundary.
 2. Read every path in `TURN_AGENT_SKILLS` (including project-scoped skills)
    before implementing. The selected skills are working guidance, not text to
@@ -31,6 +31,21 @@ genuine external requirement.
 - Add focused tests or deterministic checks for the contract you own, and leave
   concise launch/use notes where downstream workers can find them.
 
-Submit the result and its small artifact list through the Turn CLI. Never write
-Turn result/status JSON files directly and never claim completion from a build
-alone when the requested user journey is not usable.
+## Pre-handoff quality gate
+
+Before reporting `COMPLETE`, exercise the real boundary you own: run the
+focused tests and the documented build or launch command from the project
+structure. For visual or interactive work, use the available browser QA skill
+and inspect the rendered result, controls, state transitions, and console
+errors. Controls must change real application state, and the requested user
+journey must be reachable from the actual entry point; green unit tests alone
+are not sufficient. If an external dependency prevents this check, report the
+exact missing requirement with `BLOCK` instead of claiming completion.
+
+Submit the result and its small artifact list through the Turn CLI. Every file
+created or linked by the result belongs in `artifacts`; use `document_refs`
+for Markdown or other documents whose contents should remain dynamic. Keep
+ordinary summaries inline and use a document reference only when the output
+is too large to read comfortably in the CLI. Never write Turn result/status
+JSON files directly and never claim completion from a build alone when the
+requested user journey is not usable.

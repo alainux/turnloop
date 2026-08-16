@@ -86,7 +86,6 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 parent_id=node.parent_id,
                 objective=node.objective,
                 instructions=node.generated_prompt,
-                architecture_spec=node.architecture_spec,
                 status=node.status,
                 executor=node.executor,
                 agent=node.agent,
@@ -99,6 +98,7 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 run_policy=node.run_policy,
                 required_inputs=node.required_inputs,
                 resource_refs=node.resource_refs,
+                document_refs=node.document_refs,
                 artifact_refs=node.artifact_refs,
                 depends_on=dependencies.get(node.id, []),
                 children=[uuid.UUID(child) for child in children.get(node.id.hex, [])],
@@ -186,13 +186,9 @@ def _summary(item: dict) -> str:
     if item.get("instructions"):
         instructions = str(item["instructions"]).strip()
         line += "\n  instructions:\n" + "\n".join(f"    {part}" for part in instructions.splitlines())
-    if item.get("architecture_spec"):
-        spec = item["architecture_spec"]
-        section_count = len(spec.get("sections") or [])
-        diagram_count = len(spec.get("diagrams") or [])
-        line += (
-            f"\n  architecture: {spec.get('title', 'untitled')}"
-            f"; sections={section_count}; diagrams={diagram_count}"
+    if item.get("document_refs"):
+        line += "\n  document_refs: " + ", ".join(
+            ref["ref"] for ref in item["document_refs"]
         )
     if item.get("agent_state") or item.get("agent_message"):
         line += "\n  working: " + " — ".join(

@@ -24,5 +24,6 @@ def test_generated_ui_contract_matches_shared_schema():
     assert "export interface Integrator" in generated
     assert "export interface GraphNodeView" in generated
     assert "export interface GraphView" in generated
-    assert "export interface ArchitectureSpec" in generated
-    assert "export interface ArchitectureDiagram" in generated
+    assert "export interface DocumentRef" in generated
+    assert "export interface ArchitectureSpec" not in generated
+    assert "architecture_spec" not in generated

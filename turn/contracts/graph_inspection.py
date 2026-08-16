@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from turn.domain.schemas import (
     Agent,
-    ArchitectureSpec,
     ArtifactKind,
+    DocumentRef,
     Edge,
     InputSpec,
     NodeStatus,
@@ -59,7 +59,6 @@ class GraphInspectionNode(BaseModel):
     parent_id: Optional[uuid.UUID] = None
     objective: str
     instructions: Optional[str] = None
-    architecture_spec: Optional[ArchitectureSpec] = None
     status: NodeStatus
     executor: Optional[str] = None
     agent: Optional[Agent] = None
@@ -72,6 +71,7 @@ class GraphInspectionNode(BaseModel):
     run_policy: Optional[RunPolicy] = None
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
+    document_refs: list[DocumentRef] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
     depends_on: list[uuid.UUID] = Field(default_factory=list)
     children: list[uuid.UUID] = Field(default_factory=list)
@@ -85,7 +85,7 @@ class GraphInspection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 4
+    schema_version: int = 5
     project_id: uuid.UUID
     nodes: list[GraphInspectionNode] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

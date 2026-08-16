@@ -71,6 +71,8 @@ class HerdrAdapter(Protocol):
 
     async def close_pane(self, pane_id: str) -> bool: ...
 
+    async def send_keys(self, pane_id: str, keys: tuple[str, ...]) -> bool: ...
+
     async def read_pane(
         self,
         pane_id: str,
@@ -235,6 +237,22 @@ class HerdrCliAdapter:
     async def close_pane(self, pane_id: str) -> bool:
         try:
             await self._run("pane", "close", pane_id)
+        except HerdrResourceNotFound:
+            return False
+        return True
+
+    async def send_keys(self, pane_id: str, keys: tuple[str, ...]) -> bool:
+        """Send logical keys through Herdr's pane surface.
+
+        This is deliberately separate from terminal.input. Scroll gestures are
+        pane operations, not bytes appended to the provider's current prompt.
+        Keeping them on the Herdr adapter also means the browser never needs a
+        second local transcript or a guessed PTY escape sequence.
+        """
+        if not keys:
+            return True
+        try:
+            await self._run("pane", "send-keys", pane_id, *keys)
         except HerdrResourceNotFound:
             return False
         return True

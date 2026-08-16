@@ -22,11 +22,8 @@ from turn.contracts.dag import plan_handoff_example
 from turn.workers import parsing
 from turn.domain.schemas import (
     AgentConfig,
-    ArchitectureDiagram,
-    ArchitectureDiagramEdge,
-    ArchitectureDiagramNode,
-    ArchitectureSection,
-    ArchitectureSpec,
+    ArtifactSpec,
+    DocumentRef,
     AgentType,
     EdgeSpec,
     EdgeType,
@@ -134,72 +131,8 @@ class HeuristicPlanner(Planner):
         ]
         return PlanResult(
             nodes=nodes,
-            architecture_spec=ArchitectureSpec(
-                title=f"Architecture: {ctx.node.objective}",
-                executive_summary=(
-                    f"A modular implementation plan for {objective}, with independent "
-                    "domain lanes and one final integration boundary."
-                ),
-                approach=(
-                    "Establish the core domain contract first, develop independent "
-                    "input/storage and user-facing output lanes in parallel, then "
-                    "integrate them into the requested deliverable."
-                ),
-                strategy=(
-                    "Keep boundaries explicit, preserve the user's end-to-end outcome, "
-                    "and make the final integrator validate the real launch/use path."
-                ),
-                architecture_principles=[
-                    "Independent lanes own stable boundaries.",
-                    "Dependencies describe real artifact or contract consumption.",
-                    "The final integration produces the user-facing result.",
-                ],
-                requirements=[objective],
-                acceptance_criteria=[
-                    "The requested result is present in the assigned project directory.",
-                    "The result can be launched, used, or inspected through its intended path.",
-                ],
-                sections=[
-                    ArchitectureSection(
-                        id="workstreams",
-                        title="Workstreams and ownership",
-                        content=(
-                            "The core, input/storage, and output lanes are independent "
-                            "where possible. The integration lane consumes their concrete "
-                            "outputs and owns the final assembly."
-                        ),
-                        diagram_ids=["workstream-flow"],
-                    ),
-                    ArchitectureSection(
-                        id="delivery",
-                        title="Delivery and verification",
-                        content=(
-                            "The integrator verifies the actual user-facing outcome rather "
-                            "than stopping at isolated contracts or passing unit tests."
-                        ),
-                    ),
-                ],
-                diagrams=[
-                    ArchitectureDiagram(
-                        id="workstream-flow",
-                        title="Workstream flow",
-                        description="Independent work converges at the final integration boundary.",
-                        nodes=[
-                            ArchitectureDiagramNode(id="core", label="Core structure", kind="domain"),
-                            ArchitectureDiagramNode(id="inputs", label="Inputs and storage", kind="boundary"),
-                            ArchitectureDiagramNode(id="outputs", label="Output surface", kind="surface"),
-                            ArchitectureDiagramNode(id="integrate", label="Final integration", kind="integration"),
-                        ],
-                        edges=[
-                            ArchitectureDiagramEdge(src="core", dst="integrate"),
-                            ArchitectureDiagramEdge(src="inputs", dst="integrate"),
-                            ArchitectureDiagramEdge(src="outputs", dst="integrate"),
-                        ],
-                    )
-                ],
-            ),
             edges=edges,
-            notes="Heuristic architectural decomposition (no LLM planner available).",
+            notes="Deterministic test-only decomposition (no LLM planner available).",
         )
 
 
@@ -254,69 +187,17 @@ DELIVERY BAR — preserve the requested product:
   avoiding duplicate nodes and unnecessary coordination; it never authorizes
   omitting product scope.
 - If a limited scope is explicitly requested, record the omitted scope and
-  the resulting acceptance boundary in the architecture metadata.
+  the resulting acceptance boundary in the project document.
 - The final integrator must make the complete requested result runnable and
   usable, not merely prove that isolated modules or a demo shell exist.
 
-ARCHITECTURAL METADATA — the graph is also the durable project specification:
-- For a broad product, system, or multi-part deliverable, include an
-  `architecture_spec` object in the submitted PlanResult. This is mandatory
-  for broad work and optional only when the objective is genuinely atomic.
-- Treat it as an implementation-ready architecture brief, not a task-list
-  preamble. It must explain the requested outcome, approach, strategy,
-  boundaries, important decisions, constraints, risks, and acceptance criteria.
-- Use `sections` for substantive, named parts of the approach. Each section
-  has an id, title, Markdown `content`, and optional `subsections`. The
-  document view derives its table of contents from this section tree, so use
-  meaningful section order and nesting.
-- Use typed `diagrams` when a relationship, data flow, system boundary, or
-  execution topology is clearer visually. A diagram has nodes with stable ids
-  and edges using those ids; do not submit decorative or generic diagrams.
-- For a visual, spatial, game, brand, or interaction-heavy outcome, use the
-  project-scoped imagegen skill to create at least one purposeful concept
-  reference when it would reduce implementation ambiguity. Store the image
-  under turn/concepts/ and include it in architecture_spec.concept_images with exactly
-  {{id,title,source,alt,caption}}. source is the project-relative path or a
-  direct HTTPS URL. Do not invent a concept image entry for a non-visual
-  objective. Concept images are references for workers and verifiers, not
-  substitutes for runnable deliverables. The worker that creates or changes
-  the image reports its path through the normal Turn CLI artifact workflow.
-- Include `filesystem_structure` as a concise plain-text tree for the project
-  (for example `src/`, `tests/`, and the domain/application boundaries). This
-  is graph metadata shared with workers, not a second plan handoff. It must
-  name the real application/package entry point, test locations, asset or
-  concept locations where relevant, and the integration boundary that a clean
-  checkout will launch. Every concrete node prompt must respect this tree.
-- Include `research_sources` with the direct URLs actually consulted while
-  planning. Use the harness's web/search facility when available, and also
-  use `turn skills show find-skills`, `npx skills find`, skills.sh, Agency
-  Agents, and authoritative project documentation as appropriate. Do not
-  fabricate sources or rely only on intuition for a broad product.
-- Keep the metadata specific to this request. Do not pad it with generic
-  headings. Every work node must map to a meaningful section or boundary in
-  the spec, and every integrator must be accountable for the acceptance
-  criteria, not merely for merging files.
-- The submitted architecture metadata is persisted on this graph boundary and
-  is automatically shown to every descendant worker. Do not write a separate
-  architecture document to the filesystem as a Turn protocol handoff.
-- The architecture metadata is strict JSON. Use only the fields in the exact
-  example below; do not invent aliases or extra fields. A minimal valid spec
-  has only `title`, `executive_summary`, `approach`, `strategy`, and text
-  `sections`; all other fields are optional and should be omitted when they do
-  not materially help. In particular, do not emit `decisions`, `risks`, or
-  `diagrams` just to fill a template. If you do emit them, complete every
-  required field exactly as documented below—never submit a half-shaped item.
-  A section is only `id`, `title`, Markdown `content`, and optional nested
-  `subsections`; do not put decisions, risks, or diagram objects inside it.
-- If you use `decisions`, each item is exactly `{{id,title,decision,rationale,
-  consequences}}`, where `consequences` is one short text string. If you use `risks`, each item is exactly
-  `{{id,title,description,mitigation}}`. Diagram nodes are exactly
-  `{{id,label,kind}}` and diagram edges are exactly `{{src,dst,label}}`. Do not
-  add `id`-like keys to a section or invent alternate names such as `choice`,
-  `why`, `from`, or `to`.
-- Put dependencies only in each node's `depends_on` list. Omit the optional
-  top-level `edges` array; Turn creates the graph edges from those lists. This
-  avoids a duplicate relationship syntax and the edge `type` enum entirely.
+DOCUMENT REFERENCES — keep the graph composable and the documents authoritative:
+- The graph is the execution model. It stores references to project documents; it does not store a special architecture object or ingest file contents.
+- When the objective is broad product or system work, architecture planners should create `ARCHITECTURE.md` in the assigned project directory and submit it through the Turn CLI as a file artifact. Add `"document_refs":["ARCHITECTURE.md"]` to the plan so workers and users can open the live source.
+- The architecture skill guides the document's useful content, but the protocol does not require named sections, diagrams, research fields, or any other domain-specific metadata. Use ordinary Markdown headings, links, code blocks, and image embeds as the work requires.
+- Additional Markdown files may be linked through `document_refs` or Markdown links when the material is large or independently maintained. Keep references dynamic: submit paths/URLs, never copied contents.
+- For visual or spatial work, use the project-scoped imagegen skill when a concept reference will reduce ambiguity. Submit the image as a normal file artifact and link/embed it from the Markdown document; do not add a special graph image record.
+- Record research, decisions, risks, contracts, directory structure, and acceptance evidence in the relevant Markdown document when they matter. Do not duplicate that content in the plan payload.
 
 First preserve the requested outcome. State what must be runnable, usable,
 readable, or otherwise deliverable at the end. For software, account for the
@@ -427,28 +308,21 @@ TOPOLOGY — arrange the children to express a left-to-right architectural flow:
   result lives. An integrator must preserve or reconcile those contracts. Do
   not assume every objective is software; use equivalent concepts for books,
   research, operations, design, or other kinds of generation.
-- SKILLS: before submitting, run `turn skills show find-skills`, search for
-  guidance separately for each concrete executor, integrator, and verifier,
-  inspect the candidate, and choose the narrowest useful match. Every such
-  node must declare the selected references in its `skills` array; do not omit
-  the field or rely on the server to infer it. A local built-in skill is valid
-  when it fits. An external reference must be a direct HTTP(S) URL to the
-  skill document. If no suitable skill exists, author a concise
-  `.turn/skills/<slug>/SKILL.md` with YAML `name` and `description` frontmatter
-  and reference it as `project:<slug>`. Do not paste skill bodies into prompts.
-  Record the sources actually consulted in `architecture_spec.research_sources`.
-  Every concrete executor, integrator, and verifier must declare the
-  project skill references it needs in the node's `skills` array. A reference
-  is either a local library id or a direct HTTP(S) URL to the selected skill
-  document. Use the planner's `find-skills` guidance to research candidates
-  (including skills.sh, agency-agents, `npx skills find`, and GitHub's
-  agent-skills topic), then choose only skills that materially improve the
-  assigned work. The server installs URL references into the current project's
-  `.turn/skills` directory. Do not paste skill bodies into the prompt. Planners
-  automatically have only `turn-planning`, `imagegen`, and `find-skills`; all
-  domain, architecture, QA, and product skills must be deliberately selected
-  for the relevant worker. Use the image skill whenever a visual reference
-  will guide implementation or QA.
+- SKILLS: before submitting, run `turn skills show find-skills` and investigate
+  the concrete work. Search for the narrowest useful guidance for each
+  executor, integrator, and verifier, then put selected local ids, standard
+  skill URLs, or `project:<slug>` references in that node's `skills` array.
+  A standard external source is a direct `SKILL.md`, a GitHub skill directory,
+  or a skills.sh skill URL; never reference an HTML listing page. If no useful
+  skill exists, author `.turn/skills/<slug>/SKILL.md` with YAML `name` and
+  `description` frontmatter and reference it as `project:<slug>`. Do not paste
+  skill bodies into prompts. Role-base skills are supplied automatically, so a
+  node may have an empty additional `skills` array when investigation finds no
+  material addition; do not spend a resubmission correcting that omission.
+  Record sources actually consulted in `ARCHITECTURE.md` when a project
+  document is appropriate. Planners themselves have only
+  `turn-planning`, `imagegen`, and `find-skills`; domain, architecture, QA,
+  and product skills are selected for workers by this planning process.
 - VERIFICATION: almost every concrete executor or integrator should be
   followed by a verifier when its output has meaningful code, visual, runtime,
   or contract risk. A verifier is an ordinary sibling at this planning
@@ -504,10 +378,11 @@ FINAL RESEARCH AND SKILL CHECK:
   reference to inspect when it fits; it is not automatically assigned to this
   planner. A game plan that only names an engine and a story is incomplete
   unless the request genuinely has no other product boundary.
-- Record each direct URL consulted in `architecture_spec.research_sources`.
-- Every concrete executor, integrator, and verifier must have a non-empty
-  `skills` array containing the selected local id, direct skill URL, or a
-  `project:<slug>` skill you authored under `.turn/skills/<slug>/SKILL.md`.
+- Record each direct URL consulted in the project document when research is
+  part of the plan. Do not add research metadata to the graph payload.
+- Give every concrete executor, integrator, and verifier a non-empty `skills`
+  array when the investigation found a material project-specific addition;
+  the server supplies the role base skill and accepts an empty additional list.
 - For each selected skill, make the node prompt state the contract it improves
   and make sure the file will exist in the project scope before that worker
   launches. Do not paste skill text into the prompt.
@@ -819,6 +694,31 @@ class AgentPlanner(Planner):
         if not isinstance(data, dict) or "nodes" not in data:
             return None
 
+        def document_refs(values):
+            return [
+                item
+                if isinstance(item, DocumentRef)
+                else DocumentRef(ref=item)
+                if isinstance(item, str)
+                else DocumentRef.model_validate(item)
+                for item in (values or [])
+            ]
+
+        def artifact_specs(values):
+            specs = []
+            for item in values or []:
+                if isinstance(item, str):
+                    specs.append(
+                        ArtifactSpec(
+                            kind="file",
+                            name=item.rsplit("/", 1)[-1] or item,
+                            ref=item,
+                        )
+                    )
+                else:
+                    specs.append(ArtifactSpec.model_validate(item))
+            return specs
+
         raw_nodes = [
             NodeSpec(
                 key=n["key"],
@@ -837,6 +737,8 @@ class AgentPlanner(Planner):
                     for i in n.get("required_inputs", [])
                 ],
                 resource_refs=list(n.get("resource_refs", [])),
+                document_refs=document_refs(n.get("document_refs")),
+                artifacts=artifact_specs(n.get("artifacts")),
                 skills=list(n.get("skills", [])),
                 parent_key=n.get("parent_key"),
                 depends_on=list(n.get("depends_on", [])),
@@ -885,31 +787,10 @@ class AgentPlanner(Planner):
                 d for d in deps[n.key] if d in index and index[d] < index[n.key]
             ]
 
-        architecture_spec = data.get("architecture_spec")
-        parsed_architecture = (
-            ArchitectureSpec.model_validate(architecture_spec)
-            if architecture_spec is not None
-            else None
-        )
-        if parsed_architecture is not None and len(nodes) > 1:
-            concrete = [
-                node for node in nodes
-                if not node.plan and node.agent_type is not AgentType.PLANNER
-            ]
-            missing_skills = [node.key for node in concrete if not node.skills]
-            if missing_skills:
-                raise ValueError(
-                    "broad plan must declare selected skills for every concrete node; "
-                    f"missing: {', '.join(missing_skills)}"
-                )
-            if not parsed_architecture.research_sources:
-                raise ValueError(
-                    "broad plan must record the direct research URLs consulted in "
-                    "architecture_spec.research_sources"
-                )
         return PlanResult(
             nodes=nodes,
-            architecture_spec=parsed_architecture,
+            document_refs=document_refs(data.get("document_refs")),
+            artifacts=artifact_specs(data.get("artifacts")),
             edges=[],
             notes=data.get("notes"),
         )

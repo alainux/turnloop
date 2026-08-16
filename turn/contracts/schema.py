@@ -3,13 +3,6 @@ from __future__ import annotations
 
 from turn.domain.schemas import (
     Agent,
-    ArchitectureDecision,
-    ArchitectureDiagram,
-    ArchitectureDiagramEdge,
-    ArchitectureDiagramNode,
-    ArchitectureRisk,
-    ArchitectureSection,
-    ArchitectureSpec,
     Artifact,
     ArtifactSpec,
     Edge,
@@ -34,13 +27,6 @@ from turn.domain.schemas import (
 
 PUBLIC_DOMAIN_MODELS = {
     "Agent": Agent,
-    "ArchitectureDecision": ArchitectureDecision,
-    "ArchitectureDiagram": ArchitectureDiagram,
-    "ArchitectureDiagramEdge": ArchitectureDiagramEdge,
-    "ArchitectureDiagramNode": ArchitectureDiagramNode,
-    "ArchitectureRisk": ArchitectureRisk,
-    "ArchitectureSection": ArchitectureSection,
-    "ArchitectureSpec": ArchitectureSpec,
     "Planner": Planner,
     "Executor": Executor,
     "Integrator": Integrator,

@@ -1,20 +1,23 @@
-import { useState, type ReactElement } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
-  ArchitectureDiagram,
-  ArchitectureConceptImage,
-  ArchitectureSection,
-  ArchitectureSpec,
+  DocumentRef,
   Edge,
   GraphNode,
 } from "../domain";
-import { displayNodeTitle, stripMarkdown } from "../domain";
+import {
+  displayNodeTitle,
+  documentReferenceContentHref,
+  documentReferenceHref,
+  documentReferenceLabel,
+  isExternalDocumentReference,
+  stripMarkdown,
+} from "../domain";
 
 interface Props {
   nodes: GraphNode[];
   edges: Edge[];
-  architectureSpec?: ArchitectureSpec | null;
   projectId?: string;
 }
 
@@ -122,313 +125,207 @@ function dependencyLabels(node: GraphNode, nodes: GraphNode[], edges: Edge[]): s
     .filter((name): name is string => Boolean(name));
 }
 
-function wrapLabel(value: string, width = 20): string[] {
-  const words = value.split(/\s+/).filter(Boolean);
-  const lines: string[] = [];
-  let line = "";
-  for (const word of words) {
-    if (line && `${line} ${word}`.length > width) {
-      lines.push(line);
-      line = word;
-    } else {
-      line = line ? `${line} ${word}` : word;
-    }
-  }
-  if (line) lines.push(line);
-  return lines.length ? lines.slice(0, 3) : [""];
-}
-
-function diagramPositions(diagram: ArchitectureDiagram) {
-  const incoming = new Map(diagram.nodes.map((node) => [node.id, [] as string[]]));
-  for (const edge of diagram.edges) {
-    incoming.set(edge.dst, [...(incoming.get(edge.dst) ?? []), edge.src]);
-  }
-  const rankCache = new Map<string, number>();
-  const rankOf = (id: string, visiting = new Set<string>()): number => {
-    const cached = rankCache.get(id);
-    if (cached !== undefined) return cached;
-    if (visiting.has(id)) return 0;
-    visiting.add(id);
-    const rank = Math.max(
-      0,
-      ...(incoming.get(id) ?? []).map((parent) => rankOf(parent, visiting) + 1),
+function DocumentLinks({
+  refs,
+  projectId,
+  onOpenDocument,
+}: {
+  refs: DocumentRef[];
+  projectId?: string;
+  onOpenDocument?: (reference: DocumentRef) => void;
+}) {
+  if (!refs.length || !projectId) return null;
+  const render = (reference: DocumentRef) => {
+    const external = isExternalDocumentReference(reference);
+    const href = documentReferenceHref(reference, projectId);
+    return (
+    <li key={`${reference.ref}:${reference.title ?? ""}`}>
+      <a
+        href={href}
+        target={external ? "_blank" : undefined}
+        rel={external ? "noreferrer" : undefined}
+        onClick={external || !onOpenDocument ? undefined : (event) => {
+          event.preventDefault();
+          onOpenDocument(reference);
+        }}
+      >
+        {documentReferenceLabel(reference)}
+      </a>
+      {reference.imports.length > 0 && (
+        <ul>{reference.imports.map((child) => render(child))}</ul>
+      )}
+    </li>
     );
-    visiting.delete(id);
-    rankCache.set(id, rank);
-    return rank;
   };
-  const rows = new Map<number, string[]>();
-  for (const node of diagram.nodes) {
-    const rank = rankOf(node.id);
-    rows.set(rank, [...(rows.get(rank) ?? []), node.id]);
-  }
-  const maxRank = Math.max(0, ...rows.keys());
-  const maxRow = Math.max(1, ...Array.from(rows.values()).map((row) => row.length));
-  const positions = new Map<string, { x: number; y: number }>();
-  for (const [rank, ids] of rows) {
-    ids.forEach((id, row) => {
-      const primary = diagram.direction === "LR" ? rank : row;
-      const secondary = diagram.direction === "LR" ? row : rank;
-      positions.set(id, { x: 30 + primary * 220, y: 24 + secondary * 92 });
-    });
-  }
-  return {
-    positions,
-    width: (diagram.direction === "LR" ? maxRank + 1 : maxRow) * 220 + 40,
-    height: (diagram.direction === "LR" ? maxRow : maxRank + 1) * 92 + 24,
-  };
-}
-
-function ArchitectureDiagramView({ diagram }: { diagram: ArchitectureDiagram }) {
-  const { positions, width, height } = diagramPositions(diagram);
-  const markerId = `diagram-arrow-${diagram.id}`;
   return (
-    <figure className="architecture-diagram">
-      <figcaption>
-        <strong>{diagram.title}</strong>
-        {diagram.description && <span>{diagram.description}</span>}
-      </figcaption>
-      <div className="architecture-diagram-scroll">
-        <svg
-          className="architecture-diagram-svg"
-          viewBox={`0 0 ${width} ${height}`}
-          role="img"
-          aria-label={diagram.title}
-        >
-          <defs>
-            <marker
-              id={markerId}
-              markerWidth="8"
-              markerHeight="8"
-              refX="7"
-              refY="4"
-              orient="auto"
-            >
-              <path d="M0,0 L8,4 L0,8 Z" />
-            </marker>
-          </defs>
-          {diagram.edges.map((edge, index) => {
-            const source = positions.get(edge.src);
-            const target = positions.get(edge.dst);
-            if (!source || !target) return null;
-            const horizontal = diagram.direction === "LR";
-            const x1 = horizontal ? source.x + 154 : source.x + 77;
-            const y1 = horizontal ? source.y + 28 : source.y + 56;
-            const x2 = horizontal ? target.x : target.x + 77;
-            const y2 = horizontal ? target.y + 28 : target.y;
-            return (
-              <g key={`${edge.src}-${edge.dst}-${index}`} className="architecture-diagram-edge">
-                <line x1={x1} y1={y1} x2={x2} y2={y2} markerEnd={`url(#${markerId})`} />
-                {edge.label && (
-                  <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 6} textAnchor="middle">
-                    {edge.label}
-                  </text>
-                )}
-              </g>
-            );
-          })}
-          {diagram.nodes.map((node) => {
-            const position = positions.get(node.id);
-            if (!position) return null;
-            const lines = wrapLabel(node.label);
-            return (
-              <g key={node.id} className="architecture-diagram-node">
-                <rect x={position.x} y={position.y} width="154" height="56" rx="8" />
-                <text x={position.x + 77} y={position.y + 22} textAnchor="middle">
-                  {lines.map((line, index) => (
-                    <tspan key={line} x={position.x + 77} dy={index === 0 ? 0 : 14}>
-                      {line}
-                    </tspan>
-                  ))}
-                </text>
-                <text className="architecture-diagram-kind" x={position.x + 77} y={position.y + 48} textAnchor="middle">
-                  {node.kind}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
-      </div>
-    </figure>
+    <section className="document-links">
+      <h3>Document references</h3>
+      <ul>{refs.map((reference) => render(reference))}</ul>
+    </section>
   );
 }
 
-function sectionEntries(sections: ArchitectureSection[], depth = 0): ReactElement[] {
-  return sections.flatMap((section) => [
-    <li key={section.id} style={{ marginLeft: `${depth * 14}px` }}>
-      <a href={`#architecture-section-${section.id}`}>{section.title}</a>
-    </li>,
-    ...sectionEntries(section.subsections, depth + 1),
-  ]);
+function markdownText(value: ReactNode): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.map(markdownText).join("");
+  return "";
 }
 
-function ArchitectureSectionView({
-  section,
-  diagrams,
-  depth = 0,
-}: {
-  section: ArchitectureSection;
-  diagrams: Map<string, ArchitectureDiagram>;
-  depth?: number;
-}) {
-  return (
-    <details
-      id={`architecture-section-${section.id}`}
-      className={`architecture-section depth-${Math.min(depth, 3)}`}
-      open={depth === 0}
-    >
-      <summary>
-        <span>{section.title}</span>
-      </summary>
-      <div className="architecture-section-body">
-        {section.content && (
-          <div className="document-markdown">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.content}</ReactMarkdown>
-          </div>
-        )}
-        {section.diagram_ids.map((diagramId) => {
-          const diagram = diagrams.get(diagramId);
-          return diagram ? <ArchitectureDiagramView key={diagram.id} diagram={diagram} /> : null;
-        })}
-        {section.subsections.map((child) => (
-          <ArchitectureSectionView key={child.id} section={child} diagrams={diagrams} depth={depth + 1} />
-        ))}
-      </div>
-    </details>
-  );
+function headingId(value: string): string {
+  return stripMarkdown(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "section";
 }
 
-function MetadataList({ title, values }: { title: string; values: string[] }) {
-  if (!values.length) return null;
-  const renderValue = (value: string) => {
-    const trimmed = value.trim();
-    if (/^https?:\/\/\S+$/i.test(trimmed)) {
-      return (
-        <a href={trimmed} target="_blank" rel="noreferrer">
-          {value}
-        </a>
-      );
+function splitDocumentReference(value: string): { path: string; suffix: string } {
+  const match = /^([^?#]*)([?#].*)?$/.exec(value);
+  return { path: match?.[1] ?? value, suffix: match?.[2] ?? "" };
+}
+
+function resolveDocumentPath(value: string, baseReference: string): string {
+  if (/^(?:https?:|data:|#|\/)/i.test(value)) return value;
+  const { path, suffix } = splitDocumentReference(value);
+  const base = splitDocumentReference(baseReference).path.split("/").slice(0, -1);
+  const parts = [...base, ...path.split("/")];
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (normalized.length) normalized.pop();
+      continue;
     }
-    return value;
-  };
-  return (
-    <section className="architecture-metadata-list">
-      <h3>{title}</h3>
-      <ul>{values.map((value) => <li key={value}>{renderValue(value)}</li>)}</ul>
-    </section>
+    normalized.push(part);
+  }
+  return `${normalized.join("/")}${suffix}`;
+}
+
+function projectPathHref(path: string, projectId: string): string {
+  return documentReferenceHref(
+    { ref: path, title: null, media_type: null, imports: [] },
+    projectId,
   );
 }
 
-function ConceptImages({
-  images,
+function MarkdownContent({
+  content,
+  baseReference,
   projectId,
+  onOpenDocument,
 }: {
-  images: ArchitectureConceptImage[];
-  projectId?: string;
+  content: string;
+  baseReference: string;
+  projectId: string;
+  onOpenDocument?: (reference: DocumentRef) => void;
 }) {
-  if (!images.length || !projectId) return null;
-  const sourceFor = (source: string) => {
-    if (/^https?:\/\//i.test(source)) return source;
-    const encoded = source.split("/").map((part) => encodeURIComponent(part)).join("/");
-    return "/api/projects/" + encodeURIComponent(projectId) + "/concept-images/" + encoded;
-  };
   return (
-    <section className="architecture-concept-images">
-      <h3>Concept references</h3>
-      <div className="architecture-concept-image-grid">
-        {images.map((image) => (
-          <figure key={image.id} className="architecture-concept-image">
-            <img src={sourceFor(image.source)} alt={image.alt} />
-            <figcaption>
-              <strong>{image.title}</strong>
-              {image.caption && <span>{image.caption}</span>}
-            </figcaption>
-          </figure>
-        ))}
-      </div>
-    </section>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        h1: ({ children }) => <h1 id={headingId(markdownText(children))}>{children}</h1>,
+        h2: ({ children }) => <h2 id={headingId(markdownText(children))}>{children}</h2>,
+        h3: ({ children }) => <h3 id={headingId(markdownText(children))}>{children}</h3>,
+        a: ({ href, children, ...props }) => {
+          const value = href ?? "";
+          const resolved = resolveDocumentPath(value, baseReference);
+          const external = isExternalDocumentReference({
+            ref: resolved,
+            title: null,
+            media_type: null,
+            imports: [],
+          });
+          if (external || value.startsWith("#") || !onOpenDocument) {
+            return <a href={external ? resolved : value} {...props}>{children}</a>;
+          }
+          const reference: DocumentRef = {
+            ref: resolved,
+            title: markdownText(children) || resolved,
+            media_type: null,
+            imports: [],
+          };
+          return (
+            <a
+              href={projectPathHref(resolved, projectId)}
+              {...props}
+              onClick={(event) => {
+                event.preventDefault();
+                onOpenDocument(reference);
+              }}
+            >
+              {children}
+            </a>
+          );
+        },
+        img: ({ src, alt, ...props }) => {
+          const value = src ?? "";
+          const resolved = resolveDocumentPath(value, baseReference);
+          const imageSrc = /^(?:https?:|data:|\/)/i.test(resolved)
+            ? resolved
+            : projectPathHref(resolved, projectId);
+          return <img src={imageSrc} alt={alt ?? ""} {...props} />;
+        },
+      }}
+    >
+      {content}
+    </ReactMarkdown>
   );
 }
 
-function ArchitectureMetadata({
-  spec,
+function useProjectDocument(projectId: string, reference: DocumentRef) {
+  const [content, setContent] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setContent(null);
+    setError(null);
+    if (!reference.ref) return () => { cancelled = true; };
+    void fetch(documentReferenceContentHref(reference, projectId))
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Unable to read ${reference.ref}`);
+        return response.text();
+      })
+      .then((value) => { if (!cancelled) setContent(value); })
+      .catch((reason: unknown) => { if (!cancelled) setError(String(reason)); });
+    return () => { cancelled = true; };
+  }, [projectId, reference.ref]);
+  return { content, error };
+}
+
+function DocumentReader({
   projectId,
+  reference,
+  onBack,
+  onOpenDocument,
 }: {
-  spec: ArchitectureSpec;
-  projectId?: string;
+  projectId: string;
+  reference: DocumentRef;
+  onBack: () => void;
+  onOpenDocument?: (reference: DocumentRef) => void;
 }) {
-  const diagrams = new Map(spec.diagrams.map((diagram) => [diagram.id, diagram]));
-  const attachedDiagramIds = new Set<string>();
-  const collectAttachedDiagrams = (sections: ArchitectureSection[]) => {
-    sections.forEach((section) => {
-      section.diagram_ids.forEach((diagramId) => attachedDiagramIds.add(diagramId));
-      collectAttachedDiagrams(section.subsections);
-    });
-  };
-  collectAttachedDiagrams(spec.sections);
-  const unplacedDiagrams = spec.diagrams.filter((diagram) => !attachedDiagramIds.has(diagram.id));
+  const { content, error } = useProjectDocument(projectId, reference);
+
+  const markdown = /\.(?:md|markdown|mdown)$/i.test(reference.ref.split(/[?#]/, 1)[0]);
   return (
-    <div className="architecture-metadata">
-      <div className="document-kicker">Architecture metadata</div>
-      <div className="architecture-summary document-markdown">
-        <h2>Executive summary</h2>
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{spec.executive_summary}</ReactMarkdown>
-      </div>
-      <nav className="architecture-toc" aria-label="Table of contents">
-        <div className="architecture-toc-heading">Contents</div>
-        <ol>{sectionEntries(spec.sections)}</ol>
-      </nav>
-      <div className="architecture-two-column">
-        {spec.approach && <div className="architecture-callout document-markdown"><h3>Approach</h3><ReactMarkdown remarkPlugins={[remarkGfm]}>{spec.approach}</ReactMarkdown></div>}
-        {spec.strategy && <div className="architecture-callout document-markdown"><h3>Strategy</h3><ReactMarkdown remarkPlugins={[remarkGfm]}>{spec.strategy}</ReactMarkdown></div>}
-      </div>
-      <MetadataList title="Architecture principles" values={spec.architecture_principles} />
-      <MetadataList title="Requirements" values={spec.requirements} />
-      <MetadataList title="Constraints" values={spec.constraints} />
-      {spec.filesystem_structure && (
-        <section className="architecture-filesystem">
-          <h3>Project directory structure</h3>
-          <pre>{spec.filesystem_structure}</pre>
-        </section>
-      )}
-      <MetadataList title="Research sources" values={spec.research_sources} />
-      <ConceptImages images={spec.concept_images} projectId={projectId} />
-      {spec.decisions.length > 0 && (
-        <section className="architecture-cards">
-          <h3>Decisions</h3>
-          {spec.decisions.map((decision) => (
-            <article key={decision.id}>
-              <h4>{decision.title}</h4>
-              <p>{decision.decision}</p>
-              <small>Rationale: {decision.rationale}</small>
-              {decision.consequences && <p>{decision.consequences}</p>}
-            </article>
-          ))}
-        </section>
-      )}
-      {spec.risks.length > 0 && (
-        <section className="architecture-cards">
-          <h3>Risks</h3>
-          {spec.risks.map((risk) => (
-            <article key={risk.id}>
-              <h4>{risk.title}</h4>
-              <p>{risk.description}</p>
-              {risk.mitigation && <small>Mitigation: {risk.mitigation}</small>}
-            </article>
-          ))}
-        </section>
-      )}
-      <section className="architecture-sections">
-        {spec.sections.map((section) => <ArchitectureSectionView key={section.id} section={section} diagrams={diagrams} />)}
-      </section>
-      {unplacedDiagrams.length > 0 && (
-        <section className="architecture-sections architecture-diagrams">
-          <h3>Diagrams</h3>
-          {unplacedDiagrams.map((diagram) => <ArchitectureDiagramView key={diagram.id} diagram={diagram} />)}
-        </section>
-      )}
-      <MetadataList title="Acceptance criteria" values={spec.acceptance_criteria} />
-    </div>
+    <article className="document-reader">
+      <button className="document-reader-back" type="button" onClick={onBack}>← Back to specification</button>
+      <div className="document-kicker">Project document</div>
+      <h1>{documentReferenceLabel(reference)}</h1>
+      <p className="document-reader-path">{reference.ref}</p>
+      {error && <p className="document-reader-error">{error}</p>}
+      {!error && content === null && <p className="document-reader-loading">Loading document…</p>}
+      {!error && content !== null && (markdown ? (
+        <div className="document-markdown document-reader-content">
+          <MarkdownContent
+            content={content}
+            baseReference={reference.ref}
+            projectId={projectId}
+            onOpenDocument={onOpenDocument}
+          />
+        </div>
+      ) : (
+        <pre className="document-reader-content document-reader-plain">{content}</pre>
+      ))}
+    </article>
   );
 }
 
@@ -437,11 +334,15 @@ function DocumentNode({
   nodes,
   edges,
   path,
+  projectId,
+  onOpenDocument,
 }: {
   node: GraphNode;
   nodes: GraphNode[];
   edges: Edge[];
   path: number[];
+  projectId?: string;
+  onOpenDocument?: (reference: DocumentRef) => void;
 }) {
   const [open, setOpen] = useState(path.length < 2);
   const children = orderDocumentNodes(nodes, edges, node.id);
@@ -474,6 +375,7 @@ function DocumentNode({
             <span>Depends on</span> {dependencies.join(" · ")}
           </p>
         )}
+        <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
         {prompt && (
           <div className="document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{prompt}</ReactMarkdown>
@@ -487,6 +389,8 @@ function DocumentNode({
                 node={child}
                 nodes={nodes}
                 edges={edges}
+                projectId={projectId}
+                onOpenDocument={onOpenDocument}
                 path={[...path, index + 1]}
               />
             ))}
@@ -497,35 +401,55 @@ function DocumentNode({
   );
 }
 
-export function DocumentView({ nodes, edges, architectureSpec, projectId }: Props) {
+export function DocumentView({ nodes, edges, projectId }: Props) {
+  const [documentReference, setDocumentReference] = useState<DocumentRef | null>(null);
+  useEffect(() => {
+    const onPopState = () => setDocumentReference(null);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
   const root = nodes.find((node) => node.parent_id === null);
   if (!root) {
     return <div className="document-empty">No specification is available.</div>;
   }
   const children = orderDocumentNodes(nodes, edges, root.id);
+  const openDocument = (reference: DocumentRef) => {
+    setDocumentReference(reference);
+    window.history.pushState({ document: reference.ref }, "", `#document=${encodeURIComponent(reference.ref)}`);
+  };
+  if (documentReference) {
+    return (
+      <div className="document-view" aria-label="Project document">
+        <DocumentReader projectId={projectId ?? root.project_id} reference={documentReference} onOpenDocument={openDocument} onBack={() => {
+          window.history.back();
+          setDocumentReference(null);
+        }} />
+      </div>
+    );
+  }
   return (
     <div className="document-view" aria-label="Read-only specification">
       <article className="document-spec">
         <div className="document-kicker">Read-only graph specification</div>
-        <h1>{stripMarkdown(architectureSpec?.title ?? root.architecture_spec?.title ?? root.objective)}</h1>
+        <h1>{stripMarkdown(root.project_name ?? root.objective)}</h1>
         <div className="document-meta">
           <span className={`badge ${root.ui_state}`}>{statusLabel(root)}</span>
           <span>{nodes.length} work items</span>
           <span>Sequence follows dependencies</span>
         </div>
-        {(architectureSpec ?? root.architecture_spec) ? (
-          <ArchitectureMetadata
-            spec={(architectureSpec ?? root.architecture_spec)!}
-            projectId={projectId ?? root.project_id}
-          />
-        ) : root.generated_prompt?.trim() ? (
+        {root.generated_prompt?.trim() && (
           <div className="document-intent document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {root.generated_prompt.trim()}
             </ReactMarkdown>
           </div>
-        ) : null}
-        <div className="document-flow">
+        )}
+        <DocumentLinks
+          refs={root.document_refs}
+          projectId={projectId ?? root.project_id}
+          onOpenDocument={openDocument}
+        />
+        <div id="work-specification" className="document-flow">
           <div className="document-flow-heading">
             <span>Work specification</span>
             <small>Nested sections are collapsible. This view is read-only.</small>
@@ -536,6 +460,8 @@ export function DocumentView({ nodes, edges, architectureSpec, projectId }: Prop
               node={child}
               nodes={nodes}
               edges={edges}
+              projectId={projectId ?? root.project_id}
+              onOpenDocument={openDocument}
               path={[index + 1]}
             />
           ))}

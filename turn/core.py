@@ -29,7 +29,7 @@ class TurnCore:
         terminal_transport=None,
     ):
         self.settings = settings
-        self.store = Store(settings.data_dir)
+        self.store = Store(settings.data_dir, projects_dir=settings.projects_dir)
         self.events = EventBus()
         self.runner = Runner(
             self.store,

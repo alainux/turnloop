@@ -11,7 +11,10 @@ export TURN_PROJECTS_DIR="${TURN_PROJECTS_DIR:-$(pwd)/projects}"
 export TURN_PLANNER="${TURN_PLANNER:-codex}"
 export TURN_DEFAULT_EXECUTOR="${TURN_DEFAULT_EXECUTOR:-codex}"
 export TURN_EXECUTION_BACKEND="${TURN_EXECUTION_BACKEND:-direct}"
-export PYTHONPATH="${PYTHONPATH:-.}:$(pwd)"
+# Resolve the checkout first so the daemon always serves the source tree the
+# user launched it from, even when an older installed Turn package is present
+# earlier on the process environment's import path.
+export PYTHONPATH="$(pwd)${PYTHONPATH:+:$PYTHONPATH}"
 
 PORT="${TURN_PORT:-8000}"
 echo "Turn → http://127.0.0.1:${PORT}"
