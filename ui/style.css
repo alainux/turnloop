@@ -1186,6 +1186,7 @@ form.composer:has(.composer-config-panel) {
   align-items: center;
   gap: 12px;
   padding: 10px 4px;
+  padding-left: calc(4px + var(--document-indent, 0px));
   cursor: pointer;
   list-style: none;
 }
@@ -1245,13 +1246,19 @@ form.composer:has(.composer-config-panel) {
   text-overflow: ellipsis;
 }
 .document-node-body {
-  padding: 0 4px 22px 76px;
+  box-sizing: border-box;
+  padding: 0 4px 22px;
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.document-children .document-node-body {
-  padding-left: 42px;
+.document-node.depth-0 > .document-node-body {
+  padding-left: 0;
 }
+.document-node.depth-0 { --document-indent: 0px; }
+.document-node.depth-1 { --document-indent: 12px; }
+.document-node.depth-2 { --document-indent: 18px; }
+.document-node.depth-3 { --document-indent: 24px; }
+.document-node.depth-4 { --document-indent: 30px; }
 .document-dependencies {
   margin: 0 0 14px;
   color: var(--text-3);
@@ -1324,7 +1331,7 @@ form.composer:has(.composer-config-panel) {
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
-  margin: 14px 0 0 12px;
+  margin: 12px 0 0;
   padding-left: 0;
   border-left: 0;
 }
@@ -1333,7 +1340,6 @@ form.composer:has(.composer-config-panel) {
 }
 .document-children > .document-node > .document-node-summary {
   min-height: 46px;
-  padding-left: 0;
 }
 .document-children .document-node-copy strong {
   font-size: 12px;
@@ -3045,9 +3051,31 @@ img.icon {
   height: 10px;
 }
 .node-run.running {
-  border-color: color-mix(in srgb, var(--red) 50%, var(--border));
-  color: var(--red);
-  background: var(--red-soft);
+  border-color: var(--red);
+  border-radius: 3px;
+  color: var(--on-accent);
+  background: var(--red);
+}
+.node-run.running:hover {
+  border-color: var(--red);
+  color: var(--on-accent);
+  background: color-mix(in srgb, var(--red) 82%, black);
+}
+.node-run.running .icon,
+.stop-action .icon {
+  opacity: 1;
+  filter: brightness(0) invert(1);
+}
+.stop-action {
+  border-color: var(--red) !important;
+  border-radius: 3px !important;
+  color: var(--on-accent) !important;
+  background: var(--red) !important;
+}
+.stop-action:hover {
+  border-color: var(--red) !important;
+  color: var(--on-accent) !important;
+  background: color-mix(in srgb, var(--red) 82%, black) !important;
 }
 .terminal-shadow-host {
   min-height: 0;

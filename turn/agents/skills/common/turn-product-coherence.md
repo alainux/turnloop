@@ -20,6 +20,11 @@ surfaces, or interaction states.
 
 ## Preserve one product
 
+For a complete-product request, preserve the full requested scope through
+integration. MVP, POC, prototype, demo, and vertical-slice language is a
+scope instruction only when the user actually supplied it; never introduce
+that reduction as an implementation assumption.
+
 - Every visible surface must be driven by the same runtime state and must be
   reachable from the documented entry point.
 - A visual element, overlay, control, asset, or route must have a clear role in

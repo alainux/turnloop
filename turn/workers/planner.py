@@ -1,7 +1,8 @@
 """Planners.
 
 The initial planner and any later decomposition use the *same* operation:
-produce the smallest useful workgraph that can begin executing now.
+produce a complete workgraph that can begin executing now, with no duplicate
+responsibilities or unnecessary coordination nodes.
 
 `CodexPlanner` asks Codex to submit a plan through Turn's CLI. If it submits
 nothing usable, the run fails visibly. ``HeuristicPlanner``
@@ -238,9 +239,24 @@ PLANNING INSTRUCTIONS FOR THIS NODE:
 {ctx.node.generated_prompt or "No additional planning instructions."}
 
 You are the architect decomposing THIS node into its direct children. Produce
-the smallest useful workgraph that divides the actual labor required to
-accomplish the user's objective. This is an orchestration effort, not a mere
-abstraction exercise or chronological checklist.
+a complete workgraph that divides all of the actual labor required to
+accomplish the user's objective, using the smallest number of meaningful
+responsibilities. This is an orchestration effort, not a mere abstraction
+exercise or chronological checklist.
+
+DELIVERY BAR — preserve the requested product:
+- Unless the user explicitly requests an MVP, proof of concept, prototype,
+  demo, spike, mock, or other limited slice, plan for the complete finished product
+  described by the request. Do not silently convert it into an MVP,
+  POC, vertical slice, framework, or intentionally small first release.
+- Cover every requested capability, user interaction, integration, quality
+  expectation, and acceptance condition. “Smallest useful” refers only to
+  avoiding duplicate nodes and unnecessary coordination; it never authorizes
+  omitting product scope.
+- If a limited scope is explicitly requested, record the omitted scope and
+  the resulting acceptance boundary in the architecture metadata.
+- The final integrator must make the complete requested result runnable and
+  usable, not merely prove that isolated modules or a demo shell exist.
 
 ARCHITECTURAL METADATA — the graph is also the durable project specification:
 - For a broad product, system, or multi-part deliverable, include an

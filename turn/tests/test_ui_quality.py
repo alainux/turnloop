@@ -37,7 +37,11 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     css = (UI / "style.css").read_text()
     api = (ROOT / "turn" / "server" / "api.py").read_text()
     assert 'const runnable = node.allowed_actions.includes("run");' in graph
-    assert "node.generation_active" in graph and 'name={running ? "square-stop" : "play"}' in graph
+    assert "node.generation_active" in graph and 'name={running ? "stop" : "play"}' in graph
+    inspector = source("components", "Inspector.tsx")
+    css = (UI / "style.css").read_text()
+    assert 'primaryAction === "cancel" ? "danger stop-action"' in inspector
+    assert ".node-run.running" in css and ".stop-action" in css
     assert 'item["generation_active"]' in api
     assert ".edge-active" not in css and "@keyframes flow" not in css
     assert "node-breathe" not in css
@@ -202,3 +206,8 @@ def test_document_view_is_a_read_only_spec_projection():
     assert "user-select: text" in css
     assert "className=\"project-path\"" in app
     assert "#app-shell .project-title small.project-path" in css
+    assert "depth-${Math.min(Math.max(path.length - 1, 0), 4)}" in document
+    assert "--document-indent" in css
+    assert ".document-node.depth-4" in css
+    assert ".document-node.depth-0 > .document-node-body" in css
+    assert "padding: 0 4px 22px;" in css

@@ -10,7 +10,12 @@ The kernel is intentionally small: a versioned graph of `Node`, `Edge`, `Run`,
 and `Artifact` records, a scheduler, and replaceable planner/worker adapters. The
 IDE-like web UI and the headless CLI are clients of that same core.
 
-## What the MVP includes
+## What Turn currently includes
+
+This section describes Turn's currently implemented capabilities. It is not a
+reduced delivery bar for projects created through Turn: unless a user asks
+for an MVP, POC, prototype, or other limited slice, project plans target the
+complete requested product.
 
 - Prompt-first project authoring and opening, a collapsible project explorer,
   graph canvas, inspector, real PTY-backed xterm terminal, light/dark themes,

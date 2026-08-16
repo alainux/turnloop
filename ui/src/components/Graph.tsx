@@ -193,7 +193,7 @@ export function Graph({
                     : "Run this node"
                 }
               >
-                <Icon name={running ? "square-stop" : "play"} />
+                <Icon name={running ? "stop" : "play"} />
               </button>
             )}
             <button

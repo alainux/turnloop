@@ -449,7 +449,7 @@ function DocumentNode({
   const prompt = node.generated_prompt?.trim();
   return (
     <details
-      className="document-node"
+      className={`document-node depth-${Math.min(Math.max(path.length - 1, 0), 4)}`}
       open={open}
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >

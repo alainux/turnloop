@@ -448,7 +448,7 @@ function Overview({
             <div className="action-row">
               {primaryAction ? (
                 <button
-                  className={`button compact ${primaryAction === "cancel" ? "danger" : "accent"}`}
+                  className={`button compact ${primaryAction === "cancel" ? "danger stop-action" : "accent"}`}
                   onClick={async () => {
                     if (
                       primaryAction === "regenerate" &&
@@ -466,7 +466,7 @@ function Overview({
                     );
                   }}
                 >
-                  {primaryAction === "cancel" && <Icon name="square-stop" />}
+                  {primaryAction === "cancel" && <Icon name="stop" />}
                   {primaryNodeActionLabel(primaryAction)}
                 </button>
               ) : (

@@ -68,7 +68,7 @@ class Worker(ABC):
 
 
 class Planner(ABC):
-    """Produces the smallest useful workgraph that can begin executing now."""
+    """Produces a complete workgraph that can begin executing now."""
 
     name: str
 

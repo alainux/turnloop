@@ -914,6 +914,19 @@ def test_planner_treats_subplanners_as_rare_exceptions():
     assert "exception, not the normal shape" in prompt
     assert "multi-organization" in prompt
     assert "visible at a glance" in prompt
+    assert "complete finished product" in prompt
+    assert "Do not silently convert it into an MVP" in prompt
+
+
+def test_planner_only_uses_limited_delivery_scope_when_user_requests_it():
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build an MVP of the product",
+        generated_prompt="Build an MVP with the smallest demonstrable slice.",
+    )
+    prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
+    assert "complete finished product" in prompt
+    assert "If a limited scope is explicitly requested" in prompt
 
 
 def test_planner_requires_skill_research_and_visual_references_when_relevant():
