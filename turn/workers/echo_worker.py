@@ -14,6 +14,7 @@ from turn.domain.schemas import (
     InputKind,
     InputSpec,
     Outcome,
+    VerificationResult,
     WorkerResult,
 )
 from turn.workers.base import NodeExecutionContext, Worker
@@ -82,4 +83,9 @@ class EchoWorker(Worker):
             error=data.get("error"),
             retry_recommended=bool(data.get("retry_recommended", False)),
             children=None,
+            verification=(
+                VerificationResult.model_validate(data["verification"])
+                if data.get("verification") is not None
+                else None
+            ),
         )

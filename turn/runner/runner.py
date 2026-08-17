@@ -24,7 +24,6 @@ from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
     ArtifactSpec,
-    EdgeType,
     HarnessKind,
     Node,
     NodeStatus,
@@ -36,7 +35,7 @@ from turn.domain.schemas import (
     VerificationDecision,
     WorkerResult,
 )
-from turn.graph.logic import GraphWalker
+from turn.graph.logic import GraphWalker, rejection_target
 from turn.runner.events import EventBus
 from turn.runner.recovery import backoff_seconds, should_retry
 from turn.workers.base import NodeExecutionContext, Worker
@@ -691,13 +690,13 @@ class Runner:
         return [*linked, *explicit]
 
     async def _handle_verification(
-        self, verifier: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
+        self, reviewer: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
-        """Persist a verifier decision and route rejections to its target."""
+        """Persist a review decision and route rejections to its target."""
         decision = result.verification
         if decision is None:
             raise RuntimeError("verification outcome missing decision")
-        current = await self.store.get_node(verifier.id)
+        current = await self.store.get_node(reviewer.id)
         if current is None:
             return
         current.verification = decision
@@ -717,29 +716,25 @@ class Runner:
 
         if decision.decision is VerificationDecision.REJECT:
             nodes, edges, _ = await self.store.get_workgraph(project_id)
-            target_ids = [
-                edge.src
-                for edge in edges
-                if edge.type is EdgeType.DEPENDS_ON and edge.dst == current.id
-            ]
-            target = await self.store.get_node(target_ids[0]) if len(target_ids) == 1 else None
+            walker = GraphWalker(nodes, edges)
+            target = rejection_target(current, decision, walker.indexes)
             if target is None:
                 raise RuntimeError(
-                    "verifier rejection requires exactly one dependency target"
+                    "rejection requires a valid target_node_id or exactly one dependency target"
                 )
-            await self._notify_rejection(target, verifier, decision)
-            # A verifier may be the active member of a manual Step barrier.
-            # Rejection moves that verifier back behind the corrected target,
+            await self._notify_rejection(target, reviewer, decision)
+            # A reviewer may be the active member of a manual Step barrier.
+            # Rejection moves that reviewer back behind the corrected target,
             # so the old barrier can never settle. The next Step must be
-            # allowed to select the repaired target, and then the verifier
+            # allowed to select the repaired target, and then the reviewer
             # again after that target completes.
             self._manual_stages.pop(project_id, None)
-            # A rejection invalidates the target and every dependent result;
-            # the graph will replay them in dependency order. The verifier
-            # itself becomes runnable again after the target completes.
-            walker = GraphWalker(nodes, edges)
-            invalidated = [target]
-            pending = list(walker.indexes.dependents.get(target.id, []))
+            # A rejection invalidates the target, the review node, and every
+            # dependent result reachable from either. The graph replays them
+            # in dependency order; the target is runnable immediately and the
+            # reviewer becomes runnable again after its prerequisites settle.
+            invalidated: list[Node] = []
+            pending = [target.id, reviewer.id]
             seen: set[uuid.UUID] = set()
             while pending:
                 dependent_id = pending.pop(0)
@@ -751,7 +746,7 @@ class Runner:
                     invalidated.append(dependent)
                     pending.extend(walker.indexes.dependents.get(dependent_id, []))
             for item in invalidated:
-                if item.id == target.id or item.id == verifier.id or item.status != NodeStatus.RUNNING:
+                if item.id == target.id or item.id == reviewer.id or item.status != NodeStatus.RUNNING:
                     item.status = NodeStatus.RUNNABLE if item.id == target.id else NodeStatus.PENDING
                     item.agent_state = None
                     item.agent_message = None
@@ -761,17 +756,27 @@ class Runner:
                     # starting a new conversation from zero.
                     await self.store._save_node(item)
                     await self._emit("node.updated", project_id, _dump(item))
-        await self._emit("node.updated", project_id, _dump(await self.store.get_node(verifier.id)))
+        await self._emit("node.updated", project_id, _dump(await self.store.get_node(reviewer.id)))
         self.wake()
 
-    async def _notify_rejection(self, target: Node, verifier: Node, decision) -> None:
-        """Deliver feedback to the predecessor's node-scoped conversation."""
+    async def _notify_rejection(self, target: Node, reviewer: Node, decision) -> None:
+        """Deliver feedback to the selected node's scoped conversation."""
         repo = await self._project_repo(target.project_id)
         if not repo:
             return
+        # Echo is a deterministic, non-conversational test worker. A served
+        # Echo demo still needs to exercise routing, but it has no provider
+        # session that Herdr can resume or receive pasted feedback in.
+        if (
+            target.agent is not None
+            and target.agent.harness is HarnessKind.ECHO
+            and getattr(self.terminal, "backend_name", None) == "herdr"
+            and self.s.default_executor == "echo"
+        ):
+            return
         lines = [
             "TURN VERIFICATION REJECTED",
-            f"Verifier: {verifier.objective}",
+            f"Reviewer: {reviewer.objective}",
             f"Summary: {decision.summary}",
             *[f"- {item}" for item in decision.findings],
             "Required changes:",
@@ -789,7 +794,7 @@ class Runner:
             )
             if harness_name not in process_names:
                 # A completed native harness may have returned to the shell.
-                # Resume the exact session stored on this predecessor node;
+                # Resume the exact session stored on this selected target;
                 # never select a global or most-recent session.
                 session_id = target.agent.session_id if target.agent is not None else None
                 command = (

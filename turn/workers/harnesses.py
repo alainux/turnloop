@@ -290,7 +290,7 @@ Use BLOCK only for genuinely external human input. Continue the existing
 session when a node is rerun; preserve prior context and files.
     """
     if verification:
-        prompt += "\n\nVERIFICATION TARGET: this verifier runs after its single dependency. Use `turn graph` to inspect that prerequisite node, its files, and its run history before deciding."
+        prompt += "\n\nVERIFICATION TARGET: this verifier normally runs after its single dependency. Use `turn graph` to inspect the workgraph, the relevant node's files, and its run history before deciding. A rejection defaults to that dependency; set `target_node_id` in the decision when an earlier node is the one that needs correction."
     return f"{prompt}\n\n{result_handoff(verification=verification)}"
 
 
@@ -576,6 +576,23 @@ class CLIHarnessWorker(Worker):
                     content=format_verification_result(decision),
                 )],
             )
+        if submitted is not None:
+            try:
+                decision = parse_verification(submitted)
+            except (TypeError, ValueError):
+                decision = None
+            if decision is not None:
+                return WorkerResult(
+                    outcome=Outcome.COMPLETE,
+                    summary=decision.summary,
+                    verification=decision,
+                    session_id=session or agent.session_id,
+                    artifacts=[ArtifactSpec(
+                        kind=ArtifactKind.TEXT,
+                        name="verification-result",
+                        content=format_verification_result(decision),
+                    )],
+                )
         text = json.dumps(submitted) if submitted is not None else ""
         usage = Usage()
         data = parsing.first_result_json(text) or {}

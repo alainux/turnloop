@@ -241,13 +241,20 @@ class VerificationDecision(str, Enum):
 
 
 class VerificationResult(BaseModel):
-    """Evidence-backed decision emitted by a verifier through the CLI."""
+    """Evidence-backed review decision emitted by a node through the CLI.
+
+    ``target_node_id`` is optional for compatibility with the original QA
+    contract. When omitted, the runner returns a rejection to the reviewer's
+    single dependency. A reviewer may name any other node in the same
+    workgraph explicitly when that is the node that needs correction.
+    """
 
     decision: VerificationDecision
     summary: str = Field(min_length=1)
     findings: list[str] = Field(default_factory=list)
     required_changes: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
+    target_node_id: Optional[uuid.UUID] = None
 
 
 def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
@@ -379,7 +386,7 @@ class Integrator(Agent):
 
 
 class Verifier(Agent):
-    """Specialized agent that approves or rejects a predecessor's work."""
+    """Specialized agent that approves or rejects work in the workgraph."""
 
     type_id: AgentType = AgentType.VERIFIER
 

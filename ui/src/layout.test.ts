@@ -79,6 +79,15 @@ describe("dendrogram", () => {
     expect(path).toContain("Q");
   });
 
+  it("adapts return endpoints when the target is to the right", () => {
+    const reviewer = { x: 0, y: 20, depth: 0 };
+    const target = { x: 278, y: 20, depth: 1 };
+    const path = returnPathBetween(reviewer, target);
+
+    expect(path).toMatch(/^M272 68Q299 44/);
+    expect(path).toMatch(/326 68$/);
+  });
+
   it("orders sibling dependencies before their dependents", () => {
     const layout = layoutDendrogram(
       [node("root", null), node("dependent", "root"), node("prerequisite", "root")],

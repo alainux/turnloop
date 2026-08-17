@@ -362,20 +362,21 @@ export function pathBetween(
 }
 
 /**
- * Draw a transient backwards handoff without making it part of DAG layout.
- * The source exits through its left edge and the target is entered through its
- * right edge, so a verifier-to-executor return reads in the correct direction.
- * A shallow upper bend keeps the return leg legible without competing with the
- * ordinary dependency edge when cards are close.
+ * Draw a transient handoff without making it part of DAG layout. The endpoints
+ * adapt to the relative horizontal positions, so a return to an earlier node
+ * exits left/enters right while a return to a node on the right exits
+ * right/enters left. A shallow upper bend keeps the leg legible without
+ * competing with ordinary dependency edges when cards are close.
  */
 export function returnPathBetween(a: Position, b: Position): string {
   const ax = a.x + GRAPH_PADDING,
     ay = a.y + GRAPH_PADDING,
     bx = b.x + GRAPH_PADDING,
     by = b.y + GRAPH_PADDING;
-  const x1 = ax,
+  const sourceIsLeftOfTarget = ax <= bx;
+  const x1 = sourceIsLeftOfTarget ? ax + NODE_WIDTH : ax,
     y1 = ay,
-    x2 = bx + NODE_WIDTH,
+    x2 = sourceIsLeftOfTarget ? bx : bx + NODE_WIDTH,
     y2 = by;
   const distance = Math.abs(x1 - x2);
   const bend = Math.max(24, Math.min(42, distance * 0.42));

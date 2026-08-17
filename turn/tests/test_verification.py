@@ -25,7 +25,7 @@ from turn.domain.schemas import (
 )
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
-from turn.graph.logic import GraphWalker
+from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 from turn.__main__ import agent_command, parser
 from turn.workers.interactive import format_verification_result
@@ -246,6 +246,115 @@ async def test_rejection_respects_auto_step_and_manual_progression(tmp_path):
     await store.dispose()
 
 
+async def test_any_node_can_reject_and_route_to_an_arbitrary_node(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "Build an echo project with a cross-branch review",
+        repo_path=str(tmp_path / "repo"),
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+    )
+    plan = PlanResult(nodes=[
+        NodeSpec(key="foundation", objective="Build the foundation", executor="echo"),
+        NodeSpec(key="polish", objective="Polish the integration", executor="echo"),
+        NodeSpec(
+            key="review",
+            objective="Review the integration",
+            executor="echo",
+            agent_type=AgentType.EXECUTOR,
+            depends_on=["polish"],
+        ),
+    ], edges=[])
+    foundation, polish, review = await store.apply_plan(root, plan)
+    await store.set_status(foundation.id, NodeStatus.COMPLETE)
+    await store.set_status(polish.id, NodeStatus.COMPLETE)
+    await store.set_status(review.id, NodeStatus.RUNNING)
+
+    terminal = FakeTerminalTransport()
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=terminal,
+    )
+    run = await store.create_run(review, "echo")
+    await runner._handle_outcome(
+        review,
+        run,
+        root.id,
+        WorkerResult(
+            outcome=Outcome.COMPLETE,
+            summary="cross-branch review rejected",
+            verification=VerificationResult(
+                decision=VerificationDecision.REJECT,
+                summary="The foundation is incompatible with the integration",
+                required_changes=["Repair the foundation before polishing again"],
+                target_node_id=foundation.id,
+            ),
+        ),
+    )
+
+    refreshed = {
+        node.id: await store.get_node(node.id)
+        for node in (foundation, polish, review)
+    }
+    assert refreshed[foundation.id].status is NodeStatus.RUNNABLE
+    assert refreshed[polish.id].status is NodeStatus.COMPLETE
+    assert refreshed[review.id].status is NodeStatus.PENDING
+    nodes, edges, _ = await store.get_workgraph(root.id)
+    flow = derive_flow_edges(
+        nodes,
+        edges,
+        GraphWalker(nodes, edges).evaluate().status,
+    )
+    assert [(edge.src, edge.dst) for edge in flow] == [(review.id, foundation.id)]
+    assert "Repair the foundation" in str(terminal.snapshot(foundation.id)["output"])
+    await store.dispose()
+
+
+async def test_echo_server_rejection_does_not_require_a_provider_session(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "Run an Echo rejection demo",
+        repo_path=str(tmp_path / "repo"),
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    work, review = await store.apply_plan(
+        root,
+        PlanResult(nodes=[
+            NodeSpec(key="work", objective="Start", executor="echo"),
+            NodeSpec(
+                key="review",
+                objective="Review",
+                executor="echo",
+                depends_on=["work"],
+            ),
+        ]),
+    )
+    runner = Runner(
+        store,
+        registry=WorkerRegistry(),
+        settings=Settings(default_executor="echo"),
+        herdr_adapter=FakeHerdrAdapter(),
+    )
+
+    await runner._notify_rejection(
+        work,
+        review,
+        VerificationResult(
+            decision=VerificationDecision.REJECT,
+            summary="Return to Start",
+            target_node_id=work.id,
+        ),
+    )
+
+    assert runner.terminal.snapshot(work.id)["active"] is False
+    await store.dispose()
+
+
 class ActiveHerdrConversation:
     supports_inject = True
 
@@ -305,7 +414,7 @@ async def test_rejection_is_pasted_into_the_target_node_session(tmp_path):
     await store.dispose()
 
 
-def test_verifier_cli_is_the_only_verification_handoff(tmp_path, monkeypatch):
+def test_verification_cli_writes_the_verification_handoff(tmp_path, monkeypatch):
     handoff = tmp_path / "node.verification.json"
     status = tmp_path / "node.status.json"
     monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
@@ -324,3 +433,24 @@ def test_verifier_cli_is_the_only_verification_handoff(tmp_path, monkeypatch):
     assert agent_command(args) == 0
     assert json.loads(handoff.read_text())["decision"] == "REJECT"
     assert json.loads(status.read_text())["state"] == "complete"
+
+
+def test_any_node_can_submit_a_review_through_the_result_handoff(tmp_path, monkeypatch):
+    handoff = tmp_path / "node.result.json"
+    status = tmp_path / "node.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", str(uuid.uuid4()))
+    target = uuid.uuid4()
+    args = parser().parse_args(["agent", "verify", "--stdin"])
+    monkeypatch.setattr(
+        "sys.stdin",
+        __import__("io").StringIO(json.dumps({
+            "decision": "REJECT",
+            "summary": "An earlier node needs correction",
+            "target_node_id": str(target),
+        })),
+    )
+
+    assert agent_command(args) == 0
+    assert json.loads(handoff.read_text())["target_node_id"] == str(target)

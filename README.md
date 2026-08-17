@@ -67,7 +67,7 @@ Codex, Claude Code, OpenCode, and Pi.
 The storage, graph, runner, terminal, and harness boundaries are independent so
 new providers, scheduling policies, and evidence types can be added without
 making the UI own orchestration state. The graph also models derived flow
-edges, such as verifier rejection returns, separately from the durable
+edges, such as review rejection returns, separately from the durable
 dependency topology.
 
 ## Screenshots
@@ -213,3 +213,23 @@ child caps, semantic deduplication, title truncation, or domain-specific nodes.
 
 The visual and interaction contract lives in [DESIGN.md](DESIGN.md). This README
 is the product, architecture, scope, operation, and verification guide.
+
+## Roadmap
+
+- [x] Basic workflow
+- [x] Skills
+- [x] Nested planners
+- [x] Org agent
+- [x] MCP basic
+- [x] Arbitrary node reject
+- [ ] Composable graph
+- [ ] Triggers
+- [ ] Skills / MCP via Capabilities / Agent Plugins 1.0
+- [ ] Retries / Recoveries
+- [ ] Loops / Goals / Hill-climbing
+- [ ] Local library of skills and MCPs
+- [ ] Native app
+- [ ] Terminal UI
+- [ ] In-host multiplexer
+- [ ] Ghostty Web
+- [ ] Website with public skill library

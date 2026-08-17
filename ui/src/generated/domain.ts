@@ -293,6 +293,7 @@ export interface VerificationResult {
   findings: Array<string>;
   required_changes: Array<string>;
   evidence_refs: Array<string>;
+  target_node_id: string | null;
 }
 
 export interface Verifier {

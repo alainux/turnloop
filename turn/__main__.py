@@ -64,7 +64,7 @@ def parser() -> argparse.ArgumentParser:
     payload = submit.add_mutually_exclusive_group(required=True)
     payload.add_argument("--payload", help="JSON object supplied to the Turn protocol")
     payload.add_argument("--stdin", action="store_true", help="read the JSON object from stdin")
-    verify = agent_sub.add_parser("verify", help="approve or reject the predecessor's work")
+    verify = agent_sub.add_parser("verify", help="submit an approve/reject review decision")
     verification_payload = verify.add_mutually_exclusive_group(required=True)
     verification_payload.add_argument("--payload", help="verification JSON object")
     verification_payload.add_argument("--stdin", action="store_true", help="read verification JSON from stdin")
@@ -83,7 +83,11 @@ def _agent_protocol_path(kind: str) -> Path:
         raise SystemExit("TURN_HANDOFF_FILE is not set; this command must run inside a Turn agent")
     path = Path(raw).expanduser()
     expected = f".{kind}.json"
-    if not path.name.endswith(expected):
+    # Any node may submit a review decision when its work discovers a defect
+    # elsewhere. Ordinary workers use the result handoff path, while verifier
+    # workers keep their dedicated verification path.
+    accepted = (expected, ".result.json") if kind == "verification" else (expected,)
+    if not any(path.name.endswith(suffix) for suffix in accepted):
         raise SystemExit(f"TURN_HANDOFF_FILE is not a {kind} handoff: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

@@ -405,14 +405,14 @@ def result_handoff(*, plan: bool = False, verification: bool = False) -> str:
     """Prompt fragment for the harness-neutral Turn control plane."""
     turn_cli = "turn"
     if verification:
-        shape = '{"decision":"APPROVE","summary":"What was verified","findings":[],"required_changes":[],"evidence_refs":[]}'
+        shape = '{"decision":"APPROVE","summary":"What was verified","findings":[],"required_changes":[],"evidence_refs":[],"target_node_id":null}'
     elif plan:
         shape = plan_handoff_example()
     else:
         shape = '{"outcome":"COMPLETE","summary":"What happened","missing_inputs":[]}'
     kind = "verification" if verification else "plan" if plan else "result"
     completion = (
-        "When the verification is complete, submit the decision and let Turn route it."
+        "When the verification is complete, submit the decision and let Turn route it. Omit target_node_id to return to the single dependency, or set it to any earlier node id from `turn graph --format json` to return work there."
         if verification
         else "When the plan is complete, submit it and let Turn continue."
         if plan

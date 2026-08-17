@@ -85,7 +85,7 @@ def test_return_edge_requires_a_rejected_verifier_and_one_active_target():
     assert derive_flow_edges(nodes, edges) == []
 
     nodes, edges, _, _ = _scenario(verifier_type=AgentType.EXECUTOR)
-    assert derive_flow_edges(nodes, edges) == []
+    assert len(derive_flow_edges(nodes, edges)) == 1
 
     nodes, edges, _, _ = _scenario(extra_target=True)
     assert derive_flow_edges(nodes, edges) == []
@@ -97,3 +97,24 @@ def test_return_edge_is_not_shown_when_the_target_is_not_the_next_worker_step():
         effective = {target.id: NodeStatus.RUNNABLE} if status is NodeStatus.PENDING else None
         expected = 1 if status is NodeStatus.PENDING else 0
         assert len(derive_flow_edges(nodes, edges, effective)) == expected
+
+
+def test_any_node_can_return_to_an_explicit_arbitrary_target():
+    nodes, edges, dependency, reviewer = _scenario(verifier_type=AgentType.EXECUTOR)
+    arbitrary = Node(
+        project_id=dependency.project_id,
+        objective="Repair the earlier foundation",
+        status=NodeStatus.RUNNABLE,
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+    )
+    nodes.append(arbitrary)
+    reviewer.verification = VerificationResult(
+        decision=VerificationDecision.REJECT,
+        summary="The earlier foundation needs correction",
+        target_node_id=arbitrary.id,
+    )
+
+    flow = derive_flow_edges(nodes, edges)
+
+    assert len(flow) == 1
+    assert (flow[0].src, flow[0].dst) == (reviewer.id, arbitrary.id)

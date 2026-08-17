@@ -266,6 +266,28 @@ class CodexWorker(Worker):
                 )],
             )
 
+        # A non-verifier can still use the shared review CLI when its work
+        # discovers a defect in another node. It writes the decision through
+        # the ordinary result handoff path; normal result payloads do not
+        # contain a decision, so this remains unambiguous.
+        if structured_text:
+            try:
+                decision = VerificationResult.model_validate(json.loads(structured_text))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decision = None
+            if decision is not None:
+                return WorkerResult(
+                    outcome=Outcome.COMPLETE,
+                    summary=decision.summary,
+                    verification=decision,
+                    session_id=discovered_session or session_id,
+                    artifacts=[ArtifactSpec(
+                        kind=ArtifactKind.TEXT,
+                        name="verification-result",
+                        content=format_verification_result(decision),
+                    )],
+                )
+
         text = structured_text
         result = self._parse_result(text)
         result.session_id = discovered_session or session_id

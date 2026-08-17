@@ -413,7 +413,8 @@ TOPOLOGY — arrange the children to express the information and delivery flow:
   after the work it inspects without inventing containment or a VERIFIES edge.
   A verifier must receive explicit criteria in its prompt and inspect real
   evidence before approving. Rejection feedback is a runtime Herdr
-  conversation with that one predecessor; it is not additional graph data.
+  conversation with the selected return target; it is not additional graph
+  data.
 - INTEGRATORS: if a node's job is to combine or integrate its
   prerequisites (objective names 'assemble', 'merge', 'integrate', 'combine',
   'stitch'), its generated_prompt MUST tell it to READ the files those

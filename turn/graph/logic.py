@@ -11,7 +11,6 @@ import uuid
 from typing import Optional
 
 from turn.domain.schemas import (
-    AgentType,
     Edge,
     EdgeType,
     FlowEdge,
@@ -20,6 +19,7 @@ from turn.domain.schemas import (
     Node,
     NodeStatus,
     VerificationDecision,
+    VerificationResult,
 )
 
 
@@ -177,30 +177,24 @@ def derive_flow_edges(
     """Derive transient edges for a workflow whose next step changed.
 
     Persistent graph edges describe dependency semantics and must remain a DAG.
-    A verifier rejection temporarily sends its dependency target back to the
-    worker, so that direction is represented separately as a render-only flow
-    edge. The edge is present only while that target is the next runnable or
-    active step; once the target completes, normal forward flow is restored and
-    this projection becomes empty.
+    A rejection temporarily sends its selected target back to the worker, so
+    that direction is represented separately as a render-only flow edge. The
+    edge is present only while that target is the next runnable or active step;
+    once the target completes, normal forward flow is restored and this
+    projection becomes empty. Verifiers use their single dependency when no
+    explicit target is supplied; any node can use ``target_node_id`` to point
+    at another node.
     """
     indexes = build_indexes(nodes, edges)
     statuses = effective_status or {node.id: node.status for node in nodes}
     flow_edges: list[FlowEdge] = []
-    for verifier in nodes:
-        if verifier.agent is None or verifier.agent.type_id is not AgentType.VERIFIER:
-            continue
-        decision = verifier.verification
+    for reviewer in nodes:
+        decision = reviewer.verification
         if decision is None or decision.decision is not VerificationDecision.REJECT:
             continue
-        target_ids = list(dict.fromkeys(indexes.deps.get(verifier.id, [])))
-        targets = [
-            indexes.node_by_id[target_id]
-            for target_id in target_ids
-            if target_id in indexes.node_by_id
-        ]
-        if len(targets) != 1:
+        target = rejection_target(reviewer, decision, indexes)
+        if target is None:
             continue
-        target = targets[0]
         if statuses.get(target.id, target.status) not in {
             NodeStatus.RUNNABLE,
             NodeStatus.RUNNING,
@@ -210,14 +204,38 @@ def derive_flow_edges(
             FlowEdge(
                 id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
-                    f"turn:flow:return:{verifier.id}:{target.id}",
+                    f"turn:flow:return:{reviewer.id}:{target.id}",
                 ),
-                src=verifier.id,
+                src=reviewer.id,
                 dst=target.id,
                 type=FlowEdgeType.RETURN,
             )
         )
     return flow_edges
+
+
+def rejection_target(
+    reviewer: Node,
+    decision: VerificationResult,
+    indexes: Indexes,
+) -> Node | None:
+    """Resolve a review decision to one node in the current workgraph.
+
+    The explicit target is deliberately an ordinary node id rather than a
+    persistent edge: returning work must not mutate the DAG or introduce a
+    cycle. Omitting it preserves the original verifier behavior by selecting
+    the reviewer's one dependency.
+    """
+    if decision.target_node_id is not None:
+        target = indexes.node_by_id.get(decision.target_node_id)
+        if target is None or target.id == reviewer.id:
+            return None
+        return target
+
+    target_ids = list(dict.fromkeys(indexes.deps.get(reviewer.id, [])))
+    if len(target_ids) != 1:
+        return None
+    return indexes.node_by_id.get(target_ids[0])
 
 
 def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:

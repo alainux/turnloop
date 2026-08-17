@@ -12,6 +12,10 @@ venv/
 .env*
 !.env.example
 
+# Local configs
+.codex/
+.pi/
+
 # Databases / runtime state
 *.db
 *.sqlite
@@ -20,7 +24,6 @@ turn/config.json
 turn/herdr-workspaces.json
 turn/server.lock
 turn-demo-state/
-.pi/
 
 # Per-project repos (user deliverables; each is its own git repository)
 projects/
