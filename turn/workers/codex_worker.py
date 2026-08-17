@@ -158,6 +158,9 @@ class CodexWorker(Worker):
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
                     session_marker=str(ctx.node.id),
+                    excluded_session_ids={ctx.forbidden_session_id}
+                    if ctx.forbidden_session_id
+                    else None,
                     harness_name=self.s.codex_binary,
                     initial_input=prompt,
                     environment=environment,
@@ -175,6 +178,9 @@ class CodexWorker(Worker):
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
                     session_marker=str(ctx.node.id),
+                    excluded_session_ids={ctx.forbidden_session_id}
+                    if ctx.forbidden_session_id
+                    else None,
                     harness_name=self.s.codex_binary,
                     initial_input=prompt,
                     initial_input_mode="stdin" if not native else "native",
@@ -287,6 +293,11 @@ class CodexWorker(Worker):
                         content=format_verification_result(decision),
                     )],
                 )
+
+        if not structured_text:
+            result = self._parse_result("")
+            result.session_id = discovered_session or session_id
+            return result
 
         text = structured_text
         result = self._parse_result(text)

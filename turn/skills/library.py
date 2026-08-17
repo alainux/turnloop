@@ -41,7 +41,7 @@ SKILLS: dict[str, SkillDefinition] = {
     ),
     "turn-setup": SkillDefinition(
         "turn-setup", "Turn setup", _ROOT / "planner" / "turn-setup.md",
-        "Interpret a user request and set up the smallest sufficient workgraph.",
+        "Interpret a user request and set up the smallest complete workgraph that preserves its scope.",
     ),
     "turn-architecture-research": SkillDefinition(
         "turn-architecture-research", "Architecture research", _ROOT / "planner" / "turn-architecture-research.md",
@@ -200,25 +200,41 @@ class UrlSkillFetcher:
         parts = [unquote(part) for part in parsed.path.split("/") if part]
         if len(parts) < 3 or parts[0] == "api":
             raise ValueError("skills.sh references must identify a specific skill")
-        source = "/".join(parts[:2])
-        skill = "/".join(parts[2:])
-        endpoint = (
-            "https://skills.sh/api/v1/skills/"
-            f"{quote(source, safe='/')}/{quote(skill, safe='/')}"
+        owner, repo = parts[:2]
+        skill = "/".join(parts[2:]).rstrip("/")
+        tree_endpoint = (
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}"
+            "/git/trees/HEAD?recursive=1"
         )
-        payload = self._json(endpoint)
-        raw_files = payload.get("files") if isinstance(payload, dict) else None
-        if not isinstance(raw_files, list):
-            raise ValueError("skills.sh response did not contain a file tree")
-        files: dict[str, bytes] = {}
-        for item in raw_files:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path") or item.get("name") or "")
-            content = item.get("content", item.get("contents"))
-            if path and isinstance(content, str):
-                files[path] = content.encode("utf-8")
-        return files
+        payload = self._json(tree_endpoint)
+        tree = payload.get("tree") if isinstance(payload, dict) else None
+        if not isinstance(tree, list):
+            raise ValueError("GitHub skill source did not contain a file tree")
+
+        suffix = f"/{skill}/SKILL.md"
+        matches = [
+            str(entry["path"])
+            for entry in tree
+            if isinstance(entry, dict)
+            and entry.get("type") == "blob"
+            and isinstance(entry.get("path"), str)
+            and str(entry["path"]).endswith(suffix)
+        ]
+        if not matches:
+            raise ValueError(
+                f"GitHub repository {owner}/{repo} has no skill directory for {skill!r}"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"GitHub repository {owner}/{repo} has multiple skill directories for {skill!r}"
+            )
+
+        skill_path = matches[0].rsplit("/", 1)[0]
+        contents_endpoint = (
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contents/"
+            f"{quote(skill_path, safe='/')}?ref=HEAD"
+        )
+        return self._github_directory(contents_endpoint, "")
 
 
 def list_skills() -> tuple[SkillDefinition, ...]:

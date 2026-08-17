@@ -141,6 +141,15 @@ def test_new_codex_session_id_matches_node_marker_not_latest_mtime(tmp_path, mon
     os.utime(wanted, (now + 1, now + 1))
 
     assert _new_codex_session_id(str(tmp_path), now - 1, node_id) == wanted_id
+    assert (
+        _new_codex_session_id(
+            str(tmp_path),
+            now - 1,
+            node_id,
+            excluded_session_ids={wanted_id},
+        )
+        is None
+    )
 
 
 async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeypatch):
@@ -186,6 +195,33 @@ async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeyp
     assert result.outcome.value == "COMPLETE"
     assert result.verification is not None
     assert result.verification.decision.value == "REJECT"
+
+
+async def test_codex_worker_reports_missing_result_without_secondary_json_error(tmp_path):
+    from turn.config import Settings
+    from turn.domain.schemas import AgentConfig, HarnessKind, Node
+    from turn.workers.base import NodeExecutionContext
+    from turn.workers.codex_worker import CodexWorker
+
+    class EmptyTransport:
+        async def run(self, _node_id, _command, **_kwargs):
+            return TerminalResult(returncode=1, output=b"Codex exited before submitting a result")
+
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Research the product",
+        generated_prompt="Research the product and submit the result.",
+        repo_path=str(tmp_path),
+        executor="codex",
+        agent=AgentConfig(harness=HarnessKind.CODEX),
+    )
+    result = await CodexWorker(Settings(codex_binary="codex")).execute(
+        NodeExecutionContext(node=node, repo_path=str(tmp_path), terminal=EmptyTransport())
+    )
+
+    assert result.outcome.value == "FAIL"
+    assert result.summary == "codex stopped without a structured result"
+    assert result.error == "Codex returned no turn-result block"
 
 
 class WaitingTransport:

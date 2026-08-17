@@ -47,4 +47,14 @@ describe("truthful status", () => {
       }),
     ).toBe("working — Implementing the parser");
   });
+  it("shows a live regeneration as generating even before status is RUNNING", () => {
+    expect(
+      nodeStatusLabel({
+        ...base,
+        status: "EXPANDED",
+        ui_state: "running",
+        generation_active: true,
+      }),
+    ).toBe("generating");
+  });
 });

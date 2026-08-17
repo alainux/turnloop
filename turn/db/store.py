@@ -782,8 +782,16 @@ class Store:
             run.logs = logs
         if error is not None:
             run.error = error
+        elif status == RunStatus.COMPLETE:
+            # A run may have been marked orphaned while its owner was being
+            # registered. Completing that same run must remove the transient
+            # interruption marker instead of presenting a contradictory
+            # COMPLETE + error record.
+            run.error = None
         if retry_recommended is not None:
             run.retry_recommended = retry_recommended
+        elif status == RunStatus.COMPLETE:
+            run.retry_recommended = False
         if usage is not None:
             run.usage = usage
         if session_id is not None:
@@ -905,6 +913,36 @@ class Store:
             return []
         project_id, _ = found
         return [artifact.model_copy(deep=True) for artifact in self._states[project_id]["artifacts"].values() if artifact.node_id == node_id]
+
+    async def clear_generated_artifacts(self, node_id: uuid.UUID) -> list[uuid.UUID]:
+        """Remove prior run outputs while retaining explicit user inputs.
+
+        A fresh attempt replaces the node's generated result; keeping every
+        prior handoff artifact makes the inspector look like the node produced
+        multiple current outputs. User-supplied input artifacts remain attached
+        because they are part of the node's requirements, not run output.
+        """
+        found = self._project_for_node(node_id)
+        if not found:
+            return []
+        project_id, node = found
+        state = self._states[project_id]
+        removed = [
+            artifact_id
+            for artifact_id, artifact in state["artifacts"].items()
+            if artifact.node_id == node_id and artifact.kind is not ArtifactKind.USER_INPUT
+        ]
+        if not removed:
+            return []
+        for artifact_id in removed:
+            state["artifacts"].pop(artifact_id, None)
+        node.artifact_refs = [
+            artifact_id
+            for artifact_id in node.artifact_refs
+            if artifact_id in state["artifacts"]
+        ]
+        await self._persist_project(project_id)
+        return removed
 
     async def get_artifact(self, artifact_id: uuid.UUID) -> Optional[Artifact]:
         for state in self._states.values():

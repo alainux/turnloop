@@ -30,10 +30,13 @@ interface Props {
 }
 export const nodeStatusLabel = (node: GraphNode) => {
   const machineState =
-    node.status === "RUNNING"
+    node.status === "RUNNING" || node.generation_active
       ? node.agent_state ?? (node.generation_active ? "generating" : "starting")
       : node.ui_state.replaceAll("_", " ");
-  const message = node.status === "RUNNING" ? node.agent_message?.trim() : "";
+  const message =
+    node.status === "RUNNING" || node.generation_active
+      ? node.agent_message?.trim()
+      : "";
   return message ? `${machineState} — ${message}` : machineState;
 };
 export function Graph({
@@ -146,7 +149,7 @@ export function Graph({
         // here as a last line of defense against a stale event arriving while
         // a completed/cancelled PTY is being released.
         const runnable = node.allowed_actions.includes("run");
-        const running = node.status === "RUNNING";
+        const running = node.status === "RUNNING" || node.generation_active;
         const preparing = node.ui_state === "preparing";
         const active = running || preparing;
         const primaryAction = primaryNodeAction(node);
@@ -177,7 +180,7 @@ export function Graph({
             >
               <span className="node-copy">
                 <strong title={title}>{title}</strong>
-                <small className={node.status === "RUNNING" && node.agent_message?.trim() ? "node-working-message" : undefined}>
+                <small className={active && node.agent_message?.trim() ? "node-working-message" : undefined}>
                   {nodeStatusLabel(node)}
                 </small>
                 <small>
@@ -194,7 +197,9 @@ export function Graph({
                     name={
                       preparing
                         ? "loader"
-                        : node.agent?.type_id === "planner"
+                        : active
+                          ? "loader"
+                          : node.agent?.type_id === "planner"
                         ? "git-branch"
                         : node.agent?.type_id === "verifier"
                           ? "check"

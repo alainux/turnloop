@@ -111,6 +111,25 @@ class FixedPlanner(Planner):
         )
 
 
+class SessionPlanner(Planner):
+    name = "session-aware"
+
+    def __init__(self, session_id: str, started: asyncio.Event | None = None):
+        self.session_id = session_id
+        self.started = started
+        self.forbidden_session_id: str | None = None
+
+    async def plan(self, ctx):
+        self.forbidden_session_id = ctx.forbidden_session_id
+        if self.started is not None:
+            self.started.set()
+            await asyncio.Event().wait()
+        return PlanResult(
+            nodes=[NodeSpec(key="leaf", objective="Fresh branch", executor="echo")],
+            session_id=self.session_id,
+        )
+
+
 async def test_heuristic_planner_keeps_card_titles_short_and_full_intent_in_prompts():
     intent = "Build a tiny dependency-free one-page constellation name generator with deterministic seeds and accessible controls."
     root = Node(
@@ -556,6 +575,66 @@ async def test_regeneration_closes_removed_herdr_panes_and_projects_agent_status
     await store.dispose()
 
 
+async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    planner = SessionPlanner("new-session")
+    runner.registry.register_planner(planner)
+    root = await store.create_project(
+        "fresh planner run",
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "old-session"
+    await store._save_node(root)
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+    await store.add_artifacts(
+        root.id,
+        [ArtifactSpec(kind=ArtifactKind.JSON, name="plan-submission", content={"old": True})],
+    )
+
+    result = await runner.regenerate_descendants(root.id, fresh_session=True)
+
+    assert result["created"]
+    assert planner.forbidden_session_id == "old-session"
+    rerun_root = await store.get_node(root.id)
+    assert rerun_root.agent.session_id == "new-session"
+    run = (await store.get_runs(root.id))[-1]
+    assert run.session_id == "new-session"
+    assert run.error is None
+    artifacts = await store.get_artifacts(root.id)
+    assert [artifact.name for artifact in artifacts] == ["plan-submission"]
+    await store.dispose()
+
+
+async def test_stop_cancels_an_inflight_regeneration(tmp_path):
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    started = asyncio.Event()
+    planner = SessionPlanner("never-reached", started)
+    runner.registry.register_planner(planner)
+    runner.terminal = FakeTerminalTransport()
+    root = await store.create_project(
+        "cancel planner run",
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "old-session"
+    await store._save_node(root)
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+
+    task = asyncio.create_task(runner.regenerate_descendants(root.id, fresh_session=True))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert runner.generation_active(root.id)
+
+    await runner.cancel(root.id)
+    await asyncio.gather(task, return_exceptions=True)
+
+    cancelled = await store.get_node(root.id)
+    assert cancelled.status == NodeStatus.CANCELLED
+    assert not runner.generation_active(root.id)
+    assert (await store.get_runs(root.id))[-1].status == RunStatus.CANCELLED
+    await store.dispose()
+
+
 async def test_store_preserves_explicit_planner_agent_type(tmp_path):
     store_path = tmp_path / "planner-agent"
     store = Store(store_path)
@@ -917,7 +996,7 @@ def test_initial_setup_planner_chooses_a_domain_appropriate_board():
     for phrase in (
         "Set up the board",
         "interpreting the user's actual request",
-        "smallest sufficient",
+        "smallest complete topology",
         "top-level PlanResult field",
         "preserve it and do not",
         "lean MVP or demo",
@@ -943,6 +1022,15 @@ def test_initial_setup_planner_chooses_a_domain_appropriate_board():
         "not a mandatory pipeline",
     ):
         assert phrase in root_prompt
+    for phrase in (
+        "Explicit scope and scale are binding",
+        "smallest complete topology",
+        "An app factory is organization-scale by definition",
+        "not one app and\n  not a research assignment",
+        "Do not collapse that scope into one research, design, or",
+        "research or discovery leaf",
+    ):
+        assert phrase in root_prompt
 
     nested = Node(
         project_id=root.project_id,
@@ -957,6 +1045,33 @@ def test_initial_setup_planner_chooses_a_domain_appropriate_board():
     assert "ancestor-owned edges" in nested_prompt
     assert "sibling stages" in nested_prompt and "later stages" in nested_prompt
     assert "board owner" in nested_prompt
+
+
+def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
+    root = Node(
+        project_id=uuid.uuid4(),
+        objective="Build an app factory",
+        generated_prompt="Create the organization and platform for an entire organization.",
+    )
+    narrow_plan = PlanResult(
+        nodes=[NodeSpec(key="research", objective="Research the market", executor="codex")]
+    )
+
+    with pytest.raises(RuntimeError, match="organization-scale request"):
+        CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), narrow_plan)
+
+    nested_plan = PlanResult(
+        nodes=[
+            NodeSpec(
+                key="factory_setup",
+                objective="Plan the app factory",
+                executor="planner",
+                agent_type="planner",
+                plan=True,
+            )
+        ]
+    )
+    CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), nested_plan)
 
 
 def test_setup_plan_shape_preserves_stage_handoffs():

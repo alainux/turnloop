@@ -10,10 +10,11 @@
 - The web UI is a dumb surface meant for human inspection and interaction.
 - Default agents are Planners, Executors, Integrators, or Verifiers. Planners usually create documentation and the graph. Executors run the work. Verifiers check the work and approve / reject it. Integrators combine the work of multiple executors into cohesive units. 
 - The workflow graph is also a plan and a specification, and has a Document view that shows it in a document format (markdown). 
-- Agent capabilities are defined by their skills, which are composable. The default agents are just pre-configured agents.
+- Agent capabilities are defined by their skills, which are composable. The default agents are just pre-configured agents. They can also get a pre-configured list of MCPs.
 - The graph can be run by an agent or by a human by running single nodes, auto-running, or stepping through stages of equal depth.
 - We are harness agnostic and support out of the box: Codex, Claude Code, Opencode and Pi.
 - All project state lives directly on disk within the project repository.
+- Rejections can theoretically be done by any agent, from any node to any previous node, but only verifiers have it as a prerrogative.
 
 ## Architecture
 
@@ -59,6 +60,10 @@
 
 - Agents are more effective at large scale system execution using Turn than they are using single-agent, native multi-agent or other orchestrators.
 
+## Permissions
+
+- Agents have permissions for the necessary steps to run tests and demos
+
 ## Refereces and resources
 
 - https://www.langchain.com/blog/the-art-of-loop-engineering
@@ -70,3 +75,25 @@
 - https://github.com/public-apis/public-apis
 - https://github.com/msitarzewski/agency-agents
 - https://learn.chatgpt.com/docs/plugins
+- https://github.com/agentplugins/agent-plugins-spec
+
+## Skills search resources:
+
+- https://agentskillshub.dev/skills/
+- https://github.com/topics/agent-skills
+- https://www.skills.sh/
+- https://github.com/leonxlnx/taste-skill
+- https://maker-skills.com/
+- https://github.com/openai/plugins
+- https://github.com/msitarzewski/agency-agents 
+- https://github.com/VoltAgent/awesome-agent-skills
+- https://awesomeskill.ai/
+
+
+## MCP search resources:
+
+- https://github.com/mcp
+- https://glama.ai/
+- http://pulsemcp.com/
+- https://smithery.ai/
+

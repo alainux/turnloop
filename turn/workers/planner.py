@@ -156,13 +156,52 @@ class CodexPlanner(Planner):
             terminal=ctx.terminal, timeout=ctx.timeout_seconds,
             stall_timeout=ctx.stall_timeout_seconds,
             session_callback=ctx.session_callback,
+            forbidden_session_id=ctx.forbidden_session_id,
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
+            self._validate_setup_scope(ctx, plan)
             plan.usage = usage
             plan.session_id = session_id
             return plan
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
+
+    @staticmethod
+    def _validate_setup_scope(ctx: NodeExecutionContext, plan: PlanResult) -> None:
+        """Reject a narrow root plan that contradicts explicit broad scope."""
+        node = ctx.node
+        if node.parent_id is not None:
+            return
+        intent = " ".join((node.objective, node.generated_prompt or "")).lower()
+        broad_markers = (
+            "app factory",
+            "organization-scale",
+            "organization scale",
+            "entire organization",
+            "multi-organization",
+            "multiple organizations",
+            "multiple products",
+            "multiple teams",
+            "multi-team",
+            "enterprise",
+            "platform",
+            "ecosystem",
+        )
+        if not any(marker in intent for marker in broad_markers):
+            return
+        if len(plan.nodes) != 1:
+            return
+        only_node = plan.nodes[0]
+        is_nested_planner = (
+            only_node.plan
+            or only_node.executor == "planner"
+            or only_node.agent_type is AgentType.PLANNER
+        )
+        if not is_nested_planner:
+            raise RuntimeError(
+                "root planner collapsed an explicitly organization-scale request "
+                "to one leaf; return a broad first-level graph or a nested planner"
+            )
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
         handoff_example = plan_handoff_example()
@@ -173,11 +212,25 @@ SETUP — this is the project-root setup planner:
 - Set up the board by interpreting the user's actual request. Identify the
   requested outcome, domain, users, constraints, runtime or delivery form,
   quality bar, and explicit scope before choosing work.
-- Choose the smallest sufficient shape for this request: it might be one
+- Classify the requested scale from the user's explicit words before applying
+  any minimization heuristic. Explicit scope and scale are binding. "Smallest
+  complete" means the smallest complete topology that preserves the stated
+  outcome and scale; it never means the smallest interpretation of the
+  request.
+- Choose the shape that fits after that classification: it may be one
   focused worker, a lean MVP or demo, a book-writing workflow, a routine
-  automation, a broad product or system, or something else entirely. Do not
-  assume this is a venture, software product, or organization.
-- For a broad product, research, design, engineering, verification,
+  automation, a broad product or system, an organization-scale platform, or
+  something else entirely.
+- An app factory is organization-scale by definition: it is a repeatable
+  organization/system for producing multiple applications, not one app and
+  not a research assignment. Treat the same way any request that explicitly
+  names an organization, platform, ecosystem, enterprise, multiple products,
+  or multiple teams. Do not collapse that scope into one research, design, or
+  implementation child. Use broad first-level ownership and nested planners
+  for domains that need their own evolving subtree. Research may support one
+  domain, but it must never substitute for the organization-scale setup.
+- When the request does not state organization-scale scope, do not invent it.
+  For a broad product or system, research, design, engineering, verification,
   integration, launch or adoption, and operations stages may be useful, but
   add only stages the prompt, risk, and delivery goal justify. This is a
   decision, not a mandatory pipeline. Keep explicitly small work small.
@@ -280,6 +333,11 @@ or tests is not a finished application unless the user explicitly requested
 those things.
 
 DECOMPOSITION POLICY — match the structure to the objective:
+- SCOPE PRESERVATION: explicit scale words such as "app factory",
+  "organization", "platform", "ecosystem", "enterprise", "multiple
+  products", or "multiple teams" outrank the default preference for a small
+  plan. Preserve that breadth in the first-level graph; do not represent it
+  with a lone research or discovery leaf.
 - ATOMIC step: if the objective is a SINGLE concrete step (it says "one", "a
 single", "just one", "the next step", "first step", or names exactly one
 action), produce EXACTLY ONE child that performs it. Do NOT pad with
@@ -495,6 +553,7 @@ is the only valid plan handoff.
         self, prompt: str, cwd: str, *, agent: AgentConfig | None = None,
         stream=None, node_id=None, terminal=None, timeout=None, stall_timeout=None,
         session_callback=None, project_id=None,
+        forbidden_session_id: str | None = None,
     ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
@@ -529,6 +588,8 @@ is the only valid plan handoff.
 
         async def remember_session(session: str) -> None:
             nonlocal observed_session
+            if forbidden_session_id and session == forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
             observed_session = session
             if session_callback is not None:
                 await session_callback(session)
@@ -580,6 +641,9 @@ is the only valid plan handoff.
                 idle_reap=self.s.terminal_idle_reap_seconds,
                 session_callback=remember_session,
                 session_marker=str(node_id),
+                excluded_session_ids={forbidden_session_id}
+                if forbidden_session_id
+                else None,
                 harness_name=agent.harness.value,
                 initial_input=prompt if getattr(transport, "supports_inject", False) else (prompt if native else None),
                 initial_input_mode="stdin" if (not native and getattr(transport, "supports_inject", False)) else "native",
@@ -640,6 +704,7 @@ class AgentPlanner(Planner):
         text = await self._call_harness(agent, prompt, ctx)
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None and plan.nodes:
+            CodexPlanner._validate_setup_scope(ctx, plan)
             plan.session_id = agent.session_id
             return plan
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
@@ -690,8 +755,12 @@ class AgentPlanner(Planner):
             )
 
             async def remember_session(session: str) -> None:
+                if ctx.forbidden_session_id and session == ctx.forbidden_session_id:
+                    raise RuntimeError("provider reused the previous session during a fresh run")
                 agent.session_id = session
                 ctx.node.agent = agent
+                if ctx.session_callback is not None:
+                    await ctx.session_callback(session)
 
             async def probe_session() -> str | None:
                 if agent.harness != HarnessKind.OPENCODE:

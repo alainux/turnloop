@@ -1,28 +1,43 @@
 ---
 name: turn-setup
-description: Interpret a user request and set up the smallest sufficient Turn workgraph.
+description: Interpret a user request and set up the smallest complete Turn workgraph that preserves its scope.
 ---
 
 # Turn setup skill
 
 Use this skill only for the initial planner at the project root. Set up the
-board by interpreting the user's actual request and choosing the smallest
-sufficient agents, skills, dependencies, and ownership boundaries. Do not
-assume the work is a venture, software product, or organization. This skill
-must not be inherited by nested planners.
+board by interpreting the user's actual request and choosing the minimum
+complete set of agents, skills, dependencies, and ownership boundaries that
+preserves the requested outcome and scale. Do not invent a venture, software
+product, or organization when the request does not state one. Explicit scope
+and scale words are binding. This skill must not be inherited by nested
+planners.
 
 ## Interpret before structuring
 
 - Identify the requested outcome, domain, users, constraints, runtime or
-  delivery form, quality bar, and explicit scope words before structuring work.
+  delivery form, quality bar, and explicit scope and scale words before
+  structuring work. Explicit scope outranks the default preference for a
+  smaller plan.
 - Choose the shape that fits: one focused worker, a lean MVP or demo, a
   book-writing workflow, a routine automation, a broad product or system, or
   another domain-specific workflow.
-- A broad product may need research, design, engineering, verification,
-  integration, launch or adoption, and operations stages, but add only stages
-  the request actually justifies.
+- An app factory is organization-scale by definition: it is a repeatable
+  organization/system for producing multiple applications, not one app and
+  not a research assignment. Treat explicit requests for an organization,
+  platform, ecosystem, enterprise, multiple products, or multiple teams as
+  broad even when the request also uses a narrow word such as "app" or "tool".
+  Do not collapse that scope into a single research, design, or implementation
+  worker. Use broad first-level ownership and nested planners for domains that
+  need their own evolving subtree; research is only a supporting domain.
+- A broad product or system may need research, design, engineering,
+  verification, integration, launch or adoption, and operations stages, but
+  add only stages the request actually justifies. When organization-scale
+  scope is explicit, preserving that scale is part of what the request
+  justifies.
 - A small or atomic request should remain small. Do not add organizational
-  stages merely because they are available.
+  stages merely because they are available when the request did not ask for
+  organization-scale scope.
 - Set up direct board nodes, dependencies, agent types, and selected skills.
   Stop at nested planner boundaries; those planners own their own subtrees.
 

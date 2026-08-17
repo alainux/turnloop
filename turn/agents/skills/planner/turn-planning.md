@@ -38,6 +38,23 @@ that remains. Do not fill the architecture document from intuition when a
 primary source, maintained documentation, or an existing project convention
 can settle the decision.
 
+## Preserve explicit scale
+
+Explicit scope and scale words in the user's request are binding and outrank
+the preference for the smallest number of work nodes. “Smallest useful” means
+the smallest complete topology that preserves the requested outcome; it never
+authorizes collapsing a broad request into a narrow interpretation.
+
+An app factory is organization-scale by definition: it is a repeatable
+organization/system for producing multiple applications, not one app and not
+a research assignment. Treat explicit requests for an organization, platform,
+ecosystem, enterprise, multiple products, or multiple teams as broad even when
+the request also uses a narrow word such as “app” or “tool”. Preserve that
+scope in the first-level graph with meaningful ownership boundaries and nested
+planners where a domain needs its own evolving subtree. Research may support a
+domain, but it must not replace the organization-scale setup or become the
+only direct child.
+
 For broad engineering work, actively investigate the architecture instead of
 reducing the request to a generic checklist. Use `find-skills` to discover an
 appropriate architecture or domain skill when one is useful; the optional

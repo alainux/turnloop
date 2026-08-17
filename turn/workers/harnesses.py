@@ -427,7 +427,10 @@ class CLIHarnessWorker(Worker):
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         resume = had_session
         if not agent.session_id and self.harness == HarnessKind.CLAUDE:
-            agent.session_id = str(ctx.node.id)
+            # A fresh attempt gets a new provider conversation. Using the
+            # node id here made Claude's next Run again look like the same
+            # conversation even though Turn had cleared the old session.
+            agent.session_id = str(uuid.uuid4())
         observed_session = agent.session_id
         live_buffer = ""
 
@@ -445,6 +448,8 @@ class CLIHarnessWorker(Worker):
 
         async def remember_session(session: str) -> None:
             nonlocal observed_session
+            if ctx.forbidden_session_id and session == ctx.forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
             observed_session = session
             agent.session_id = session
             ctx.node.agent = agent
@@ -490,6 +495,9 @@ class CLIHarnessWorker(Worker):
                     session_callback=remember_session,
                     session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
+                    excluded_session_ids={ctx.forbidden_session_id}
+                    if ctx.forbidden_session_id
+                    else None,
                     harness_name=binary,
                     initial_input=prompt,
                     environment=environment,
@@ -508,6 +516,9 @@ class CLIHarnessWorker(Worker):
                     session_callback=remember_session,
                     session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
+                    excluded_session_ids={ctx.forbidden_session_id}
+                    if ctx.forbidden_session_id
+                    else None,
                     harness_name=binary,
                     initial_input=prompt,
                     initial_input_mode="stdin",

@@ -279,6 +279,46 @@ def test_external_skill_installs_a_standard_multifile_tree(tmp_path: Path):
     assert not (tmp_path / "turn" / "skills").exists()
 
 
+def test_skills_sh_reference_resolves_public_github_tree(monkeypatch):
+    from urllib.parse import urlparse
+
+    from turn.skills.library import UrlSkillFetcher
+
+    fetcher = UrlSkillFetcher()
+    json_urls: list[str] = []
+
+    def fake_json(url: str):
+        json_urls.append(url)
+        return {
+            "tree": [
+                {"path": "resources/skills/competitive-research/SKILL.md", "type": "blob"},
+                {"path": "resources/skills/other/SKILL.md", "type": "blob"},
+            ]
+        }
+
+    loaded: list[str] = []
+
+    def fake_directory(url: str, prefix: str):
+        loaded.append(url)
+        return {"SKILL.md": b"---\nname: competitive-research\ndescription: Research.\n---\n"}
+
+    monkeypatch.setattr(fetcher, "_json", fake_json)
+    monkeypatch.setattr(fetcher, "_github_directory", fake_directory)
+
+    files = fetcher._skills_sh_files(
+        urlparse("https://skills.sh/cowork-os/cowork-os/competitive-research")
+    )
+
+    assert files["SKILL.md"].startswith(b"---\n")
+    assert json_urls == [
+        "https://api.github.com/repos/cowork-os/cowork-os/git/trees/HEAD?recursive=1"
+    ]
+    assert loaded == [
+        "https://api.github.com/repos/cowork-os/cowork-os/contents/"
+        "resources/skills/competitive-research?ref=HEAD"
+    ]
+
+
 def test_external_html_is_rejected_and_invalid_existing_install_is_replaced(tmp_path: Path):
     url = "https://example.test/catalog/visual-qa"
     target = tmp_path / ".turn" / "skills" / "external-visual-qa-placeholder" / "SKILL.md"

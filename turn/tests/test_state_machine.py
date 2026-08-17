@@ -44,6 +44,17 @@ def test_reserved_nodes_expose_preparing_and_only_stop():
     assert projected.actions == (Action.CANCEL,)
 
 
+def test_live_regeneration_exposes_stop_even_while_parent_is_expanded():
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="rebuild descendants",
+        status=NodeStatus.EXPANDED,
+    )
+    projected = present_node(node, preparing=True)
+    assert projected.state == UIState.RUNNING
+    assert projected.actions == (Action.CANCEL,)
+
+
 def test_pause_overrides_execution_status_without_destroying_it():
     paused = Node(project_id="00000000-0000-0000-0000-000000000001", objective="x", status=NodeStatus.RUNNABLE, paused=True)
     assert present_node(paused).state == UIState.PAUSED

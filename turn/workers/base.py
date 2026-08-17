@@ -42,6 +42,11 @@ class NodeExecutionContext(BaseModel):
     # runner persists it before the worker returns, so an interrupted process
     # can be resumed without parsing a completed transcript first.
     session_callback: Any = None
+    # A user-triggered rerun must not receive the provider conversation that
+    # belonged to the previous attempt. The runner fills this only for an
+    # explicit fresh attempt; workers use it to reject a provider that reports
+    # the old identity anyway.
+    forbidden_session_id: str | None = None
     interactive_terminal: bool = False
     timeout_seconds: float | None = None
     stall_timeout_seconds: float | None = None

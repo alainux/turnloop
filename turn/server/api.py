@@ -1029,7 +1029,14 @@ async def edit_node(node_id: str, body: EditNode, request: Request):
 @router.post("/api/nodes/{node_id}/regenerate")
 async def regenerate(node_id: str, request: Request):
     runner = await _runner(request)
-    result = await runner.regenerate_descendants(uuid.UUID(node_id), fresh_session=True)
+    try:
+        result = await runner.regenerate_descendants(uuid.UUID(node_id), fresh_session=True)
+    except asyncio.CancelledError:
+        # Stop intentionally cancels the request task that owns an in-flight
+        # regeneration. The node transition is already persisted by Runner;
+        # report that normal user action as a successful cancellation instead
+        # of leaking an ASGI 500 to the browser.
+        return {"ok": True, "cancelled": True}
     return {"ok": True, **result}
 
 

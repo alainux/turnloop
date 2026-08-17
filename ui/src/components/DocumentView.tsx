@@ -112,7 +112,7 @@ export function documentParentMap(nodes: GraphNode[], edges: Edge[]): Map<string
 }
 
 function statusLabel(node: GraphNode): string {
-  if (node.status === "RUNNING") {
+  if (node.status === "RUNNING" || node.generation_active) {
     return node.agent_message?.trim()
       ? `${node.agent_state ?? "working"} — ${node.agent_message.trim()}`
       : node.agent_state ?? "working";

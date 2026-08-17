@@ -78,6 +78,10 @@ class Runner:
         self._running: dict[uuid.UUID, asyncio.Task] = {}
         self._reconnect_tasks: dict[uuid.UUID, asyncio.Task] = {}
         self._retries: dict[uuid.UUID, int] = {}
+        # Session ids that an explicit fresh attempt must not receive back
+        # from its provider. This is process-local because it describes the
+        # transition between two attempts, not durable graph configuration.
+        self._forbidden_fresh_sessions: dict[uuid.UUID, str] = {}
         self._wake = asyncio.Event()
         self._stop = False
         self._task: Optional[asyncio.Task] = None
@@ -111,7 +115,10 @@ class Runner:
         self._wake.set()
         self._manual_stages.clear()
         self._deleting_projects.clear()
-        for t in self._running.values():
+        running = list(self._running.values())
+        for node_id in list(self._running):
+            await self.terminal.stop(node_id)
+        for t in running:
             t.cancel()
         for t in self._reconnect_tasks.values():
             t.cancel()
@@ -123,6 +130,8 @@ class Runner:
             await asyncio.gather(*self._shell_tasks.values(), return_exceptions=True)
         if self._status_watchers:
             await asyncio.gather(*self._status_watchers.values(), return_exceptions=True)
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
         if self._task is not None:
             try:
                 await self._task
@@ -262,7 +271,9 @@ class Runner:
         # provider session; the prior run remains available in history. The
         # terminal injection path interrupts any stale shell input first.
         for orphan in orphaned_nodes:
-            await self._reset_provider_session(orphan.id)
+            previous = await self._reset_provider_session(orphan.id)
+            if previous:
+                self._forbidden_fresh_sessions[orphan.id] = previous
 
         by_id = {node.id: node for node in nodes}
 
@@ -409,10 +420,19 @@ class Runner:
             # will use. Detach only Turn's temporary control stream; do
             # not close the pane before the provider takes it over.
             await self.detach_shell(node.id)
+            forbidden_session_id = self._forbidden_fresh_sessions.pop(node.id, None)
             if node.executor == PLANNER_EXECUTOR and node.status != NodeStatus.EXPANDED:
-                await self._plan_node(node, project_id)
+                await self._plan_node(
+                    node,
+                    project_id,
+                    forbidden_session_id=forbidden_session_id,
+                )
             else:
-                await self._run_worker(node, project_id)
+                await self._run_worker(
+                    node,
+                    project_id,
+                    forbidden_session_id=forbidden_session_id,
+                )
         except asyncio.CancelledError:
             await self._mark_cancelled(node)
             raise
@@ -493,18 +513,42 @@ class Runner:
             # browser cannot leave a completed/cancelled node spinning.
             await self._emit("node.updated", project_id, _dump(node))
 
-    async def _plan_node(self, node: Node, project_id: uuid.UUID) -> list[Node]:
+    async def _plan_node(
+        self,
+        node: Node,
+        project_id: uuid.UUID,
+        *,
+        forbidden_session_id: str | None = None,
+    ) -> list[Node]:
         ctx = await self._build_context(node)
+        ctx.forbidden_session_id = forbidden_session_id
         # The planner and all descendants use the same assigned project
         # directory, so files are immediately available downstream.
         run = await self.store.create_run(node, PLANNER_EXECUTOR, self._retries.get(node.id, 0) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
+
+        async def remember_live_session(session_id: str) -> None:
+            if not session_id:
+                return
+            if forbidden_session_id and session_id == forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
+            await self._remember_session(node, session_id)
+            await self.store.update_run(run.id, session_id=session_id)
+            await self._emit(
+                "node.updated",
+                project_id,
+                _dump(await self.store.get_node(node.id)),
+            )
+
+        ctx.session_callback = remember_live_session
         try:
             planner = self.registry.planner
             if planner is None:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
+            if forbidden_session_id and plan.session_id == forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
             created = await self.store.apply_plan(node, plan)
             submitted = await self.store.add_artifacts(
                 node.id,
@@ -531,6 +575,16 @@ class Runner:
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
             return created
+        except asyncio.CancelledError:
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="run cancelled",
+                error="run cancelled by user",
+                retry_recommended=False,
+            )
+            raise
         except Exception as error:
             await self.store.update_run(
                 run.id,
@@ -546,8 +600,15 @@ class Runner:
             await self._finish_provider_terminal(node.id, project_id)
             self.wake()
 
-    async def _run_worker(self, node: Node, project_id: uuid.UUID) -> None:
+    async def _run_worker(
+        self,
+        node: Node,
+        project_id: uuid.UUID,
+        *,
+        forbidden_session_id: str | None = None,
+    ) -> None:
         ctx = await self._build_context(node)
+        ctx.forbidden_session_id = forbidden_session_id
         worker_key = node.agent.harness.value if node.agent and node.executor != PLANNER_EXECUTOR else node.executor
         # A node's agent selection is an execution contract. Never substitute
         # the workspace default when that harness is missing: OpenCode must
@@ -563,6 +624,8 @@ class Runner:
         async def remember_live_session(session_id: str) -> None:
             if not session_id:
                 return
+            if forbidden_session_id and session_id == forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
             await self._remember_session(node, session_id)
             await self.store.update_run(run.id, session_id=session_id)
             await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
@@ -580,6 +643,8 @@ class Runner:
                 if root and root.run_policy else self.s.stall_timeout_seconds
             )
             result: WorkerResult = await self.exec_adapter.run(worker, ctx, timeout=timeout)
+            if forbidden_session_id and result.session_id == forbidden_session_id:
+                raise RuntimeError("provider reused the previous session during a fresh run")
         except asyncio.TimeoutError:
             await self._handle_outcome(
                 node, run, project_id,
@@ -936,48 +1001,79 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return {"created": [], "removed": []}
-        descendants = await self.store.descendants(node_id)
-        cancelling: list[asyncio.Task] = []
-        for descendant in descendants:
-            for task in (self._running.get(descendant.id),):
-                if task is not None and task is not asyncio.current_task() and not task.done():
+        current_task = asyncio.current_task()
+        claimed = False
+        if current_task is not None:
+            existing = self._running.get(node_id)
+            if existing is not None and existing is not current_task and not existing.done():
+                await self.terminal.stop(node_id)
+                existing.cancel()
+                await asyncio.gather(existing, return_exceptions=True)
+            self._running[node_id] = current_task
+            claimed = True
+        try:
+            descendants = await self.store.descendants(node_id)
+            cancelling: list[asyncio.Task] = []
+            for descendant in descendants:
+                task = self._running.get(descendant.id)
+                if task is not None and task is not current_task and not task.done():
+                    await self.terminal.stop(descendant.id)
                     task.cancel()
                     cancelling.append(task)
-        if cancelling:
-            await asyncio.gather(*cancelling, return_exceptions=True)
-        # Removed graph nodes must release their Herdr panes before their
-        # persisted records disappear. Otherwise regeneration leaves invisible
-        # terminals behind in the project's Herdr space.
-        for descendant in descendants:
-            await self.terminal.close_persistent_session(descendant.id)
-        removed = await self.store.replace_descendants(node_id)
-        # Re-plan through the same execution path as an initial planner run so
-        # transcript, usage, and provider session continuity are preserved.
-        node = await self.store.get_node(node_id)
-        if node is None:
-            return
-        if fresh_session and node.agent is not None:
-            # A rerun is a fresh harness call in the existing Herdr pane. The
-            # command injector interrupts any active input line before typing
-            # the new invocation, so there is no reason to replace the pane.
-            await self._reset_provider_session(node_id)
-            node = await self.store.get_node(node_id) or node
-        try:
-            created = await self._plan_node(node, node.project_id)
+            if cancelling:
+                await asyncio.gather(*cancelling, return_exceptions=True)
+            # Removed graph nodes must release their Herdr panes before their
+            # persisted records disappear. Otherwise regeneration leaves
+            # invisible terminals behind in the project's Herdr space.
+            for descendant in descendants:
+                await self.terminal.close_persistent_session(descendant.id)
+            removed = await self.store.replace_descendants(node_id)
+            # Re-plan through the same execution path as an initial planner
+            # run. The request task is registered in _running for the whole
+            # operation, so the scheduler cannot orphan its run and Stop can
+            # cancel the provider while planning is still in progress.
+            node = await self.store.get_node(node_id)
+            if node is None:
+                return {"created": [], "removed": [str(c) for c in removed]}
+            forbidden_session_id = None
+            if fresh_session and node.agent is not None:
+                # Run again closes the active provider call and its stale
+                # control pane before launching a new one. A pane can survive
+                # a server restart while its control stream is no longer
+                # injectable; reusing it makes a valid rerun fail at launch.
+                await self.terminal.close_persistent_session(node_id)
+                forbidden_session_id = await self._reset_provider_session(node_id)
+                if forbidden_session_id:
+                    self._forbidden_fresh_sessions[node_id] = forbidden_session_id
+                node = await self.store.get_node(node_id) or node
+            await self.store.clear_generated_artifacts(node_id)
+            created = await self._plan_node(
+                node,
+                node.project_id,
+                forbidden_session_id=forbidden_session_id,
+            )
+            await self._emit(
+                "graph.replaced",
+                node.project_id,
+                {"node": _dump(node), "removed": [str(c) for c in removed],
+                 "created": len(created)},
+            )
+            for c in created:
+                await self._emit("node.created", node.project_id, _dump(c))
+            return {"created": [str(c.id) for c in created], "removed": [str(c) for c in removed]}
+        except asyncio.CancelledError:
+            current = await self.store.get_node(node_id)
+            if current is not None:
+                await self._mark_cancelled(current)
+            raise
         except Exception:
             await self.store.set_status(node.id, NodeStatus.FAILED)
             await self._emit("node.updated", node.project_id, _dump(await self.store.get_node(node.id)))
             raise
-        await self._emit(
-            "graph.replaced",
-            node.project_id,
-            {"node": _dump(node), "removed": [str(c) for c in removed],
-             "created": len(created)},
-        )
-        for c in created:
-            await self._emit("node.created", node.project_id, _dump(c))
-        self.wake()
-        return {"created": [str(c.id) for c in created], "removed": [str(c) for c in removed]}
+        finally:
+            if claimed and self._running.get(node_id) is current_task:
+                self._running.pop(node_id, None)
+            self.wake()
 
     async def retry(self, node_id: uuid.UUID) -> None:
         node = await self.store.get_node(node_id)
@@ -985,7 +1081,11 @@ class Runner:
             return
         if node.status == NodeStatus.FAILED:
             self._retries[node.id] = 0
-            await self._reset_provider_session(node_id)
+            await self.terminal.stop(node_id)
+            previous = await self._reset_provider_session(node_id)
+            if previous:
+                self._forbidden_fresh_sessions[node_id] = previous
+            await self.store.clear_generated_artifacts(node_id)
             await self.store.set_status(node_id, NodeStatus.RUNNABLE)
             await self._emit("node.updated", node.project_id, _dump(node))
             self.wake()
@@ -1217,8 +1317,14 @@ class Runner:
             return
         task = self._running.get(node_id)
         if task is not None:
+            # Stop the provider before cancelling Turn's awaiter. This makes
+            # Stop effective even when the task is inside a native harness
+            # call rather than inside the runner's Python bookkeeping.
+            await self.terminal.stop(node_id)
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         else:
+            await self.terminal.stop(node_id)
             await self.store.set_status(node_id, NodeStatus.CANCELLED)
             await self._emit("node.updated", node.project_id, _dump(node))
         self.wake()
@@ -1237,12 +1343,18 @@ class Runner:
             for target in targets:
                 await self.store.set_paused(target.id, False)
         elif action == "cancel":
+            cancelling: list[asyncio.Task] = []
             for target in targets:
                 task = self._running.get(target.id)
                 if task:
+                    await self.terminal.stop(target.id)
                     task.cancel()
+                    cancelling.append(task)
                 elif target.status not in (NodeStatus.COMPLETE, NodeStatus.CANCELLED):
+                    await self.terminal.stop(target.id)
                     await self.store.set_status(target.id, NodeStatus.CANCELLED)
+            if cancelling:
+                await asyncio.gather(*cancelling, return_exceptions=True)
         else:
             raise ValueError(f"unsupported branch action: {action}")
         await self._emit("graph.branch_updated", node.project_id, {"root": str(node_id), "action": action})
@@ -1340,7 +1452,11 @@ class Runner:
             return None
         # Revive a cancelled or paused node so the user can run it again.
         if node.status == NodeStatus.CANCELLED:
-            await self._reset_provider_session(node_id)
+            await self.terminal.close_persistent_session(node_id)
+            previous = await self._reset_provider_session(node_id)
+            if previous:
+                self._forbidden_fresh_sessions[node_id] = previous
+            await self.store.clear_generated_artifacts(node_id)
             await self.store.set_status(node_id, NodeStatus.RUNNABLE)
         if node.paused:
             await self.store.set_paused(node_id, False)
@@ -1447,15 +1563,22 @@ class Runner:
         if n is None:
             return
         await self.store.set_status(node.id, NodeStatus.CANCELLED)
-        await self._reset_provider_session(node.id)
-        await self._emit("node.updated", n.project_id, _dump(n))
+        previous = await self._reset_provider_session(node.id)
+        if previous:
+            self._forbidden_fresh_sessions[node.id] = previous
+        updated = await self.store.get_node(node.id)
+        await self._emit("node.updated", n.project_id, _dump(updated or n))
 
-    async def _reset_provider_session(self, node_id: uuid.UUID) -> None:
-        """Clear the provider session so the next call is injected fresh."""
+    async def _reset_provider_session(self, node_id: uuid.UUID) -> str | None:
+        """Clear the provider session and return the identity being retired."""
         fresh = await self.store.get_node(node_id)
-        if fresh is not None and fresh.agent is not None and fresh.agent.session_id:
+        if fresh is None or fresh.agent is None:
+            return None
+        previous = fresh.agent.session_id
+        if previous:
             fresh.agent.session_id = None
             await self.store._save_node(fresh)
+        return previous
 
     async def _mark_failed(self, node: Node, error: str) -> None:
         await self.store.set_status(node.id, NodeStatus.FAILED)

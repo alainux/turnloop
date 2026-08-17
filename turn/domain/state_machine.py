@@ -31,14 +31,16 @@ def present_node(
 ) -> NodePresentation:
     """Project one node into a stable UI state and guarded action set."""
     common = (Action.EDIT, Action.REGENERATE)
-    if preparing and node.status not in {
-        NodeStatus.RUNNING,
-        NodeStatus.COMPLETE,
-        NodeStatus.FAILED,
-        NodeStatus.CANCELLED,
-        NodeStatus.EXPANDED,
-    }:
-        return NodePresentation(UIState.PREPARING, (Action.CANCEL,))
+    if preparing:
+        # A planner regeneration can be live while its persisted node remains
+        # EXPANDED until the replacement plan is applied. The runner owns the
+        # live-task fact, so expose Stop for that state instead of leaving the
+        # user with a misleading Run again action.
+        state = UIState.RUNNING if node.status in {
+            NodeStatus.RUNNING,
+            NodeStatus.EXPANDED,
+        } else UIState.PREPARING
+        return NodePresentation(state, (Action.CANCEL,))
     if node.paused:
         return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
     if node.status == NodeStatus.RUNNING:

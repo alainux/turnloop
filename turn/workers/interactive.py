@@ -39,6 +39,7 @@ def _new_codex_session_id(
     cwd: str,
     started_at: float,
     session_marker: str | None = None,
+    excluded_session_ids: set[str] | None = None,
 ) -> str | None:
     """Find the session file Codex creates for a newly launched TUI.
 
@@ -86,7 +87,11 @@ def _new_codex_session_id(
                     if not found_marker:
                         continue
                 identifier = payload.get("session_id")
-            if isinstance(identifier, str) and identifier:
+            if (
+                isinstance(identifier, str)
+                and identifier
+                and identifier not in (excluded_session_ids or set())
+            ):
                 return identifier
         except (OSError, ValueError, json.JSONDecodeError):
             continue
@@ -186,6 +191,7 @@ async def run_until_result(
     session_callback=None,
     session_probe: Callable[[], Awaitable[str | None]] | None = None,
     session_marker: str | None = None,
+    excluded_session_ids: set[str] | None = None,
     harness_name: str | None = None,
     initial_input: str | None = None,
     initial_input_mode: str = "native",
@@ -361,7 +367,12 @@ async def run_until_result(
     try:
         while task is None or not task.done():
             if session_callback is not None and discovered_session is None:
-                discovered_session = _new_codex_session_id(cwd, started_at, session_marker)
+                discovered_session = _new_codex_session_id(
+                    cwd,
+                    started_at,
+                    session_marker,
+                    excluded_session_ids,
+                )
                 if discovered_session:
                     await session_callback(discovered_session)
             if session_probe is not None and discovered_session is None:
