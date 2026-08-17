@@ -58,8 +58,11 @@ location of the final user-facing path in the relevant document or acceptance
 criteria.
 
 Record the direct research URLs and why each matters. Select narrow skills for
-each executor, integrator, and verifier; author a project `SKILL.md` when no
-maintained skill fits. Skills are installed into the project and read from
+each executor, integrator, and verifier when they materially improve the work;
+otherwise leave the additional list empty. Author a project `SKILL.md` only
+for reusable project-specific domain or method guidance, never to carry the
+user's prompt, a node assignment, graph state, acceptance criteria, or
+one-off instructions. Skills are installed into the project and read from
 the filesystem, never pasted into the initial prompt. Keep document references
 dynamic: graph inspection exposes paths, while workers explicitly open files
 when they need their current contents.

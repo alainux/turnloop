@@ -33,6 +33,7 @@ from turn.workers.echo_worker import EchoWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
 from turn.workers.base import NodeExecutionContext, render_context_block
+from turn.skills.library import SKILLS, install_builtin_skill
 
 
 async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
@@ -99,6 +100,9 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
             contract = (await client.get("/api/schema")).json()
             assert {"Agent", "Node", "Edge", "PlanResult", "WorkerResult"} <= set(contract["models"])
             project_id = uuid.UUID(created.json()["project_id"])
+            project_root = components.store._project_paths[project_id]
+            for skill_id in SKILLS:
+                install_builtin_skill(skill_id, project_root)
             runner = components.runner
             workspace_id = runner.terminal.project_workspace_id(str(project_id))
             assert workspace_id in herdr.workspaces

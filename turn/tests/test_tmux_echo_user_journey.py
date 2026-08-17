@@ -1,4 +1,4 @@
-"""End-to-end user journey with Herdr persistence and deterministic Echo work."""
+"""End-to-end user journey with Herdr persistence and the fake process harness."""
 from __future__ import annotations
 
 import asyncio
@@ -14,9 +14,10 @@ from turn.db.store import Store
 from turn.domain.schemas import AgentConfig, HarnessKind, NodeStatus, RunPolicy
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.fake_harness import FakeHarnessWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
+from turn.skills.library import SKILLS, install_builtin_skill
 
 
 async def _await_run(runner: Runner, node_id) -> None:
@@ -25,32 +26,34 @@ async def _await_run(runner: Runner, node_id) -> None:
     await asyncio.wait_for(task, timeout=10)
 
 
-async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
+async def test_herdr_fake_user_journey_exercises_supported_actions(tmp_path):
     if shutil.which("herdr") is None:
         pytest.skip("Herdr is required for Turn terminal sessions")
     project_root = Path(__file__).resolve().parents[2] / "projects"
-    project_path = project_root / f".turn-test-echo-journey-{uuid.uuid4().hex}"
+    project_path = project_root / f".turn-test-fake-journey-{uuid.uuid4().hex}"
     settings = Settings(
-        data_dir=f"/private/tmp/turn-echo-journey-{uuid.uuid4().hex[:8]}",
+        data_dir=f"/private/tmp/turn-fake-journey-{uuid.uuid4().hex[:8]}",
         projects_dir=str(project_root),
-        default_executor="echo",
+        default_executor="fake",
         planner="heuristic",  # explicit deterministic test fixture only
     )
     store = Store(settings.data_dir)
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
-    registry.register_planner(HeuristicPlanner("echo"))
+    registry.register(FakeHarnessWorker(settings))
+    registry.register_planner(HeuristicPlanner("fake"))
     runner = Runner(store, registry, EventBus(), settings)
-    agent = AgentConfig(harness=HarnessKind.ECHO, type_id="planner")
+    agent = AgentConfig(harness=HarnessKind.FAKE, type_id="planner")
     root = None
     try:
         root = await store.create_project(
-            "Build an echo-backed puzzle-room demo",
+            "Build a fake-harness-backed puzzle-room demo",
             repo_path=str(project_path),
             agent=agent,
             run_policy=RunPolicy(auto_run=False),
         )
+        for skill_id in SKILLS:
+            install_builtin_skill(skill_id, project_path)
         # Creation allocates a durable Herdr shell. Opening, resizing, and
         # detaching it must preserve the same node session.
         assert await runner.ensure_node_terminal(root.id)
@@ -60,12 +63,12 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
         assert await runner.detach_shell(root.id)
         assert await runner.terminal.has_persistent_session(root.id)
 
-        # Manual Run in Step mode plans the root, then Run executes an Echo
+        # Manual Run in Step mode plans the root, then Run executes a fake
         # leaf. This covers the same actions exposed by the graph and inspector.
         assert await runner.run_node(root.id) == root.id
         await _await_run(runner, root.id)
         nodes, _, _ = await store.get_workgraph(root.id)
-        leaves = [node for node in nodes if node.parent_id == root.id and node.executor == "echo"]
+        leaves = [node for node in nodes if node.parent_id == root.id and node.executor == "fake"]
         assert len(leaves) >= 2
         # Planning does not allocate idle panes for every future node. A
         # worker gets a Herdr pane when it actually runs (or when a user opens
@@ -79,7 +82,7 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
         # Editing a planner's selected harness cascades to its active branch.
         await runner.edit_node(root.id, agent=agent.model_copy(deep=True))
         updated_leaves = await asyncio.gather(*(store.get_node(node.id) for node in leaves))
-        assert all(node is not None and node.agent.harness == HarnessKind.ECHO for node in updated_leaves)
+        assert all(node is not None and node.agent.harness == HarnessKind.FAKE for node in updated_leaves)
 
         # Step/Auto are reversible policy choices, not hidden execution modes.
         await runner.set_mode(root.id, True)
@@ -112,16 +115,17 @@ async def test_herdr_echo_user_journey_exercises_supported_actions(tmp_path):
         assert not any(removed_sessions)
         assert all(pane is not None for pane in old_panes)
         root = await store.get_node(root.id)
-        root.project_name = "Renamed echo journey"
+        root.project_name = "Renamed fake journey"
         root.objective = root.project_name
         await store._save_node(root)
-        assert (await store.get_node(root.id)).project_name == "Renamed echo journey"
+        assert (await store.get_node(root.id)).project_name == "Renamed fake journey"
     finally:
         try:
             if root is not None:
                 nodes, _, _ = await store.get_workgraph(root.id)
                 for node in nodes:
                     await runner.close_shell(node.id)
+                await runner.close_project_workspace(root.id)
                 await store.delete_project(root.id)
         finally:
             try:

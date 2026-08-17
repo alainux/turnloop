@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -53,6 +54,8 @@ def _wait_persisted_complete(state_file, seconds: float = 30) -> None:
 
 
 def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_path):
+    if shutil.which("herdr") is None:
+        pytest.skip("Herdr is required for process-harness acceptance runs")
     playwright = pytest.importorskip("playwright.sync_api")
     try:
         port = _free_port()
@@ -60,14 +63,14 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
         pytest.skip("this sandbox does not permit local listener sockets")
     data_dir = tmp_path / "turn"
     server_log = tmp_path / "server.log"
+    project_ids: list[str] = []
     env = os.environ.copy()
     env.update({
         "TURN_DATA_DIR": str(data_dir),
         "TURN_PROJECTS_DIR": str(tmp_path / "projects"),
         "TURN_PLANNER": "heuristic",
-        "TURN_DEFAULT_EXECUTOR": "echo",
+        "TURN_DEFAULT_EXECUTOR": "fake",
         "TURN_TEST_MODE": "1",
-        "TURN_TEST_HERDR_ADAPTER": "fake",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
     with server_log.open("w") as log:
@@ -89,13 +92,12 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                 console_errors: list[str] = []
                 page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
                 page.goto(f"http://127.0.0.1:{port}/", wait_until="networkidle")
-                project_ids: list[str] = []
                 state_files: list[Path] = []
 
                 for index, objective in enumerate(OBJECTIVES):
                     page.get_by_role("textbox", name="Project objective").fill(objective)
                     page.get_by_label("Harness").click()
-                    page.get_by_role("option", name="Echo · offline").click()
+                    page.get_by_role("option", name="Fake · process harness").click()
                     # Step is the product default. This acceptance flow
                     # intentionally verifies the separate Auto behavior.
                     page.get_by_role("button", name="Project and run configuration").click()
@@ -108,22 +110,22 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                     )
                     project_ids.append(project_id)
                     page.wait_for_function(
-                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json(); return g.nodes.length === 5; }",
+                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json(); return g.nodes.length === 5; }",
                         arg=project_id,
                         timeout=30000,
                     )
-                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json())", project_id)
+                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json())", project_id)
                     state_files.append(Path(graph["nodes"][0]["repo_path"]) / ".turn" / "state.json")
                     assert len(graph["nodes"]) == 5
                     assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 0
                     assert sum(edge["type"] == "DEPENDS_ON" for edge in graph["edges"]) == 3
                     assert all(
-                        node["agent"]["harness"] == "echo" and node["agent"]["model"] == "deterministic"
+                        node["agent"]["harness"] == "fake" and node["agent"]["model"] == "deterministic"
                         for node in graph["nodes"] if node["parent_id"]
                     )
 
                     page.wait_for_function(
-                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph`, {cache: 'no-store'})).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
+                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
                         arg=project_id,
                         timeout=30000,
                     )
@@ -138,6 +140,19 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                 assert not console_errors
                 browser.close()
         finally:
+            # Delete projects while the test server is still alive. This
+            # closes their Herdr workspaces through the normal API lifecycle;
+            # Runner.stop below is a second boundary-level cleanup.
+            for project_id in project_ids:
+                try:
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/projects/{project_id}",
+                        method="DELETE",
+                    )
+                    with urllib.request.urlopen(request, timeout=5):
+                        pass
+                except Exception:
+                    pass
             process.terminate()
             try:
                 process.wait(timeout=5)

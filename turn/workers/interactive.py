@@ -15,10 +15,10 @@ import sys
 from typing import Any, Awaitable, Callable
 
 from turn.contracts.dag import plan_handoff_example
-from turn.domain.schemas import VerificationResult
+from turn.domain.schemas import Usage, VerificationResult
 from turn.mcp.runtime import prepare_runtime
 from turn.workers.terminal import TerminalResult
-from turn.skills.library import materialize
+from turn.skills.library import resolve_skill_paths
 
 
 def format_verification_result(result: VerificationResult) -> str:
@@ -76,14 +76,7 @@ def _new_codex_session_id(
                     # session's rollout while it is active.  The worker puts
                     # a unique node marker in its first user prompt; only
                     # accept the rollout whose early transcript contains it.
-                    found_marker = False
-                    for _ in range(12):
-                        line = handle.readline()
-                        if not line:
-                            break
-                        if session_marker in line:
-                            found_marker = True
-                            break
+                    found_marker = any(session_marker in line for line in handle)
                     if not found_marker:
                         continue
                 identifier = payload.get("session_id")
@@ -96,6 +89,51 @@ def _new_codex_session_id(
         except (OSError, ValueError, json.JSONDecodeError):
             continue
     return None
+
+
+def read_codex_session_usage(session_id: str | None) -> Usage:
+    """Read the latest per-turn usage from a native Codex session record."""
+    if not session_id:
+        return Usage()
+    codex_home = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex")))
+    root = codex_home / "sessions"
+    try:
+        candidates = sorted(
+            root.rglob(f"rollout-*-{session_id}.jsonl"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except (FileNotFoundError, OSError):
+        return Usage()
+    for path in candidates:
+        latest: dict[str, Any] | None = None
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    payload = record.get("payload") if isinstance(record, dict) else None
+                    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                        continue
+                    info = payload.get("info")
+                    if not isinstance(info, dict):
+                        continue
+                    per_turn = info.get("last_token_usage")
+                    total = info.get("total_token_usage")
+                    candidate = per_turn if isinstance(per_turn, dict) else total
+                    if isinstance(candidate, dict):
+                        latest = candidate
+        except (OSError, UnicodeDecodeError):
+            continue
+        if latest is not None:
+            return Usage(
+                input_tokens=int(latest.get("input_tokens") or 0),
+                cached_input_tokens=int(latest.get("cached_input_tokens") or 0),
+                output_tokens=int(latest.get("output_tokens") or 0),
+            )
+    return Usage()
 
 
 def prepare_result_file(cwd: str, node_id: uuid.UUID, kind: str) -> Path:
@@ -119,7 +157,11 @@ def agent_environment(
     skills, tools, and MCP servers without inspecting terminal output.
     """
     skill_ids = list(dict.fromkeys(getattr(agent, "skill_ids", None) or []))
-    scoped_skills = materialize(skill_ids, cwd) if skill_ids else {}
+    scoped_skills = (
+        resolve_skill_paths(skill_ids, cwd, allow_library=kind == "plan")
+        if skill_ids
+        else {}
+    )
     mcp_runtime = prepare_runtime(cwd, node_id, agent)
 
     def csv(name: str) -> str:
@@ -219,8 +261,34 @@ async def run_until_result(
                 await asyncio.gather(task, return_exceptions=True)
 
     async def wait_for_attachment() -> None:
-        """Do not type into a Herdr pane until its control stream is live."""
+        """Do not type until the terminal provider reports real readiness."""
         if task is None:
+            return
+        wait_until_ready = getattr(transport, "wait_until_ready", None)
+        if wait_until_ready is not None:
+            ready_task = asyncio.create_task(wait_until_ready(node_id))
+            done, _ = await asyncio.wait(
+                {task, ready_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if task in done and ready_task not in done:
+                ready_task.cancel()
+                await asyncio.gather(ready_task, return_exceptions=True)
+                try:
+                    await task
+                except Exception as error:
+                    raise RuntimeError(
+                        "harness terminal closed before Turn could inject its command"
+                    ) from error
+                raise RuntimeError(
+                    "harness terminal closed before Turn could inject its command"
+                )
+            try:
+                await ready_task
+            except Exception as error:
+                raise RuntimeError(
+                    "harness pane was not ready before Turn injected its command"
+                ) from error
             return
         deadline = time.monotonic() + 10.0
         while True:
@@ -242,45 +310,114 @@ async def run_until_result(
                 )
             await asyncio.sleep(0.05)
 
+    async def wait_for_foreground_harness() -> None:
+        """Wait for the shell to hand the PTY to the requested harness.
+
+        A durable Herdr pane is initially owned by the shell. The command
+        injection call only confirms that Herdr accepted bytes; it does not
+        mean the child process is ready to consume its stdin. Process-info is
+        the transport-level readiness signal, so prompt delivery does not
+        depend on an arbitrary startup sleep.
+        """
+        reader = getattr(transport, "foreground_process_names", None)
+        if reader is None or not harness_name:
+            return
+        expected = harness_name.rsplit("/", 1)[-1]
+        deadline = time.monotonic() + 10.0
+        while True:
+            if task is not None and task.done():
+                try:
+                    await task
+                except Exception as error:
+                    raise RuntimeError(
+                        "harness terminal closed before Turn could send its message"
+                    ) from error
+                raise RuntimeError(
+                    "harness terminal closed before Turn could send its message"
+                )
+            names = await reader(node_id)
+            if expected in names:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"harness '{expected}' did not become the foreground process "
+                    "before Turn sent its message"
+                )
+            await asyncio.sleep(0.05)
+
+    async def wait_for_local_process() -> None:
+        """Wait for a local PTY process to produce its first terminal frame."""
+        snapshot_reader = getattr(transport, "snapshot", None)
+        if snapshot_reader is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while True:
+            snapshot = snapshot_reader(node_id)
+            if snapshot.get("active") and snapshot.get("output"):
+                return
+            if task is not None and task.done():
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("harness did not produce a terminal frame before Turn sent its message")
+            await asyncio.sleep(0.05)
+
+    async def reset_injected_session() -> None:
+        """Make the durable pane safe for a new provider command.
+
+        Herdr panes outlive a Turn attachment. Reusing one here can leave a
+        completed TUI in the foreground, which would interpret the shell
+        exports and command as user messages. The provider conversation is not
+        discarded: when a session id exists, the command includes it and the
+        provider resumes the saved conversation. Only the runner's explicit
+        fresh-run path clears that id.
+
+        A plain shell is already the correct launch surface, so preserve it.
+        Only replace a pane whose foreground process is not a shell. This is
+        important for the first launch and for a normal continuation: closing
+        the durable pane unconditionally can race Herdr's control stream and
+        leave the subsequent command with no injectable session.
+        """
+        if not getattr(transport, "supports_inject", False):
+            return
+        process_reader = getattr(transport, "foreground_process_names", None)
+        if process_reader is not None:
+            names = await process_reader(node_id)
+            shell_names = {"sh", "bash", "zsh", "fish", "ksh"}
+            if not names or all(name in shell_names for name in names):
+                return
+        close_persistent = getattr(transport, "close_persistent_session", None)
+        if close_persistent is not None:
+            await close_persistent(node_id)
+            return
+        snapshot_reader = getattr(transport, "snapshot", None)
+        if snapshot_reader is not None and snapshot_reader(node_id).get("active"):
+            await transport.stop(node_id)
+
     started_at = time.time()
     try:
         if getattr(transport, "supports_inject", False):
-            # The persistent session is a plain shell. Launch the harness by typing
-            # its command, exactly as a user would. The native harness then
-            # receives its first message through the PTY below.
-            # The inspector may already be attached to this node's durable Herdr
-            # shell. Do not create a second outer attachment: LocalPtyTransport
-            # stores one client per node and a second one used to replace the
-            # browser client, yielding a misleading "[terminated]" panel.
-            active = bool(transport.snapshot(node_id).get("active"))
-            harness_attached = False
-            if active and harness_name:
-                reader = getattr(transport, "foreground_process_names", None)
-                if reader is not None:
-                    names = await reader(node_id)
-                    harness_attached = harness_name.rsplit("/", 1)[-1] in names
-            if active:
-                owns_attachment = False
-            else:
-                task = asyncio.create_task(
-                    transport.ensure_session(
-                        node_id,
-                        cwd=cwd,
-                        environment=environment,
-                        stream=stream,
-                        idle_warning=idle_warning,
-                        idle_reap=idle_reap,
-                    )
-                )
-            await wait_for_attachment()
-            if not harness_attached:
-                injected = await transport.inject_command(
+            # A provider-native command carries its initial prompt. Reset any
+            # durable Herdr pane first so shell setup can never be interpreted
+            # by an old foreground harness as a new user message.
+            await reset_injected_session()
+            task = asyncio.create_task(
+                transport.ensure_session(
                     node_id,
-                    " ".join(shlex.quote(part) for part in command),
+                    cwd=cwd,
                     environment=environment,
+                    stream=stream,
+                    idle_warning=idle_warning,
+                    idle_reap=idle_reap,
                 )
-                if not injected:
-                    raise RuntimeError("Turn could not inject the harness command into Herdr")
+            )
+            await wait_for_attachment()
+            injected = await transport.inject_command(
+                node_id,
+                " ".join(shlex.quote(part) for part in command),
+                environment=environment,
+            )
+            if not injected:
+                raise RuntimeError("Turn could not inject the harness command into Herdr")
         else:
             task = asyncio.create_task(
                 transport.run(
@@ -300,31 +437,13 @@ async def run_until_result(
                 )
             )
         if initial_input:
-            # Native Codex must be started without a positional prompt. Passing
-            # one on the command line makes the CLI run a single non-interactive
-            # turn and exit at the very moment the user should be able to follow up
-            # or correct the result. Send the first message through the PTY so the
-            # process remains the same interactive conversation as a normal `codex`
-            # invocation.
-            for _ in range(50):
-                snapshot = transport.snapshot(node_id)
-                if task is not None and task.done():
-                    break
-                if snapshot.get("active") and snapshot.get("output"):
-                    # Codex's native process becomes writable before its composer
-                    # is painted. Give the TUI a short settling window so the
-                    # first message is not lost in startup noise; sending while a
-                    # TUI is still negotiating capabilities is indistinguishable
-                    # from a user typing into a half-started terminal and is flaky
-                    # across harnesses.
-                    # Herdr first echoes the shell launch command and only
-                    # then transfers the pane's foreground process to the
-                    # harness. The shell echo is not a readiness signal;
-                    # allow the native harness enough time to claim the PTY
-                    # before sending the first prompt.
-                    await asyncio.sleep(6.0 if getattr(transport, "supports_inject", False) else 2.5)
-                    break
-                await asyncio.sleep(0.1)
+            # Machine transports receive their prompt through stdin after the
+            # command starts. Native provider commands carry their prompt in
+            # the launch command and never enter this branch.
+            if getattr(transport, "supports_inject", False):
+                await wait_for_foreground_harness()
+            else:
+                await wait_for_local_process()
             if task is None or not task.done():
                 if initial_input_mode == "stdin":
                     # Non-interactive harnesses launched through Herdr read the
@@ -355,7 +474,6 @@ async def run_until_result(
                         if getattr(transport, "supports_inject", False) and not sent:
                             raise RuntimeError("Turn could not inject the harness prompt into Herdr")
                         await asyncio.sleep(0.01)
-                    await asyncio.sleep(0.25)
                     sent = await transport.write(node_id, "\r")
                     if getattr(transport, "supports_inject", False) and not sent:
                         raise RuntimeError("Turn could not submit the harness prompt in Herdr")
@@ -388,6 +506,21 @@ async def run_until_result(
                         if session_callback is not None:
                             await session_callback(candidate)
             if read_result_file(result_path) is not None:
+                # A provider may finish its first turn before the session
+                # marker is visible in the rollout file. At the completion
+                # boundary the newest session for this cwd is the only new
+                # candidate, so use it as a final discovery pass. The marker
+                # path remains the normal concurrency-safe route.
+                if session_callback is not None and discovered_session is None:
+                    candidate = _new_codex_session_id(
+                        cwd,
+                        started_at,
+                        session_marker=None,
+                        excluded_session_ids=excluded_session_ids,
+                    )
+                    if candidate:
+                        discovered_session = candidate
+                        await session_callback(candidate)
                 if getattr(transport, "supports_inject", False):
                     # The Herdr pane remains attached and inspectable after
                     # a handoff. Only an explicit cancel/close may stop it.

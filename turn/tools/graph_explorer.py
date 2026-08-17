@@ -174,7 +174,7 @@ def _summary(item: dict) -> str:
     if agent:
         config = ", ".join(
             f"{key}={agent.get(key) or 'default'}"
-            for key in ("type_id", "harness", "model", "reasoning", "permission", "session_id")
+            for key in ("type_id", "harness", "model", "reasoning", "session_id")
         )
         line += "\n  agent: " + config
         if agent.get("skills"):

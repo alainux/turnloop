@@ -43,6 +43,7 @@ from turn.workers.herdr import HerdrAdapter
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.mcp.runtime import prepare_runtime
+from turn.skills.library import validate_plan_skill_files
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
 
@@ -72,7 +73,6 @@ class Runner:
         self.s = settings
         self.harness_commands = HarnessCommandFactory(
             codex_binary=settings.codex_binary,
-            codex_args=settings.codex_args,
         )
         self.exec_adapter = execution_adapter or DirectExecutionAdapter(settings)
         self._running: dict[uuid.UUID, asyncio.Task] = {}
@@ -110,7 +110,7 @@ class Runner:
     async def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
 
-    async def stop(self) -> None:
+    async def stop(self, *, close_workspaces: bool = False) -> None:
         self._stop = True
         self._wake.set()
         self._manual_stages.clear()
@@ -137,6 +137,13 @@ class Runner:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if close_workspaces:
+            # Test runtimes own their entire Herdr session. Stopping node
+            # tasks only releases control streams; close the durable test
+            # workspaces too, including mappings for projects already deleted
+            # from the test store. Production shutdown intentionally preserves
+            # project workspaces across a daemon restart.
+            await self.terminal.close_orphaned_project_workspaces(set())
 
     def wake(self) -> None:
         self._wake.set()
@@ -256,24 +263,13 @@ class Runner:
             for node_id, task in mapping.items()
             if not task.done()
         }
-        orphaned_nodes = [
-            node
-            for node in nodes
-            if node.status == NodeStatus.RUNNING and node.id not in active_node_ids
-        ]
         await self.store.cancel_orphaned_runs(project_id, active_node_ids)
 
         # A process restart leaves the provider conversation outside this
-        # Runner process. Never resume that conversation automatically: the
-        # provider may still have an active writer in its durable Herdr pane,
-        # and a second ``resume`` would fail while leaving the graph spinning.
-        # Keep the orphaned pane, but start the next attempt with a fresh
-        # provider session; the prior run remains available in history. The
-        # terminal injection path interrupts any stale shell input first.
-        for orphan in orphaned_nodes:
-            previous = await self._reset_provider_session(orphan.id)
-            if previous:
-                self._forbidden_fresh_sessions[orphan.id] = previous
+        # Runner process, but the persisted provider id is still the source of
+        # truth. The next launch replaces any stale foreground provider
+        # process and resumes that id; only an explicit Run again is allowed
+        # to retire it.
 
         by_id = {node.id: node for node in nodes}
 
@@ -502,8 +498,9 @@ class Runner:
 
         The Herdr pane is the durable conversation boundary. A worker can
         finish its handoff while the native harness remains open for reconnect
-        or a later follow-up. An explicit terminal-close may kill that session;
-        a fresh rerun keeps the pane and injects a new harness call instead.
+        or a later follow-up. The next provider call replaces only the PTY
+        process and resumes the saved provider session by id; Run again is the
+        explicit path that clears that id and starts a new conversation.
         """
         self.terminal.release(node_id)
         node = await self.store.get_node(node_id)
@@ -524,7 +521,8 @@ class Runner:
         ctx.forbidden_session_id = forbidden_session_id
         # The planner and all descendants use the same assigned project
         # directory, so files are immediately available downstream.
-        run = await self.store.create_run(node, PLANNER_EXECUTOR, self._retries.get(node.id, 0) + 1)
+        prior_runs = await self.store.get_runs(node.id)
+        run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
 
@@ -549,6 +547,12 @@ class Runner:
             plan: PlanResult = await planner.plan(ctx)
             if forbidden_session_id and plan.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
+            if ctx.repo_path:
+                validate_plan_skill_files(
+                    plan.model_dump(mode="json"),
+                    ctx.repo_path,
+                    planner_skill_ids=node.agent.skill_ids if node.agent else None,
+                )
             created = await self.store.apply_plan(node, plan)
             submitted = await self.store.add_artifacts(
                 node.id,
@@ -617,7 +621,9 @@ class Runner:
         if worker is None:
             await self._mark_failed(node, f"no worker registered for executor '{node.executor}'")
             return
-        run = await self.store.create_run(node, worker.name, self._retries.get(node.id, 0) + 1)
+        prior_runs = await self.store.get_runs(node.id)
+        run = await self.store.create_run(node, worker.name, len(prior_runs) + 1)
+        ctx.attempt = run.attempt
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
 
@@ -849,81 +855,22 @@ class Runner:
             "Continue the responsible node through Turn after addressing these findings; the project execution mode controls when the refinement runs.",
         ]
         message = "\n".join(lines)
-        if getattr(self.terminal, "supports_inject", False):
-            process_reader = getattr(self.terminal, "foreground_process_names", None)
-            process_names = await process_reader(target.id) if process_reader is not None else ()
-            harness_name = (
-                target.agent.harness.value
-                if target.agent is not None
-                else None
-            )
-            if harness_name not in process_names:
-                # A completed native harness may have returned to the shell.
-                # Resume the exact session stored on this selected target;
-                # never select a global or most-recent session.
-                session_id = target.agent.session_id if target.agent is not None else None
-                command = (
-                    self._reconnect_command(target, repo, session_id)
-                    if session_id
-                    else None
-                )
-                if command is None:
-                    raise RuntimeError(
-                        f"cannot deliver rejection to node {target.id}: "
-                        "its Herdr pane is not running the selected harness and "
-                        "the node has no persisted session id"
-                    )
-                if not self.terminal.snapshot(target.id).get("active"):
-                    task = asyncio.create_task(
-                        self.terminal.ensure_session(
-                            target.id,
-                            cwd=repo,
-                            environment={"TURN_PROJECT_ID": str(target.project_id)},
-                            idle_warning=self.s.terminal_idle_warning_seconds,
-                            idle_reap=self.s.terminal_idle_reap_seconds,
-                        )
-                    )
-                    for _ in range(100):
-                        if self.terminal.snapshot(target.id).get("active"):
-                            break
-                        if task.done():
-                            break
-                        await asyncio.sleep(0.01)
-                injected = await self.terminal.inject_command(
-                    target.id,
-                    " ".join(shlex.quote(part) for part in command),
-                    environment={"TURN_PROJECT_ID": str(target.project_id)},
-                )
-                if not injected:
-                    raise RuntimeError(
-                        f"could not resume node {target.id}'s persisted harness session"
-                    )
-                found_harness = False
-                for _ in range(100):
-                    process_reader = getattr(self.terminal, "foreground_process_names", None)
-                    process_names = (
-                        await process_reader(target.id)
-                        if process_reader is not None
-                        else ()
-                    )
-                    if harness_name in process_names:
-                        found_harness = True
-                        break
-                    await asyncio.sleep(0.05)
-                if not found_harness:
-                    raise RuntimeError(
-                        f"node {target.id}'s persisted harness session did not become active"
-                    )
-            paste = f"\x1b[200~{message}\x1b[201~"
-            for offset in range(0, len(paste), 512):
-                if not await self.terminal.write(target.id, paste[offset : offset + 512]):
-                    raise RuntimeError(
-                        f"could not deliver rejection to node {target.id}'s Herdr conversation"
-                    )
-                await asyncio.sleep(0.01)
-            if not await self.terminal.write(target.id, "\r"):
+        # The process-level fake has no durable shell pane when tests inject
+        # a LocalPtyTransport, but its provider session is still meaningful:
+        # launch a fresh fake process with the retained session id so the
+        # rejection path exercises the same command boundary as native
+        # harnesses.
+        if target.agent is not None and target.agent.harness is HarnessKind.FAKE:
+            if not await self.reconnect(target.id, prompt=message):
                 raise RuntimeError(
-                    f"could not submit rejection feedback to node {target.id}'s Herdr conversation"
+                    f"could not launch fake rejection follow-up for node {target.id}"
+                )
+            return
+        if getattr(self.terminal, "supports_inject", False):
+            if not await self.reconnect(target.id, prompt=message):
+                raise RuntimeError(
+                    f"could not launch rejection follow-up for node {target.id}'s "
+                    "persisted harness session"
                 )
             return
 
@@ -1079,46 +1026,71 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return
-        if node.status == NodeStatus.FAILED:
+        if node.status in {NodeStatus.FAILED, NodeStatus.COMPLETE}:
             self._retries[node.id] = 0
-            await self.terminal.stop(node_id)
-            previous = await self._reset_provider_session(node_id)
-            if previous:
-                self._forbidden_fresh_sessions[node_id] = previous
-            await self.store.clear_generated_artifacts(node_id)
-            await self.store.set_status(node_id, NodeStatus.RUNNABLE)
-            await self._emit("node.updated", node.project_id, _dump(node))
+            refreshed = await self._prepare_fresh_run(node_id)
+            if refreshed is not None:
+                await self._emit("node.updated", refreshed.project_id, _dump(refreshed))
             self.wake()
 
-    def _reconnect_command(self, node: Node, cwd: str, session_id: str) -> list[str] | None:
+    def _reconnect_command(
+        self,
+        node: Node,
+        cwd: str,
+        session_id: str,
+        *,
+        prompt: str | None = None,
+    ) -> list[str] | None:
         """Build a native interactive command for a stored provider session."""
         agent = node.agent
         if agent is None:
             return None
+        if agent.harness is HarnessKind.FAKE:
+            # The process-level fake is test-only and intentionally does not
+            # belong in the real provider command catalog. It still needs an
+            # explicit reconnect command so rejection flows exercise the same
+            # retained-session lifecycle as native harnesses.
+            from turn.workers.fake_harness import fake_harness_script
+
+            command = [fake_harness_script(), "--reconnect", session_id]
+            return [*command, prompt] if prompt is not None else command
         runtime = prepare_runtime(cwd, node.id, agent)
         return self.harness_commands.reconnect_command(
             agent,
             cwd,
             session_id,
+            prompt=prompt,
             mcp_config=runtime.claude_config,
         )
 
-    async def reconnect(self, node_id: uuid.UUID) -> bool:
-        """Reopen the last provider conversation without rerunning the node."""
+    async def reconnect(
+        self, node_id: uuid.UUID, *, prompt: str | None = None
+    ) -> bool:
+        """Reopen the last provider conversation, optionally with a follow-up."""
         node = await self.store.get_node(node_id)
         if node is None:
             return False
-        if self.terminal.snapshot(node_id).get("active"):
+        if prompt is None and self.terminal.snapshot(node_id).get("active"):
             return True
         existing = self._reconnect_tasks.get(node_id)
         if existing is not None and not existing.done():
             return True
         cwd = await self._project_repo(node.project_id)
+        if prompt is not None:
+            # A follow-up is a new provider process with the same conversation
+            # id. Close any existing provider/pane first so the prompt is
+            # delivered through the provider's launch command, never into a
+            # stale composer.
+            await self.terminal.close_persistent_session(node_id)
         persistent_exists = await self.terminal.has_persistent_session(node_id)
         command: list[str] | None = None
-        if not persistent_exists:
+        if prompt is not None or not persistent_exists:
             session_id = node.agent.session_id if node.agent else None
-            command = self._reconnect_command(node, cwd, session_id) if cwd and session_id else None
+            command = (
+                self._reconnect_command(node, cwd, session_id, prompt=prompt)
+                if cwd and session_id
+                else None
+            )
             if not command:
                 return False
 
@@ -1266,7 +1238,13 @@ class Runner:
                     if snapshot.get("active"):
                         break
                     await asyncio.sleep(0.02)
-                if not task.done() and command and command != ["true"] and not existed:
+                # Herdr's pane is the durable process boundary. The short
+                # control task may finish while the pane remains valid, so
+                # its completion is not evidence that the command cannot be
+                # delivered. Prompted reconnects already closed the old pane;
+                # inject into the newly attached pane regardless of that
+                # control-task race.
+                if command and command != ["true"] and not existed:
                     await self.terminal.inject_command(
                         node.id,
                         " ".join(shlex.quote(part) for part in command),
@@ -1311,8 +1289,14 @@ class Runner:
             return
         reconnect = self._reconnect_tasks.get(node_id)
         if reconnect is not None and not reconnect.done():
+            # A follow-up runs in a separate reconnect task, but Stop has the
+            # same lifecycle meaning as it does for a normal worker: terminate
+            # the provider and make the next user action an explicit fresh run.
+            await self.terminal.stop(node_id)
             reconnect.cancel()
             await asyncio.gather(reconnect, return_exceptions=True)
+            await self.store.set_status(node_id, NodeStatus.CANCELLED)
+            await self._emit("node.updated", node.project_id, _dump(await self.store.get_node(node_id)))
             self.wake()
             return
         task = self._running.get(node_id)
@@ -1442,22 +1426,31 @@ class Runner:
             return None
         if node.project_id in self._deleting_projects:
             return None
-        if node.id in self._running:
-            return None
+        # Outcome handling persists the next runnable projection before the
+        # owning task reaches its finally block. If a user clicks Run in that
+        # narrow window, wait for cleanup and re-read the node instead of
+        # returning a false no-op for a valid retry.
+        existing = self._running.get(node.id)
+        if existing is not None:
+            await asyncio.gather(existing, return_exceptions=True)
+            node = await self.store.get_node(node_id)
+            if node is None:
+                return None
         if node.status in (
             NodeStatus.COMPLETE,
             NodeStatus.FAILED,
             NodeStatus.RUNNING,
         ):
             return None
-        # Revive a cancelled or paused node so the user can run it again.
+        # A manual stop is an explicit fresh-run boundary. Close the durable
+        # provider pane and retire its session before reviving the node. This
+        # is intentionally limited to CANCELLED: rejection follow-ups use the
+        # retained-session reconnect path, while retry() handles the other
+        # terminal states through the same fresh-run preparation.
         if node.status == NodeStatus.CANCELLED:
-            await self.terminal.close_persistent_session(node_id)
-            previous = await self._reset_provider_session(node_id)
-            if previous:
-                self._forbidden_fresh_sessions[node_id] = previous
-            await self.store.clear_generated_artifacts(node_id)
-            await self.store.set_status(node_id, NodeStatus.RUNNABLE)
+            node = await self._prepare_fresh_run(node_id)
+            if node is None:
+                return None
         if node.paused:
             await self.store.set_paused(node_id, False)
         if node.project_id in self._deleting_projects:
@@ -1563,9 +1556,6 @@ class Runner:
         if n is None:
             return
         await self.store.set_status(node.id, NodeStatus.CANCELLED)
-        previous = await self._reset_provider_session(node.id)
-        if previous:
-            self._forbidden_fresh_sessions[node.id] = previous
         updated = await self.store.get_node(node.id)
         await self._emit("node.updated", n.project_id, _dump(updated or n))
 
@@ -1579,6 +1569,19 @@ class Runner:
             fresh.agent.session_id = None
             await self.store._save_node(fresh)
         return previous
+
+    async def _prepare_fresh_run(self, node_id: uuid.UUID) -> Node | None:
+        """Reset a terminal node for a new prompt-driven harness launch."""
+        node = await self.store.get_node(node_id)
+        if node is None:
+            return None
+        await self.terminal.close_persistent_session(node_id)
+        previous = await self._reset_provider_session(node_id)
+        if previous:
+            self._forbidden_fresh_sessions[node_id] = previous
+        await self.store.clear_generated_artifacts(node_id)
+        await self.store.set_status(node_id, NodeStatus.RUNNABLE)
+        return await self.store.get_node(node_id)
 
     async def _mark_failed(self, node: Node, error: str) -> None:
         await self.store.set_status(node.id, NodeStatus.FAILED)

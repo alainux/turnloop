@@ -47,6 +47,9 @@ class NodeExecutionContext(BaseModel):
     # explicit fresh attempt; workers use it to reject a provider that reports
     # the old identity anyway.
     forbidden_session_id: str | None = None
+    # One-based durable run number, used by deterministic fixtures to model
+    # first-pass/retry behavior without inspecting persistence internals.
+    attempt: int = 1
     interactive_terminal: bool = False
     timeout_seconds: float | None = None
     stall_timeout_seconds: float | None = None
@@ -84,7 +87,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         lines.append(f"- Turn node id: {ctx.node.id}")
         lines.append(
             f"- harness: {agent.harness.value}; model: {agent.model or 'harness default'}; "
-            f"reasoning: {agent.reasoning.value}; permission: {agent.permission.value}"
+            f"reasoning: {agent.reasoning.value}"
         )
         try:
             declared = REAL_HARNESS_CATALOG.definition(agent.harness).capabilities
@@ -114,10 +117,11 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
                 )
             )
         lines.append(
-            "- Use `turn skills list` and `turn skills show <id>` for local skills; "
-            "external references are installed under `.turn/skills` and their "
-            "paths are listed in TURN_AGENT_SKILLS. Skill text is delivered "
-            "through the project filesystem, not appended to this initial prompt."
+            "- Use `turn skills list`, `turn skills show <id>`, and "
+            "`turn skills install <id>` for library skills. The planner owns "
+            "installing every selected skill under `.turn/skills`; paths are "
+            "listed in TURN_AGENT_SKILLS. Skill text is delivered through the "
+            "project filesystem, not appended to this initial prompt."
         )
         lines.append(
             "- Project-authored skills use `project:<slug>` and live at "

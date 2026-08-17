@@ -410,6 +410,9 @@ class CLIHarnessWorker(Worker):
         except ValueError as error:
             return WorkerResult(outcome=Outcome.FAIL, summary=str(error), error=str(error))
         transport = ctx.terminal or LocalPtyTransport()
+        # A Herdr pane is still a real interactive terminal. Its injection
+        # capability controls transport delivery only; each provider keeps
+        # its native interactive command and screen.
         native = isinstance(transport, LocalPtyTransport)
         result_path: Path
         environment: dict[str, str]
@@ -499,7 +502,6 @@ class CLIHarnessWorker(Worker):
                     if ctx.forbidden_session_id
                     else None,
                     harness_name=binary,
-                    initial_input=prompt,
                     environment=environment,
                 )
             elif getattr(transport, "supports_inject", False):

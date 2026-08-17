@@ -22,7 +22,6 @@ from turn.domain.schemas import (
     NodeSpec,
     Outcome,
     PlanResult,
-    PermissionMode,
     ReasoningLevel,
     VerificationResult,
     WorkerResult,
@@ -32,6 +31,7 @@ from turn.workers.interactive import (
     agent_environment,
     format_verification_result,
     prepare_result_file,
+    read_codex_session_usage,
     read_result_file,
     result_handoff,
     run_until_result,
@@ -61,6 +61,9 @@ class CodexWorker(Worker):
             )
         cwd = repo
         transport = ctx.terminal or LocalPtyTransport()
+        # HerdrPtyTransport intentionally subclasses LocalPtyTransport: both
+        # expose a real interactive PTY. Injection is only how Turn reaches
+        # that PTY; it must not switch Codex to JSON/exec output.
         native = isinstance(transport, LocalPtyTransport)
         agent = ctx.node.agent
         verification = bool(agent and agent.type_id is AgentType.VERIFIER)
@@ -74,18 +77,6 @@ class CodexWorker(Worker):
             result_path=result_path,
             verification=verification,
         )
-
-        permission = agent.permission if agent else PermissionMode.WORKSPACE
-        configured_bypass = any("bypass" in a for a in self.s.codex_args)
-        bypass = configured_bypass or permission == PermissionMode.FULL
-        if bypass:
-            permission_flags = ["--dangerously-bypass-approvals-and-sandbox"]
-        elif permission == PermissionMode.ASK:
-            permission_flags = ["-s", "workspace-write"]
-        else:
-            # The current Codex CLI treats --approve-for-me as the
-            # workspace-write approval mode; combining it with -s is rejected.
-            permission_flags = ["--approve-for-me"]
 
         model = agent.model if agent and agent.model else self.s.codex_model
         model_flags = ["-m", model] if model else []
@@ -106,41 +97,32 @@ class CodexWorker(Worker):
             if ctx.session_callback is not None:
                 await ctx.session_callback(session)
         if native:
-            # `codex` without a subcommand is the native interactive TUI. The
-            # JSONL `exec` subcommand is intentionally kept only for injected
-            # test transports and non-interactive compatibility adapters.
-            native_args = [
-                a for a in self.s.codex_args
-                if a not in {
-                    "--skip-git-repo-check", "exec", "resume",
-                } and "bypass" not in a
-            ]
+            # `codex` without a subcommand is the native interactive TUI. Its
+            # positional prompt starts the first turn without a PTY race; the
+            # JSONL `exec` subcommand is kept only for machine transports.
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *mcp_flags, *permission_flags, "--no-alt-screen", "-C", cwd,
-                    *native_args, session_id,
+                    *mcp_flags, "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *mcp_flags, *permission_flags, "--no-alt-screen", "-C", cwd,
-                    *native_args,
+                    *mcp_flags, "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
             # Continue the same conversation when the runner resumes a node.
             # Resume has a deliberately smaller flag surface than a fresh exec.
-            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else permission_flags
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
-                *mcp_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
+                *mcp_flags, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
-                self.s.codex_binary, "exec", *model_flags, *reasoning_flags, *permission_flags,
-                *mcp_flags, "-C", cwd, *[a for a in self.s.codex_args if "bypass" not in a], prompt_arg,
+                self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
+                *mcp_flags, "-C", cwd, prompt_arg,
             ]
 
         structured_text = ""
@@ -162,7 +144,6 @@ class CodexWorker(Worker):
                     if ctx.forbidden_session_id
                     else None,
                     harness_name=self.s.codex_binary,
-                    initial_input=prompt,
                     environment=environment,
                 )
             elif getattr(transport, "supports_inject", False):
@@ -216,6 +197,7 @@ class CodexWorker(Worker):
             submitted = read_result_file(result_path)
             if submitted is not None:
                 structured_text = json.dumps(submitted)
+            usage = read_codex_session_usage(discovered_session or session_id)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -265,6 +247,7 @@ class CodexWorker(Worker):
                 summary=decision.summary,
                 verification=decision,
                 session_id=discovered_session or session_id,
+                usage=usage,
                 artifacts=[ArtifactSpec(
                     kind=ArtifactKind.TEXT,
                     name="verification-result",
@@ -287,6 +270,7 @@ class CodexWorker(Worker):
                     summary=decision.summary,
                     verification=decision,
                     session_id=discovered_session or session_id,
+                    usage=usage,
                     artifacts=[ArtifactSpec(
                         kind=ArtifactKind.TEXT,
                         name="verification-result",
@@ -302,6 +286,7 @@ class CodexWorker(Worker):
         text = structured_text
         result = self._parse_result(text)
         result.session_id = discovered_session or session_id
+        result.usage = usage
         result.artifacts.insert(
             0,
             ArtifactSpec(

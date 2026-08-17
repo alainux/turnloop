@@ -152,23 +152,26 @@ active Herdr conversation and is not added to the graph.
 
 Before submitting, run `turn skills show find-skills`. Search the web or the
 documented skills catalog for each concrete executor, integrator, and verifier;
-do not invent a plan from intuition alone. Inspect the candidate, select the
-smallest useful local id or direct HTTP(S) skill URL, and put that reference in
-the node's `skills` array. If no suitable skill exists, author a concise,
-frontmatter-valid `.turn/skills/<slug>/SKILL.md` and reference it as
-`project:<slug>`. The server installs URL references into the current project's
-`.turn/skills` directory before launch. Do not paste skill bodies into prompts.
+do not invent a plan from intuition alone. Inspect the candidate. Install a
+selected built-in with `turn skills install <id>`. For an external skill, use
+available tools to copy it into `.turn/skills/<slug>/` and put only
+`project:<slug>` in the node's `skills` array. Never submit a URL or a skill
+whose `SKILL.md` is not already present. If no suitable skill exists, leave the
+additional `skills` array empty unless the project genuinely needs reusable
+domain or method guidance. Never create a skill just to carry the user's
+request or a node assignment. Do not paste skill bodies into prompts.
 Record the sources actually consulted in the project document when research is
 part of the plan.
 
-Treat this as a submission gate, not a suggestion: every concrete executor,
-integrator, and verifier must have at least one deliberate skill reference in
-its `skills` array. The built-in agent skill is necessary but is not evidence
-that the domain was researched. Prefer a narrow domain skill, a visual QA or
-runtime skill where appropriate, or a concise project-authored skill when the
-search finds no suitable reusable guidance. A worker must be able to find the
-selected skill in the project filesystem at launch and must be told what
-contract it is meant to improve.
+Treat this as a research gate, not a requirement to manufacture a skill:
+every concrete executor, integrator, and verifier should receive a deliberate
+additional skill reference when research finds guidance that materially
+improves its work. The built-in agent skill is sufficient when it does not.
+Prefer a narrow domain skill or a visual QA/runtime skill where appropriate;
+do not create a project skill merely to fill the field. A worker must be able
+to find any selected skill in the project filesystem at launch and must be
+told what contract it is meant to improve. The worker's objective and prompt
+are delivered separately, and the live graph is available through Turn.
 
 For visual, spatial, game, brand, or interaction-heavy work, use the
 project-scoped imagegen skill to create a purposeful reference when it would

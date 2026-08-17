@@ -274,6 +274,19 @@ async def test_herdr_scroll_targets_the_node_pane_not_the_control_stream(tmp_pat
     }
 
 
+async def test_herdr_wait_until_ready_uses_pane_output_signal(tmp_path):
+    adapter = FakeHerdrAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    node_id = uuid.uuid4()
+
+    assert await transport.ensure_persistent_shell(node_id, cwd=str(tmp_path))
+    await transport.wait_until_ready(node_id)
+
+    assert adapter.wait_outputs == [
+        (transport.pane_id(node_id), ".", "recent-unwrapped", None)
+    ]
+
+
 
 async def test_local_pty_bounds_completed_reconnect_snapshots(tmp_path):
     transport = LocalPtyTransport(backlog_limit=256, completed_session_limit=2)
@@ -306,4 +319,39 @@ def test_herdr_transport_scopes_nodes_to_project_workspaces(tmp_path):
     assert transport._project_key(str(tmp_path), None).startswith("path:")
     assert transport._control_command("w1:p1")[-4:] == [
         "--cols", "80", "--rows", "24"
+    ]
+
+
+async def test_herdr_atomic_pane_commands_accept_empty_cli_responses(tmp_path):
+    log = tmp_path / "herdr-commands.log"
+    binary = tmp_path / "herdr"
+    binary.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {str(log)!r}\n"
+    )
+    binary.chmod(0o755)
+    adapter = HerdrCliAdapter(str(binary))
+
+    assert await adapter.send_keys("w1:p1", ("ctrl+c",))
+    assert await adapter.run_command("w1:p1", "export X=1; codex")
+    assert log.read_text().splitlines() == [
+        "pane send-keys w1:p1 ctrl+c",
+        "pane run w1:p1 export X=1; codex",
+    ]
+
+
+async def test_herdr_output_wait_uses_native_wait_command(tmp_path):
+    log = tmp_path / "herdr-commands.log"
+    binary = tmp_path / "herdr"
+    binary.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {str(log)!r}\n"
+        "printf '%s\\n' '{\"result\":{}}'\n"
+    )
+    binary.chmod(0o755)
+    adapter = HerdrCliAdapter(str(binary))
+
+    assert await adapter.wait_for_output("w1:p1")
+    assert log.read_text().splitlines() == [
+        "pane wait-output w1:p1 --regex . --source recent-unwrapped",
     ]

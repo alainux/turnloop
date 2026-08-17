@@ -58,6 +58,10 @@ async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
             agent=AgentConfig(harness=HarnessKind.ECHO),
             run_policy=RunPolicy(auto_run=False),
         )
+        from turn.skills.library import SKILLS, install_builtin_skill
+
+        for skill_id in SKILLS:
+            install_builtin_skill(skill_id, project.repo_path)
         nodes = await core.run_until_settled(project.id, max_rounds=100)
         root = next(node for node in nodes if node.id == project.id)
         assert root.auto_run is True
@@ -117,3 +121,53 @@ def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, 
     ])
     with pytest.raises(SystemExit, match="invalid plan submission"):
         agent_command(args)
+
+
+def test_agent_cli_rejects_a_plan_skill_missing_from_the_project(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.plan.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_REPO", str(tmp_path))
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan",
+        "--payload", (
+            '{"nodes":[{"key":"work","objective":"Work",'
+            '"skills":["project:visual-qa"]}]}'
+        ),
+    ])
+
+    with pytest.raises(SystemExit, match="project:visual-qa.*not installed"):
+        agent_command(args)
+    assert not handoff.exists()
+
+
+def test_agent_cli_requires_builtin_skill_files_in_the_project(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+    from turn.skills.library import install_builtin_skill
+
+    handoff = tmp_path / "node.plan.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_REPO", str(tmp_path))
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan",
+        "--payload", (
+            '{"nodes":[{"key":"work","objective":"Work",'
+            '"skills":["imagegen"]}]}'
+        ),
+    ])
+
+    install_builtin_skill("imagegen", tmp_path)
+    install_builtin_skill("turn-executing", tmp_path)
+    assert agent_command(args) == 0
+    assert json.loads(handoff.read_text())["nodes"][0]["skills"] == ["imagegen"]
+
+
+async def test_skills_cli_installs_a_builtin_into_turn_repo(tmp_path, monkeypatch):
+    from turn.__main__ import async_main
+
+    monkeypatch.setenv("TURN_REPO", str(tmp_path))
+    args = parser().parse_args(["skills", "install", "imagegen"])
+
+    assert await async_main(args) == 0
+    assert (tmp_path / ".turn" / "skills" / "imagegen" / "SKILL.md").is_file()

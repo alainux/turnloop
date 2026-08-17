@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import uuid
 
 import pytest
@@ -11,6 +12,8 @@ from turn.db.store import Store
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
+    ArtifactKind,
+    ArtifactSpec,
     EdgeType,
     HarnessKind,
     NodeStatus,
@@ -31,6 +34,7 @@ from turn.__main__ import agent_command, parser
 from turn.workers.interactive import format_verification_result
 from turn.workers.echo_worker import EchoWorker
 from turn.workers.registry import WorkerRegistry
+from turn.workers.terminal import TerminalResult
 
 
 def test_verifier_contract_requires_one_dependency_target_and_is_strict():
@@ -360,19 +364,54 @@ class ActiveHerdrConversation:
 
     def __init__(self):
         self.writes: list[str | bytes] = []
+        self.commands: list[str] = []
+        self.closed = False
+        self.active = True
+        self.persistent = True
+        self.injected = asyncio.Event()
+        self.released = asyncio.Event()
 
     def snapshot(self, node_id):
-        return {"active": True, "output": ""}
+        return {"active": self.active, "output": ""}
 
     async def foreground_process_names(self, node_id):
-        return ("codex",)
+        return ("codex",) if self.active else ("zsh",)
+
+    async def close_persistent_session(self, node_id):
+        self.closed = True
+        self.active = False
+        self.persistent = False
+        return True
+
+    async def has_persistent_session(self, node_id):
+        return self.persistent
+
+    async def ensure_session(self, node_id, **kwargs):
+        self.active = True
+        self.persistent = True
+        await self.released.wait()
+        return TerminalResult(returncode=0, output=b"")
+
+    async def inject_command(self, node_id, command, **kwargs):
+        self.commands.append(command)
+        self.injected.set()
+        return True
 
     async def write(self, node_id, data):
         self.writes.append(data)
         return True
 
 
-async def test_rejection_is_pasted_into_the_target_node_session(tmp_path):
+    async def stop(self, node_id):
+        self.active = False
+        self.released.set()
+        return True
+
+    def release(self, node_id):
+        return False
+
+
+async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path):
     store = Store(tmp_path / "state")
     await store.init()
     root = await store.create_project("Build a verified product", repo_path=str(tmp_path))
@@ -389,6 +428,10 @@ async def test_rejection_is_pasted_into_the_target_node_session(tmp_path):
         session_id="node-owned-session",
     )
     await store._save_node(work)
+    await store.add_artifacts(
+        work.id,
+        [ArtifactSpec(kind=ArtifactKind.TEXT, name="existing-result", content="kept")],
+    )
     transport = ActiveHerdrConversation()
     runner = Runner(
         store,
@@ -407,10 +450,22 @@ async def test_rejection_is_pasted_into_the_target_node_session(tmp_path):
             required_changes=["Fix the entry point"],
         ),
     )
-    combined = "".join(value.decode() if isinstance(value, bytes) else value for value in transport.writes)
-    assert "\x03" not in combined
-    assert "\x1b[200~TURN VERIFICATION REJECTED" in combined
-    assert transport.writes[-1] == "\r"
+    await asyncio.wait_for(transport.injected.wait(), timeout=1)
+    try:
+        command = shlex.split(transport.commands[-1])
+        assert transport.closed
+        assert command[:2] == ["codex", "resume"]
+        assert "node-owned-session" in command
+        assert "TURN VERIFICATION REJECTED" in command[-1]
+        refreshed = await store.get_node(work.id)
+        assert refreshed.agent.session_id == "node-owned-session"
+        artifacts = await store.get_artifacts(work.id)
+        assert [artifact.name for artifact in artifacts] == ["existing-result"]
+    finally:
+        await runner.terminal.stop(work.id)
+        reconnect = runner._reconnect_tasks.get(work.id)
+        if reconnect is not None:
+            await asyncio.gather(reconnect, return_exceptions=True)
     await store.dispose()
 
 

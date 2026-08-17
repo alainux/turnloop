@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 REAL_HARNESSES = frozenset({"codex", "claude", "opencode", "pi"})
-TEST_ONLY_PLANNERS = frozenset({"heuristic"})
-TEST_ONLY_EXECUTORS = frozenset({"echo"})
+TEST_ONLY_PLANNERS = frozenset({"heuristic", "echo", "fake"})
+TEST_ONLY_EXECUTORS = frozenset({"echo", "fake"})
 
 
 def test_modes_enabled() -> bool:
@@ -25,7 +25,6 @@ def _default_agent_defaults() -> dict[str, dict[str, str]]:
         "harness": os.getenv("TURN_DEFAULT_EXECUTOR", "codex"),
         "model": os.getenv("TURN_CODEX_MODEL", ""),
         "reasoning": os.getenv("TURN_REASONING", "default"),
-        "permission": os.getenv("TURN_PERMISSION", "workspace"),
     }
     return {
         role: dict(shared)
@@ -36,8 +35,9 @@ def _default_agent_defaults() -> dict[str, dict[str, str]]:
 def validate_server_settings(config: "Settings") -> None:
     """Reject deterministic/test-only modes at the served-app boundary."""
     if config.planner in TEST_ONLY_PLANNERS:
+        planner_name = f"{config.planner} planning"
         raise RuntimeError(
-            "heuristic planning is test-only; the served app requires TURN_PLANNER=codex"
+            f"{planner_name} is test-only; the served app requires TURN_PLANNER=codex"
         )
     if config.planner != "codex":
         raise RuntimeError(
@@ -133,12 +133,6 @@ class Settings:
     )
     default_reasoning: str = field(
         default_factory=lambda: os.getenv("TURN_REASONING", "default")
-    )
-    default_permission: str = field(
-        default_factory=lambda: os.getenv("TURN_PERMISSION", "workspace")
-    )
-    codex_args: list[str] = field(
-        default_factory=lambda: os.getenv("TURN_CODEX_ARGS", "").split()
     )
     default_executor: str = field(
         default_factory=lambda: os.getenv("TURN_DEFAULT_EXECUTOR", "codex")

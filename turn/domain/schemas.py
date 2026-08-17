@@ -143,6 +143,7 @@ class HarnessKind(str, Enum):
     OPENCODE = "opencode"
     PI = "pi"
     ECHO = "echo"
+    FAKE = "fake"
     SHELL = "shell"
 
 
@@ -153,12 +154,6 @@ class ReasoningLevel(str, Enum):
     HIGH = "high"
     XHIGH = "xhigh"
     MAX = "max"
-
-
-class PermissionMode(str, Enum):
-    ASK = "ask"
-    WORKSPACE = "workspace"
-    FULL = "full"
 
 
 class MCPTransport(str, Enum):
@@ -309,8 +304,7 @@ class Agent(BaseModel):
     harness: HarnessKind = HarnessKind.CODEX
     model: Optional[str] = None
     reasoning: ReasoningLevel = ReasoningLevel.DEFAULT
-    permission: PermissionMode = PermissionMode.WORKSPACE
-    # ``skills`` is the materialized filesystem view used by harness adapters.
+    # ``skills`` is the project filesystem view used by harness adapters.
     # ``skill_ids`` is the stable graph/library contract and is project-scoped
     # into the project's .turn/skills directory before a harness is launched.
     skills: list[str] = Field(default_factory=list)
@@ -665,8 +659,8 @@ class NodeSpec(BaseModel):
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
     artifacts: list["ArtifactSpec"] = Field(default_factory=list)
-    # Local library ids or HTTP(S) URLs requested for this worker; the server
-    # materializes them into the current project's .turn/skills scope.
+    # Local library ids or project:<slug> references installed by the planner
+    # into the current project's .turn/skills scope.
     skills: list[str] = Field(default_factory=list)
     # Researched MCP assignments. The server preserves source_url for audit
     # and renders explicit runtime definitions through the selected harness.

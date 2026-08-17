@@ -17,6 +17,7 @@ import {
   displayProjectTitle,
   isGraph,
   primaryNodeAction,
+  primaryNodeActionIcon,
   primaryNodeActionLabel,
   tokens,
 } from "./domain";
@@ -44,7 +45,6 @@ const emptyAgent: Agent = {
   harness: "codex",
   model: null,
   reasoning: "default",
-  permission: "workspace",
   skills: [],
   skill_ids: [],
   tools: [],
@@ -58,7 +58,6 @@ type AgentDefault = {
   harness: HarnessId;
   model: string;
   reasoning: Reasoning;
-  permission: string;
 };
 
 const AGENT_ROLES: Array<{ id: AgentRole; label: string }> = [
@@ -80,7 +79,6 @@ function agentDefaultsFromSettings(settings: Record<string, unknown>): Record<Ag
         harness: String(value.harness ?? "codex") as HarnessId,
         model: String(value.model ?? ""),
         reasoning: String(value.reasoning ?? "default") as Reasoning,
-        permission: String(value.permission ?? "workspace"),
       }];
     }),
   ) as Record<AgentRole, AgentDefault>;
@@ -611,7 +609,15 @@ export default function App() {
                   .catch((error) => notify(String(error)));
               }}
             >
-              <Icon name="circle-play" /> {primaryNodeActionLabel(primaryNodeAction(nodeMenu.node) ?? "run")}
+              <Icon
+                name={primaryNodeActionIcon(
+                  primaryNodeAction(nodeMenu.node) ?? "run",
+                  nodeMenu.node.ui_state === "cancelled",
+                )}
+              /> {primaryNodeActionLabel(
+                primaryNodeAction(nodeMenu.node) ?? "run",
+                nodeMenu.node.ui_state === "cancelled",
+              )}
             </button>
           )}
         </div>
@@ -995,7 +1001,6 @@ function Author({
       harness: harness.id,
       model: model?.id ?? value.model,
       reasoning: reasoning as Reasoning,
-      permission: plannerDefaults.permission as Agent["permission"],
     }));
     // New projects must inherit the workspace defaults exposed by Settings.
     // Previously only the agent defaults were applied, so changing the
@@ -1190,23 +1195,6 @@ function Author({
                   placeholder="Derived from objective"
                 />
               </label>
-              <label className="field">
-                <span>Permissions</span>
-                <select
-                  value={agent.permission}
-                  onChange={(event) =>
-                    setAgent({
-                      ...agent,
-                      permission: event.target
-                        .value as Agent["permission"],
-                    })
-                  }
-                >
-                  <option value="ask">Ask</option>
-                  <option value="workspace">Workspace</option>
-                  <option value="full">Full access</option>
-                </select>
-              </label>
             </div>
             <div className="run-options">
               <label className="check">
@@ -1239,8 +1227,7 @@ function Author({
         )}
       </form>
       <p className="author-disclaimer">
-              Agents act directly in the assigned project directory. Check
-              permissions before starting.
+        Agents act directly in the assigned project directory.
       </p>
     </section>
   );

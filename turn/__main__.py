@@ -73,6 +73,10 @@ def parser() -> argparse.ArgumentParser:
     skills_sub.add_parser("list", help="list available skill ids")
     show_skill = skills_sub.add_parser("show", help="print one skill")
     show_skill.add_argument("skill_id")
+    install_skill = skills_sub.add_parser(
+        "install", help="copy one built-in skill into the current project"
+    )
+    install_skill.add_argument("skill_id")
     sub.add_parser("doctor", help="show available coding harnesses")
     return root
 
@@ -144,7 +148,18 @@ def agent_command(args) -> int:
     kind = "verification" if args.agent_command == "verify" else args.kind
     value = _read_agent_object(args)
     try:
-        validate_agent_submission(kind, value)
+        validated = validate_agent_submission(kind, value)
+        if kind == "plan":
+            from turn.skills.library import validate_plan_skill_files
+
+            validate_plan_skill_files(
+                validated.model_dump(mode="json"),
+                os.getenv("TURN_REPO"),
+                planner_skill_ids=[
+                    item for item in os.getenv("TURN_AGENT_SKILL_IDS", "").split(",")
+                    if item
+                ],
+            )
     except (TypeError, ValueError) as error:
         detail = (
             compact_validation_error(error)
@@ -232,7 +247,7 @@ async def async_main(args) -> int:
         print(json.dumps({"harnesses": harness_capabilities()}, indent=2))
         return 0
     if args.command == "skills":
-        from turn.skills.library import get_skill, list_skills
+        from turn.skills.library import get_skill, install_builtin_skill, list_skills
 
         if args.skills_command == "list":
             print(json.dumps([
@@ -244,6 +259,11 @@ async def async_main(args) -> int:
                 }
                 for item in list_skills()
             ], indent=2))
+            return 0
+        if args.skills_command == "install":
+            project_root = os.getenv("TURN_REPO") or str(Path.cwd())
+            target = install_builtin_skill(args.skill_id, project_root)
+            print(str(target))
             return 0
         item = get_skill(args.skill_id)
         print(item.source_path.read_text(encoding="utf-8"))

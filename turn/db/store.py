@@ -573,7 +573,7 @@ class Store:
                 # Inspector saves usually send the editable configuration
                 # without the runtime session id. Do not accidentally erase
                 # the resumable conversation while changing model, reasoning,
-                # permissions, skills, or tools.
+                # skills, or tools.
                 updated_agent.session_id = node.agent.session_id
             node.agent = updated_agent
             if node.executor == PLANNER_EXECUTOR:
@@ -627,13 +627,16 @@ class Store:
             parent.document_refs,
             plan.document_refs,
         )
-        # A root setup planner may supply a concise navigation name when the
-        # user left the project unnamed. Explicit user names remain authoritative
-        # and nested planners can never rename the project root.
+        # A root setup planner may supply the concise name/objective when the
+        # user left the project unnamed. Persist it on the node itself so every
+        # graph consumer sees the same objective; generated_prompt remains the
+        # full authored request. Explicit user names remain authoritative and
+        # nested planners can never rename the project root.
         if parent.parent_id is None and parent.project_name is None and plan.project_name:
             candidate_name = plan.project_name.strip()
             if candidate_name:
                 parent.project_name = candidate_name
+                parent.objective = candidate_name
         parent_id = parent.id
         if not plan.nodes:
             parent.status = NodeStatus.COMPLETE

@@ -21,7 +21,14 @@ from pydantic import BaseModel, Field
 
 from turn.db.store import Store
 from turn.config import REAL_HARNESSES
-from turn.domain.schemas import AgentConfig, GraphView, InputSpec, Node, NodeStatus, RunPolicy
+from turn.domain.schemas import (
+    AgentConfig,
+    GraphView,
+    InputSpec,
+    Node,
+    NodeStatus,
+    RunPolicy,
+)
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
@@ -30,7 +37,6 @@ from turn.workers.conversations import (
     ConversationProgress,
     cleanup_conversations,
     conversation_refs,
-    missing_conversation_sessions,
 )
 
 
@@ -248,7 +254,7 @@ async def create_project(body: CreateProject, request: Request):
 
     if body.agent is None:
         from turn.config import settings as app_settings
-        from turn.domain.schemas import HarnessKind, PermissionMode, ReasoningLevel
+        from turn.domain.schemas import HarnessKind, ReasoningLevel
         defaults = app_settings.agent_defaults["planner"]
 
         try:
@@ -261,15 +267,10 @@ async def create_project(body: CreateProject, request: Request):
             reasoning = ReasoningLevel(defaults["reasoning"])
         except ValueError as error:
             raise HTTPException(500, "stored reasoning level is not supported") from error
-        try:
-            permission = PermissionMode(defaults["permission"])
-        except ValueError as error:
-            raise HTTPException(500, "stored permission mode is not supported") from error
         body.agent = AgentConfig(
             harness=harness,
             model=defaults["model"] or None,
             reasoning=reasoning,
-            permission=permission,
         )
         _validate_served_agent(body.agent, request)
     if body.run_policy is None:
@@ -347,17 +348,23 @@ async def update_settings(body: SettingsUpdate, request: Request):
         expected_roles = {"planner", "executor", "integrator", "verifier"}
         if set(body.agent_defaults) != expected_roles:
             raise HTTPException(422, "agent_defaults must define planner, executor, integrator, and verifier")
+        normalized_defaults: dict[str, dict[str, str]] = {}
         for role, value in body.agent_defaults.items():
-            required = {"harness", "model", "reasoning", "permission"}
-            if set(value) != required:
-                raise HTTPException(422, f"agent_defaults.{role} must define harness, model, reasoning, and permission")
+            required = {"harness", "model", "reasoning"}
+            if not required.issubset(value):
+                raise HTTPException(422, f"agent_defaults.{role} must define harness, model, and reasoning")
             if value["harness"] not in REAL_HARNESSES and not test_modes_enabled():
                 raise HTTPException(422, f"agent_defaults.{role}.harness is not available in the served app")
             supported = reasoning_levels_for(value["harness"], value["model"] or None)
             if value["reasoning"] not in supported:
                 raise HTTPException(422, f"agent_defaults.{role}.reasoning is not supported by {value['harness']} model '{value['model'] or 'default'}'")
-        await store.set_setting("agent_defaults", json.dumps(body.agent_defaults, sort_keys=True))
-        app_settings.agent_defaults = body.agent_defaults
+            normalized_defaults[role] = {
+                "harness": value["harness"],
+                "model": value["model"],
+                "reasoning": value["reasoning"],
+            }
+        await store.set_setting("agent_defaults", json.dumps(normalized_defaults, sort_keys=True))
+        app_settings.agent_defaults = normalized_defaults
     if body.default_auto_run is not None:
         await store.set_setting("default_auto_run", "1" if body.default_auto_run else "0")
     for key in ("theme", "density"):
@@ -499,46 +506,13 @@ async def _delete_project(
     if root is None or root.parent_id is not None:
         raise HTTPException(404, "project not found")
 
-    # Capture provider session ids before cancellation. Cancelling a live
-    # harness run intentionally clears the node's resumable session so a later
-    # retry starts fresh; deletion still needs the original provider id to
-    # invoke the harness's public delete/archive command.
+    # Capture provider session ids before cancellation. A manual stop keeps
+    # the node's session until the user explicitly chooses Run, while project
+    # deletion still needs the original provider id to invoke the harness's
+    # public delete/archive command.
     nodes, _, _ = await store.get_workgraph(pid)
     runs = await store.get_project_runs(pid)
     refs = conversation_refs(nodes, runs)
-    missing = missing_conversation_sessions(nodes, runs)
-    if options.delete_conversations and missing:
-        message = (
-            "Conversation cleanup cannot proceed: one or more real harness runs "
-            "have no stored provider session id. The project was not removed."
-        )
-        await request.app.state.events.publish({
-            "type": "project.deletion_progress",
-            "project_id": project_id,
-            "phase": "conversations",
-            "completed": 0,
-            "total": len(refs) + len(missing),
-            "status": "failed",
-            "message": message,
-        })
-        await request.app.state.events.publish({
-            "type": "project.deletion_failed",
-            "project_id": project_id,
-            "phase": "conversations",
-            "message": message,
-            "cleanup": {
-                "total": len(refs) + len(missing),
-                "deleted": 0,
-                "archived": 0,
-                "failed": len(missing),
-                "unsupported": 0,
-                "errors": [
-                    f"{harness.value}: node {node_id} has no stored session id"
-                    for harness, node_id in missing
-                ],
-            },
-        })
-        raise HTTPException(status_code=409, detail=message)
     await runner.cancel_project_runs(pid)
     # Provider conversations may still be attached to Turn-owned Herdr panes
     # after their run tasks are cancelled. Close the project workspace before
@@ -1044,7 +1018,8 @@ async def regenerate(node_id: str, request: Request):
 async def retry(node_id: str, request: Request):
     runner = await _runner(request)
     await runner.retry(uuid.UUID(node_id))
-    return {"ok": True}
+    nid = await runner.run_node(uuid.UUID(node_id))
+    return {"ok": nid is not None, "ran": str(nid) if nid else None}
 
 
 @router.post("/api/nodes/{node_id}/reconnect")

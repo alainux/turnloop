@@ -1,21 +1,16 @@
-"""Skill catalog and project-scoped skill installer.
+"""Built-in skills and planner-authored project skill references.
 
-Built-in skills are addressed by stable ids. A planner may also select a
-specific HTTPS/HTTP skill URL; the server fetches it once into the current
-project's ``.turn/skills`` directory. Fetching is behind a small port so tests
-can use deterministic content without network access.
+Turn owns the built-in skill catalog. Planners use their available tools to
+copy selected library skills or author external skills directly in
+``.turn/skills`` and submit them as local ``project:<slug>`` references. Turn
+never downloads or inspects external skill content.
 """
 from __future__ import annotations
 
-import hashlib
 import re
-import shutil
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
-from urllib.parse import quote, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -30,9 +25,9 @@ class SkillDefinition:
 _ROOT = Path(__file__).resolve().parent.parent / "agents" / "skills"
 _AGENCY_AGENTS = "https://github.com/msitarzewski/agency-agents"
 _SKILLS_SH = "https://skills.sh/"
-_GITHUB_AGENT_SKILLS = "https://github.com/search?q=topic%3Aagent-skills&type=repositories"
-_MAX_SKILL_BYTES = 1024 * 1024
-_PROJECT_SKILL_PATTERN = re.compile(r"^project:([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)$")
+_PROJECT_SKILL_PATTERN = re.compile(
+    r"^project:([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)$"
+)
 
 SKILLS: dict[str, SkillDefinition] = {
     "turn-planning": SkillDefinition(
@@ -93,150 +88,6 @@ SKILLS: dict[str, SkillDefinition] = {
 }
 
 
-class SkillFetcher(Protocol):
-    """Port used to retrieve an external skill document."""
-
-    def fetch(self, url: str) -> bytes:
-        ...
-
-    def fetch_files(self, url: str) -> dict[str, bytes]:
-        """Fetch a standard skill document and its optional support files."""
-        ...
-
-
-class UrlSkillFetcher:
-    """Network adapter for standard single- and multi-file skill sources.
-
-    A web page is never treated as a skill. Known repository/catalog URLs are
-    resolved to their Markdown source and support files; direct URLs must
-    themselves return a standards-shaped ``SKILL.md``.
-    """
-
-    def fetch(self, url: str) -> bytes:
-        request = Request(url, headers={"User-Agent": "turn-skill-installer/1.0"})
-        with urlopen(request, timeout=20) as response:
-            payload = response.read(_MAX_SKILL_BYTES + 1)
-        if len(payload) > _MAX_SKILL_BYTES:
-            raise ValueError(f"skill at {url} exceeds {_MAX_SKILL_BYTES} bytes")
-        if not payload.strip():
-            raise ValueError(f"skill at {url} is empty")
-        return payload
-
-    def _json(self, url: str) -> object:
-        request = Request(
-            url,
-            headers={
-                "User-Agent": "turn-skill-installer/1.0",
-                "Accept": "application/vnd.github+json, application/json",
-            },
-        )
-        with urlopen(request, timeout=20) as response:
-            payload = response.read(_MAX_SKILL_BYTES + 1)
-        if len(payload) > _MAX_SKILL_BYTES:
-            raise ValueError(f"skill source at {url} exceeds {_MAX_SKILL_BYTES} bytes")
-        return json.loads(payload.decode("utf-8"))
-
-    def fetch_files(self, url: str) -> dict[str, bytes]:
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        if host == "github.com" or host.endswith(".github.com"):
-            return self._github_files(parsed)
-        if host == "skills.sh" or host.endswith(".skills.sh"):
-            return self._skills_sh_files(parsed)
-        return {"SKILL.md": self.fetch(url)}
-
-    def _github_files(self, parsed) -> dict[str, bytes]:
-        parts = [unquote(part) for part in parsed.path.split("/") if part]
-        if len(parts) < 4 or parts[2] not in {"tree", "blob"}:
-            raise ValueError(
-                "GitHub skill references must target a /tree/<ref>/<skill-directory> "
-                "or /blob/<ref>/SKILL.md source"
-            )
-        owner, repo, kind, ref = parts[:4]
-        path = "/".join(parts[4:])
-        if kind == "blob":
-            if Path(path).name != "SKILL.md":
-                raise ValueError("GitHub skill files must be named SKILL.md")
-            raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{quote(ref, safe='')}/{quote(path, safe='/')}"
-            return {"SKILL.md": self.fetch(raw)}
-
-        api = f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contents"
-        if path:
-            api += "/" + quote(path, safe="/")
-        api += "?ref=" + quote(ref, safe="")
-        return self._github_directory(api, "")
-
-    def _github_directory(self, url: str, prefix: str) -> dict[str, bytes]:
-        listing = self._json(url)
-        if isinstance(listing, dict) and listing.get("type") == "file":
-            name = str(listing.get("name") or Path(urlparse(url).path).name)
-            if name != "SKILL.md":
-                raise ValueError("GitHub skill files must be named SKILL.md")
-            download = listing.get("download_url")
-            if not isinstance(download, str):
-                raise ValueError("GitHub skill file has no download URL")
-            return {prefix + name: self.fetch(download)}
-        if not isinstance(listing, list):
-            raise ValueError("GitHub skill directory response is not a file listing")
-        files: dict[str, bytes] = {}
-        for entry in listing:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("name") or "")
-            if not name or name in {".git", ".github"}:
-                continue
-            entry_type = entry.get("type")
-            entry_url = entry.get("url")
-            relative = prefix + name
-            if entry_type == "dir" and isinstance(entry_url, str):
-                files.update(self._github_directory(entry_url, relative + "/"))
-            elif entry_type == "file":
-                download = entry.get("download_url")
-                if isinstance(download, str):
-                    files[relative] = self.fetch(download)
-        return files
-
-    def _skills_sh_files(self, parsed) -> dict[str, bytes]:
-        parts = [unquote(part) for part in parsed.path.split("/") if part]
-        if len(parts) < 3 or parts[0] == "api":
-            raise ValueError("skills.sh references must identify a specific skill")
-        owner, repo = parts[:2]
-        skill = "/".join(parts[2:]).rstrip("/")
-        tree_endpoint = (
-            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}"
-            "/git/trees/HEAD?recursive=1"
-        )
-        payload = self._json(tree_endpoint)
-        tree = payload.get("tree") if isinstance(payload, dict) else None
-        if not isinstance(tree, list):
-            raise ValueError("GitHub skill source did not contain a file tree")
-
-        suffix = f"/{skill}/SKILL.md"
-        matches = [
-            str(entry["path"])
-            for entry in tree
-            if isinstance(entry, dict)
-            and entry.get("type") == "blob"
-            and isinstance(entry.get("path"), str)
-            and str(entry["path"]).endswith(suffix)
-        ]
-        if not matches:
-            raise ValueError(
-                f"GitHub repository {owner}/{repo} has no skill directory for {skill!r}"
-            )
-        if len(matches) > 1:
-            raise ValueError(
-                f"GitHub repository {owner}/{repo} has multiple skill directories for {skill!r}"
-            )
-
-        skill_path = matches[0].rsplit("/", 1)[0]
-        contents_endpoint = (
-            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contents/"
-            f"{quote(skill_path, safe='/')}?ref=HEAD"
-        )
-        return self._github_directory(contents_endpoint, "")
-
-
 def list_skills() -> tuple[SkillDefinition, ...]:
     return tuple(SKILLS[key] for key in sorted(SKILLS))
 
@@ -259,7 +110,7 @@ def is_project_skill_reference(reference: str) -> bool:
 
 
 def validate_skill_reference(reference: str) -> str:
-    """Validate a built-in id, project skill id, or external HTTP(S) URL."""
+    """Validate the shape of a built-in, project, or external reference."""
     if reference in SKILLS:
         return reference
     if is_project_skill_reference(reference):
@@ -267,121 +118,111 @@ def validate_skill_reference(reference: str) -> str:
     if is_skill_url(reference):
         return reference
     raise ValueError(
-        f"unknown skill reference {reference!r}; use a local id, project:<slug>, or an http(s) URL"
+        f"unknown skill reference {reference!r}; use a built-in id, project:<slug>, or an http(s) URL"
     )
 
 
-def _project_skill_path(reference: str, project_root: str | Path) -> Path:
+def project_skill_path(reference: str, project_root: str | Path) -> Path:
     match = _PROJECT_SKILL_PATTERN.fullmatch(reference)
     if match is None:
         raise ValueError(f"invalid project skill reference: {reference!r}")
     return Path(project_root) / ".turn" / "skills" / match.group(1) / "SKILL.md"
 
 
-def _external_install_key(url: str) -> str:
-    parsed = urlparse(url)
-    basename = Path(unquote(parsed.path).rstrip("/")).name or parsed.netloc
-    stem = Path(basename).stem or "skill"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-")[:40] or "skill"
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    return f"external-{slug}-{digest}"
+def install_builtin_skill(skill_id: str, project_root: str | Path) -> Path:
+    """Copy one trusted library skill into the current project."""
+    skill = get_skill(skill_id)
+    target = Path(project_root) / ".turn" / "skills" / skill.id / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(skill.source_path.read_bytes())
+    return target
 
 
-def _validate_project_skill_document(path: Path, payload: bytes) -> None:
-    """Require the small frontmatter contract for planner-authored skills."""
-    text = payload.decode("utf-8")
-    if re.match(r"\s*<(?:!doctype\s+html|html|head|body)\b", text, re.I):
-        raise ValueError(f"skill {path} resolved to HTML; provide its Markdown source")
-    if not text.startswith("---\n"):
-        raise ValueError(f"project skill {path} must start with YAML frontmatter")
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        raise ValueError(f"project skill {path} has incomplete YAML frontmatter")
-    frontmatter = text[4:end]
-    fields = {
-        line.split(":", 1)[0].strip()
-        for line in frontmatter.splitlines()
-        if ":" in line and not line.lstrip().startswith("#")
-    }
-    if not {"name", "description"}.issubset(fields):
-        raise ValueError(
-            f"project skill {path} frontmatter must define name and description"
-        )
-
-
-def materialize(
-    skill_ids: list[str],
-    project_root: str | Path,
-    *,
-    fetcher: SkillFetcher | None = None,
+def resolve_skill_paths(
+    skill_ids: list[str], project_root: str | Path, *, allow_library: bool = False
 ) -> dict[str, Path]:
-    """Install selected skills into this project only, returning their paths."""
-    destination = Path(project_root) / ".turn" / "skills"
-    external_fetcher = fetcher or UrlSkillFetcher()
+    """Resolve project skills, optionally exposing library sources to planners."""
     resolved: dict[str, Path] = {}
     for reference in dict.fromkeys(skill_ids):
         validate_skill_reference(reference)
-        if reference in SKILLS:
-            definition = get_skill(reference)
-            if not definition.source_path.is_file():
-                raise FileNotFoundError(f"skill source does not exist: {definition.source_path}")
-            install_key = reference
-            payload = definition.source_path.read_bytes()
-        elif is_project_skill_reference(reference):
-            target = _project_skill_path(reference, project_root)
-            if not target.is_file():
-                raise FileNotFoundError(
-                    f"project skill {reference} has not been authored at {target}"
-                )
-            _validate_project_skill_document(target, target.read_bytes())
-            resolved[reference] = target
-            continue
-        else:
-            install_key = _external_install_key(reference)
-            target = destination / install_key / "SKILL.md"
-            if target.is_file():
-                try:
-                    _validate_project_skill_document(target, target.read_bytes())
-                except (UnicodeDecodeError, ValueError):
-                    # Replace an older invalid materialization, including the
-                    # raw HTML written by the previous installer.
-                    pass
-                else:
-                    resolved[reference] = target
-                    continue
-            fetch_files = getattr(external_fetcher, "fetch_files", None)
-            files = (
-                fetch_files(reference)
-                if callable(fetch_files)
-                else {"SKILL.md": external_fetcher.fetch(reference)}
+        if is_skill_url(reference):
+            raise ValueError(
+                f"external skill URL {reference!r} was not installed by the planner; "
+                "submit it as project:<slug>"
             )
-            if not files:
-                raise ValueError(f"skill source {reference} returned no files")
-            skill_paths = [path for path in files if Path(path).name == "SKILL.md"]
-            if len(skill_paths) != 1:
-                raise ValueError(
-                    f"skill source {reference} must resolve to exactly one SKILL.md"
-                )
-            skill_root = Path(skill_paths[0]).parent
-            normalized_files: dict[str, bytes] = {}
-            for relative, content in files.items():
-                relative_path = Path(relative)
-                if relative_path.is_absolute() or ".." in relative_path.parts:
-                    raise ValueError(f"skill source {reference} contains an unsafe path")
-                normalized = relative_path.relative_to(skill_root) if skill_root != Path(".") else relative_path
-                normalized_files[str(normalized)] = content
-            payload = normalized_files.get("SKILL.md")
-            if payload is None:
-                raise ValueError(f"skill source {reference} did not contain SKILL.md")
-        target = destination / install_key / "SKILL.md"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if reference in SKILLS:
-            shutil.copyfile(SKILLS[reference].source_path, target)
-        else:
-            _validate_project_skill_document(target, payload)
-            for relative, content in normalized_files.items():
-                output = target.parent / relative
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_bytes(content)
-        resolved[reference] = target
+        if reference in SKILLS and allow_library:
+            resolved[reference] = SKILLS[reference].source_path
+            continue
+        path = (
+            Path(project_root) / ".turn" / "skills" / reference / "SKILL.md"
+            if reference in SKILLS
+            else project_skill_path(reference, project_root)
+        )
+        if not path.is_file():
+            raise ValueError(
+                f"{reference} is not installed at {path}; install it in the project "
+                "before launching the worker"
+            )
+        resolved[reference] = path
     return resolved
+
+
+def validate_plan_skill_files(
+    payload: dict,
+    project_root: str | Path | None,
+    *,
+    planner_skill_ids: list[str] | None = None,
+) -> None:
+    """Check only that every planner-selected skill exists in the project.
+
+    This is intentionally a filesystem-presence check. Skill contents are
+    authored and managed by the planner and are never parsed by Turn.
+    """
+    references: list[tuple[str, str]] = [
+        ("planner.skill_ids", reference)
+        for reference in (planner_skill_ids or [])
+    ]
+    from turn.domain.schemas import skill_ids_for_agent_type
+
+    for index, node in enumerate(payload.get("nodes", [])):
+        if not isinstance(node, dict):
+            continue
+        key = str(node.get("key") or index)
+        references.extend(
+            (f"node {key}.skills", str(reference))
+            for reference in node.get("skills", [])
+        )
+        agent = node.get("agent")
+        if isinstance(agent, dict):
+            references.extend(
+                (f"node {key}.agent.skill_ids", str(reference))
+                for reference in agent.get("skill_ids", [])
+            )
+        role = node.get("agent_type")
+        if isinstance(agent, dict):
+            role = agent.get("type_id") or role
+        if not role:
+            role = "planner" if node.get("plan") or node.get("executor") == "planner" else "executor"
+        for reference in skill_ids_for_agent_type(role):
+            references.append((f"node {key} role skill", reference))
+    if not references:
+        return
+    if project_root is None:
+        raise ValueError("TURN_REPO is required to check planner-installed skills")
+    for location, reference in references:
+        validate_skill_reference(reference)
+        if is_skill_url(reference):
+            raise ValueError(
+                f"{location} contains external skill URL {reference!r}; the planner must "
+                "install it under .turn/skills/<slug>/SKILL.md and submit project:<slug>"
+            )
+        path = (
+            Path(project_root) / ".turn" / "skills" / reference / "SKILL.md"
+            if reference in SKILLS
+            else project_skill_path(reference, project_root)
+        )
+        if not path.is_file():
+            raise ValueError(
+                f"{location} {reference} is not installed at {path}; the planner must "
+                "create or install the skill before submitting the plan"
+            )

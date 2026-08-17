@@ -51,8 +51,13 @@ the path matters as much as the final artifact.
 | Evidence | Document view, logs, artifacts, diffs, token/cost usage, and server-projected UI state |
 | Harnesses | Codex, Claude Code, OpenCode, and Pi adapters with local availability detection |
 
-Deterministic Echo workers and heuristic planning are test-only fixtures; they
-are not exposed by the served application.
+The process-level Fake harness and heuristic planning are test-only fixtures.
+For a repeatable local workflow laboratory, set `TURN_TEST_MODE=1`, choose
+`TURN_PLANNER=fake` and `TURN_DEFAULT_EXECUTOR=fake`, and add
+`TURN_FAKE_WORKFLOWS=1`; the server then seeds the rejection, expansion, rerun,
+failure, input, and cancellation projects once in the configured data
+directory. The Fake provider is not advertised or accepted by production
+runtime configuration.
 
 ### Current scope
 
@@ -177,6 +182,11 @@ npm run build
 python -m pytest -q
 ```
 
+The process-level Fake workflow laboratory is covered by the mandatory
+`turn/tests/test_fake_workflows_e2e.py` end-to-end test, which launches the
+repository-owned harness process and drives those scenarios through the API,
+terminal transport, retained sessions, persisted graph, runs, and artifacts.
+
 The test suite covers:
 
 - domain schemas, transitions, graph invariants, and storage
@@ -222,14 +232,27 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Org agent
 - [x] MCP basic
 - [x] Arbitrary node reject
+- [ ] Architecture / Hygiene & Cleanups
+- [ ] Live Logs / State & Graph Transitions
 - [ ] Composable graph
-- [ ] Triggers
 - [ ] Skills / MCP via Capabilities / Agent Plugins 1.0
-- [ ] Retries / Recoveries
+- [ ] Triggers
+- [ ] Decision-based Routing
+- [ ] Skipped / Locked nodes for Repeatable organizations
+- [ ] Tickets / Units of work / Spec-driven execution
+- [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management
 - [ ] Loops / Goals / Hill-climbing
-- [ ] Local library of skills and MCPs
+- [ ] Metrics
+- [ ] Capability library
+- [ ] Architecture / Hygiene & Cleanups
 - [ ] Native app
 - [ ] Terminal UI
+- [ ] Better Styling / Document view
 - [ ] In-host multiplexer
+- [ ] Tmux
 - [ ] Ghostty Web
-- [ ] Website with public skill library
+- [ ] Worktrees
+- [ ] Security / Sandboxes / Permission boundaries
+- [ ] Website / Demos - Capabilities, MCPs, and Skills
+- [ ] Architecture / Hygiene & Cleanups
+- [ ] Plugins / Extensions / Hooks

@@ -28,6 +28,7 @@ from turn.workers.echo_worker import EchoWorker
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
+from turn.workers.terminal import HerdrPtyTransport
 
 
 async def _app(tmp_path: Path) -> tuple[FastAPI, Store, Runner]:
@@ -50,6 +51,93 @@ async def _app(tmp_path: Path) -> tuple[FastAPI, Store, Runner]:
     app.state.events = runner.events
     app.state.test_mode = True
     return app, store, runner
+
+
+async def test_runner_stop_closes_all_owned_herdr_workspaces(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "turn"),
+        projects_dir=str(tmp_path / "projects"),
+        default_executor="echo",
+        planner="heuristic",
+    )
+    store = Store(settings.data_dir, projects_dir=settings.projects_dir)
+    await store.init()
+    adapter = FakeHerdrAdapter()
+    runner = Runner(
+        store,
+        WorkerRegistry(),
+        EventBus(),
+        settings,
+        herdr_adapter=adapter,
+    )
+    project = await store.create_project(
+        "workspace cleanup",
+        repo_path=str(tmp_path / "projects" / "workspace-cleanup"),
+    )
+
+    try:
+        assert await runner.ensure_node_terminal(project.id)
+        assert len(adapter.workspaces) == 1
+
+        await runner.stop(close_workspaces=True)
+
+        assert adapter.workspaces == {}
+    finally:
+        await store.dispose()
+
+
+async def test_project_delete_recovers_a_lost_herdr_workspace_mapping(tmp_path, monkeypatch):
+    """Deleting a project must close its Herdr space even if metadata was lost."""
+    app, store, runner = await _app(tmp_path)
+    transport = runner.terminal
+    assert isinstance(transport, HerdrPtyTransport)
+    adapter = transport.adapter
+    project_path = tmp_path / "projects" / "lost-herdr-mapping"
+    try:
+        project = await store.create_project(
+            "lost Herdr mapping",
+            repo_path=str(project_path),
+            agent=AgentConfig(harness=HarnessKind.CODEX),
+        )
+        persisted = await store.get_node(project.id)
+        assert persisted is not None and persisted.agent is not None
+        persisted.agent.session_id = "c-1"
+        await store._save_node(persisted)  # type: ignore[attr-defined]
+        assert await runner.ensure_node_terminal(project.id)
+        workspace_id = transport.project_workspace_id(str(project.id))
+        assert workspace_id is not None
+        assert workspace_id in {item.workspace_id for item in await adapter.list_workspaces()}
+
+        # Reproduce the live failure: the workspace survives, but the local
+        # mapping is gone, so the old deletion path cannot identify it.
+        transport._projects.pop(str(project.id), None)  # type: ignore[attr-defined]
+
+        async def fake_cleanup(refs, *, cwd, commands, on_progress):
+            del cwd, commands, on_progress
+            assert [ref.session_id for ref in refs] == ["c-1"]
+            assert await adapter.list_workspaces() == ()
+            return ConversationCleanup(1, 1, 0, 0, 0, ())
+
+        monkeypatch.setattr(server_api, "cleanup_conversations", fake_cleanup)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.request(
+                "DELETE",
+                f"/api/projects/{project.id}",
+                json={"delete_files": True, "delete_conversations": True},
+            )
+
+        assert response.status_code == 200, response.text
+        assert await store.get_node(project.id) is None
+        assert not project_path.exists()
+        assert workspace_id not in {item.workspace_id for item in await adapter.list_workspaces()}
+    finally:
+        for workspace in await adapter.list_workspaces():
+            await adapter.close_workspace(workspace.workspace_id)
+        await runner.stop()
+        await store.dispose()
 
 
 async def test_conversation_refs_are_deduplicated_across_current_and_historical_sessions():
@@ -268,7 +356,7 @@ async def test_project_delete_closes_workspace_before_conversation_cleanup(tmp_p
         await store.dispose()
 
 
-async def test_project_delete_fails_closed_when_a_harness_session_is_untracked(tmp_path, monkeypatch):
+async def test_project_delete_ignores_runs_without_provider_sessions(tmp_path, monkeypatch):
     app, store, runner = await _app(tmp_path)
     cancelled = False
     try:
@@ -285,22 +373,21 @@ async def test_project_delete_fails_closed_when_a_harness_session_is_untracked(t
             assert node is not None
             await store.create_run(node, "planner")
 
-            async def should_not_cancel(_project_id):
+            async def record_cancel(_project_id):
                 nonlocal cancelled
                 cancelled = True
 
-            monkeypatch.setattr(runner, "cancel_project_runs", should_not_cancel)
+            monkeypatch.setattr(runner, "cancel_project_runs", record_cancel)
             response = await client.request(
                 "DELETE",
                 f"/api/projects/{project_id}",
                 json={"delete_files": True, "delete_conversations": True},
             )
 
-            assert response.status_code == 409
-            assert "no stored provider session id" in response.json()["detail"]
-            assert not cancelled
-            assert await store.get_node(project_id) is not None
-            assert Path(created.json()["repo_path"]).exists()
+            assert response.status_code == 200, response.text
+            assert cancelled
+            assert await store.get_node(project_id) is None
+            assert not Path(created.json()["repo_path"]).exists()
     finally:
         await runner.stop()
         await store.dispose()

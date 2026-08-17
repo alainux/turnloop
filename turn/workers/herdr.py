@@ -73,6 +73,17 @@ class HerdrAdapter(Protocol):
 
     async def send_keys(self, pane_id: str, keys: tuple[str, ...]) -> bool: ...
 
+    async def run_command(self, pane_id: str, command: str) -> bool: ...
+
+    async def wait_for_output(
+        self,
+        pane_id: str,
+        *,
+        regex: str = ".",
+        source: str = "recent-unwrapped",
+        lines: int | None = None,
+    ) -> bool: ...
+
     async def read_pane(
         self,
         pane_id: str,
@@ -130,11 +141,28 @@ class HerdrCliAdapter:
             )
         return value
 
+    async def _run_without_result(self, *args: str) -> None:
+        """Run a successful side-effect command whose CLI response is empty."""
+        if not self.available:
+            raise HerdrAdapterError("Herdr is required for terminal commands")
+        process = await asyncio.create_subprocess_exec(
+            *self.command(*args),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()
+            self._raise_command_error(detail, args)
+
     @staticmethod
     def _raise_command_error(detail: str, args: tuple[str, ...]) -> None:
         for resource in ("workspace", "pane"):
             if f"{resource}_not_found" in detail:
-                resource_id = args[-1] if args else "unknown"
+                resource_id = next(
+                    (argument for argument in args if ":" in argument),
+                    args[-1] if args else "unknown",
+                )
                 raise HerdrResourceNotFound(resource, resource_id)
         raise HerdrAdapterError(detail or f"herdr {' '.join(args)} failed")
 
@@ -252,9 +280,48 @@ class HerdrCliAdapter:
         if not keys:
             return True
         try:
-            await self._run("pane", "send-keys", pane_id, *keys)
+            await self._run_without_result("pane", "send-keys", pane_id, *keys)
         except HerdrResourceNotFound:
             return False
+        return True
+
+    async def run_command(self, pane_id: str, command: str) -> bool:
+        """Submit one complete shell command through Herdr's atomic pane API."""
+        if not command:
+            return True
+        try:
+            await self._run_without_result("pane", "run", pane_id, command)
+        except HerdrResourceNotFound:
+            return False
+        return True
+
+    async def wait_for_output(
+        self,
+        pane_id: str,
+        *,
+        regex: str = ".",
+        source: str = "recent-unwrapped",
+        lines: int | None = None,
+    ) -> bool:
+        """Wait for Herdr to observe output from a live pane.
+
+        Herdr owns the pane lifecycle and provides this as an event-driven
+        readiness primitive. In particular, a newly-created shell is not safe
+        to interrupt or inject into merely because ``tab create`` returned its
+        pane id; the first terminal output is the shell's actual ready signal.
+        """
+        args = [
+            "pane",
+            "wait-output",
+            pane_id,
+            "--regex",
+            regex,
+            "--source",
+            source,
+        ]
+        if lines is not None:
+            args.extend(("--lines", str(max(1, lines))))
+        await self._run(*args)
         return True
 
     async def read_pane(
@@ -296,9 +363,13 @@ class HerdrCliAdapter:
         names: list[str] = []
         for process in processes:
             if isinstance(process, dict):
-                name = process.get("name") or process.get("argv0")
-                if isinstance(name, str) and name:
-                    names.append(name.rsplit("/", 1)[-1])
+                # Node-based CLIs such as Pi report `name: node` while their
+                # argv0 remains the provider command. Preserve both so
+                # foreground readiness can match the configured harness.
+                for field in ("name", "argv0"):
+                    name = process.get(field)
+                    if isinstance(name, str) and name:
+                        names.append(name.rsplit("/", 1)[-1])
         return tuple(dict.fromkeys(names))
 
     def terminal_control_command(

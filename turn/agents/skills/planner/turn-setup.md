@@ -55,6 +55,9 @@ branches.
 ## Procure only the skills the chosen work needs
 
 - Use `find-skills` to search for narrow domain guidance for the chosen agents.
+- Install every selected built-in skill from the Turn library with
+  `turn skills install <id>`. For external skills, use your tools to copy the
+  complete skill directory into `.turn/skills/<slug>/` before submitting.
 - For web or app architecture, procure a stack- and runtime-specific
   architecture skill only when an architecture stage is warranted. Do not
   assume one is needed for every request.

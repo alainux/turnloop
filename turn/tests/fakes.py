@@ -26,6 +26,8 @@ class FakeHerdrAdapter:
         self._workspace_number = 0
         self._pane_number = 0
         self.sent_keys: list[tuple[str, tuple[str, ...]]] = []
+        self.run_commands: list[tuple[str, str]] = []
+        self.wait_outputs: list[tuple[str, str, str, int | None]] = []
         self.read_requests: list[tuple[str, str, int]] = []
 
     @property
@@ -83,6 +85,23 @@ class FakeHerdrAdapter:
         self.sent_keys.append((pane_id, keys))
         return True
 
+    async def run_command(self, pane_id: str, command: str) -> bool:
+        await self.get_pane(pane_id)
+        self.run_commands.append((pane_id, command))
+        return True
+
+    async def wait_for_output(
+        self,
+        pane_id: str,
+        *,
+        regex: str = ".",
+        source: str = "recent-unwrapped",
+        lines: int | None = None,
+    ) -> bool:
+        await self.get_pane(pane_id)
+        self.wait_outputs.append((pane_id, regex, source, lines))
+        return True
+
     async def read_pane(self, pane_id: str, *, source: str = "recent", lines: int = 2000) -> str:
         await self.get_pane(pane_id)
         self.read_requests.append((pane_id, source, lines))
@@ -101,6 +120,8 @@ class FakeTerminalTransport:
     def __init__(self):
         self._state: dict[uuid.UUID, dict[str, object]] = {}
         self._stops: dict[uuid.UUID, asyncio.Event] = {}
+        self.closed_nodes: set[uuid.UUID] = set()
+        self.close_requests: list[uuid.UUID] = []
 
     @property
     def available(self) -> bool:
@@ -175,9 +196,13 @@ class FakeTerminalTransport:
         return str(self._node(node_id)["pane"])
 
     async def close_persistent_session(self, node_id: uuid.UUID) -> bool:
+        self.close_requests.append(node_id)
         state = self._node(node_id)
         closed = bool(state["persistent"])
+        await self.stop(node_id)
         state["persistent"] = False
+        if closed:
+            self.closed_nodes.add(node_id)
         return closed
 
     async def close_project_workspace(self, project_key: str) -> bool:

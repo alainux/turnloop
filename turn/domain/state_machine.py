@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from turn.domain.schemas import Node, NodeAction, NodeStatus, NodeUIState
+from turn.domain.schemas import AgentType, Node, NodeAction, NodeStatus, NodeUIState
 
 
 UIState = NodeUIState
@@ -50,6 +50,12 @@ def present_node(
     if node.status == NodeStatus.CANCELLED:
         return NodePresentation(UIState.CANCELLED, (Action.RUN, *common))
     if node.status == NodeStatus.COMPLETE:
+        # A completed leaf can be run again with its original prompt. Planner
+        # containers retain the graph-regeneration action instead.
+        if node.executor != "planner" and (
+            node.agent is None or node.agent.type_id != AgentType.PLANNER
+        ):
+            return NodePresentation(UIState.COMPLETE, (Action.RETRY, *common))
         return NodePresentation(UIState.COMPLETE, common)
     if node.status == NodeStatus.EXPANDED:
         return NodePresentation(UIState.CONTAINER, (Action.PAUSE, *common))
@@ -63,7 +69,11 @@ def present_node(
     if node.status == NodeStatus.BLOCKED:
         return NodePresentation(
             UIState.WAITING_DEPENDENCY,
-            (Action.PAUSE, *common),
+            # A dependency-waiting node cannot execute or regenerate its
+            # descendants. Keep inspection/editing available, but do not
+            # project a run-like action that the graph will render as
+            # "Run again".
+            (Action.PAUSE, Action.EDIT),
             blocked_reason,
         )
     if node.status == NodeStatus.RUNNABLE:

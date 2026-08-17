@@ -6,7 +6,6 @@ export interface Agent {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  permission: PermissionMode;
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
@@ -64,7 +63,6 @@ export interface Executor {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  permission: PermissionMode;
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
@@ -126,7 +124,7 @@ export interface GraphView {
   artifacts: Array<Artifact>;
 }
 
-export type HarnessKind = "codex" | "claude" | "opencode" | "pi" | "echo" | "shell";
+export type HarnessKind = "codex" | "claude" | "opencode" | "pi" | "echo" | "fake" | "shell";
 
 export type InputKind = "text" | "file" | "decision" | "credential" | "account" | "approval";
 
@@ -144,7 +142,6 @@ export interface Integrator {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  permission: PermissionMode;
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
@@ -219,8 +216,6 @@ export type NodeUIState = "queued" | "ready" | "running" | "preparing" | "paused
 
 export type Outcome = "COMPLETE" | "EXPAND" | "BLOCK" | "FAIL";
 
-export type PermissionMode = "ask" | "workspace" | "full";
-
 export interface PlanResult {
   nodes: Array<NodeSpec>;
   project_name: string | null;
@@ -238,7 +233,6 @@ export interface Planner {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  permission: PermissionMode;
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;
@@ -302,7 +296,6 @@ export interface Verifier {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  permission: PermissionMode;
   skills: Array<string>;
   skill_ids: Array<string>;
   tools: Array<string>;

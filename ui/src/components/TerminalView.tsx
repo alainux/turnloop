@@ -119,14 +119,34 @@ export function TerminalView({ node }: Props) {
       terminalWriteQueue = write.catch(() => undefined);
       return write;
     };
-    const syncSize = () => {
-      const rect = mountHost.getBoundingClientRect();
-      if (rect.width < 80 || rect.height < 80) return;
+    const fitTerminal = () => {
       try {
         fit.fit();
+        // FitAddon measures xterm's fractional cell height, while the DOM
+        // renderer rounds each row up to a whole pixel. That can leave the
+        // final row extending below the viewport by a few pixels. Reconcile
+        // the actual rendered row height with the mount's usable height so
+        // the last line remains fully visible at every panel size.
+        const firstRow = mount.querySelector<HTMLElement>('.xterm-rows > div');
+        if (!firstRow) return;
+        const mountStyle = window.getComputedStyle(mount);
+        const verticalPadding =
+          parseFloat(mountStyle.paddingTop) + parseFloat(mountStyle.paddingBottom);
+        const rowHeight = firstRow.getBoundingClientRect().height;
+        const usableHeight = mount.clientHeight - verticalPadding;
+        if (rowHeight <= 0 || usableHeight <= 0) return;
+        const maxRows = Math.max(8, Math.floor((usableHeight - 1) / rowHeight));
+        if (maxRows < terminal.rows) {
+          terminal.resize(terminal.cols, maxRows);
+        }
       } catch {
         /* hidden panel */
       }
+    };
+    const syncSize = () => {
+      const rect = mountHost.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 80) return;
+      fitTerminal();
       if (socket?.readyState === WebSocket.OPEN) {
         socket.send(
           JSON.stringify({
@@ -288,7 +308,10 @@ export function TerminalView({ node }: Props) {
         amount: Math.min(10, Math.max(1, Math.round(Math.abs(delta) / 24))),
       }));
     };
-    viewport?.addEventListener("wheel", forwardWheel, { passive: false });
+    // Capture before xterm's own viewport handler. Herdr owns scrollback, so
+    // xterm must not first move an independent local viewport and then pass
+    // the same wheel event through as a second scroll operation.
+    viewport?.addEventListener("wheel", forwardWheel, { passive: false, capture: true });
     const observer = new ResizeObserver(() => refitAfterLayout());
     observer.observe(mountHost);
     refitAfterLayout();
@@ -303,7 +326,7 @@ export function TerminalView({ node }: Props) {
       disposed = true;
       refitTimers.forEach((timer) => window.clearTimeout(timer));
       observer.disconnect();
-      viewport?.removeEventListener("wheel", forwardWheel);
+      viewport?.removeEventListener("wheel", forwardWheel, true);
       socket?.close();
       terminal.dispose();
     };

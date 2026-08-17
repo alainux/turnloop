@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   displayPath,
+  displayNodeTitle,
   displayProjectTitle,
   documentReferenceHref,
   documentReferenceContentHref,
   documentReferenceLabel,
+  primaryNodeActionIcon,
+  primaryNodeActionLabel,
   skillReferenceLabel,
   skillSourceHref,
   skillTooltip,
@@ -43,6 +46,13 @@ const project = (overrides: Partial<Project> = {}): Project => {
 };
 
 describe("display labels", () => {
+  it("labels cancelled runs as a fresh run on every action surface", () => {
+    expect(primaryNodeActionLabel("run", true)).toBe("Run again");
+    expect(primaryNodeActionIcon("run", true)).toBe("rotate-cw");
+    expect(primaryNodeActionLabel("run")).toBe("Run");
+    expect(primaryNodeActionIcon("run")).toBe("play");
+  });
+
   it("strips Markdown without changing the authored prompt", () => {
     expect(stripMarkdown("Build a **playable** [game](https://example.test)"))
       .toBe("Build a playable game");
@@ -51,6 +61,12 @@ describe("display labels", () => {
   it("prefers an explicit project name over the objective", () => {
     expect(displayProjectTitle(project({ project_name: "My **Game**" }))).toBe("My Game");
     expect(displayProjectTitle(project({ project_name: null, objective: "Scoped **title**" }))).toBe("Scoped title");
+  });
+
+  it("uses the node objective for the root setup node", () => {
+    expect(displayNodeTitle(project({ project_name: "Navigation only" }))).toBe(
+      "Build a playable game",
+    );
   });
 
   it("renders home paths with a portable prefix", () => {

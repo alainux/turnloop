@@ -38,10 +38,13 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     app = source("App.tsx")
     css = (UI / "style.css").read_text()
     api = (ROOT / "turn" / "server" / "api.py").read_text()
-    assert 'const runnable = node.allowed_actions.includes("run");' in graph
-    assert "node.generation_active" in graph and 'name={active ? "stop" : "play"}' in graph
+    assert 'const runAction = active ? "cancel" : primaryAction;' in graph
+    assert "node.generation_active" in graph
+    assert 'name={nodeAgentIcon(node)}' in graph
+    assert 'name={nodeRunIcon(active, runAction, freshRun)}' in graph
+    assert 'return "rotate-cw"' in graph
     assert 'const preparing = node.ui_state === "preparing";' in graph
-    assert 'preparing\n                        ? "loader"' in graph
+    assert 'preparing\n                        ? "loader"' not in graph
     inspector = source("components", "Inspector.tsx")
     css = (UI / "style.css").read_text()
     assert 'primaryAction === "cancel" ? "danger stop-action"' in inspector

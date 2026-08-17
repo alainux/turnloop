@@ -384,6 +384,29 @@ class LocalPtyTransport:
         released = self.release(node_id)
         return stopped or released
 
+    async def ensure_persistent_shell(
+        self, node_id: uuid.UUID, *, cwd: str, environment: dict[str, str] | None = None
+    ) -> bool:
+        """Local process runs do not need a pre-created multiplexer pane."""
+        return True
+
+    async def has_persistent_session(self, node_id: uuid.UUID) -> bool:
+        """Report whether this local process transport still has a session."""
+        session = self.sessions.get(node_id)
+        return session is not None and not session.ended
+
+    async def project_workspace_state(self, project_key: str) -> WorkspaceLinkState:
+        """Local PTYs have no external project workspace to reconcile."""
+        return "unmapped"
+
+    async def close_project_workspace(self, project_key: str) -> bool:
+        """There is no multiplexer workspace in the local process adapter."""
+        return False
+
+    async def close_orphaned_project_workspaces(self, project_keys: set[str]) -> int:
+        """No-op counterpart to the Herdr workspace reconciliation port."""
+        return 0
+
     async def detach(self, node_id: uuid.UUID) -> bool:
         """End the attaching PTY client without killing the harness.
 
@@ -493,6 +516,7 @@ class HerdrPtyTransport(LocalPtyTransport):
         self._pane_create_lock = asyncio.Lock()
         self._control_locks: dict[uuid.UUID, asyncio.Lock] = {}
         self._control_closed: dict[uuid.UUID, asyncio.Event] = {}
+        self._pane_ready_events: dict[uuid.UUID, asyncio.Event] = {}
         self._node_projects: dict[uuid.UUID, str] = {}
 
     @staticmethod
@@ -598,15 +622,31 @@ class HerdrPtyTransport(LocalPtyTransport):
         """Close the Herdr space owned by a Turn project and forget its panes."""
         async with self._metadata_lock:
             record = self._projects.get(project_key)
-            if not isinstance(record, dict):
-                return False
-            workspace_id = record.get("workspace_id")
-            if not isinstance(workspace_id, str) or not workspace_id:
+            workspace_ids: list[str] = []
+            if isinstance(record, dict):
+                workspace_id = record.get("workspace_id")
+                if isinstance(workspace_id, str) and workspace_id:
+                    workspace_ids.append(workspace_id)
+            else:
+                # The workspace is durable in Herdr, while this small mapping
+                # file can be edited, truncated, or lost independently. A
+                # project deletion must still be able to find the space it
+                # owns, otherwise its provider process keeps its conversation
+                # locked and the subsequent harness delete command fails.
+                expected_label = f"Turn · {project_key[:8]}"
+                for workspace in await self.adapter.list_workspaces():
+                    if workspace.label == expected_label:
+                        workspace_ids.append(workspace.workspace_id)
+
+            if not workspace_ids:
                 self._projects.pop(project_key, None)
                 await self._save_metadata()
                 return False
-            await self.adapter.close_workspace(workspace_id)
-            for node_id in (record.get("panes") or {}):
+
+            for workspace_id in workspace_ids:
+                await self.adapter.close_workspace(workspace_id)
+            panes_record = record if isinstance(record, dict) else {}
+            for node_id in (panes_record.get("panes") or {}):
                 try:
                     self._node_projects.pop(uuid.UUID(node_id), None)
                 except (TypeError, ValueError):
@@ -639,6 +679,7 @@ class HerdrPtyTransport(LocalPtyTransport):
             existing = panes.get(str(node_id))
             if isinstance(existing, str) and await self._pane_exists(existing):
                 self._node_projects[node_id] = project_key
+                self._pane_ready_events.setdefault(node_id, asyncio.Event()).set()
                 return existing
 
             # The root shell is created together with the workspace. Subsequent
@@ -657,6 +698,7 @@ class HerdrPtyTransport(LocalPtyTransport):
             self._projects[project_key] = record
             await self._save_metadata()
             self._node_projects[node_id] = project_key
+            self._pane_ready_events.setdefault(node_id, asyncio.Event()).set()
             return pane_id
 
     async def has_persistent_session(self, node_id: uuid.UUID) -> bool:
@@ -693,6 +735,20 @@ class HerdrPtyTransport(LocalPtyTransport):
         if reader is None:
             return ()
         return await reader(pane_id)
+
+    async def wait_until_ready(self, node_id: uuid.UUID) -> None:
+        """Wait for Herdr's pane-native first-output readiness signal."""
+        pane_ready = self._pane_ready_events.setdefault(node_id, asyncio.Event())
+        if self.pane_id(node_id) is None:
+            await pane_ready.wait()
+        pane_id = self.pane_id(node_id)
+        if pane_id is None:
+            raise HerdrResourceNotFound("pane", str(node_id))
+        waiter = getattr(self.adapter, "wait_for_output", None)
+        if waiter is None:
+            await self.adapter.get_pane(pane_id)
+            return
+        await waiter(pane_id, regex=".", source="recent-unwrapped")
 
     def _control_command(self, pane_id: str, cols: int = 80, rows: int = 24) -> list[str]:
         return self.adapter.terminal_control_command(
@@ -939,41 +995,24 @@ class HerdrPtyTransport(LocalPtyTransport):
         *,
         environment: dict[str, str] | None = None,
     ) -> bool:
-        # Reruns are injected into a durable shell that may still contain a
-        # partially typed command from the previous attempt. Interrupt that
-        # line and accept an empty line before typing the new command so the
-        # shell cannot concatenate stale input with the fresh invocation.
-        lines = [b"\x03\r"]
-        if environment:
-            # Keep each export below the PTY's line-buffer limit. A single
-            # `env ... command` line can be truncated by Herdr while it is
-            # being echoed, leaving the shell with a half-written command.
-            lines.extend(
-                (
-                    f"export {key}={shlex.quote(str(value))}\r"
-                ).encode()
-                for key, value in environment.items()
-                if value is not None
-            )
-        lines.append((command + "\r").encode())
-        # Herdr's terminal bridge accepts input in bounded PTY-sized chunks.
-        # Send complete short shell lines in order, with a small settling gap
-        # so zsh processes each export before the next line arrives.
-        for line in lines:
-            for offset in range(0, len(line), 256):
-                chunk = line[offset : offset + 256]
-                sent = await self._send_control(
-                    node_id,
-                    {
-                        "type": "terminal.input",
-                        "bytes": base64.b64encode(chunk).decode(),
-                    },
-                )
-                if not sent:
-                    return False
-                await asyncio.sleep(0.01)
-            await asyncio.sleep(0.05)
-        return True
+        pane_id = self.pane_id(node_id)
+        if pane_id is None:
+            return False
+
+        # A Herdr pane can retain a partially typed shell line after a failed
+        # launch. Clear it with a logical key, then submit the complete command
+        # through Herdr's atomic pane-run API. Sending a burst of raw PTY bytes
+        # is lossy for long exports and can interleave shell echoes with later
+        # chunks, leaving the provider command unexecuted.
+        if not await self.adapter.send_keys(pane_id, ("ctrl+c",)):
+            return False
+        parts = [
+            f"export {key}={shlex.quote(str(value))}"
+            for key, value in (environment or {}).items()
+            if value is not None
+        ]
+        parts.append(command)
+        return await self.adapter.run_command(pane_id, "; ".join(parts))
 
     async def write(self, node_id: uuid.UUID, data: str | bytes) -> bool:
         payload = data if isinstance(data, bytes) else data.encode()
@@ -1047,5 +1086,8 @@ class HerdrPtyTransport(LocalPtyTransport):
             for record in self._projects.values():
                 (record.get("panes") or {}).pop(str(node_id), None)
             self._node_projects.pop(node_id, None)
+            pane_ready = self._pane_ready_events.pop(node_id, None)
+            if pane_ready is not None:
+                pane_ready.set()
             await self._save_metadata()
         return detached or closed

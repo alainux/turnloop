@@ -1,9 +1,10 @@
 import { useMemo } from "react";
-import type { Edge, FlowEdge, GraphNode, Usage } from "../domain";
+import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Usage } from "../domain";
 import {
   displayNodeTitle,
   mcpTooltip,
   primaryNodeAction,
+  primaryNodeActionLabel,
   skillTooltip,
   tokens,
 } from "../domain";
@@ -25,7 +26,7 @@ interface Props {
   usage: Record<string, Usage>;
   selected: string | null;
   onSelect: (id: string) => void;
-  onRun: (node: GraphNode, action: "run" | "cancel") => void;
+  onRun: (node: GraphNode, action: PrimaryNodeAction) => void;
   onContextMenu: (node: GraphNode, x: number, y: number) => void;
 }
 export const nodeStatusLabel = (node: GraphNode) => {
@@ -39,6 +40,31 @@ export const nodeStatusLabel = (node: GraphNode) => {
       : "";
   return message ? `${machineState} — ${message}` : machineState;
 };
+
+/** The glyph identifies the configured agent role; it is not a run indicator. */
+export const nodeAgentIcon = (node: GraphNode): string =>
+  node.agent?.type_id === "planner"
+    ? "git-branch"
+    : node.agent?.type_id === "verifier"
+      ? "check"
+      : "bot";
+
+export const nodeRunIcon = (
+  active: boolean,
+  action: PrimaryNodeAction | null = null,
+  freshRun = false,
+): string => {
+  if (active || action === "cancel") return "stop";
+  if (freshRun || action === "retry" || action === "regenerate") return "rotate-cw";
+  return "play";
+};
+
+export const nodeRunLabel = (
+  active: boolean,
+  action: PrimaryNodeAction,
+  freshRun = false,
+): string => (active ? "Stop" : freshRun ? "Run again" : primaryNodeActionLabel(action));
+
 export function Graph({
   nodes,
   edges,
@@ -148,11 +174,14 @@ export function Graph({
         // The action projection is authoritative, but keep the status guard
         // here as a last line of defense against a stale event arriving while
         // a completed/cancelled PTY is being released.
-        const runnable = node.allowed_actions.includes("run");
         const running = node.status === "RUNNING" || node.generation_active;
         const preparing = node.ui_state === "preparing";
         const active = running || preparing;
         const primaryAction = primaryNodeAction(node);
+        const runAction = active ? "cancel" : primaryAction;
+        const actionable = runAction !== null;
+        const freshRun = node.ui_state === "cancelled";
+        const runLabel = runAction ? nodeRunLabel(active, runAction, freshRun) : "";
         const title = displayNodeTitle(node);
         const skillRefs = node.agent?.skill_ids ?? [];
         const mcpServers = node.agent?.mcp_servers ?? [];
@@ -161,7 +190,7 @@ export function Graph({
           <article
             key={node.id}
             data-node-id={node.id}
-            className={`gnode ${node.ui_state} ${(runnable || active) ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
+            className={`gnode ${node.ui_state} ${actionable ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
             onContextMenu={(event) => {
               event.preventDefault();
               onSelect(node.id);
@@ -193,19 +222,7 @@ export function Graph({
               </span>
               <span className="node-icons" aria-hidden={skillRefs.length === 0 && mcpServers.length === 0 ? true : undefined}>
                 <span className="node-glyph">
-                  <Icon
-                    name={
-                      preparing
-                        ? "loader"
-                        : active
-                          ? "loader"
-                          : node.agent?.type_id === "planner"
-                        ? "git-branch"
-                        : node.agent?.type_id === "verifier"
-                          ? "check"
-                          : "bot"
-                    }
-                  />
+                  <Icon name={nodeAgentIcon(node)} />
                 </span>
                 {skillRefs.length > 0 && (
                   <span
@@ -227,22 +244,16 @@ export function Graph({
                 )}
               </span>
             </button>
-            {(runnable || active) && primaryAction && (
+            {runAction && (
               <button
                 className={`node-run ${active ? "running" : ""}`}
-                onClick={() => onRun(node, active ? "cancel" : "run")}
-                aria-label={
-                  active
-                    ? `Stop ${title}`
-                    : `Run ${title}`
-                }
+                onClick={() => onRun(node, runAction)}
+                aria-label={`${runLabel} ${title}`}
                 title={
-                  active
-                    ? "Stop this node"
-                    : "Run this node"
+                  active ? "Stop this node" : runLabel
                 }
               >
-                <Icon name={active ? "stop" : "play"} />
+                <Icon name={nodeRunIcon(active, runAction, freshRun)} />
               </button>
             )}
             <button

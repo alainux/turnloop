@@ -1445,35 +1445,6 @@ form.composer:has(.composer-config-panel) {
   margin-left: auto;
   flex: 0 0 auto;
 }
-.gnode.running .node-glyph {
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-.gnode.preparing .node-glyph {
-  color: var(--amber);
-  background: var(--amber-soft);
-}
-.gnode.preparing .node-glyph .icon {
-  animation: spin 1s linear infinite;
-}
-.gnode.complete .node-glyph {
-  color: var(--green);
-  background: var(--green-soft);
-}
-.gnode.verifying .node-glyph,
-.gnode.waiting_input .node-glyph,
-.gnode.waiting_dependency .node-glyph {
-  color: var(--amber);
-  background: var(--amber-soft);
-}
-.gnode.failed .node-glyph,
-.gnode.cancelled .node-glyph {
-  color: var(--red);
-  background: var(--red-soft);
-}
-.gnode.ready .node-glyph {
-  color: var(--violet);
-}
 .node-progress {
   position: absolute;
   left: 0;
@@ -3349,12 +3320,6 @@ img.icon {
 .project-item:focus-within .project-menu {
   opacity: 1;
 }
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
 /* Interaction and density corrections: one spacing rhythm, explicit selections,
    and menus that stay attached to the objects they operate on. */
 .button,

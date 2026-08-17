@@ -42,6 +42,7 @@ from turn.workers.base import NodeExecutionContext, Planner, Worker, render_cont
 from turn.workers.echo_worker import EchoWorker
 from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
+from turn.workers.harness_catalog import HarnessCommandFactory
 import turn.workers.harnesses as harness_module
 from turn.workers import parsing
 from turn.workers.registry import WorkerRegistry
@@ -49,6 +50,15 @@ from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
 import turn.workers.planner as planner_module
 from turn.workers.terminal import LocalPtyTransport, TerminalResult
+from turn.skills.library import SKILLS, install_builtin_skill
+
+
+@pytest.fixture(autouse=True)
+def install_builtin_skills(tmp_path):
+    # Direct worker tests bypass the planner boundary.
+    for project_root in (tmp_path, tmp_path / "project"):
+        for skill_id in SKILLS:
+            install_builtin_skill(skill_id, project_root)
 
 
 def test_codex_model_discovery_handles_long_lived_server_bytes(monkeypatch):
@@ -118,9 +128,25 @@ class SessionPlanner(Planner):
         self.session_id = session_id
         self.started = started
         self.forbidden_session_id: str | None = None
+        self.seen_session_id: str | None = None
+        self.command: list[str] | None = None
 
     async def plan(self, ctx):
         self.forbidden_session_id = ctx.forbidden_session_id
+        self.seen_session_id = ctx.node.agent.session_id if ctx.node.agent else None
+        if ctx.node.agent and ctx.node.agent.harness in {
+            HarnessKind.CODEX,
+            HarnessKind.CLAUDE,
+            HarnessKind.OPENCODE,
+            HarnessKind.PI,
+        }:
+            self.command = HarnessCommandFactory().planner_command(
+                ctx.node.agent,
+                "fresh planner prompt",
+                cwd=ctx.repo_path or ".",
+                native=True,
+                resume=self.seen_session_id is not None,
+            )
         if self.started is not None:
             self.started.set()
             await asyncio.Event().wait()
@@ -240,12 +266,40 @@ def test_local_cli_harnesses_use_native_commands_for_the_browser_terminal():
         "/tmp/project",
         native=True,
     )
-    assert "--mode" not in pi and "--print" not in pi and "do the work" not in pi
+    assert "--mode" not in pi and "--print" not in pi and pi[-1] == "do the work"
     assert "run" not in opencode and "--format" not in opencode
     # The transport does not classify commands. Native-vs-machine behavior is
     # solely a launch decision owned by the harness catalog.
     assert pi[0] == "pi" and opencode[0] == "opencode"
-    assert "--prompt" not in opencode
+    assert opencode[-2:] == ["--prompt", "do the work"]
+
+
+@pytest.mark.parametrize("harness", [HarnessKind.CLAUDE, HarnessKind.OPENCODE, HarnessKind.PI])
+def test_native_harness_commands_deploy_prompt_and_resume_saved_session(harness):
+    worker = CLIHarnessWorker(harness)
+    fresh = worker._command(
+        AgentConfig(harness=harness, model="test-model"),
+        "initial prompt",
+        "/workspace/project",
+        native=True,
+    )
+    resumed = worker._command(
+        AgentConfig(harness=harness, model="test-model", session_id="saved-session"),
+        "follow-up prompt",
+        "/workspace/project",
+        native=True,
+        resume=True,
+    )
+    assert "initial prompt" in fresh
+    assert "follow-up prompt" in resumed
+    assert "saved-session" in resumed
+    assert "--print" not in fresh and "--mode" not in fresh
+    if harness is HarnessKind.OPENCODE:
+        assert fresh[-2:] == ["--prompt", "initial prompt"]
+        assert resumed[-2:] == ["--prompt", "follow-up prompt"]
+    else:
+        assert fresh[-1] == "initial prompt"
+        assert resumed[-1] == "follow-up prompt"
 
 
 @pytest.mark.parametrize(
@@ -332,7 +386,7 @@ def test_reconnect_commands_use_native_provider_sessions():
     opencode = runner._reconnect_command(node, "/tmp/project", "opencode-session")
     assert opencode is not None
     assert opencode[:3] == ["opencode", "--session", "opencode-session"]
-    assert "run" not in opencode and "--format" not in opencode and "--auto" in opencode
+    assert "run" not in opencode and "--format" not in opencode and "--auto" not in opencode
 
 
 async def test_user_shell_is_independent_from_node_activity(tmp_path):
@@ -441,6 +495,33 @@ async def test_reconnect_requires_the_node_session_not_run_history(tmp_path):
     # another session id happens to be present in the node's run history.
     assert await runner.reconnect(root.id) is False
     assert runner._reconnect_tasks == {}
+    await store.dispose()
+
+
+async def test_manual_stop_of_retained_follow_up_requires_a_fresh_run(tmp_path):
+    store = Store(tmp_path / "session-state")
+    await store.init()
+    root = await store.create_project(
+        "stop retained follow up",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "retained-session"
+    await store._save_node(root)
+    transport = FakeTerminalTransport()
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=transport,
+    )
+    assert await runner.reconnect(root.id)
+    assert await runner.cancel(root.id) is None
+    stopped = await store.get_node(root.id)
+    assert stopped.status == NodeStatus.CANCELLED
+    assert stopped.agent.session_id == "retained-session"
+    assert not transport.snapshot(root.id)["active"]
     await store.dispose()
 
 
@@ -581,7 +662,7 @@ async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
     runner.registry.register_planner(planner)
     root = await store.create_project(
         "fresh planner run",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.OPENCODE),
         run_policy=RunPolicy(auto_run=False),
     )
     root.agent.session_id = "old-session"
@@ -589,13 +670,30 @@ async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
     await store.set_status(root.id, NodeStatus.EXPANDED)
     await store.add_artifacts(
         root.id,
-        [ArtifactSpec(kind=ArtifactKind.JSON, name="plan-submission", content={"old": True})],
+        [ArtifactSpec(kind=ArtifactKind.TEXT, name="old-artifact", content="old")],
     )
+    terminal = FakeTerminalTransport()
+    runner.terminal = terminal
+    runner.shell = terminal
+    await terminal.ensure_persistent_shell(root.id, cwd=str(tmp_path))
+    running_process = asyncio.create_task(
+        terminal.run(root.id, ["provider"], cwd=str(tmp_path))
+    )
+    for _ in range(100):
+        if terminal.snapshot(root.id)["active"]:
+            break
+        await asyncio.sleep(0.01)
 
     result = await runner.regenerate_descendants(root.id, fresh_session=True)
 
     assert result["created"]
     assert planner.forbidden_session_id == "old-session"
+    assert planner.seen_session_id is None
+    assert planner.command is not None
+    assert "--session" not in planner.command
+    assert planner.command[-2:] == ["--prompt", "fresh planner prompt"]
+    assert running_process.done()
+    assert root.id in terminal.closed_nodes
     rerun_root = await store.get_node(root.id)
     assert rerun_root.agent.session_id == "new-session"
     run = (await store.get_runs(root.id))[-1]
@@ -784,7 +882,7 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
     assert (await store.get_runs(orphan.id))[-1].status == RunStatus.CANCELLED
     repaired_orphan = await store.get_node(orphan.id)
     assert repaired_orphan.status == NodeStatus.RUNNABLE
-    assert repaired_orphan.agent.session_id is None
+    assert repaired_orphan.agent.session_id == "stale-session"
     assert await runner.terminal.has_persistent_session(orphan.id)
     assert (await store.get_runs(live.id))[-1].status == RunStatus.RUNNING
     assert orphan_run.id != live_run.id
@@ -793,8 +891,9 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
     await store.dispose()
 
 
-async def test_retry_starts_a_fresh_provider_call_in_the_existing_pane(tmp_path):
+async def test_retry_prepares_a_fresh_provider_call(tmp_path):
     _, store, runner = await _runtime(tmp_path, EchoWorker())
+    runner.terminal = FakeTerminalTransport()
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     node = await store.create_node(
         project_id=root.id,
@@ -810,7 +909,8 @@ async def test_retry_starts_a_fresh_provider_call_in_the_existing_pane(tmp_path)
     retried = await store.get_node(node.id)
     assert retried.status == NodeStatus.RUNNABLE
     assert retried.agent.session_id is None
-    assert await runner.terminal.has_persistent_session(node.id)
+    assert node.id in runner.terminal.close_requests
+    assert not await runner.terminal.has_persistent_session(node.id)
     await store.dispose()
 
 
@@ -953,10 +1053,16 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
     state_file = tmp_path / "turn" / "projects" / f"proj-{root.id.hex[:8]}" / ".turn" / "state.json"
     nodes, children = await graph_explorer._query(str(state_file), str(root.id), str(worker.id), "tree")
     by_id = {item["id"]: item for item in nodes}
+    root_view = by_id[str(root.id)]
     worker_view = by_id[str(worker.id)]
     dependent_view = by_id[str(dependent.id)]
 
+    # A worker can inspect the root request and sibling instructions through
+    # the read-only graph explorer; requester is metadata, not an ACL filter.
+    assert root_view["objective"] == "Original user intention"
+    assert root_view["instructions"] == "Original user intention"
     assert worker_view["instructions"] == "Implement the domain contract from the original intention."
+    assert dependent_view["instructions"] == "Read the domain output and assemble the product."
     assert worker_view["agent"]["harness"] == "echo"
     assert worker_view["agent"]["model"] == "deterministic"
     assert worker_view["session_id"] == "worker-session"
@@ -1183,6 +1289,40 @@ def test_planner_requires_skill_research_and_visual_references_when_relevant():
     assert "normal file artifact" in prompt
 
 
+def test_planner_does_not_turn_project_prompt_into_a_skill():
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a greeting CLI",
+        generated_prompt=(
+            "Create the complete command, tests, launch instructions, and acceptance evidence."
+        ),
+    )
+    prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
+
+    assert "do not create a project skill merely to carry the assignment" in prompt
+    assert "must never contain the user's request" in prompt
+    assert "this node's objective or generated_prompt" in prompt
+    assert "Do not paste skill text into the prompt" in prompt
+    assert "Agents already receive their node" in prompt
+    assert "can inspect the live graph" in prompt
+
+
+def test_worker_context_delivers_assignment_and_live_graph_access():
+    from turn.workers.codex_worker import CodexWorker
+
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a greeting CLI",
+        generated_prompt="Write the executable command and tests.",
+    )
+    prompt = CodexWorker()._build_prompt(NodeExecutionContext(node=node))
+
+    assert "OBJECTIVE:\nBuild a greeting CLI" in prompt
+    assert "TASK:\nWrite the executable command and tests." in prompt
+    assert "GRAPH EXPLORATION TOOL" in prompt
+    assert "turn graph" in prompt
+
+
 def test_codex_choked_output_is_not_a_false_success():
     from turn.workers.codex_worker import CodexWorker
 
@@ -1382,6 +1522,61 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
     runs = await store.get_runs(child.id)
     assert cancelled.status == NodeStatus.CANCELLED
     assert runs[-1].status.value == "CANCELLED"
+    await store.dispose()
+
+
+async def test_run_after_manual_stop_starts_a_fresh_provider_session(tmp_path):
+    class SessionWorker(Worker):
+        name = "echo"
+
+        def __init__(self):
+            self.seen_sessions: list[str | None] = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
+            self.seen_sessions.append(ctx.node.agent.session_id if ctx.node.agent else None)
+            if len(self.seen_sessions) == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return WorkerResult(
+                outcome=Outcome.COMPLETE,
+                summary="session boundary verified",
+                session_id=f"new-session-{len(self.seen_sessions)}",
+            )
+
+    worker = SessionWorker()
+    _, store, runner = await _runtime(tmp_path, worker)
+    runner.terminal = FakeTerminalTransport()
+    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+    node = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="manual rerun",
+        executor="echo",
+        status=NodeStatus.RUNNABLE,
+        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="old-session"),
+    )
+
+    await runner.run_node(node.id)
+    await asyncio.wait_for(worker.first_started.wait(), timeout=1)
+    await runner.cancel(node.id)
+
+    stopped = await store.get_node(node.id)
+    assert stopped.status == NodeStatus.CANCELLED
+    assert stopped.agent.session_id == "old-session"
+
+    await runner.run_node(node.id)
+    for _ in range(100):
+        if len(worker.seen_sessions) == 2 and node.id not in runner._running:
+            break
+        await asyncio.sleep(0.01)
+
+    rerun = await store.get_node(node.id)
+    assert worker.seen_sessions == ["old-session", None]
+    assert rerun.agent.session_id == "new-session-2"
+    assert node.id in runner.terminal.close_requests
     await store.dispose()
 
 

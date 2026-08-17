@@ -7,33 +7,43 @@ import os
 import subprocess
 import uuid
 
+import pytest
+
 from turn.workers.interactive import (
     _new_codex_session_id,
     agent_environment,
     prepare_result_file,
+    read_codex_session_usage,
     read_result_file,
     result_handoff,
     run_until_result,
 )
 from turn.tests.fakes import FakeHerdrAdapter
-from turn.workers.terminal import HerdrPtyTransport, TerminalResult
+from turn.skills.library import SKILLS, install_builtin_skill
+from turn.workers.terminal import HerdrPtyTransport, LocalPtyTransport, TerminalResult
+from turn.domain.schemas import AgentConfig
+
+
+@pytest.fixture(autouse=True)
+def install_builtin_skills(tmp_path):
+    # Direct worker tests bypass the planner boundary; production workers only
+    # receive projects whose planner has already installed these files.
+    for skill_id in SKILLS:
+        install_builtin_skill(skill_id, tmp_path)
 
 
 async def test_injected_command_clears_partial_shell_input(tmp_path, monkeypatch):
     transport = HerdrPtyTransport(str(tmp_path), adapter=FakeHerdrAdapter())
-    sent: list[dict] = []
-
-    async def capture(_node_id, command):
-        sent.append(command)
-        return True
-
-    monkeypatch.setattr(transport, "_send_control", capture)
+    node_id = uuid.uuid4()
+    await transport._ensure_pane(node_id, cwd=str(tmp_path), environment={"TURN_PROJECT_ID": "project"})
     await transport.inject_command(
-        uuid.uuid4(), "codex --model test", environment={"TURN_PROJECT_ID": "project"}
+        node_id, "codex --model test", environment={"TURN_PROJECT_ID": "project"}
     )
 
-    raw = b"".join(base64.b64decode(item["bytes"]) for item in sent)
-    assert raw == b"\x03\rexport TURN_PROJECT_ID=project\rcodex --model test\r"
+    assert transport.adapter.sent_keys[-1][1] == ("ctrl+c",)
+    assert transport.adapter.run_commands[-1][1] == (
+        "export TURN_PROJECT_ID=project; codex --model test"
+    )
 
 
 def test_agent_handoff_prompt_uses_shell_safe_cli_stdin_submission():
@@ -69,6 +79,17 @@ def test_worker_environment_uses_the_inherited_turn_command(tmp_path):
         text=True,
     )
     assert "submit" in completed.stdout
+
+
+def test_worker_environment_rejects_an_unprocured_external_skill(tmp_path):
+    node_id = uuid.uuid4()
+    handoff = prepare_result_file(str(tmp_path), node_id, "result")
+    agent = AgentConfig(
+        skill_ids=["https://github.com/example/skills/tree/main/visual-qa"]
+    )
+
+    with pytest.raises(ValueError, match="not installed by the planner"):
+        agent_environment(str(tmp_path), node_id, "result", handoff, agent=agent)
 
 
 def test_verifier_environment_uses_verification_handoff(tmp_path):
@@ -133,6 +154,7 @@ def test_new_codex_session_id_matches_node_marker_not_latest_mtime(tmp_path, mon
     wanted.write_text(
         json.dumps({"type": "session_meta", "payload": {"session_id": wanted_id, **common}})
         + "\n"
+        + ("{}\n" * 20)
         + json.dumps({"type": "message", "payload": {"text": f"TURN node id: {node_id}"}})
         + "\n"
     )
@@ -152,6 +174,43 @@ def test_new_codex_session_id_matches_node_marker_not_latest_mtime(tmp_path, mon
     )
 
 
+def test_codex_session_usage_reads_latest_per_turn_count(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    session_dir = codex_home / "sessions" / "2026" / "08" / "15"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    session_id = "019fff3a-2c16-7143-8ec3-1f68bce525e7"
+    session_file = session_dir / f"rollout-2026-08-15T00-00-00-000000-{session_id}.jsonl"
+    session_file.write_text(
+        json.dumps({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 90,
+                        "output_tokens": 20,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 12,
+                        "cached_input_tokens": 8,
+                        "output_tokens": 3,
+                    },
+                },
+            },
+        })
+        + "\n"
+    )
+
+    assert read_codex_session_usage(session_id).model_dump() == {
+        "input_tokens": 12,
+        "cached_input_tokens": 8,
+        "output_tokens": 3,
+        "cost_usd": None,
+    }
+
+
 async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeypatch):
     from turn.config import Settings
     from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, Node
@@ -165,7 +224,8 @@ async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeyp
     async def fake_run_until_result(_transport, _node_id, _command, **kwargs):
         assert kwargs["environment"]["TURN_HANDOFF_KIND"] == "verification"
         assert kwargs["result_path"].name.endswith(".verification.json")
-        assert "agent verify --stdin" in kwargs["initial_input"]
+        assert "agent verify --stdin" in _command[-1]
+        assert "initial_input" not in kwargs
         kwargs["result_path"].write_text(
             '{"decision":"REJECT","summary":"The game is not playable",'
             '"findings":["The launch command fails"],'
@@ -244,6 +304,10 @@ class AttachedHerdrHarness:
 
     def __init__(self):
         self.injected: list[str] = []
+        self.inject_events: list[str] = []
+        self.closed = False
+        self.released = asyncio.Event()
+        self.session_done = asyncio.Event()
 
     def snapshot(self, node_id):
         return {"active": True, "output": "Codex ready"}
@@ -251,15 +315,28 @@ class AttachedHerdrHarness:
     async def foreground_process_names(self, node_id):
         return ("codex",)
 
+    async def close_persistent_session(self, node_id):
+        self.closed = True
+        return True
+
+    async def ensure_session(self, node_id, **kwargs):
+        try:
+            await self.released.wait()
+            return TerminalResult(returncode=0, output=b"")
+        finally:
+            self.session_done.set()
+
     async def inject_command(self, node_id, command, **kwargs):
+        self.inject_events.extend(("send-keys:ctrl+c", "pane.run"))
         self.injected.append(command)
         return True
 
     async def stop(self, node_id):
+        self.released.set()
         return True
 
 
-async def test_active_node_pane_reuses_its_foreground_harness(tmp_path):
+async def test_active_node_pane_is_replaced_before_launching_new_command(tmp_path):
     node_id = uuid.uuid4()
     result_path = prepare_result_file(str(tmp_path), node_id, "result")
     transport = AttachedHerdrHarness()
@@ -267,7 +344,7 @@ async def test_active_node_pane_reuses_its_foreground_harness(tmp_path):
         run_until_result(
             transport,
             node_id,
-            ["codex", "--resume", "wrong-to-inject"],
+            ["codex", "--resume", "saved-session", "new prompt"],
             cwd=str(tmp_path),
             result_path=result_path,
             harness_name="codex",
@@ -276,7 +353,84 @@ async def test_active_node_pane_reuses_its_foreground_harness(tmp_path):
     await asyncio.sleep(0.05)
     result_path.write_text('{"outcome":"COMPLETE","summary":"done"}')
     await task
+    transport.released.set()
+    await transport.session_done.wait()
+    assert transport.closed
+    assert transport.injected == ["codex --resume saved-session 'new prompt'"]
+
+
+class ShellAttachedHerdrHarness(AttachedHerdrHarness):
+    async def foreground_process_names(self, node_id):
+        return ("zsh",)
+
+
+async def test_shell_pane_is_reused_for_a_first_native_launch(tmp_path):
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    transport = ShellAttachedHerdrHarness()
+    task = asyncio.create_task(
+        run_until_result(
+            transport,
+            node_id,
+            ["codex", "initial prompt"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+            harness_name="codex",
+        )
+    )
+    await asyncio.sleep(0.05)
+    result_path.write_text('{"outcome":"COMPLETE","summary":"done"}')
+    await task
+    transport.released.set()
+    await transport.session_done.wait()
+    assert not transport.closed
+    assert transport.injected == ["codex 'initial prompt'"]
+
+
+class GatedReadyHerdrHarness(AttachedHerdrHarness):
+    def __init__(self):
+        super().__init__()
+        self.ready = asyncio.Event()
+        self.ready_called = asyncio.Event()
+
+    async def wait_until_ready(self, node_id):
+        self.ready_called.set()
+        await self.ready.wait()
+
+
+async def test_native_launch_waits_for_provider_readiness_before_injection(tmp_path):
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    transport = GatedReadyHerdrHarness()
+    task = asyncio.create_task(
+        run_until_result(
+            transport,
+            node_id,
+            ["codex", "initial prompt"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+            harness_name="codex",
+        )
+    )
+
+    await transport.ready_called.wait()
     assert transport.injected == []
+    # This is the regression: the old implementation sent Ctrl-C as soon as
+    # the control stream existed, which interrupted a shell before its prompt.
+    assert transport.inject_events == []
+
+    transport.ready.set()
+    for _ in range(100):
+        if transport.injected:
+            break
+        await asyncio.sleep(0.01)
+    assert transport.injected == ["codex 'initial prompt'"]
+    assert transport.inject_events == ["send-keys:ctrl+c", "pane.run"]
+
+    result_path.write_text('{"outcome":"COMPLETE","summary":"done"}')
+    await task
+    transport.released.set()
+    await transport.session_done.wait()
 
 
 class RejectingHerdrLaunch:
@@ -390,18 +544,18 @@ async def test_native_codex_session_id_is_observed_before_completion(tmp_path, m
 
 async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp_path):
     from turn.config import Settings
-    from turn.domain.schemas import AgentConfig, HarnessKind, Node, PermissionMode
+    from turn.domain.schemas import AgentConfig, HarnessKind, Node
     from turn.workers.base import NodeExecutionContext
     from turn.workers.codex_worker import CodexWorker
 
     binary = tmp_path / "fake-codex"
     binary.write_text(
         "#!/usr/bin/env python3\n"
-        "import pathlib, sys, time\n"
+        "import os, pathlib, sys, time\n"
         "root = pathlib.Path.cwd()\n"
         "print('\\x1b[2J\\x1b[HOpenAI Codex fake', flush=True)\n"
         "(root / 'native-smoke.txt').write_text('native PTY OK')\n"
-        "result = pathlib.Path(next(token for token in sys.argv if token.endswith('.result.json')))\n"
+        "result = pathlib.Path(os.environ['TURN_HANDOFF_FILE'])\n"
         "tmp = result.with_suffix('.tmp')\n"
         "tmp.write_text('{\"outcome\":\"COMPLETE\",\"summary\":\"native verified\",\"missing_inputs\":[]}')\n"
         "tmp.replace(result)\n"
@@ -418,7 +572,6 @@ async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp
         executor="codex",
         agent=AgentConfig(
             harness=HarnessKind.CODEX,
-            permission=PermissionMode.FULL,
         ),
     )
     result_path = tmp_path / ".turn" / "interactive" / f"{node.id}.result.json"
@@ -426,7 +579,6 @@ async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp
         Settings(
             codex_binary=str(binary),
             codex_model="fake",
-            codex_args=[str(result_path)],
         )
     ).execute(NodeExecutionContext(node=node, repo_path=str(tmp_path), timeout_seconds=0.01))
     submission = next(a for a in result.artifacts if a.name == "result-submission")
@@ -434,3 +586,55 @@ async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp
     assert (tmp_path / "native-smoke.txt").read_text() == "native PTY OK"
     assert "OpenAI Codex fake" not in json.dumps(submission.content)
     assert "\x1b[2J" not in json.dumps(submission.content)
+
+
+async def test_herdr_transport_keeps_codex_in_native_interactive_mode(tmp_path, monkeypatch):
+    from turn.config import Settings
+    from turn.domain.schemas import AgentConfig, HarnessKind, Node
+    from turn.workers.base import NodeExecutionContext
+    from turn.workers.codex_worker import CodexWorker
+    import turn.workers.codex_worker as codex_module
+
+    class HerdrLikeTransport(LocalPtyTransport):
+        supports_inject = True
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_until_result(_transport, _node_id, command, **kwargs):
+        captured["command"] = command
+        kwargs["result_path"].write_text(
+            '{"outcome":"COMPLETE","summary":"interactive mode verified"}'
+        )
+        return TerminalResult(returncode=0, output=b"")
+
+    monkeypatch.setattr(codex_module, "run_until_result", fake_run_until_result)
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Keep the terminal interactive",
+        generated_prompt="Submit the result.",
+        repo_path=str(tmp_path),
+        executor="codex",
+        agent=AgentConfig(harness=HarnessKind.CODEX),
+    )
+
+    result = await CodexWorker(
+        Settings(codex_binary="codex", codex_model="fake")
+    ).execute(
+        NodeExecutionContext(
+            node=node,
+            repo_path=str(tmp_path),
+            terminal=HerdrLikeTransport(),
+        )
+    )
+
+    assert result.outcome.value == "COMPLETE"
+    command = captured["command"]
+    assert command[:6] == [
+        "codex",
+        "-m",
+        "fake",
+        "--no-alt-screen",
+        "-C",
+        str(tmp_path),
+    ]
+    assert "Submit the result." in command[-1]

@@ -5,12 +5,12 @@ import type {
   Agent,
   HarnessCapability,
   NodeDetail as Detail,
-  Permission,
   Reasoning,
 } from "../domain";
 import {
   displayNodeTitle,
   primaryNodeAction,
+  primaryNodeActionIcon,
   primaryNodeActionLabel,
   mcpServerLabel,
   skillSourceHref,
@@ -149,6 +149,7 @@ function Overview({
   const [agent, setAgent] = useState<Agent | null>(node.agent ?? null);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const primaryAction = primaryNodeAction(node);
+  const freshRun = node.ui_state === "cancelled";
   const skillRefs = agent?.skill_ids ?? [];
   const mcpServers = agent?.mcp_servers ?? [];
   useEffect(() => {
@@ -290,22 +291,6 @@ function Overview({
                 setAgent({ ...agent, reasoning })
               }
             />
-            <label className="field">
-              <span>Permissions</span>
-              <select
-                value={agent.permission}
-                onChange={(event) =>
-                  setAgent({
-                    ...agent,
-                    permission: event.target.value as Permission,
-                  })
-                }
-              >
-                <option value="ask">Ask</option>
-                <option value="workspace">Workspace</option>
-                <option value="full">Full access</option>
-              </select>
-            </label>
           </div>
           <div className="agent-resources">
             <span>{skillRefs.length} skills</span>
@@ -493,12 +478,12 @@ function Overview({
                       { method: "POST" },
                       primaryAction === "cancel"
                         ? "Node stopped"
-                        : `${primaryNodeActionLabel(primaryAction)} started`,
+                        : `${primaryNodeActionLabel(primaryAction, freshRun)} started`,
                     );
                   }}
                 >
-                  {primaryAction === "cancel" && <Icon name="stop" />}
-                  {primaryNodeActionLabel(primaryAction)}
+                  <Icon name={primaryNodeActionIcon(primaryAction, freshRun)} />
+                  {primaryNodeActionLabel(primaryAction, freshRun)}
                 </button>
               ) : (
                 <span className="empty-action">No direct action</span>

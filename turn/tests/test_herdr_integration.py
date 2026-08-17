@@ -16,7 +16,7 @@ from turn.db.store import Store
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server.api import router
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.fake_harness import FakeHarnessWorker
 from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
@@ -49,14 +49,14 @@ async def test_herdr_project_space_contract(tmp_path: Path):
     settings = Settings(
         data_dir=str(tmp_path / "turn-state"),
         projects_dir=str(project_root),
-        default_executor="echo",
+        default_executor="fake",
         planner="heuristic",
     )
     store = Store(settings.data_dir)
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
-    registry.register_planner(HeuristicPlanner("echo"))
+    registry.register(FakeHarnessWorker(settings))
+    registry.register_planner(HeuristicPlanner("fake"))
     runner = Runner(store, registry, EventBus(), settings)
     app = FastAPI()
     app.include_router(router)
@@ -74,7 +74,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
                 json={
                     "name": "Herdr contract project",
                     "prompt": "Exercise the Herdr project-space contract",
-                    "agent": {"harness": "echo", "type_id": "executor"},
+                    "agent": {"harness": "fake", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                     "working_dir": str(project_paths[0]),
                 },
@@ -127,7 +127,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
                 json={
                     "name": "Externally deleted Herdr project",
                     "prompt": "Verify reverse lifecycle reconciliation",
-                    "agent": {"harness": "echo", "type_id": "executor"},
+                    "agent": {"harness": "fake", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                     "working_dir": str(project_paths[1]),
                 },

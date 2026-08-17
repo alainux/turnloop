@@ -124,6 +124,28 @@ def test_claude_adapter_receives_per_run_mcp_config():
     assert command[command.index("--mcp-config") + 1] == "/tmp/project/.turn/mcp.json"
 
 
+def test_harness_adapters_do_not_inject_permission_policy():
+    factory = HarnessCommandFactory()
+    policy_flags = {
+        "--approve-for-me",
+        "--auto",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-skip-permissions",
+        "--permission-mode",
+        "--approve",
+        "-s",
+    }
+    for harness in (HarnessKind.CODEX, HarnessKind.CLAUDE, HarnessKind.OPENCODE, HarnessKind.PI):
+        agent = AgentConfig(harness=harness, session_id="session")
+        commands = [factory.reconnect_command(agent, "/tmp/project", "session")]
+        if harness != HarnessKind.CODEX:
+            commands.extend([
+                factory.worker_command(harness, agent, "prompt", "/tmp/project"),
+                factory.planner_command(agent, "prompt", cwd="/tmp/project", native=False, resume=False),
+            ])
+        assert all(policy_flags.isdisjoint(command or []) for command in commands)
+
+
 def test_codex_adapter_keeps_mcp_config_out_of_the_prompt():
     agent = AgentConfig(harness=HarnessKind.CODEX, mcp_servers=[explicit_server()])
     overrides = codex_mcp_overrides(agent)

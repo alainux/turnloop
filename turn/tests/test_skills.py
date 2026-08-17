@@ -13,28 +13,14 @@ from turn.domain.schemas import (
     SETUP_SKILL_ID,
     PlanResult,
 )
-from turn.skills.library import SKILLS, materialize, validate_skill_reference
+from turn.skills.library import (
+    SKILLS,
+    install_builtin_skill,
+    resolve_skill_paths,
+    validate_plan_skill_files,
+    validate_skill_reference,
+)
 from turn.workers.planner import AgentPlanner
-
-
-class FakeSkillFetcher:
-    def __init__(self, payload: bytes):
-        self.payload = payload
-        self.urls: list[str] = []
-
-    def fetch(self, url: str) -> bytes:
-        self.urls.append(url)
-        return self.payload
-
-
-class FakeBundleFetcher(FakeSkillFetcher):
-    def __init__(self, files: dict[str, bytes]):
-        super().__init__(files[next(path for path in files if Path(path).name == "SKILL.md")])
-        self.files = files
-
-    def fetch_files(self, url: str) -> dict[str, bytes]:
-        self.urls.append(url)
-        return self.files
 
 
 def test_find_skills_is_a_planner_skill():
@@ -214,17 +200,14 @@ def test_plan_accepts_local_ids_and_external_skill_urls():
 
 
 def test_unknown_skill_reference_is_rejected():
-    with pytest.raises(ValueError, match=r"local id, project:<slug>, or an http\(s\) URL"):
+    with pytest.raises(ValueError, match=r"built-in id, project:<slug>, or an http\(s\) URL"):
         validate_skill_reference("not-installed")
 
 
-def test_project_authored_skill_is_resolved_without_copying_or_network(tmp_path: Path):
+def test_project_authored_skill_is_resolved_without_content_validation(tmp_path: Path):
     path = tmp_path / ".turn" / "skills" / "game-design" / "SKILL.md"
     path.parent.mkdir(parents=True)
-    path.write_text(
-        "---\nname: game-design\ndescription: Design playable game loops.\n---\n\n"
-        "Keep the interaction loop concrete.\n"
-    )
+    path.write_text("planner-authored guidance without required frontmatter\n")
 
     plan = PlanResult(nodes=[NodeSpec(
         key="game",
@@ -232,105 +215,38 @@ def test_project_authored_skill_is_resolved_without_copying_or_network(tmp_path:
         skills=["project:game-design"],
     )])
     assert plan.nodes[0].skills == ["project:game-design"]
-    installed = materialize(["project:game-design"], tmp_path)
-    assert installed["project:game-design"] == path
+    assert resolve_skill_paths(["project:game-design"], tmp_path)["project:game-design"] == path
 
 
-def test_project_authored_skill_requires_frontmatter(tmp_path: Path):
-    path = tmp_path / ".turn" / "skills" / "bad" / "SKILL.md"
-    path.parent.mkdir(parents=True)
-    path.write_text("# Missing metadata\n")
+def test_planner_can_install_a_builtin_skill_from_the_turn_library(tmp_path: Path):
+    path = install_builtin_skill("imagegen", tmp_path)
 
-    with pytest.raises(ValueError, match="YAML frontmatter"):
-        materialize(["project:bad"], tmp_path)
-
-
-def test_external_skill_is_fetched_once_into_hidden_project_turn_directory(tmp_path: Path):
-    url = "https://example.test/skills/visual-qa/SKILL.md"
-    payload = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\n# Visual QA\nInspect the real rendered screen.\n"
-    fetcher = FakeSkillFetcher(payload)
-
-    installed = materialize(["turn-executing", url], tmp_path, fetcher=fetcher)
-    assert installed["turn-executing"].is_file()
-    external_path = installed[url]
-    assert external_path == tmp_path / ".turn" / "skills" / external_path.parent.name / "SKILL.md"
-    assert not (tmp_path / "turn" / "skills").exists()
-    assert external_path.read_bytes() == payload
-    assert fetcher.urls == [url]
-
-    materialize([url], tmp_path, fetcher=fetcher)
-    assert fetcher.urls == [url]
+    assert path == tmp_path / ".turn" / "skills" / "imagegen" / "SKILL.md"
+    assert path.read_bytes() == SKILLS["imagegen"].source_path.read_bytes()
+    assert resolve_skill_paths(["imagegen"], tmp_path)["imagegen"] == path
 
 
-def test_external_skill_installs_a_standard_multifile_tree(tmp_path: Path):
-    url = "https://github.com/example/skills/tree/main/visual-qa"
-    skill = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\nUse browser evidence.\n"
-    fetcher = FakeBundleFetcher({
-        "visual-qa/SKILL.md": skill,
-        "visual-qa/references/checklist.md": b"# Checklist\n",
-        "visual-qa/scripts/check.py": b"print('ok')\n",
-    })
+def test_plan_skill_files_require_current_project_installation(tmp_path: Path):
+    payload = {"nodes": [{"key": "work", "skills": ["imagegen", "project:visual-qa"]}]}
 
-    installed = materialize([url], tmp_path, fetcher=fetcher)
-    root = installed[url].parent
-    assert (root / "SKILL.md").read_bytes() == skill
-    assert (root / "references" / "checklist.md").read_text() == "# Checklist\n"
-    assert (root / "scripts" / "check.py").read_text() == "print('ok')\n"
-    assert not (tmp_path / "turn" / "skills").exists()
+    with pytest.raises(ValueError, match="imagegen.*not installed"):
+        validate_plan_skill_files(payload, tmp_path)
 
+    install_builtin_skill("imagegen", tmp_path)
+    with pytest.raises(ValueError, match="project:visual-qa.*not installed"):
+        validate_plan_skill_files(payload, tmp_path)
 
-def test_skills_sh_reference_resolves_public_github_tree(monkeypatch):
-    from urllib.parse import urlparse
-
-    from turn.skills.library import UrlSkillFetcher
-
-    fetcher = UrlSkillFetcher()
-    json_urls: list[str] = []
-
-    def fake_json(url: str):
-        json_urls.append(url)
-        return {
-            "tree": [
-                {"path": "resources/skills/competitive-research/SKILL.md", "type": "blob"},
-                {"path": "resources/skills/other/SKILL.md", "type": "blob"},
-            ]
-        }
-
-    loaded: list[str] = []
-
-    def fake_directory(url: str, prefix: str):
-        loaded.append(url)
-        return {"SKILL.md": b"---\nname: competitive-research\ndescription: Research.\n---\n"}
-
-    monkeypatch.setattr(fetcher, "_json", fake_json)
-    monkeypatch.setattr(fetcher, "_github_directory", fake_directory)
-
-    files = fetcher._skills_sh_files(
-        urlparse("https://skills.sh/cowork-os/cowork-os/competitive-research")
-    )
-
-    assert files["SKILL.md"].startswith(b"---\n")
-    assert json_urls == [
-        "https://api.github.com/repos/cowork-os/cowork-os/git/trees/HEAD?recursive=1"
-    ]
-    assert loaded == [
-        "https://api.github.com/repos/cowork-os/cowork-os/contents/"
-        "resources/skills/competitive-research?ref=HEAD"
-    ]
+    skill_path = tmp_path / ".turn" / "skills" / "visual-qa" / "SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("anything the planner authored")
+    install_builtin_skill("turn-executing", tmp_path)
+    validate_plan_skill_files(payload, tmp_path)
 
 
-def test_external_html_is_rejected_and_invalid_existing_install_is_replaced(tmp_path: Path):
-    url = "https://example.test/catalog/visual-qa"
-    target = tmp_path / ".turn" / "skills" / "external-visual-qa-placeholder" / "SKILL.md"
-    # The actual key is URL-derived; create the stale file after resolving it.
-    from turn.skills.library import _external_install_key
-    target = tmp_path / ".turn" / "skills" / _external_install_key(url) / "SKILL.md"
-    target.parent.mkdir(parents=True)
-    target.write_text("<!doctype html><title>catalog</title>")
-    valid = b"---\nname: visual-qa\ndescription: Inspect rendered output.\n---\n\nUse browser evidence.\n"
-    installed = materialize([url], tmp_path, fetcher=FakeSkillFetcher(valid))
-    assert installed[url].read_bytes() == valid
+def test_plan_skill_files_reject_external_urls(tmp_path: Path):
+    payload = {
+        "nodes": [{"key": "work", "skills": ["https://example.test/SKILL.md"]}]
+    }
 
-    bad_url = "https://example.test/catalog/bad"
-    with pytest.raises(ValueError, match="HTML"):
-        materialize([bad_url], tmp_path, fetcher=FakeSkillFetcher(b"<!doctype html><body>catalog</body>"))
+    with pytest.raises(ValueError, match="must install.*project:<slug>"):
+        validate_plan_skill_files(payload, tmp_path)

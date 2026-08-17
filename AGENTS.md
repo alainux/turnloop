@@ -8,13 +8,30 @@
 - The CLI is a dumb surface meant for communication with the server by agents in order to update statuses.
 - The server encapsulates orchestration and processes, and is meant to run as a global daemon.
 - The web UI is a dumb surface meant for human inspection and interaction.
-- Default agents are Planners, Executors, Integrators, or Verifiers. Planners usually create documentation and the graph. Executors run the work. Verifiers check the work and approve / reject it. Integrators combine the work of multiple executors into cohesive units. 
 - The workflow graph is also a plan and a specification, and has a Document view that shows it in a document format (markdown). 
 - Agent capabilities are defined by their skills, which are composable. The default agents are just pre-configured agents. They can also get a pre-configured list of MCPs.
 - The graph can be run by an agent or by a human by running single nodes, auto-running, or stepping through stages of equal depth.
 - We are harness agnostic and support out of the box: Codex, Claude Code, Opencode and Pi.
 - All project state lives directly on disk within the project repository.
 - Rejections can theoretically be done by any agent, from any node to any previous node, but only verifiers have it as a prerrogative.
+
+### Agents
+
+- Planners: Research, procure skills, create workflows and contracts
+- Executors: Execute scoped and tested work.
+- Integrators: Combine work into cohesive units and ensure it is integrally sound.
+- Verifiers: Approve or reject work based on contracts.
+
+Everything else is a skill.
+
+
+### Node control flow
+
+- Run: Launches the harness with a predeployed prompt and a pre-existing sessionId, if any. For first runs and continuations.
+- Re-run: Re-launches the harness with a predeployed prompt, clearing the session.
+- Manual stop, failure, finish: Next action is only "Re-run".
+- Continuation scenarios like rejection flows: Next action is "Run".
+- Waiting for dependency: No action is possible. 
 
 ## Architecture
 
@@ -51,6 +68,7 @@
 - No fallbacks, no "legacy" support, no "just in case" code. If it is not needed, it is not there. And if it fails, it fails visibly.
 - Keep a good hygiene of the open workspaces, terminals, harnesses and sessions.
 - Avoid overfitting or hardcoding to specific conditions. Aim for framework-making, and seek generalizable, agnostic approaches.
+- Solve from first principles, avoid surface-level patchwork and find a root cause for problems.
 
 ## How to work
 - The only definition of done for a feature is tests. 

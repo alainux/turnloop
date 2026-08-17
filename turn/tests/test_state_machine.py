@@ -24,6 +24,16 @@ def test_node_state_matrix(node, expected, actions):
     assert actions.issubset(set(projected.actions))
 
 
+def test_completed_executor_exposes_fresh_run_again_action():
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="finished leaf",
+        status=NodeStatus.COMPLETE,
+        executor="codex",
+    )
+    assert Action.RETRY in present_node(node).actions
+
+
 def test_running_nodes_expose_only_stop_to_every_surface():
     node = Node(
         project_id="00000000-0000-0000-0000-000000000001",
@@ -71,6 +81,19 @@ def test_human_input_is_distinct_from_dependency_waiting():
     assert present_node(node).state == UIState.WAITING_INPUT
     dependency = node.model_copy(update={"required_inputs": []})
     assert present_node(dependency, blocked_reason="dependency incomplete").state == UIState.WAITING_DEPENDENCY
+
+
+def test_waiting_dependency_does_not_expose_a_primary_run_action():
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="wait for prerequisite",
+        status=NodeStatus.BLOCKED,
+    )
+
+    projected = present_node(node, blocked_reason="dependency incomplete")
+
+    assert projected.state == UIState.WAITING_DEPENDENCY
+    assert not ({Action.RUN, Action.RETRY, Action.REGENERATE} & set(projected.actions))
 
 
 def test_graph_projection_never_reclassifies_a_running_node_as_runnable():

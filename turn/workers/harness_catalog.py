@@ -77,9 +77,8 @@ MODEL_DISCOVERY_COMMANDS = {
 class HarnessCommandFactory:
     """Build provider commands for workers, planners, and reconnects."""
 
-    def __init__(self, *, codex_binary: str = "codex", codex_args: list[str] | None = None):
+    def __init__(self, *, codex_binary: str = "codex"):
         self.codex_binary = codex_binary
-        self.codex_args = list(codex_args or [])
 
     def worker_command(
         self,
@@ -108,13 +107,12 @@ class HarnessCommandFactory:
                 cmd += ["--model", model]
             if reasoning != "default":
                 cmd += ["--effort", reasoning]
-            if agent.permission.value == "full":
-                cmd.append("--dangerously-skip-permissions")
-            elif agent.permission.value == "workspace":
-                cmd += ["--permission-mode", "acceptEdits"]
             if agent.tools:
                 cmd += ["--allowedTools", *agent.tools]
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            # Native Claude starts its interactive session immediately with
+            # the positional prompt.  The print adapter keeps stdin support
+            # for machine-readable transports.
+            return [*cmd, prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if harness == HarnessKind.OPENCODE:
             cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
             if session:
@@ -123,9 +121,10 @@ class HarnessCommandFactory:
                 cmd += ["--model", model]
             if reasoning != "default":
                 cmd += ["--variant", reasoning]
-            if agent.permission.value != "ask":
-                cmd.append("--auto")
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            # OpenCode's interactive TUI owns the initial prompt through its
+            # provider-native --prompt option; do not type into its composer
+            # after startup.
+            return [*cmd, "--prompt", prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if harness == HarnessKind.PI:
             cmd = ["pi"] if native else ["pi", "-p", "--mode", "json"]
             if session:
@@ -134,11 +133,11 @@ class HarnessCommandFactory:
                 cmd += ["--model", model]
             if reasoning != "default":
                 cmd += ["--thinking", reasoning]
-            if agent.permission.value != "ask":
-                cmd.append("--approve")
             if agent.tools:
                 cmd += ["--tools", ",".join(agent.tools)]
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            # Pi accepts one or more initial messages as positional args and
+            # keeps the interactive session alive after processing them.
+            return [*cmd, prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         raise ValueError(f"unsupported generic harness: {harness}")
 
     def planner_command(
@@ -147,29 +146,25 @@ class HarnessCommandFactory:
         mcp_config: str | None = None,
     ) -> list[str]:
         if agent.harness == HarnessKind.OPENCODE:
-            cmd = ["opencode", cwd] if native else ["opencode", "run", "--auto"]
+            cmd = ["opencode", cwd] if native else ["opencode", "run"]
             if agent.session_id:
                 cmd += ["--session", agent.session_id]
             if model := agent.model:
                 cmd += ["--model", model]
             if agent.reasoning.value != "default":
                 cmd += ["--variant", agent.reasoning.value]
-            if native:
-                cmd.append("--auto")
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            return [*cmd, "--prompt", prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if agent.harness == HarnessKind.PI:
-            cmd = ["pi"] if native else ["pi", "--print", "--mode", "text", "--approve"]
+            cmd = ["pi"] if native else ["pi", "--print", "--mode", "text"]
             if agent.session_id:
                 cmd += ["--session" if native and resume else "--session-id", agent.session_id]
             if model := agent.model:
                 cmd += ["--model", model]
             if agent.reasoning.value != "default":
                 cmd += ["--thinking", agent.reasoning.value]
-            if native:
-                cmd.append("--approve")
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            return [*cmd, prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if agent.harness == HarnessKind.CLAUDE:
-            cmd = ["claude"] if native else ["claude", "--print", "--output-format", "text", "--permission-mode", "acceptEdits"]
+            cmd = ["claude"] if native else ["claude", "--print", "--output-format", "text"]
             if mcp_config:
                 cmd += ["--mcp-config", mcp_config]
             if agent.session_id:
@@ -178,7 +173,7 @@ class HarnessCommandFactory:
                 cmd += ["--model", model]
             if agent.reasoning.value != "default":
                 cmd += ["--effort", agent.reasoning.value]
-            return cmd if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            return [*cmd, prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         raise ValueError(f"planner harness '{agent.harness.value}' is unsupported")
 
     def reconnect_command(
@@ -187,6 +182,7 @@ class HarnessCommandFactory:
         cwd: str,
         session_id: str,
         *,
+        prompt: str | None = None,
         mcp_config: str | None = None,
     ) -> list[str] | None:
         mcp_flags = [
@@ -195,31 +191,25 @@ class HarnessCommandFactory:
             for item in ("-c", override)
         ]
         if agent.harness == HarnessKind.CODEX:
-            permission = (
-                ["--dangerously-bypass-approvals-and-sandbox"]
-                if agent.permission.value == "full"
-                else ["-s", "workspace-write"]
-                if agent.permission.value == "ask"
-                else ["--approve-for-me"]
-            )
-            native_args = [
-                arg for arg in self.codex_args
-                if arg not in {"--skip-git-repo-check", "exec", "resume"}
-                and "bypass" not in arg
-            ]
             model = ["--model", agent.model] if agent.model else []
             thinking = (["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
                         if agent.reasoning.value != "default" else [])
-            return [self.codex_binary, "resume", *model, *thinking, *mcp_flags, *permission,
-                    "--no-alt-screen", "-C", cwd, *native_args, session_id]
+            command = [self.codex_binary, "resume", *model, *thinking, *mcp_flags,
+                       "--no-alt-screen", "-C", cwd, session_id]
+            return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.PI:
-            return ["pi", "--session", session_id, *(["--model", agent.model] if agent.model else [])]
+            command = ["pi", "--session", session_id, *(["--model", agent.model] if agent.model else [])]
+            return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.OPENCODE:
-            command = ["opencode", "--session", session_id, cwd]
+            command = (
+                ["opencode", cwd, "--session", session_id]
+                if prompt is not None
+                else ["opencode", "--session", session_id, cwd]
+            )
             if agent.model:
                 command += ["--model", agent.model]
-            if agent.permission.value != "ask":
-                command.append("--auto")
+            if prompt is not None:
+                command += ["--prompt", prompt]
             return command
         if agent.harness == HarnessKind.CLAUDE:
             command = ["claude", "--resume", session_id]
@@ -227,11 +217,7 @@ class HarnessCommandFactory:
                 command += ["--mcp-config", mcp_config]
             if agent.model:
                 command += ["--model", agent.model]
-            if agent.permission.value == "full":
-                command.append("--dangerously-skip-permissions")
-            elif agent.permission.value == "workspace":
-                command += ["--permission-mode", "acceptEdits"]
-            return command
+            return [*command, prompt] if prompt is not None else command
         return None
 
     def conversation_delete_command(

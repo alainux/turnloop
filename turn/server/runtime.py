@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import asyncio
 import json
+import uuid
 from typing import Any
 
 from turn.config import Settings, test_modes_enabled, validate_server_settings
@@ -14,6 +15,7 @@ from turn.runner.runner import Runner
 from turn.workers.herdr import HerdrAdapter
 from turn.workers.registry import WorkerRegistry, build_registry
 from turn.workers.harnesses import harness_capabilities
+from turn.fake_workflows import fake_workflows_enabled, seed_fake_workflows
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class TurnRuntime:
         registry: WorkerRegistry | None = None,
         execution_adapter: Any | None = None,
         herdr_adapter: HerdrAdapter | None = None,
+        terminal_transport: Any | None = None,
         test_mode: bool | None = None,
     ):
         self.settings = settings
@@ -53,6 +56,7 @@ class TurnRuntime:
         self._registry = registry
         self._execution_adapter = execution_adapter
         self._herdr_adapter = herdr_adapter
+        self._terminal_transport = terminal_transport
         self.test_mode = test_modes_enabled() if test_mode is None else test_mode
         self.runner: Runner | None = None
         self.capabilities: list[dict[str, Any]] = []
@@ -82,6 +86,16 @@ class TurnRuntime:
                 "accepts_custom_models": False, "reasoning_profiles": [],
                 "available": True,
             })
+            from turn.workers.fake_harness import fake_harness_script
+
+            self.capabilities.append({
+                "id": "fake", "label": "Fake · process harness", "binary": fake_harness_script(),
+                "reasoning": ["default"],
+                "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "test"}],
+                "supports_sessions": True, "supports_tools": False,
+                "accepts_custom_models": False, "reasoning_profiles": [],
+                "available": True,
+            })
         registry = self._registry or build_registry(self.settings, test_mode=self.test_mode)
         adapter = self._execution_adapter or get_execution_adapter(self.settings)
         self.runner = Runner(
@@ -91,14 +105,20 @@ class TurnRuntime:
             self.settings,
             adapter,
             herdr_adapter=self._herdr_adapter,
+            terminal_transport=self._terminal_transport,
         )
         await self.runner.start()
+        if self.test_mode and fake_workflows_enabled():
+            created = await seed_fake_workflows(self.store)
+            for project_id in created:
+                await self.runner.ensure_node_terminal(uuid.UUID(project_id))
+            self.runner.wake()
         self._started = True
         return self.components
 
     async def stop(self) -> None:
         if self.runner is not None:
-            await self.runner.stop()
+            await self.runner.stop(close_workspaces=self.test_mode)
         if self._started:
             await self.store.dispose()
         self._started = False
@@ -135,7 +155,6 @@ class TurnRuntime:
             "default_harness": "default_executor",
             "default_model": "codex_model",
             "reasoning": "default_reasoning",
-            "permission": "default_permission",
         }
         for key, target in stored.items():
             value = await self.store.get_setting(key)

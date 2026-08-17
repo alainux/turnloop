@@ -11,7 +11,6 @@ import type {
   MCPServerAccess,
   Node,
   NodeUIState,
-  PermissionMode,
   ReasoningLevel,
   Run,
   RunPolicy,
@@ -34,7 +33,6 @@ export type {
   NodeAction,
   NodeStatus,
   NodeUIState,
-  PermissionMode,
   ReasoningLevel,
   Run,
   RunPolicy,
@@ -46,7 +44,6 @@ export type GraphNode = GraphNodeView;
 export type Graph = GraphView;
 export type Project = Node;
 export type HarnessId = HarnessKind;
-export type Permission = PermissionMode;
 export type Reasoning = ReasoningLevel;
 export type UIState = NodeUIState;
 
@@ -74,7 +71,7 @@ export function displayProjectTitle(node: Project): string {
 }
 
 /** Node cards never expose Markdown punctuation in their title label. */
-export function displayNodeTitle(node: GraphNode): string {
+export function displayNodeTitle(node: Project): string {
   return stripMarkdown(node.objective);
 }
 
@@ -171,10 +168,19 @@ export function primaryNodeAction(node: GraphNode): PrimaryNodeAction | null {
   return priority.find((action) => node.allowed_actions.includes(action)) ?? null;
 }
 
-export function primaryNodeActionLabel(action: PrimaryNodeAction): string {
+export function primaryNodeActionLabel(action: PrimaryNodeAction, freshRun = false): string {
   if (action === "cancel") return "Stop";
-  if (action === "retry" || action === "regenerate") return "Run again";
+  if (freshRun || action === "retry" || action === "regenerate") return "Run again";
   return "Run";
+}
+
+export function primaryNodeActionIcon(
+  action: PrimaryNodeAction,
+  freshRun = false,
+): string {
+  if (action === "cancel") return "stop";
+  if (freshRun || action === "retry" || action === "regenerate") return "rotate-cw";
+  return "play";
 }
 
 export interface NodeDetail {

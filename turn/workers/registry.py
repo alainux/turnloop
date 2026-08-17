@@ -4,7 +4,8 @@ from __future__ import annotations
 from turn.config import REAL_HARNESSES, Settings
 from turn.workers.base import Planner, Worker
 from turn.workers.codex_worker import CodexWorker
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.echo_worker import EchoPlanner, EchoWorker
+from turn.workers.fake_harness import FakeHarnessPlanner, FakeHarnessWorker
 from turn.workers.planner import AgentPlanner, HeuristicPlanner
 from turn.workers.shell_worker import ShellWorker
 from turn.workers.harnesses import CLIHarnessWorker
@@ -49,6 +50,7 @@ def build_registry(
     executor = default_executor or settings.default_executor
     if test_mode:
         reg.register(EchoWorker())
+        reg.register(FakeHarnessWorker(settings))
     elif settings.planner != "codex":
         raise RuntimeError(
             "non-Codex planners are test-only; construct the registry with test_mode=True"
@@ -60,6 +62,10 @@ def build_registry(
 
     if test_mode and settings.planner == "heuristic":
         planner: Planner = HeuristicPlanner(default_executor=executor)
+    elif test_mode and settings.planner == "echo":
+        planner = EchoPlanner()
+    elif test_mode and settings.planner == "fake":
+        planner = FakeHarnessPlanner(settings)
     else:
         planner = AgentPlanner(settings=settings)
     reg.register_planner(planner)

@@ -33,7 +33,6 @@ from turn.domain.schemas import (
     MCPServerAccess,
     NodeSpec,
     PlanResult,
-    PermissionMode,
     Resource,
     Usage,
 )
@@ -41,10 +40,12 @@ from turn.workers.base import NodeExecutionContext, Planner, render_context_bloc
 from turn.workers.harnesses import recover_session_id
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.mcp.runtime import codex_mcp_overrides
+from turn.skills.library import SKILLS, install_builtin_skill
 from turn.workers.interactive import (
     agent_environment,
     opencode_session_ids,
     prepare_result_file,
+    read_codex_session_usage,
     read_result_file,
     result_handoff,
     run_until_result,
@@ -65,6 +66,12 @@ class HeuristicPlanner(Planner):
         self.default_executor = default_executor
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
+        # This deterministic test fixture has no shell/tool loop. Mirror the
+        # real planner's library-install action so its synthetic plans obey
+        # the same project-local skill contract.
+        if ctx.repo_path:
+            for skill_id in SKILLS:
+                install_builtin_skill(skill_id, ctx.repo_path)
         # A root may have a concise project name while its complete intent is
         # stored in generated_prompt. Keep graph-card objectives compact and
         # put the authoritative detail in the execution prompt.
@@ -446,15 +453,22 @@ TOPOLOGY — arrange the children to express the information and delivery flow:
   research, operations, design, or other kinds of generation.
 - SKILLS: before submitting, run `turn skills show find-skills` and investigate
   the concrete work. Search for the narrowest useful guidance for each
-  executor, integrator, and verifier, then put selected local ids, standard
-  skill URLs, or `project:<slug>` references in that node's `skills` array.
-  A standard external source is a direct `SKILL.md`, a GitHub skill directory,
-  or a skills.sh skill URL; never reference an HTML listing page. If no useful
-  skill exists, author `.turn/skills/<slug>/SKILL.md` with YAML `name` and
-  `description` frontmatter and reference it as `project:<slug>`. Do not paste
-  skill bodies into prompts. Role-base skills are supplied automatically, so a
-  node may have an empty additional `skills` array when investigation finds no
-  material addition; do not spend a resubmission correcting that omission.
+  executor, integrator, and verifier. You own procurement: for every selected
+  built-in skill, inspect it with `turn skills show <id>` and copy it into this
+  project with `turn skills install <id>`; for every external skill, use your
+  available shell/browser/download tools to place its files under
+  `.turn/skills/<slug>/` and reference it as `project:<slug>`. Never submit a
+  URL as a skill reference. If no useful skill exists, do not create a project skill merely to carry the assignment; leave the additional skills array empty.
+  Project skills are only for reusable domain or method guidance that applies
+  beyond this one project prompt; they must never contain the user's request,
+  this node's objective or generated_prompt, the graph, acceptance criteria,
+  or a copy of work instructions. If genuinely reusable project-specific
+  guidance is needed, author `.turn/skills/<slug>/SKILL.md` with YAML `name`
+  and `description` frontmatter and reference it as `project:<slug>`. Do not
+  paste skill bodies into prompts. Role-base skills are attached automatically
+  from the selected agent type, but you still own installing those library
+  files into this project before submission. A node may have an empty
+  additional `skills` array when investigation finds no material addition.
   Record sources actually consulted in the relevant project document when one
   is appropriate. Scoped planners have
   `turn-planning`, `imagegen`, `find-skills`, and `find-mcps`; the root setup
@@ -510,8 +524,9 @@ ORDER & SAFETY:
   remains the conversation context.
 
 FINAL RESEARCH AND SKILL CHECK:
-- Before submission, actually run `turn skills show find-skills` and `turn
-  skills show find-mcps`, inspect the
+- Before submission, actually run `turn skills show find-skills`, `turn
+  skills show find-mcps`, and `turn skills install <id>` for every selected
+  built-in skill. Inspect the
   repository and live graph, and perform the relevant web/search or skills.sh
   queries. Do not claim a source you did not consult.
 - For broad engineering work, investigate the domain before choosing nodes.
@@ -528,10 +543,16 @@ FINAL RESEARCH AND SKILL CHECK:
   without a source URL or a concrete reason is incomplete.
 - Give every concrete executor, integrator, and verifier a non-empty `skills`
   array when the investigation found a material project-specific addition;
-  the server supplies the role base skill and accepts an empty additional list.
-- For each selected skill, make the node prompt state the contract it improves
-  and make sure the file will exist in the project scope before that worker
-  launches. Do not paste skill text into the prompt.
+  the server supplies the role base assignment, while you install its library
+  file into the project.
+- For every skill in the planner's own configuration and every node's
+  `skills` or `agent.skill_ids`, make sure the corresponding file exists in
+  this project's `.turn/skills` directory before submitting. Verify each one
+  with a filesystem check. For each selected skill, make the node prompt state
+  the contract it improves. Do not paste skill text into the prompt, and do not turn the node
+  prompt or project request into a skill. Agents already receive their node
+  objective and assignment directly and can inspect the live graph and
+  predecessor outputs through the Turn context.
 - For a visual or interactive product, include a purposeful concept reference
   when it clarifies the result, and make the final acceptance path test one
   coherent product rather than isolated modules.
@@ -558,20 +579,15 @@ is the only valid plan handoff.
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
         transport = terminal or LocalPtyTransport()
+        # HerdrPtyTransport is an interactive PTY transport backed by a
+        # durable pane. Injection is only the delivery mechanism; it must not
+        # switch Codex from its native TUI to JSON/exec output.
         native = isinstance(transport, LocalPtyTransport)
         result_path = prepare_result_file(cwd, node_id, "plan")
         environment = agent_environment(cwd, node_id, "plan", result_path, agent)
         if project_id is not None:
             environment["TURN_PROJECT_ID"] = str(project_id)
         prompt = f"{prompt}\n\n{result_handoff(plan=True)}"
-        bypass = any("bypass" in a for a in self.s.codex_args)
-        permission = agent.permission if agent else PermissionMode.WORKSPACE
-        if bypass or permission == PermissionMode.FULL:
-            sandbox_flags = ["--dangerously-bypass-approvals-and-sandbox"]
-        elif permission == PermissionMode.ASK:
-            sandbox_flags = ["-s", "workspace-write"]
-        else:
-            sandbox_flags = ["--approve-for-me"]
         model = agent.model if agent and agent.model else self.s.codex_model
         model_flags = ["-m", model] if model else []
         reasoning = agent.reasoning.value if agent else "default"
@@ -594,37 +610,27 @@ is the only valid plan handoff.
             if session_callback is not None:
                 await session_callback(session)
         if native:
-            native_args = [
-                a for a in self.s.codex_args
-                if a not in {
-                    "--skip-git-repo-check", "exec", "resume",
-                } and "bypass" not in a
-            ]
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *mcp_flags, *sandbox_flags, "--no-alt-screen", "-C", cwd,
-                    *native_args, session_id,
+                    *mcp_flags, "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *mcp_flags, *sandbox_flags, "--no-alt-screen", "-C", cwd,
-                    *native_args,
+                    *mcp_flags, "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
-            resume_permissions = ["--dangerously-bypass-approvals-and-sandbox"] if bypass else sandbox_flags
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
-                *reasoning_flags, *mcp_flags, *resume_permissions, "-C", cwd, session_id, prompt_arg,
+                *reasoning_flags, *mcp_flags, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *mcp_flags, *sandbox_flags, "-C", cwd,
-                *[a for a in self.s.codex_args if "bypass" not in a],
+                *mcp_flags, "-C", cwd,
                 prompt_arg,
             ]
         structured = ""
@@ -644,9 +650,14 @@ is the only valid plan handoff.
                 excluded_session_ids={forbidden_session_id}
                 if forbidden_session_id
                 else None,
-                harness_name=agent.harness.value,
-                initial_input=prompt if getattr(transport, "supports_inject", False) else (prompt if native else None),
-                initial_input_mode="stdin" if (not native and getattr(transport, "supports_inject", False)) else "native",
+                # This path always launches the Codex planner. The selected
+                # project harness is inherited by its planned leaves and is
+                # not the foreground process we are waiting for here.
+                harness_name=self.s.codex_binary,
+                initial_input=prompt
+                if getattr(transport, "supports_inject", False) and not native
+                else None,
+                initial_input_mode="stdin" if getattr(transport, "supports_inject", False) else "native",
                 environment=environment,
             )
             if result.stalled:
@@ -654,6 +665,7 @@ is the only valid plan handoff.
             submitted = read_result_file(result_path)
             if submitted is not None:
                 structured = json.dumps(submitted)
+            usage = read_codex_session_usage(observed_session or session_id)
         except asyncio.TimeoutError as error:
             raise GenerationStalled("planner exceeded the run timeout") from error
         except (FileNotFoundError, OSError):
@@ -669,10 +681,7 @@ is the only valid plan handoff.
         # Native sessions communicate their plan through the atomic Turn
         # handoff file. Their PTY bytes are deliberately never scanned for
         # JSON; the browser terminal is the only consumer of that stream.
-        if native:
-            return structured, Usage(), observed_session or session_id
-
-        return structured, Usage(), observed_session or session_id
+        return structured, usage, observed_session or session_id
 
 
 class AgentPlanner(Planner):
@@ -691,7 +700,6 @@ class AgentPlanner(Planner):
         self.codex = CodexPlanner(settings=settings)
         self.commands = HarnessCommandFactory(
             codex_binary=settings.codex_binary,
-            codex_args=settings.codex_args,
         )
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
@@ -797,7 +805,6 @@ class AgentPlanner(Planner):
                     session_probe=probe_session if agent.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
                     harness_name=agent.harness.value,
-                    initial_input=native_prompt,
                     environment=environment,
                 )
             elif getattr(transport, "supports_inject", False):
