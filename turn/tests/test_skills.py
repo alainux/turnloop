@@ -9,6 +9,7 @@ from turn.db.store import Store
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
+    Node,
     NodeSpec,
     SETUP_SKILL_ID,
     PlanResult,
@@ -63,6 +64,37 @@ async def test_only_the_project_root_gets_the_setup_skill(tmp_path):
     assert SETUP_SKILL_ID not in architect.agent.skill_ids
     assert "imagegen" in architect.agent.skill_ids
     assert "turn-architecture-research" in architect.agent.skill_ids
+
+    refreshed_root = await store.get_node(root.id)
+    assert refreshed_root is not None and refreshed_root.agent is not None
+    assert "imagegen" not in refreshed_root.agent.skill_ids
+    assert not any(path.endswith("/imagegen.md") for path in refreshed_root.agent.skills)
+
+
+def test_decoding_an_old_root_drops_the_removed_imagegen_skill(tmp_path):
+    """Existing projects must remain editable after the root skill contract changes."""
+    project_id = __import__("uuid").uuid4()
+    root = Node(
+        project_id=project_id,
+        objective="CLI Quest",
+        executor="planner",
+        agent=AgentConfig(type_id=AgentType.PLANNER),
+    )
+    raw = {
+        "version": 2,
+        "project_id": str(project_id),
+        "nodes": [root.model_dump(mode="json")],
+        "edges": [],
+        "runs": [],
+        "artifacts": [],
+    }
+
+    state, normalized = Store(tmp_path / "state")._decode_state(raw)
+    migrated = state.nodes[root.id]
+
+    assert normalized is True
+    assert "imagegen" not in migrated.agent.skill_ids
+    assert not any(path.endswith("/imagegen.md") for path in migrated.agent.skills)
 
 
 @pytest.mark.asyncio

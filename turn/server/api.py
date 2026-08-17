@@ -304,8 +304,7 @@ async def create_project(body: CreateProject, request: Request):
                 index += 1
             target.write_bytes(payload)
             refs.append(str(target.resolve()))
-        root.resource_refs = refs
-        root = await store._save_node(root)
+        root = await store.set_resource_refs(root.id, refs) or root
     runner.wake()
     return {
         "project_id": str(root.id),
@@ -624,11 +623,10 @@ async def rename_project(project_id: str, body: RenameProject, request: Request)
     node = await store.get_node(uuid.UUID(project_id))
     if node is None or node.parent_id is not None:
         raise HTTPException(404, "project not found")
-    node.project_name = body.name.strip()
     # Keep the authored objective and generated prompt intact. The explicit
     # project_name is the only user override; when it is absent the UI may use
     # the planner-scoped document title.
-    node = await store._save_node(node)
+    node = await store.rename_project(uuid.UUID(project_id), body.name) or node
     await request.app.state.events.publish(
         {"type": "node.updated", "project_id": str(node.project_id), "data": _dump(node)}
     )
@@ -649,9 +647,7 @@ async def set_project_policy(project_id: str, body: ProjectPolicyUpdate, request
     node = await store.get_node(uuid.UUID(project_id))
     if node is None:
         raise HTTPException(404, "project not found")
-    node.run_policy = body.run_policy
-    node.auto_run = body.run_policy.auto_run
-    await store._save_node(node)
+    await store.set_project_policy(uuid.UUID(project_id), body.run_policy)
     request.app.state.runner.wake()
     return {"ok": True}
 

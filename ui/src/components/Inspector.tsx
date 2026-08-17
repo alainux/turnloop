@@ -16,7 +16,7 @@ import {
   skillSourceHref,
   skillReferenceLabel,
 } from "../domain";
-import { api, json } from "../api";
+import { editNode, getNodeDetail, provideNodeInput, runNodeAction } from "../api/nodes";
 import { Icon } from "./Icon";
 import { ModelControl } from "./ModelControl";
 const TerminalView = lazy(() =>
@@ -49,7 +49,7 @@ export function Inspector({
   const load = async () => {
     const version = ++loadVersion.current;
     try {
-      const result = await api<Detail>(`/api/nodes/${nodeId}`);
+      const result = await getNodeDetail(nodeId);
       if (version !== loadVersion.current) return;
       setDetail(result);
       setError("");
@@ -66,9 +66,12 @@ export function Inspector({
   useEffect(() => {
     if (!dirty.current) void load();
   }, [refreshKey]);
-  const mutate = async (path: string, init?: RequestInit, message?: string) => {
+  const mutate = async (
+    operation: () => Promise<void>,
+    message?: string,
+  ) => {
     try {
-      await api(path, init);
+      await operation();
       if (message) notify(message);
       await onChanged();
       await load();
@@ -139,7 +142,7 @@ function Overview({
 }: {
   detail: Detail;
   capabilities: HarnessCapability[];
-  mutate: (path: string, init?: RequestInit, message?: string) => Promise<void>;
+  mutate: (operation: () => Promise<void>, message?: string) => Promise<void>;
   onDirtyChange: (value: boolean) => void;
 }) {
   const node = detail.node;
@@ -243,8 +246,7 @@ function Overview({
               disabled={!scopeDirty}
               onClick={() =>
                 mutate(
-                  `/api/nodes/${node.id}/edit`,
-                  json("POST", {
+                  () => editNode(node.id, {
                     objective: objective.trim(),
                     generated_prompt: prompt.trim() || null,
                   }),
@@ -355,8 +357,7 @@ function Overview({
             disabled={!agentDirty}
             onClick={() =>
               mutate(
-                `/api/nodes/${node.id}/edit`,
-                json("POST", { agent }),
+                () => editNode(node.id, { agent: agent ?? undefined }),
                 "Agent configuration updated",
               )
             }
@@ -391,11 +392,11 @@ function Overview({
                   disabled={!inputs[input.id]?.trim()}
                   onClick={() =>
                     mutate(
-                      `/api/nodes/${node.id}/provide-input`,
-                      json("POST", {
-                        input_id: input.id,
-                        value: inputs[input.id].trim(),
-                      }),
+                      () => provideNodeInput(
+                        node.id,
+                        input.id,
+                        inputs[input.id].trim(),
+                      ),
                       "Input supplied",
                     )
                   }
@@ -474,8 +475,7 @@ function Overview({
                     )
                       return;
                     await mutate(
-                      `/api/nodes/${node.id}/${primaryAction}`,
-                      { method: "POST" },
+                      () => runNodeAction(node.id, primaryAction),
                       primaryAction === "cancel"
                         ? "Node stopped"
                         : `${primaryNodeActionLabel(primaryAction, freshRun)} started`,

@@ -169,8 +169,7 @@ async def seed_fake_workflows(store: Store) -> list[str]:
         plan_path = Path(repo_path) / ".turn" / "fake-plan.json"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(definition.plan.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        root.resource_refs = [str(plan_path.resolve())]
-        root = await store._save_node(root)
+        root = await store.set_resource_refs(root.id, [str(plan_path.resolve())]) or root
         await store.apply_plan(root, definition.plan)
         created.append(str(root_id))
         existing.add(definition.title)

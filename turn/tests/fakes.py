@@ -208,6 +208,12 @@ class FakeTerminalTransport:
     async def close_project_workspace(self, project_key: str) -> bool:
         return True
 
+    async def close_orphaned_project_workspaces(self, project_keys: set[str]) -> None:
+        return None
+
+    async def project_workspace_state(self, project_key: str) -> str:
+        return "present"
+
 
 class DeterministicExecutionAdapter:
     """Execution port that records calls and invokes only the supplied worker."""

@@ -232,7 +232,7 @@ class HarnessCommandFactory:
         non-interactive operation for this lifecycle action.
         """
         if harness == HarnessKind.CODEX:
-            return [self.codex_binary, "delete", session_id, "--force"]
+            return [self.codex_binary, "delete", session_id]
         if harness == HarnessKind.OPENCODE:
             return ["opencode", "session", "delete", session_id]
         return None

@@ -10,7 +10,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import inspect
+import os
 from pathlib import Path
+import pty
+import select
+import subprocess
 from typing import Awaitable, Callable, Sequence
 import uuid
 
@@ -63,6 +67,51 @@ ProgressCallback = Callable[[ConversationProgress], Awaitable[None] | None]
 CommandRunner = Callable[[Sequence[str], Path | None], Awaitable[tuple[int, str]]]
 
 
+def _run_confirmed_command(command: Sequence[str], cwd: Path | None) -> tuple[int, str]:
+    """Run a provider confirmation command in a real terminal.
+
+    Codex deliberately refuses its non-forced delete confirmation when stdin
+    is a pipe. A small PTY here keeps the public provider command unchanged
+    while allowing the cleanup operation to answer its explicit prompt.
+    """
+    master, slave = pty.openpty()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd) if cwd is not None else None,
+            stdin=slave,
+            stdout=slave,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        os.close(slave)
+        slave = -1
+        os.write(master, b"y\n")
+        output = bytearray()
+        while process.poll() is None:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if not readable:
+                continue
+            try:
+                output.extend(os.read(master, 4096))
+            except OSError:
+                break
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+        return process.wait() or 0, output.decode(errors="replace").strip()
+    finally:
+        if slave >= 0:
+            os.close(slave)
+        os.close(master)
+
+
 def conversation_refs(nodes: Sequence[Node], runs: Sequence[Run]) -> list[ConversationRef]:
     """Collect persisted provider sessions once, preserving discovery order.
 
@@ -93,6 +142,8 @@ def conversation_refs(nodes: Sequence[Node], runs: Sequence[Run]) -> list[Conver
 async def _default_command_runner(
     command: Sequence[str], cwd: Path | None,
 ) -> tuple[int, str]:
+    if "delete" in command:
+        return await asyncio.to_thread(_run_confirmed_command, command, cwd)
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd) if cwd is not None else None,
@@ -112,11 +163,12 @@ async def cleanup_conversations(
     on_progress: ProgressCallback | None = None,
     run_command: CommandRunner = _default_command_runner,
 ) -> ConversationCleanup:
-    """Delete/archive each conversation using only its harness CLI.
+    """Archive then delete each supported conversation using its harness CLI.
 
-    A failed delete is retried with the harness archive command only when that
-    fallback exists. A missing fallback is reported as unsupported; no local
-    transcript or provider database is inspected or modified by Turn.
+    Codex cleanup deliberately archives before deleting, without forcing the
+    provider command. Other harnesses keep their own supported delete/archive
+    behavior. No local transcript or provider database is inspected or
+    modified by Turn.
     """
     factory = commands or HarnessCommandFactory()
     total = len(refs)
@@ -134,6 +186,40 @@ async def cleanup_conversations(
     for index, ref in enumerate(refs, start=1):
         delete_command = factory.conversation_delete_command(ref.harness, ref.session_id)
         archive_command = factory.conversation_archive_command(ref.harness, ref.session_id)
+        if ref.harness == HarnessKind.CODEX and archive_command is not None and delete_command is not None:
+            await report(index, ref, "archiving", f"Running {ref.harness.value} conversation archive command")
+            try:
+                archive_code, archive_output = await run_command(archive_command, cwd)
+            except (OSError, asyncio.SubprocessError) as error:
+                archive_code, archive_output = 1, str(error)
+            if archive_code != 0:
+                failed += 1
+                message = archive_output or f"archive command exited with status {archive_code}"
+                errors.append(f"{ref.harness.value}:{ref.session_id}: {message}")
+                await report(index, ref, "failed", message)
+                continue
+            archived += 1
+            await report(index, ref, "archived", "Conversation archived")
+            await report(
+                index,
+                ref,
+                "deleting",
+                f"Running {ref.harness.value} conversation delete command",
+            )
+            try:
+                returncode, output = await run_command(delete_command, cwd)
+            except (OSError, asyncio.SubprocessError) as error:
+                returncode, output = 1, str(error)
+            if returncode == 0:
+                deleted += 1
+                await report(index, ref, "deleted", "Conversation deleted")
+                continue
+            failed += 1
+            message = output or f"command exited with status {returncode}"
+            errors.append(f"{ref.harness.value}:{ref.session_id}: {message}")
+            await report(index, ref, "failed", message)
+            continue
+
         if delete_command is None:
             if archive_command is None:
                 unsupported += 1

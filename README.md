@@ -232,7 +232,7 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Org agent
 - [x] MCP basic
 - [x] Arbitrary node reject
-- [ ] Architecture / Hygiene & Cleanups
+- [x] Architecture / Hygiene & Cleanups
 - [ ] Live Logs / State & Graph Transitions
 - [ ] Composable graph
 - [ ] Skills / MCP via Capabilities / Agent Plugins 1.0

@@ -41,7 +41,11 @@ case "$handoff_kind" in
     ;;
   result)
     attempt="${TURN_FAKE_ATTEMPT:-1}"
-    if [[ "$prompt" == *"FAKE_EXPAND"* ]]; then
+    if [[ "$prompt" == *"FAKE_EXPANDED_A"* ]]; then
+      payload='{"outcome":"COMPLETE","summary":"Expanded part A complete."}'
+    elif [[ "$prompt" == *"FAKE_EXPANDED_B"* ]]; then
+      payload='{"outcome":"COMPLETE","summary":"Expanded part B complete."}'
+    elif [[ "$prompt" == *"FAKE_EXPAND"* ]]; then
       payload='{"outcome":"EXPAND","summary":"Expansion produced two child tasks.","children":{"nodes":[{"key":"part-a","objective":"Complete expanded part A","executor":"fake","generated_prompt":"FAKE_EXPANDED_A"},{"key":"part-b","objective":"Complete expanded part B","executor":"fake","generated_prompt":"FAKE_EXPANDED_B","depends_on":["part-a"]}]}}'
     elif [[ "$prompt" == *"FAKE_RERUN"* && "$attempt" == "1" ]]; then
       payload='{"outcome":"COMPLETE","summary":"First pass complete.","artifacts":[{"name":"first-pass","content":"old output"}]}'
@@ -59,10 +63,6 @@ case "$handoff_kind" in
       printf 'fake-turn: waiting for cancellation\n'
       sleep 5
       payload='{"outcome":"COMPLETE","summary":"This task only completes if it is not stopped."}'
-    elif [[ "$prompt" == *"FAKE_EXPANDED_A"* ]]; then
-      payload='{"outcome":"COMPLETE","summary":"Expanded part A complete."}'
-    elif [[ "$prompt" == *"FAKE_EXPANDED_B"* ]]; then
-      payload='{"outcome":"COMPLETE","summary":"Expanded part B complete."}'
     else
       payload='{"outcome":"COMPLETE","summary":"The process-level harness completed the greeting task.","artifacts":[{"kind":"text","name":"greeting.txt","content":"Hello from the process-level harness.\n"}]}'
     fi

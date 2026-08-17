@@ -7,7 +7,6 @@ import type {
   Graph,
   HarnessId,
   Project,
-  ProjectsResponse,
   Reasoning,
   RunPolicy,
   UsageResponse,
@@ -15,13 +14,27 @@ import type {
 import {
   displayPath,
   displayProjectTitle,
-  isGraph,
   primaryNodeAction,
   primaryNodeActionIcon,
   primaryNodeActionLabel,
   tokens,
 } from "./domain";
-import { api, ApiError, json } from "./api";
+import { ApiError } from "./api";
+import {
+  createProject,
+  deleteProject as deleteProjectRequest,
+  getProjectGraph,
+  getProjectUsage,
+  listProjects,
+  renameProject as renameProjectRequest,
+  setProjectMode,
+  setProjectPolicy,
+  stepProject,
+} from "./api/projects";
+import { chooseDirectory, getCapabilities, getSettings, saveSettings } from "./api/workspace";
+import { runNodeAction } from "./api/nodes";
+
+// Project deletion is serialized by the typed API module as json("DELETE", ...).
 import { Graph as GraphCanvas } from "./components/Graph";
 import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
@@ -201,19 +214,17 @@ export default function App() {
     console.error(`[Turn] ${text}`);
   }, []);
   const loadProjects = useCallback(async () => {
-    const result = await api<ProjectsResponse>("/api/projects");
+    const result = await listProjects();
     setProjects(result.projects);
   }, []);
   const loadGraph = useCallback(async () => {
     if (!projectId) return;
     const version = ++graphLoadVersion.current;
     const [next, nextUsage] = await Promise.all([
-      api<unknown>(`/api/projects/${projectId}/graph`),
-      api<UsageResponse>(`/api/projects/${projectId}/usage`),
+      getProjectGraph(projectId),
+      getProjectUsage(projectId),
     ]);
     if (version !== graphLoadVersion.current) return;
-    if (!isGraph(next))
-      throw new Error("Server returned an invalid graph schema");
     setGraph(next);
     setUsage(nextUsage);
     await loadProjects();
@@ -222,8 +233,8 @@ export default function App() {
     setCapabilitiesLoading(true);
     void Promise.all([
       loadProjects(),
-      api<Capabilities>("/api/capabilities").then(setCapabilities),
-      api<Record<string, unknown>>("/api/settings").then((value) => {
+      getCapabilities().then(setCapabilities),
+      getSettings().then((value) => {
         setWorkspaceSettings(value);
         applyAppearance(value);
       }),
@@ -445,9 +456,7 @@ export default function App() {
                   <button
                     className="button accent"
                     onClick={() =>
-                      void api(`/api/projects/${projectId}/step`, {
-                        method: "POST",
-                      }).then(loadGraph)
+                      void stepProject(projectId).then(loadGraph)
                     }
                   >
                     Next stage
@@ -485,7 +494,7 @@ export default function App() {
                     selected={selected}
                     onSelect={setSelected}
                     onRun={(node, action) =>
-                      void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
+                      void runNodeAction(node.id, action)
                         .then(loadGraph)
                         .catch((error) => notify(String(error)))
                     }
@@ -604,7 +613,7 @@ export default function App() {
                   )
                 )
                   return;
-                void api(`/api/nodes/${node.id}/${action}`, { method: "POST" })
+                void runNodeAction(node.id, action)
                   .then(loadGraph)
                   .catch((error) => notify(String(error)));
               }}
@@ -733,10 +742,7 @@ function Projects({
     if (!menu) return;
     try {
       if (!draftName.trim()) return;
-      await api(
-        `/api/projects/${menu.node.id}`,
-        json("PATCH", { name: draftName.trim() }),
-      );
+      await renameProjectRequest(menu.node.id, draftName.trim());
       setMenu(null);
       setRenaming(false);
       await onChanged();
@@ -766,10 +772,10 @@ function Projects({
     setDeleteBusy(true);
     setDeleteError(null);
     try {
-      await api(`/api/projects/${deleteTarget.id}`, json("DELETE", {
+      await deleteProjectRequest(deleteTarget.id, {
         delete_files: deleteFiles,
         delete_conversations: deleteConversations,
-      }));
+      });
       const deletedId = deleteTarget.id;
       setDeleteTarget(null);
       setDeleteProgress(null);
@@ -1039,18 +1045,15 @@ function Author({
           content_base64: await fileBase64(file),
         })),
       );
-      const result = await api<{ project_id: string }>(
-        "/api/projects",
-        json("POST", {
-          prompt: promptText.trim(),
-          name: name.trim() || null,
-          working_dir: directory || null,
-          mode: "create",
-          agent,
-          run_policy: policy,
-          attachments: encoded,
-        }),
-      );
+      const result = await createProject({
+        prompt: promptText.trim(),
+        name: name.trim() || null,
+        working_dir: directory || null,
+        mode: "create",
+        agent,
+        run_policy: policy,
+        attachments: encoded,
+      });
       onCreated(result.project_id);
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error));
@@ -1117,10 +1120,7 @@ function Author({
             type="button"
             onClick={async () => {
               try {
-                const result = await api<{ path: string | null }>(
-                  "/api/system/pick-directory",
-                  { method: "POST" },
-                );
+                const result = await chooseDirectory();
                 if (result.path) setDirectory(result.path);
               } catch (error) {
                 notify(String(error));
@@ -1247,7 +1247,7 @@ function Settings({
   );
   const [initial, setInitial] = useState("");
   useEffect(() => {
-    void api<Record<string, unknown>>("/api/settings").then((value) => {
+    void getSettings().then((value) => {
       setSettings(value);
       setInitial(JSON.stringify(value));
     });
@@ -1267,7 +1267,7 @@ function Settings({
           event.preventDefault();
           if (!dirty) return;
           try {
-            await api("/api/settings", json("POST", settings));
+            await saveSettings(settings);
             setInitial(JSON.stringify(settings));
             applyAppearance(settings);
             notify("Settings saved");
@@ -1370,10 +1370,7 @@ function Policy({
           event.preventDefault();
           if (!dirty) return;
           try {
-            await api(
-              `/api/projects/${projectId}/policy`,
-              json("POST", { run_policy: value }),
-            );
+            await setProjectPolicy(projectId, value);
             await onSaved();
             onClose();
           } catch (error) {
@@ -1435,10 +1432,7 @@ async function setMode(
   autoRun: boolean,
   refresh: () => Promise<void>,
 ) {
-  await api(
-    `/api/projects/${projectId}/mode`,
-    json("POST", { auto_run: autoRun }),
-  );
+  await setProjectMode(projectId, autoRun);
   await refresh();
 }
 async function fileBase64(file: File): Promise<string> {

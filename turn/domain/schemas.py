@@ -26,6 +26,13 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from turn.domain.skill_contracts import (
+    SETUP_SKILL_ID,
+    skill_ids_for_agent_type,
+    skill_paths_for_agent_type,
+    validate_skill_reference,
+)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -173,9 +180,6 @@ class AgentType(str, Enum):
     VERIFIER = "verifier"
 
 
-SETUP_SKILL_ID = "turn-setup"
-
-
 class MCPServerAccess(BaseModel):
     """A researched MCP assignment and optional launch configuration.
 
@@ -240,7 +244,7 @@ class VerificationResult(BaseModel):
 
     ``target_node_id`` is optional for compatibility with the original QA
     contract. When omitted, the runner returns a rejection to the reviewer's
-    single dependency. A reviewer may name any other node in the same
+    only dependency when there is one. A reviewer may name any other node in the same
     workgraph explicitly when that is the node that needs correction.
     """
 
@@ -250,43 +254,6 @@ class VerificationResult(BaseModel):
     required_changes: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     target_node_id: Optional[uuid.UUID] = None
-
-
-def skill_paths_for_agent_type(agent_type: AgentType | str) -> list[str]:
-    """Return the filesystem skills required by a built-in agent type."""
-    key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
-    root = Path(__file__).resolve().parent.parent / "agents" / "skills"
-    paths = {
-        AgentType.PLANNER.value: [
-            root / "planner" / "turn-planning.md",
-            root / "planner" / "imagegen.md",
-            root / "planner" / "find-skills.md",
-            root / "planner" / "find-mcps.md",
-        ],
-        AgentType.EXECUTOR.value: [
-            root / "executor" / "turn-executing.md",
-        ],
-        AgentType.INTEGRATOR.value: [
-            root / "integrator" / "turn-integrating.md",
-        ],
-        AgentType.VERIFIER.value: [
-            root / "verifier" / "turn-verifying.md",
-        ],
-    }
-    return [str(path) for path in paths.get(key, [])]
-
-
-def skill_ids_for_agent_type(agent_type: AgentType | str) -> list[str]:
-    """Stable library ids assigned to every built-in agent specialization."""
-    key = agent_type.value if isinstance(agent_type, AgentType) else str(agent_type)
-    return {
-        AgentType.PLANNER.value: [
-            "turn-planning", "imagegen", "find-skills", "find-mcps"
-        ],
-        AgentType.EXECUTOR.value: ["turn-executing"],
-        AgentType.INTEGRATOR.value: ["turn-integrating"],
-        AgentType.VERIFIER.value: ["turn-verifying"],
-    }.get(key, [])
 
 
 class Agent(BaseModel):
@@ -315,8 +282,6 @@ class Agent(BaseModel):
 
     @model_validator(mode="after")
     def attach_type_skills(self) -> "Agent":
-        from turn.skills.library import validate_skill_reference
-
         required = skill_paths_for_agent_type(self.type_id)
         required_ids = skill_ids_for_agent_type(self.type_id)
         object.__setattr__(self, "skills", list(dict.fromkeys([*required, *self.skills])))
@@ -670,7 +635,7 @@ class NodeSpec(BaseModel):
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
     # Workflow sequencing is deliberately independent from containment. A
     # verifier is a normal sibling in the graph and names the work it checks
-    # only through this ordinary prerequisite relation.
+    # through one or more ordinary prerequisite relations.
     depends_on: list[str] = Field(default_factory=list)  # prior left-to-right stage keys
     # When True (or executor == "planner") the created node is itself a
     # sub-planner: the runner will decompose it again on its next turn instead
@@ -721,8 +686,6 @@ class PlanResult(BaseModel):
         adjacency: dict[str, set[str]] = {key: set() for key in keys}
         for node in self.nodes:
             if node.skills:
-                from turn.skills.library import validate_skill_reference
-
                 for reference in node.skills:
                     validate_skill_reference(reference)
             if node.parent_key:
@@ -742,15 +705,10 @@ class PlanResult(BaseModel):
             requested_type = node.agent_type or (
                 node.agent.type_id if node.agent is not None else None
             )
-            if requested_type is AgentType.VERIFIER:
-                if node.parent_key:
-                    raise ValueError(
-                        f"verifier node {node.key} must use depends_on, not parent_key"
-                    )
-                if len(node.depends_on) != 1:
-                    raise ValueError(
-                        f"verifier node {node.key} must depend on exactly one target"
-                    )
+            if requested_type is AgentType.VERIFIER and node.parent_key:
+                raise ValueError(
+                    f"verifier node {node.key} must use depends_on, not parent_key"
+                )
 
         for edge in self.edges:
             if edge.src not in known or edge.dst not in known:

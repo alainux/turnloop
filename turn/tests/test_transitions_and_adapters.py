@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from turn.config import Settings
 from turn.db.store import Store
+from turn.__main__ import agent_command, parser
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
@@ -608,6 +609,146 @@ async def test_regeneration_has_no_fork_or_revision_branch(tmp_path):
     assert all(not hasattr(node, "revision") for node in nodes)
     assert all(not artifact.name.startswith("revision-") for artifact in (await store.get_artifacts(root.id)))
     assert all(edge.src == root.id or edge.dst != root.id for edge in edges)
+    await store.dispose()
+
+
+async def test_cli_plan_revision_replaces_an_expanded_subtree(tmp_path, monkeypatch):
+    """A follow-up plan submitted in the retained planner session is applied."""
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    runner.registry.register_planner(FixedPlanner())
+    root = await store.create_project(
+        "revise the lantern",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "planner-session"
+    await store._save_node(root)
+    runner.terminal.supports_inject = True
+
+    await runner._plan_node(root, root.id)
+    original = await store.descendants(root.id)
+    assert [node.objective for node in original] == ["Alternative ending"]
+    await store.set_agent_status(root.id, state="failed", message="stale prior rejection")
+
+    handoff = Path(root.repo_path) / ".turn" / "interactive" / f"{root.id}.plan.json"
+    status = handoff.parent / f"{root.id}.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", str(root.id))
+    monkeypatch.setenv("TURN_REPO", root.repo_path)
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan", "--payload",
+        json.dumps({
+            "nodes": [
+                {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
+                {"key": "write", "objective": "Write chapters", "executor": "echo", "depends_on": ["chapters"]},
+            ],
+        }),
+    ])
+    assert agent_command(args) == 0
+
+    for _ in range(100):
+        revised = await store.descendants(root.id)
+        if {node.objective for node in revised} == {"Plan chapters", "Write chapters"}:
+            break
+        await asyncio.sleep(0.01)
+
+    assert {node.objective for node in revised} == {"Plan chapters", "Write chapters"}
+    assert all(node.id not in {old.id for old in original} for node in revised)
+    updated_root = await store.get_node(root.id)
+    assert updated_root.status == NodeStatus.EXPANDED
+    assert updated_root.agent_state is None
+    assert updated_root.agent_message is None
+    await runner.stop()
+    await store.dispose()
+
+
+async def test_runner_restores_retained_handoff_watchers_after_restart(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "restore planner editability",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "retained-planner-session"
+    await store._save_node(root)
+    terminal = FakeTerminalTransport()
+    terminal.supports_inject = True
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=terminal,
+    )
+
+    await runner.start()
+    try:
+        for _ in range(100):
+            if root.id in runner._handoff_watchers:
+                break
+            await asyncio.sleep(0.01)
+        assert root.id in runner._handoff_watchers
+    finally:
+        await runner.stop()
+        await store.dispose()
+
+
+async def test_cli_result_revision_updates_a_completed_executor_session(tmp_path, monkeypatch):
+    """Every retained executor conversation can publish a corrected result."""
+    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    root = await store.create_project(
+        "revise executor work",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    [work] = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="work", objective="Implement the feature", executor="echo")]),
+    )
+    work.agent = AgentConfig(harness=HarnessKind.CODEX, session_id="executor-session")
+    await store._save_node(work)
+    runner.terminal.supports_inject = True
+
+    initial_run = await store.create_run(work, "codex")
+    await store.set_status(work.id, NodeStatus.RUNNING)
+    await runner._handle_outcome(
+        work,
+        initial_run,
+        root.id,
+        WorkerResult(
+            outcome=Outcome.COMPLETE,
+            summary="initial implementation",
+            session_id="executor-session",
+        ),
+    )
+
+    handoff = Path(root.repo_path) / ".turn" / "interactive" / f"{work.id}.result.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(handoff.parent / f"{work.id}.status.json"))
+    monkeypatch.setenv("TURN_NODE_ID", str(work.id))
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "result", "--payload",
+        json.dumps({
+            "outcome": "COMPLETE",
+            "summary": "corrected implementation",
+            "artifacts": ["src/corrected.py"],
+        }),
+    ])
+    assert agent_command(args) == 0
+
+    for _ in range(100):
+        runs = await store.get_runs(work.id)
+        if len(runs) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    refreshed = await store.get_node(work.id)
+    assert refreshed is not None and refreshed.status is NodeStatus.COMPLETE
+    assert runs[-1].summary == "corrected implementation"
+    assert any(artifact.ref == "src/corrected.py" for artifact in await store.get_artifacts(work.id))
+    await runner.stop()
     await store.dispose()
 
 

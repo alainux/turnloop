@@ -290,7 +290,7 @@ Use BLOCK only for genuinely external human input. Continue the existing
 session when a node is rerun; preserve prior context and files.
     """
     if verification:
-        prompt += "\n\nVERIFICATION TARGET: this verifier normally runs after its single dependency. Use `turn graph` to inspect the workgraph, the relevant node's files, and its run history before deciding. A rejection defaults to that dependency; set `target_node_id` in the decision when an earlier node is the one that needs correction."
+        prompt += "\n\nVERIFICATION TARGET: this verifier may depend on one or more work items. Use `turn graph` to inspect the full workgraph, the relevant nodes' files, and their run history before deciding. A rejection without `target_node_id` returns to the only dependency when there is exactly one; when several dependencies are present, set `target_node_id` to the specific earlier node that needs correction."
     return f"{prompt}\n\n{result_handoff(verification=verification)}"
 
 

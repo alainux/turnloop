@@ -14,6 +14,7 @@
 - We are harness agnostic and support out of the box: Codex, Claude Code, Opencode and Pi.
 - All project state lives directly on disk within the project repository.
 - Rejections can theoretically be done by any agent, from any node to any previous node, but only verifiers have it as a prerrogative.
+- Agents have plenty of freedom and autonomy, and the CLI denies very few actions. Most prerrogatives belong in skills.
 
 ### Agents
 
@@ -71,8 +72,9 @@ Everything else is a skill.
 - Solve from first principles, avoid surface-level patchwork and find a root cause for problems.
 
 ## How to work
-- The only definition of done for a feature is tests. 
+- The only definition of done is testing it. That means: specs, integration, e2e, smoke and finally manual qa using real data.
 - Code defensively. Think ahead for things you implement, considering edge cases and adjacent problems.
+- No made up requirements or restrictions.
 
 ## Success criteria
 

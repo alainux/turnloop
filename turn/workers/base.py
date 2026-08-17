@@ -9,9 +9,9 @@ from __future__ import annotations
 import shlex
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from turn.domain.schemas import (
     ArtifactSpec,
@@ -21,6 +21,7 @@ from turn.domain.schemas import (
     WorkerResult,
 )
 from turn.workers.harness_catalog import REAL_HARNESS_CATALOG
+from turn.workers.terminal import SessionCallback, StreamCallback, TerminalTransport
 
 
 class NodeExecutionContext(BaseModel):
@@ -36,12 +37,12 @@ class NodeExecutionContext(BaseModel):
     # Optional live stream plus provider-neutral terminal transport. Local
     # harnesses use a true PTY; future cloud adapters can expose equivalent
     # event/input semantics without changing the graph or worker protocol.
-    stream: Any = None
-    terminal: Any = None
+    stream: StreamCallback | None = None
+    terminal: SkipValidation[TerminalTransport | None] = None
     # Called as soon as a harness exposes a resumable conversation id. The
     # runner persists it before the worker returns, so an interrupted process
     # can be resumed without parsing a completed transcript first.
-    session_callback: Any = None
+    session_callback: SessionCallback | None = None
     # A user-triggered rerun must not receive the provider conversation that
     # belonged to the previous attempt. The runner fills this only for an
     # explicit fresh attempt; workers use it to reject a provider that reports

@@ -7,10 +7,15 @@ never downloads or inspects external skill content.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from turn.domain.skill_contracts import (
+    is_project_skill_reference as _is_project_skill_reference,
+    is_skill_url as _is_skill_url,
+    project_skill_slug,
+    skill_ids_for_agent_type,
+    validate_skill_reference as _validate_skill_reference,
+)
 
 
 @dataclass(frozen=True)
@@ -25,10 +30,6 @@ class SkillDefinition:
 _ROOT = Path(__file__).resolve().parent.parent / "agents" / "skills"
 _AGENCY_AGENTS = "https://github.com/msitarzewski/agency-agents"
 _SKILLS_SH = "https://skills.sh/"
-_PROJECT_SKILL_PATTERN = re.compile(
-    r"^project:([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)$"
-)
-
 SKILLS: dict[str, SkillDefinition] = {
     "turn-planning": SkillDefinition(
         "turn-planning", "Turn planning", _ROOT / "planner" / "turn-planning.md",
@@ -100,33 +101,21 @@ def get_skill(skill_id: str) -> SkillDefinition:
 
 
 def is_skill_url(reference: str) -> bool:
-    parsed = urlparse(reference)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    return _is_skill_url(reference)
 
 
 def is_project_skill_reference(reference: str) -> bool:
     """Return whether ``reference`` names a skill authored in this project."""
-    return _PROJECT_SKILL_PATTERN.fullmatch(reference) is not None
+    return _is_project_skill_reference(reference)
 
 
 def validate_skill_reference(reference: str) -> str:
     """Validate the shape of a built-in, project, or external reference."""
-    if reference in SKILLS:
-        return reference
-    if is_project_skill_reference(reference):
-        return reference
-    if is_skill_url(reference):
-        return reference
-    raise ValueError(
-        f"unknown skill reference {reference!r}; use a built-in id, project:<slug>, or an http(s) URL"
-    )
+    return _validate_skill_reference(reference)
 
 
 def project_skill_path(reference: str, project_root: str | Path) -> Path:
-    match = _PROJECT_SKILL_PATTERN.fullmatch(reference)
-    if match is None:
-        raise ValueError(f"invalid project skill reference: {reference!r}")
-    return Path(project_root) / ".turn" / "skills" / match.group(1) / "SKILL.md"
+    return Path(project_root) / ".turn" / "skills" / project_skill_slug(reference) / "SKILL.md"
 
 
 def install_builtin_skill(skill_id: str, project_root: str | Path) -> Path:
@@ -182,8 +171,6 @@ def validate_plan_skill_files(
         ("planner.skill_ids", reference)
         for reference in (planner_skill_ids or [])
     ]
-    from turn.domain.schemas import skill_ids_for_agent_type
-
     for index, node in enumerate(payload.get("nodes", [])):
         if not isinstance(node, dict):
             continue

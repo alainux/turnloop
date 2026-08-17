@@ -181,9 +181,9 @@ def derive_flow_edges(
     that direction is represented separately as a render-only flow edge. The
     edge is present only while that target is the next runnable or active step;
     once the target completes, normal forward flow is restored and this
-    projection becomes empty. Verifiers use their single dependency when no
-    explicit target is supplied; any node can use ``target_node_id`` to point
-    at another node.
+    projection becomes empty. Verifiers use their only dependency when no
+    explicit target is supplied; a verifier with multiple dependencies must
+    use ``target_node_id`` to point at the node that needs correction.
     """
     indexes = build_indexes(nodes, edges)
     statuses = effective_status or {node.id: node.status for node in nodes}
@@ -223,8 +223,8 @@ def rejection_target(
 
     The explicit target is deliberately an ordinary node id rather than a
     persistent edge: returning work must not mutate the DAG or introduce a
-    cycle. Omitting it preserves the original verifier behavior by selecting
-    the reviewer's one dependency.
+    cycle. Omitting it selects the reviewer's only dependency; a verifier with
+    multiple dependencies must identify its correction target explicitly.
     """
     if decision.target_node_id is not None:
         target = indexes.node_by_id.get(decision.target_node_id)

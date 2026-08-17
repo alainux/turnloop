@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from turn.config import Settings
 from turn.db.store import Store
-from turn.domain.schemas import AgentConfig, HarnessKind, Node, Run
+from turn.domain.schemas import AgentConfig, HarnessKind, Node, NodeSpec, PlanResult, Run, RunPolicy
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server import api as server_api
@@ -21,6 +21,7 @@ from turn.workers.conversations import (
     ConversationCleanup,
     ConversationProgress,
     ConversationRef,
+    _default_command_runner,
     cleanup_conversations,
     conversation_refs,
 )
@@ -83,6 +84,42 @@ async def test_runner_stop_closes_all_owned_herdr_workspaces(tmp_path):
 
         assert adapter.workspaces == {}
     finally:
+        await store.dispose()
+
+
+async def test_close_project_workspace_closes_node_processes_before_workspace(tmp_path):
+    app, store, runner = await _app(tmp_path)
+    del app
+    project = await store.create_project(
+        "close every project process",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    [child] = await store.apply_plan(
+        project,
+        PlanResult(nodes=[NodeSpec(key="child", objective="Child work", executor="echo")]),
+    )
+    order: list[tuple[str, uuid.UUID | str]] = []
+
+    async def close_node(node_id):
+        order.append(("node", node_id))
+        return True
+
+    async def close_workspace(project_key):
+        order.append(("workspace", project_key))
+        return True
+
+    runner.terminal.close_persistent_session = close_node  # type: ignore[method-assign]
+    runner.terminal.close_project_workspace = close_workspace  # type: ignore[method-assign]
+    try:
+        assert await runner.close_project_workspace(project.id)
+        assert order == [
+            ("node", project.id),
+            ("node", child.id),
+            ("workspace", str(project.id)),
+        ]
+    finally:
+        await runner.stop()
         await store.dispose()
 
 
@@ -170,7 +207,7 @@ def test_harness_conversation_commands_use_public_provider_surfaces():
     factory = HarnessCommandFactory(codex_binary="codex-test")
 
     assert factory.conversation_delete_command(HarnessKind.CODEX, "c-1") == [
-        "codex-test", "delete", "c-1", "--force",
+        "codex-test", "delete", "c-1",
     ]
     assert factory.conversation_archive_command(HarnessKind.CODEX, "c-1") == [
         "codex-test", "archive", "c-1",
@@ -182,7 +219,49 @@ def test_harness_conversation_commands_use_public_provider_surfaces():
     assert factory.conversation_delete_command(HarnessKind.PI, "p-1") is None
 
 
-async def test_conversation_cleanup_runs_one_by_one_and_falls_back_to_archive():
+async def test_non_forced_delete_runs_with_a_tty_confirmation(tmp_path):
+    command = tmp_path / "requires-tty"
+    command.write_text(
+        "#!/bin/sh\n"
+        "if [ ! -t 0 ]; then exit 2; fi\n"
+        "read answer\n"
+        "[ \"$answer\" = y ] && printf 'deleted\\n'\n"
+    )
+    command.chmod(0o755)
+
+    code, output = await _default_command_runner(
+        [str(command), "delete", "c-1"], tmp_path
+    )
+
+    assert code == 0
+    assert "deleted" in output
+
+
+async def test_codex_cleanup_archives_before_deleting_without_force():
+    ref = ConversationRef(HarnessKind.CODEX, "c-1", uuid.uuid4())
+    calls: list[tuple[str, ...]] = []
+
+    async def run_command(command: Sequence[str], cwd: Path | None) -> tuple[int, str]:
+        del cwd
+        calls.append(tuple(command))
+        return 0, ""
+
+    result = await cleanup_conversations(
+        [ref],
+        cwd=Path("/project"),
+        commands=HarnessCommandFactory(codex_binary="codex-test"),
+        run_command=run_command,
+    )
+
+    assert calls == [
+        ("codex-test", "archive", "c-1"),
+        ("codex-test", "delete", "c-1"),
+    ]
+    assert result.deleted == 1
+    assert result.archived == 1
+
+
+async def test_conversation_cleanup_archives_codex_before_a_non_forced_delete():
     refs = [
         ConversationRef(HarnessKind.CODEX, "c-1", uuid.uuid4()),
         ConversationRef(HarnessKind.OPENCODE, "o-1", uuid.uuid4()),
@@ -194,7 +273,7 @@ async def test_conversation_cleanup_runs_one_by_one_and_falls_back_to_archive():
     async def run_command(command: Sequence[str], cwd: Path | None) -> tuple[int, str]:
         del cwd
         calls.append(tuple(command))
-        if len(command) > 1 and command[1] == "delete":
+        if tuple(command[:2]) == ("codex-test", "delete"):
             return 1, "delete is unavailable"
         return 0, ""
 
@@ -207,12 +286,12 @@ async def test_conversation_cleanup_runs_one_by_one_and_falls_back_to_archive():
     )
 
     assert calls == [
-        ("codex-test", "delete", "c-1", "--force"),
         ("codex-test", "archive", "c-1"),
+        ("codex-test", "delete", "c-1"),
         ("opencode", "session", "delete", "o-1"),
     ]
     assert [item.status for item in progress] == [
-        "deleting", "archived", "deleting", "deleted", "unsupported",
+        "archiving", "archived", "deleting", "failed", "deleting", "deleted", "unsupported",
     ]
     assert result.total == 3
     assert result.deleted == 1
@@ -228,9 +307,6 @@ async def test_conversation_cleanup_executes_the_harness_commands(tmp_path, monk
     log = tmp_path / "commands.log"
     script = """#!/bin/sh
 printf '%s\\n' "$*" >> "$TURN_TEST_COMMAND_LOG"
-if [ "$1" = "delete" ]; then
-  exit 1
-fi
 exit 0
 """
     for name in ("codex", "opencode"):
@@ -249,12 +325,12 @@ exit 0
         commands=HarnessCommandFactory(),
     )
 
-    assert result.deleted == 1
+    assert result.deleted == 2
     assert result.archived == 1
     assert result.failed == 0
     assert log.read_text().splitlines() == [
-        "delete c-1 --force",
         "archive c-1",
+        "delete c-1",
         "session delete o-1",
     ]
 

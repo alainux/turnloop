@@ -9,45 +9,41 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from turn.config import Settings, settings as default_settings
-from turn.db.store import Store
+from turn.config import Settings
 from turn.domain.schemas import AgentConfig, RunPolicy
-from turn.runner.events import EventBus
-from turn.runner.prefect_adapter import get_execution_adapter
-from turn.runner.runner import Runner
-from turn.workers.registry import build_registry
 from turn.workers.filesystem import init_project_directory
+from turn.runtime import TurnRuntime
 
 
 class TurnCore:
     def __init__(
         self,
-        settings: Settings = default_settings,
+        settings: Settings | None = None,
         *,
         test_mode: bool = False,
         herdr_adapter=None,
         terminal_transport=None,
     ):
-        self.settings = settings
-        self.store = Store(settings.data_dir, projects_dir=settings.projects_dir)
-        self.events = EventBus()
-        self.runner = Runner(
-            self.store,
-            build_registry(settings, test_mode=test_mode),
-            self.events,
-            settings,
-            get_execution_adapter(settings),
+        self.settings = settings or Settings()
+        self.runtime = TurnRuntime(
+            self.settings,
             herdr_adapter=herdr_adapter,
             terminal_transport=terminal_transport,
+            test_mode=test_mode,
         )
+        self.store = self.runtime.store
+        self.events = self.runtime.events
+
+    @property
+    def runner(self):
+        return self.runtime.components.runner
 
     async def __aenter__(self):
-        await self.store.init()
+        await self.runtime.start()
         return self
 
     async def __aexit__(self, *_):
-        await self.runner.stop()
-        await self.store.dispose()
+        await self.runtime.stop()
 
     async def create_project(
         self,
@@ -86,9 +82,9 @@ class TurnCore:
         # project was authored in step mode.
         await self.runner.set_mode(project_id, True)
         for _ in range(max_rounds):
-            await self.runner._schedule_project(project_id)
-            if self.runner._running:
-                await asyncio.gather(*list(self.runner._running.values()), return_exceptions=True)
+            await self.runner.schedule_once(project_id)
+            await self.runner.wait_for_idle(project_id)
+            if self.runner.active_node_ids(project_id):
                 continue
             nodes, _, _ = await self.store.get_workgraph(project_id)
             active = [n for n in nodes if n.status.value in {"PENDING", "RUNNABLE", "RUNNING"}]

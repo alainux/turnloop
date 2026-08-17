@@ -143,12 +143,17 @@ field. The current planner node remains the boundary and its conversation
 context remains active while the descendant subtree is replaced.
 
 Verifiers are ordinary sibling nodes in the graph. Set `agent_type: "verifier"`,
-omit `parent_key`, and put exactly the executor or integrator key being checked
-in `depends_on`. This ordinary dependency is the entire graph representation of
-verification, so the verifier appears after its target without a CONTAINS or
-VERIFIES relationship. Use the graph explorer to inspect that prerequisite's
-files and run history. Rejection feedback is sent through the predecessor's
-active Herdr conversation and is not added to the graph.
+omit `parent_key`, and put the executor or integrator keys being checked in
+`depends_on`; a verifier may depend on multiple work items. When several
+branches must be checked together, prefer an integrator before the verifier so
+the verifier can inspect one cohesive, user-facing result, but this is guidance
+and not a schema requirement. This ordinary dependency relation is the entire
+graph representation of verification, so the verifier appears after its
+targets without a CONTAINS or VERIFIES relationship. Use the graph explorer to
+inspect every prerequisite's files and run history. If a multi-dependency
+verifier rejects work, set `target_node_id` to the specific earlier node that
+needs correction. Rejection feedback is sent through the predecessor's active
+Herdr conversation and is not added to the graph.
 
 Before submitting, run `turn skills show find-skills`. Search the web or the
 documented skills catalog for each concrete executor, integrator, and verifier;

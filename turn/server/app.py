@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from turn.config import settings, test_modes_enabled
 from turn.server import api
-from turn.server.runtime import TurnRuntime
+from turn.runtime import TurnRuntime
 from turn.server.security import LocalOnlyMiddleware
 
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
@@ -24,7 +24,7 @@ XTERM_FIT_DIR = ROOT_DIR / "node_modules" / "@xterm" / "addon-fit"
 async def lifespan(app: FastAPI):
     herdr_adapter = None
     if test_modes_enabled() and os.getenv("TURN_TEST_HERDR_ADAPTER") == "fake":
-        from turn.tests.fakes import FakeHerdrAdapter
+        from turn.testing.fakes import FakeHerdrAdapter
 
         herdr_adapter = FakeHerdrAdapter()
     runtime = TurnRuntime(settings, herdr_adapter=herdr_adapter)

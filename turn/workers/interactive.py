@@ -556,7 +556,7 @@ def result_handoff(*, plan: bool = False, verification: bool = False) -> str:
         shape = '{"outcome":"COMPLETE","summary":"What happened","missing_inputs":[]}'
     kind = "verification" if verification else "plan" if plan else "result"
     completion = (
-        "When the verification is complete, submit the decision and let Turn route it. Omit target_node_id to return to the single dependency, or set it to any earlier node id from `turn graph --format json` to return work there."
+        "When the verification is complete, submit the decision and let Turn route it. Omit target_node_id only when there is one dependency; when several dependencies are present, set it to the earlier node id from `turn graph --format json` that needs correction."
         if verification
         else "When the plan is complete, submit it and let Turn continue."
         if plan
@@ -607,4 +607,9 @@ The CLI submission is the only completion signal. Do not finish by printing a
 fenced result block or by relying on provider output formatting.
 
 {completion}
+
+Follow-up edits and resubmissions are allowed in this retained conversation.
+Use them cautiously: downstream work or verification may already have moved on,
+so a late edit can be too late to affect the graph or may have no effect at all.
+When in doubt, prefer an explicit rerun or the normal dependency flow.
 """.strip()

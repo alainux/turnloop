@@ -33,18 +33,20 @@ from turn.domain.schemas import (
     EdgeType,
     Graph,
     InputSpec,
-    MCPServerAccess,
     Node,
     NodeStatus,
     Outcome,
     PlanResult,
+    VerificationResult,
     Run,
     RunPolicy,
     RunStatus,
     Usage,
     SETUP_SKILL_ID,
 )
+from turn.db.state import ProjectState
 from turn.graph.logic import GraphWalker
+from turn.graph.mutations import append_artifacts, apply_plan as apply_graph_plan, merge_document_refs
 
 PLANNER_EXECUTOR = "planner"
 STATE_VERSION = 2
@@ -66,18 +68,6 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _merge_document_refs(existing: list[DocumentRef], incoming: list[DocumentRef]) -> list[DocumentRef]:
-    """Merge references by URI while preserving their authored order."""
-    merged: list[DocumentRef] = []
-    seen: set[str] = set()
-    for ref in [*existing, *incoming]:
-        if ref.ref in seen:
-            continue
-        seen.add(ref.ref)
-        merged.append(ref)
-    return merged
-
-
 class Store:
     """Durable local-file store rooted at a filesystem directory."""
 
@@ -97,11 +87,12 @@ class Store:
             if projects_dir
             else self.data_dir / "projects"
         )
-        self._states: dict[uuid.UUID, dict[str, dict[uuid.UUID, Any]]] = {}
+        self._states: dict[uuid.UUID, ProjectState] = {}
         self._project_paths: dict[uuid.UUID, Path] = {}
         self._settings: dict[str, str] = {}
         self._loaded = False
         self._write_lock = asyncio.Lock()
+        self._project_locks: dict[uuid.UUID, asyncio.Lock] = {}
 
     @staticmethod
     def _resolve_data_dir(raw: str) -> Path:
@@ -132,8 +123,8 @@ class Store:
         return uuid.UUID(str(root.get("project_id") or root["id"]))
 
     @staticmethod
-    def _empty_state() -> dict[str, dict[uuid.UUID, Any]]:
-        return {"nodes": {}, "edges": {}, "runs": {}, "artifacts": {}}
+    def _empty_state() -> ProjectState:
+        return ProjectState.empty()
 
     @staticmethod
     def _write_json(path: Path, payload: Any) -> None:
@@ -207,23 +198,23 @@ class Store:
     def _decode_state(
         self,
         raw: dict[str, Any],
-    ) -> tuple[dict[str, dict[uuid.UUID, Any]], bool]:
+    ) -> tuple[ProjectState, bool]:
         state = self._empty_state()
         normalized = False
         edge_keys: set[tuple[uuid.UUID, uuid.UUID, EdgeType]] = set()
         for item in raw.get("nodes", []):
             node = Node.model_validate(item)
-            state["nodes"][node.id] = node
+            state.nodes[node.id] = node
         for item in raw.get("edges", []):
             edge = Edge.model_validate(item)
             key = (edge.src, edge.dst, edge.type)
             if key in edge_keys:
                 continue
-            state["edges"][edge.id] = edge
+            state.edges[edge.id] = edge
             edge_keys.add(key)
         for item in raw.get("runs", []):
             run = Run.model_validate(item)
-            state["runs"][run.id] = run
+            state.runs[run.id] = run
         artifact_keys: set[tuple[Any, ...]] = set()
         for item in raw.get("artifacts", []):
             artifact = Artifact.model_validate(item)
@@ -243,9 +234,23 @@ class Store:
                 normalized = True
                 continue
             artifact_keys.add(key)
-            state["artifacts"][artifact.id] = artifact
-        for node in state["nodes"].values():
-            filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state["artifacts"]]
+            state.artifacts[artifact.id] = artifact
+        for node in state.nodes.values():
+            if node.parent_id is None and node.agent is not None:
+                # The root setup contract no longer includes imagegen. Older
+                # projects were persisted with it, and validating a later
+                # planner submission against that stale list makes an
+                # otherwise valid graph edit fail before it reaches the
+                # mutation layer.
+                skill_ids = [skill_id for skill_id in node.agent.skill_ids if skill_id != "imagegen"]
+                skills = [path for path in node.agent.skills if Path(path).name != "imagegen.md"]
+                if skill_ids != node.agent.skill_ids or skills != node.agent.skills:
+                    # Agent assignment validation restores built-in type
+                    # skills, so this migration must bypass that validator.
+                    object.__setattr__(node.agent, "skill_ids", skill_ids)
+                    object.__setattr__(node.agent, "skills", skills)
+                    normalized = True
+            filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state.artifacts]
             if filtered != node.artifact_refs:
                 node.artifact_refs = filtered
                 normalized = True
@@ -256,10 +261,10 @@ class Store:
         return {
             "version": STATE_VERSION,
             "project_id": str(project_id),
-            "nodes": [self._model_dump(value) for value in state["nodes"].values()],
-            "edges": [self._model_dump(value) for value in state["edges"].values()],
-            "runs": [self._model_dump(value) for value in state["runs"].values()],
-            "artifacts": [self._model_dump(value) for value in state["artifacts"].values()],
+            "nodes": [self._model_dump(value) for value in state.nodes.values()],
+            "edges": [self._model_dump(value) for value in state.edges.values()],
+            "runs": [self._model_dump(value) for value in state.runs.values()],
+            "artifacts": [self._model_dump(value) for value in state.artifacts.values()],
         }
 
     async def _persist_project(self, project_id: uuid.UUID) -> None:
@@ -279,12 +284,15 @@ class Store:
     async def dispose(self) -> None:
         return None
 
-    def _state(self, project_id: uuid.UUID) -> dict[str, dict[uuid.UUID, Any]]:
+    def _state(self, project_id: uuid.UUID) -> ProjectState:
         return self._states.setdefault(project_id, self._empty_state())
+
+    def _project_lock(self, project_id: uuid.UUID) -> asyncio.Lock:
+        return self._project_locks.setdefault(project_id, asyncio.Lock())
 
     def _project_for_node(self, node_id: uuid.UUID) -> tuple[uuid.UUID, Node] | None:
         for project_id, state in self._states.items():
-            node = state["nodes"].get(node_id)
+            node = state.nodes.get(node_id)
             if node is not None:
                 return project_id, node
         return None
@@ -363,7 +371,7 @@ class Store:
         project_path.mkdir(parents=True, exist_ok=True)
         self._project_paths[root_id] = project_path
         state = self._empty_state()
-        state["nodes"][node.id] = node
+        state.nodes[node.id] = node
         self._states[root_id] = state
         await self._persist_project(root_id)
         await self._persist_config()
@@ -371,15 +379,16 @@ class Store:
 
     async def list_projects(self) -> list[Node]:
         return [
-            state["nodes"][project_id].model_copy(deep=True)
+            state.nodes[project_id].model_copy(deep=True)
             for project_id, state in self._states.items()
-            if project_id in state["nodes"] and state["nodes"][project_id].parent_id is None
+            if project_id in state.nodes and state.nodes[project_id].parent_id is None
         ]
 
     async def delete_project(self, project_id: uuid.UUID) -> None:
-        self._states.pop(project_id, None)
-        self._project_paths.pop(project_id, None)
-        await self._persist_config()
+        async with self._project_lock(project_id):
+            self._states.pop(project_id, None)
+            self._project_paths.pop(project_id, None)
+            await self._persist_config()
 
     async def clear_projects(self) -> None:
         self._states.clear()
@@ -399,7 +408,7 @@ class Store:
         project_id, _ = found
         return [
             node.model_copy(deep=True)
-            for node in self._states[project_id]["nodes"].values()
+            for node in self._states[project_id].nodes.values()
             if node.parent_id == node_id
         ]
 
@@ -414,12 +423,12 @@ class Store:
 
     async def get_graph(self, project_id: uuid.UUID) -> Graph:
         state = self._states.get(project_id, self._empty_state())
-        root = state["nodes"].get(project_id)
+        root = state.nodes.get(project_id)
         return Graph(
             project_id=project_id,
-            nodes=[node.model_copy(deep=True) for node in state["nodes"].values()],
-            edges=[edge.model_copy(deep=True) for edge in state["edges"].values()],
-            artifacts=[artifact.model_copy(deep=True) for artifact in state["artifacts"].values()],
+            nodes=[node.model_copy(deep=True) for node in state.nodes.values()],
+            edges=[edge.model_copy(deep=True) for edge in state.edges.values()],
+            artifacts=[artifact.model_copy(deep=True) for artifact in state.artifacts.values()],
         )
 
     async def _load_graph(self, project_id: uuid.UUID):
@@ -463,7 +472,7 @@ class Store:
         if node.project_id not in self._states:
             return node
         saved = node.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
-        self._states[node.project_id]["nodes"][node.id] = saved
+        self._states[node.project_id].nodes[node.id] = saved
         await self._persist_project(node.project_id)
         return saved.model_copy(deep=True)
 
@@ -477,11 +486,17 @@ class Store:
     async def set_status_if_current(
         self, node_id: uuid.UUID, status: NodeStatus, expected: tuple[NodeStatus, ...]
     ) -> Optional[Node]:
-        node = await self.get_node(node_id)
-        if node is None or node.status not in expected:
+        found = self._project_for_node(node_id)
+        if found is None:
             return None
-        node.status = status
-        return await self._save_node(node)
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            current = self._states[project_id].nodes.get(node_id)
+            if current is None or current.status not in expected:
+                return None
+            node = current.model_copy(deep=True)
+            node.status = status
+            return await self._save_node(node)
 
     async def set_agent_status(
         self, node_id: uuid.UUID, *, state: str | None, message: str | None
@@ -505,6 +520,98 @@ class Store:
         if node is None:
             return None
         node.auto_run = auto_run
+        return await self._save_node(node)
+
+    async def set_resource_refs(self, node_id: uuid.UUID, refs: list[str]) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.resource_refs = list(refs)
+        return await self._save_node(node)
+
+    async def rename_project(self, project_id: uuid.UUID, name: str) -> Optional[Node]:
+        node = await self.get_node(project_id)
+        if node is None or node.parent_id is not None:
+            return None
+        node.project_name = name.strip()
+        return await self._save_node(node)
+
+    async def set_project_policy(self, project_id: uuid.UUID, policy: RunPolicy) -> Optional[Node]:
+        node = await self.get_node(project_id)
+        if node is None or node.parent_id is not None:
+            return None
+        node.run_policy = policy
+        node.auto_run = policy.auto_run
+        return await self._save_node(node)
+
+    async def set_project_mode(self, project_id: uuid.UUID, auto_run: bool) -> Optional[Node]:
+        node = await self.get_node(project_id)
+        if node is None or node.parent_id is not None:
+            return None
+        node.auto_run = auto_run
+        if node.run_policy is not None:
+            node.run_policy.auto_run = auto_run
+        return await self._save_node(node)
+
+    async def set_required_inputs(
+        self,
+        node_id: uuid.UUID,
+        required_inputs: list[InputSpec],
+        *,
+        merge: bool = False,
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        if merge:
+            by_id = {item.id: item for item in node.required_inputs}
+            by_id.update({item.id: item for item in required_inputs})
+            node.required_inputs = list(by_id.values())
+        else:
+            node.required_inputs = list(required_inputs)
+        return await self._save_node(node)
+
+    async def set_agent_session(
+        self, node_id: uuid.UUID, session_id: str | None, *, agent: AgentConfig | None = None
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        if agent is not None:
+            node.agent = agent.model_copy(deep=True)
+        if node.agent is None:
+            node.agent = AgentConfig()
+        node.agent.session_id = session_id
+        return await self._save_node(node)
+
+    async def clear_agent_session(self, node_id: uuid.UUID) -> Optional[Node]:
+        return await self.set_agent_session(node_id, None)
+
+    async def complete_verification(
+        self,
+        node_id: uuid.UUID,
+        decision: VerificationResult,
+        *,
+        session_id: str | None = None,
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.verification = decision
+        if session_id and node.agent is not None:
+            node.agent.session_id = session_id
+        node.status = NodeStatus.COMPLETE
+        return await self._save_node(node)
+
+    async def reset_node_after_rejection(
+        self, node_id: uuid.UUID, status: NodeStatus
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.status = status
+        node.agent_state = None
+        node.agent_message = None
         return await self._save_node(node)
 
     # -- settings ---------------------------------------------------------
@@ -538,10 +645,10 @@ class Store:
             required_inputs=required_inputs or [], resource_refs=resource_refs or [],
         )
         state = self._state(project_id)
-        state["nodes"][node.id] = node
+        state.nodes[node.id] = node
         if parent_id is not None:
             edge = Edge(src=parent_id, dst=node.id, type=EdgeType.CONTAINS)
-            state["edges"][edge.id] = edge
+            state.edges[edge.id] = edge
         await self._persist_project(project_id)
         return node.model_copy(deep=True)
 
@@ -607,139 +714,26 @@ class Store:
         descendants = await self.descendants(node_id)
         ids = {item.id for item in descendants}
         state = self._state(node.project_id)
-        for key in list(state["nodes"]):
+        for key in list(state.nodes):
             if key in ids:
-                del state["nodes"][key]
-        for key, edge in list(state["edges"].items()):
+                del state.nodes[key]
+        for key, edge in list(state.edges.items()):
             if edge.src in ids or edge.dst in ids:
-                del state["edges"][key]
-        for key, run in list(state["runs"].items()):
+                del state.edges[key]
+        for key, run in list(state.runs.items()):
             if run.node_id in ids:
-                del state["runs"][key]
-        for key, artifact in list(state["artifacts"].items()):
+                del state.runs[key]
+        for key, artifact in list(state.artifacts.items()):
             if artifact.node_id in ids:
-                del state["artifacts"][key]
+                del state.artifacts[key]
         await self._persist_project(node.project_id)
         return [item.id for item in descendants]
 
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
-        parent.document_refs = _merge_document_refs(
-            parent.document_refs,
-            plan.document_refs,
-        )
-        # A root setup planner may supply the concise name/objective when the
-        # user left the project unnamed. Persist it on the node itself so every
-        # graph consumer sees the same objective; generated_prompt remains the
-        # full authored request. Explicit user names remain authoritative and
-        # nested planners can never rename the project root.
-        if parent.parent_id is None and parent.project_name is None and plan.project_name:
-            candidate_name = plan.project_name.strip()
-            if candidate_name:
-                parent.project_name = candidate_name
-                parent.objective = candidate_name
-        parent_id = parent.id
-        if not plan.nodes:
-            parent.status = NodeStatus.COMPLETE
-            state = self._state(parent.project_id)
-            state["nodes"][parent_id] = parent.model_copy(deep=True)
-            self._append_artifacts(
-                state,
-                parent_id,
-                plan.artifacts,
-            )
-            await self._persist_project(parent.project_id)
-            return []
-
-        keys_to_ids = {spec.key: uuid.uuid4() for spec in plan.nodes}
-        state = self._state(parent.project_id)
-        edge_keys = {(edge.src, edge.dst, edge.type) for edge in state["edges"].values()}
-
-        def add_edge(src: uuid.UUID, dst: uuid.UUID, edge_type: EdgeType) -> None:
-            key = (src, dst, edge_type)
-            if key in edge_keys:
-                return
-            edge = Edge(src=src, dst=dst, type=edge_type)
-            state["edges"][edge.id] = edge
-            edge_keys.add(key)
-
-        created: list[Node] = []
-        for spec in plan.nodes:
-            node_id = keys_to_ids[spec.key]
-            parent_id = keys_to_ids[spec.parent_key] if spec.parent_key else parent.id
-            executor = PLANNER_EXECUTOR if (spec.plan or spec.executor == PLANNER_EXECUTOR) else (spec.executor or "codex")
-            inherited_agent = parent.agent.model_copy(deep=True) if parent.agent else None
-            if inherited_agent:
-                inherited_agent.skill_ids = [
-                    skill_id
-                    for skill_id in inherited_agent.skill_ids
-                    if skill_id != SETUP_SKILL_ID
-                ]
-            generic_leaf = executor != PLANNER_EXECUTOR and executor == "codex"
-            if generic_leaf and inherited_agent:
-                executor = inherited_agent.harness.value
-            if spec.agent:
-                node_agent = spec.agent.model_copy(deep=True)
-            elif executor == PLANNER_EXECUTOR:
-                node_agent = inherited_agent or AgentConfig(type_id="planner")
-            elif generic_leaf and inherited_agent:
-                node_agent = inherited_agent
-            elif inherited_agent and executor == inherited_agent.harness.value:
-                node_agent = inherited_agent
-            elif executor in {"codex", "claude", "opencode", "pi", "echo", "shell"}:
-                node_agent = AgentConfig(harness=executor)
-            else:
-                node_agent = inherited_agent or AgentConfig()
-            node_agent.session_id = None
-            requested_agent_type = spec.agent_type or (
-                spec.agent.type_id if spec.agent is not None else None
-            )
-            if requested_agent_type is not None:
-                node_agent = node_agent.as_type(requested_agent_type)
-            elif not spec.agent:
-                node_agent = node_agent.as_type(
-                    AgentType.PLANNER if executor == PLANNER_EXECUTOR else AgentType.EXECUTOR
-                )
-            node_agent.skill_ids = list(dict.fromkeys([*node_agent.skill_ids, *spec.skills]))
-            assigned_mcp: dict[str, MCPServerAccess] = {
-                server.name: server for server in [
-                    *node_agent.mcp_servers,
-                    *spec.mcp_servers,
-                ]
-            }
-            node_agent.mcp_servers = list(assigned_mcp.values())
-            node = Node(
-                id=node_id, project_id=parent.project_id, parent_id=parent_id,
-                objective=spec.objective, generated_prompt=spec.generated_prompt,
-                executor=executor, agent=node_agent, status=NodeStatus.PENDING,
-                required_inputs=spec.required_inputs, resource_refs=spec.resource_refs,
-                document_refs=spec.document_refs,
-            )
-            state["nodes"][node.id] = node
-            self._append_artifacts(
-                state,
-                node.id,
-                spec.artifacts,
-            )
-            created.append(node)
-            if not spec.parent_key:
-                add_edge(parent.id, node.id, EdgeType.CONTAINS)
-        for spec in plan.nodes:
-            if spec.parent_key:
-                add_edge(keys_to_ids[spec.parent_key], keys_to_ids[spec.key], EdgeType.CONTAINS)
-            for dep in spec.depends_on:
-                add_edge(keys_to_ids[dep], keys_to_ids[spec.key], EdgeType.DEPENDS_ON)
-        for item in plan.edges:
-            key = (keys_to_ids[item.src], keys_to_ids[item.dst], item.type)
-            add_edge(key[0], key[1], key[2])
-        parent.status = NodeStatus.EXPANDED
-        state["nodes"][parent.id] = parent.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
-        self._append_artifacts(
-            state,
-            parent.id,
-            plan.artifacts,
-        )
+        """Persist a validated graph mutation without interpreting its policy."""
+        created = apply_graph_plan(self._state(parent.project_id), parent, plan)
         await self._persist_project(parent.project_id)
-        return [node.model_copy(deep=True) for node in created]
+        return created
 
     # -- runs -------------------------------------------------------------
 
@@ -754,13 +748,13 @@ class Store:
             attempt=attempt,
             session_id=node.agent.session_id if node.agent else None,
         )
-        self._state(node.project_id)["runs"][run.id] = run
+        self._state(node.project_id).runs[run.id] = run
         await self._persist_project(node.project_id)
         return run.model_copy(deep=True)
 
     def _project_for_run(self, run_id: uuid.UUID) -> tuple[uuid.UUID, Run] | None:
         for project_id, state in self._states.items():
-            run = state["runs"].get(run_id)
+            run = state.runs.get(run_id)
             if run is not None:
                 return project_id, run
         return None
@@ -809,27 +803,27 @@ class Store:
         if not found:
             return []
         project_id, _ = found
-        return [run.model_copy(deep=True) for run in self._states[project_id]["runs"].values() if run.node_id == node_id]
+        return [run.model_copy(deep=True) for run in self._states[project_id].runs.values() if run.node_id == node_id]
 
     async def get_project_runs(self, project_id: uuid.UUID) -> list[Run]:
         state = self._states.get(project_id, self._empty_state())
-        ids = set(state["nodes"])
-        return [run.model_copy(deep=True) for run in state["runs"].values() if run.node_id in ids]
+        ids = set(state.nodes)
+        return [run.model_copy(deep=True) for run in state.runs.values() if run.node_id in ids]
 
     async def cancel_orphaned_runs(self, project_id: uuid.UUID, active_node_ids: set[uuid.UUID]) -> int:
         state = self._states.get(project_id)
         if state is None:
             return 0
-        node_ids = set(state["nodes"])
+        node_ids = set(state.nodes)
         changed = 0
-        for run in state["runs"].values():
+        for run in state.runs.values():
             if run.node_id in node_ids and run.status == RunStatus.RUNNING and run.node_id not in active_node_ids:
                 run.status = RunStatus.CANCELLED
                 run.outcome = Outcome.FAIL
                 run.ended_at = datetime.now(timezone.utc)
                 run.error = "Run interrupted before this runner process started"
                 run.retry_recommended = True
-                node = state["nodes"].get(run.node_id)
+                node = state.nodes.get(run.node_id)
                 if node is not None and node.status == NodeStatus.RUNNING:
                     # A persisted RUNNING node has no live task after a
                     # restart. Put it back on the scheduler so a direct
@@ -844,50 +838,13 @@ class Store:
 
     # -- artifacts --------------------------------------------------------
 
-    @staticmethod
-    def _append_artifacts(
-        state: dict[str, dict[uuid.UUID, Any]],
-        node_id: uuid.UUID,
-        specs: list[ArtifactSpec],
-    ) -> list[Artifact]:
-        """Append non-duplicate artifact identities to an in-memory state."""
-        existing = {
-            ("ref", artifact.ref) if artifact.ref else
-            ("value", artifact.kind, artifact.name, json.dumps(artifact.content, sort_keys=True, default=str))
-            for artifact in state["artifacts"].values()
-            if artifact.node_id == node_id
-        }
-        artifacts: list[Artifact] = []
-        for spec in specs:
-            key = (
-                ("ref", spec.ref) if spec.ref else
-                ("value", spec.kind, spec.name, json.dumps(spec.content, sort_keys=True, default=str))
-            )
-            if key in existing:
-                continue
-            artifact = Artifact(
-                id=uuid.uuid4(),
-                node_id=node_id,
-                kind=spec.kind,
-                name=spec.name,
-                content=spec.content,
-                ref=spec.ref,
-            )
-            state["artifacts"][artifact.id] = artifact
-            existing.add(key)
-            artifacts.append(artifact)
-        node = state["nodes"].get(node_id)
-        if node is not None and artifacts:
-            node.artifact_refs = [*node.artifact_refs, *(artifact.id for artifact in artifacts)]
-        return artifacts
-
     async def add_artifacts(self, node_id: uuid.UUID, specs: list[ArtifactSpec]) -> list[Artifact]:
         found = self._project_for_node(node_id)
         if not found:
             return []
         project_id, _ = found
         state = self._states[project_id]
-        artifacts = self._append_artifacts(state, node_id, specs)
+        artifacts = append_artifacts(state, node_id, specs)
         await self._persist_project(project_id)
         return [artifact.model_copy(deep=True) for artifact in artifacts]
 
@@ -903,10 +860,10 @@ class Store:
             return []
         project_id, _ = found
         state = self._states[project_id]
-        node = state["nodes"].get(node_id)
+        node = state.nodes.get(node_id)
         if node is None:
             return []
-        node.document_refs = _merge_document_refs(node.document_refs, refs)
+        node.document_refs = merge_document_refs(node.document_refs, refs)
         await self._persist_project(project_id)
         return []
 
@@ -915,7 +872,7 @@ class Store:
         if not found:
             return []
         project_id, _ = found
-        return [artifact.model_copy(deep=True) for artifact in self._states[project_id]["artifacts"].values() if artifact.node_id == node_id]
+        return [artifact.model_copy(deep=True) for artifact in self._states[project_id].artifacts.values() if artifact.node_id == node_id]
 
     async def clear_generated_artifacts(self, node_id: uuid.UUID) -> list[uuid.UUID]:
         """Remove prior run outputs while retaining explicit user inputs.
@@ -932,24 +889,24 @@ class Store:
         state = self._states[project_id]
         removed = [
             artifact_id
-            for artifact_id, artifact in state["artifacts"].items()
+            for artifact_id, artifact in state.artifacts.items()
             if artifact.node_id == node_id and artifact.kind is not ArtifactKind.USER_INPUT
         ]
         if not removed:
             return []
         for artifact_id in removed:
-            state["artifacts"].pop(artifact_id, None)
+            state.artifacts.pop(artifact_id, None)
         node.artifact_refs = [
             artifact_id
             for artifact_id in node.artifact_refs
-            if artifact_id in state["artifacts"]
+            if artifact_id in state.artifacts
         ]
         await self._persist_project(project_id)
         return removed
 
     async def get_artifact(self, artifact_id: uuid.UUID) -> Optional[Artifact]:
         for state in self._states.values():
-            artifact = state["artifacts"].get(artifact_id)
+            artifact = state.artifacts.get(artifact_id)
             if artifact is not None:
                 return artifact.model_copy(deep=True)
         return None

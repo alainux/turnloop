@@ -4,6 +4,7 @@ import asyncio
 import json
 import shlex
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -37,9 +38,17 @@ from turn.workers.registry import WorkerRegistry
 from turn.workers.terminal import TerminalResult
 
 
-def test_verifier_contract_requires_one_dependency_target_and_is_strict():
-    with pytest.raises(ValueError, match="exactly one target"):
-        PlanResult(nodes=[NodeSpec(key="check", objective="Check", agent_type=AgentType.VERIFIER)])
+def test_verifier_contract_allows_multiple_dependency_targets():
+    plan = PlanResult(nodes=[
+        NodeSpec(key="design", objective="Design product"),
+        NodeSpec(key="implementation", objective="Implement product"),
+        NodeSpec(
+            key="check", objective="Verify product", agent_type=AgentType.VERIFIER,
+            depends_on=["design", "implementation"],
+        ),
+    ])
+    assert plan.nodes[2].depends_on == ["design", "implementation"]
+
     with pytest.raises(ValueError, match="must use depends_on"):
         PlanResult(nodes=[
             NodeSpec(
@@ -466,6 +475,115 @@ async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path
         reconnect = runner._reconnect_tasks.get(work.id)
         if reconnect is not None:
             await asyncio.gather(reconnect, return_exceptions=True)
+    await store.dispose()
+
+
+async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_path, monkeypatch):
+    """A user-directed verifier follow-up can revise both reason and decision."""
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "Reconsider a verification",
+        repo_path=str(tmp_path / "repo"),
+        agent=AgentConfig(harness=HarnessKind.ECHO),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    work, verifier = await store.apply_plan(
+        root,
+        PlanResult(nodes=[
+            NodeSpec(key="work", objective="Build product", executor="echo"),
+            NodeSpec(
+                key="verify", objective="Verify product", executor="echo",
+                agent_type=AgentType.VERIFIER, depends_on=["work"],
+            ),
+        ]),
+    )
+    await store.set_status(work.id, NodeStatus.COMPLETE)
+    verifier.agent = AgentConfig(
+        harness=HarnessKind.CODEX,
+        type_id=AgentType.VERIFIER,
+        session_id="verifier-session",
+    )
+    await store._save_node(verifier)
+    await store.set_status(verifier.id, NodeStatus.RUNNING)
+    settings = Settings(default_executor="echo")
+    terminal = FakeTerminalTransport()
+    terminal.supports_inject = True
+    terminal.backend_name = "herdr"
+    runner = Runner(
+        store,
+        registry=WorkerRegistry(),
+        events=EventBus(),
+        settings=settings,
+        herdr_adapter=FakeHerdrAdapter(),
+        terminal_transport=terminal,
+    )
+    runner.registry.register(EchoWorker())
+
+    initial_run = await store.create_run(verifier, "codex")
+    await runner._handle_outcome(
+        verifier,
+        initial_run,
+        root.id,
+        WorkerResult(
+            outcome=Outcome.COMPLETE,
+            session_id="verifier-session",
+            verification=VerificationResult(
+                decision=VerificationDecision.REJECT,
+                summary="The launch path is broken",
+                findings=["The entry point is not mounted"],
+                required_changes=["Mount the entry point"],
+                target_node_id=work.id,
+            ),
+        ),
+    )
+
+    # Verifier submissions may use the shared result handoff as well as the
+    # dedicated verification path; both are part of the CLI contract.
+    handoff = Path(root.repo_path) / ".turn" / "interactive" / f"{verifier.id}.result.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(handoff.parent / f"{verifier.id}.status.json"))
+    monkeypatch.setenv("TURN_NODE_ID", str(verifier.id))
+    args = parser().parse_args(["agent", "verify", "--stdin"])
+    monkeypatch.setattr(
+        "sys.stdin",
+        __import__("io").StringIO(json.dumps({
+            "decision": "REJECT",
+            "summary": "The entry point needs a clearer handoff",
+            "findings": ["The user-facing launch instruction is ambiguous"],
+            "required_changes": ["Document the launch instruction"],
+            "target_node_id": str(work.id),
+        })),
+    )
+    assert agent_command(args) == 0
+
+    for _ in range(100):
+        current = await store.get_node(verifier.id)
+        if current and current.verification and current.verification.summary == "The entry point needs a clearer handoff":
+            break
+        await asyncio.sleep(0.01)
+    assert current is not None
+    assert current.verification.summary == "The entry point needs a clearer handoff"
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        __import__("io").StringIO(json.dumps({
+            "decision": "APPROVE",
+            "summary": "The revised handoff is acceptable",
+            "findings": [],
+            "required_changes": [],
+        })),
+    )
+    assert agent_command(args) == 0
+    for _ in range(100):
+        current = await store.get_node(verifier.id)
+        if current and current.verification and current.verification.decision is VerificationDecision.APPROVE:
+            break
+        await asyncio.sleep(0.01)
+    assert current is not None
+    assert current.verification.decision is VerificationDecision.APPROVE
+    assert len(await store.get_runs(verifier.id)) == 3
+    await runner.stop()
     await store.dispose()
 
 

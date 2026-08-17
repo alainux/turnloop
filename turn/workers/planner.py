@@ -479,12 +479,15 @@ TOPOLOGY — arrange the children to express the information and delivery flow:
 - VERIFICATION: almost every concrete executor or integrator should be
   followed by a verifier when its output has meaningful code, visual, runtime,
   or contract risk. A verifier is an ordinary sibling at this planning
-  boundary: set `agent_type` to `verifier`, omit `parent_key`, and put exactly
-  the implementation key it checks in `depends_on`. This is the only graph
-  relationship for verification. It makes the verifier appear immediately
-  after the work it inspects without inventing containment or a VERIFIES edge.
-  A verifier must receive explicit criteria in its prompt and inspect real
-  evidence before approving. Rejection feedback is a runtime Herdr
+  boundary: set `agent_type` to `verifier`, omit `parent_key`, and put every
+  implementation or integration key it checks in `depends_on`. A verifier may
+  have multiple dependencies. Prefer an integrator before a verifier when
+  several branches need one cohesive user-facing review, but treat that as a
+  planning recommendation rather than a validation rule. This is the only
+  graph relationship for verification. A verifier must receive explicit
+  criteria in its prompt and inspect real evidence before approving. If it
+  rejects a multi-dependency graph, set `target_node_id` to the specific
+  earlier node needing correction. Rejection feedback is a runtime Herdr
   conversation with the selected return target; it is not additional graph
   data.
 - INTEGRATORS: if a node's job is to combine or integrate its

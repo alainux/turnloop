@@ -98,6 +98,80 @@ def test_agent_cli_writes_atomic_status_and_result_handoffs(tmp_path, monkeypatc
     assert json.loads(status.read_text())["state"] == "complete"
 
 
+def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.plan.json"
+    status = tmp_path / "node.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", "node-1")
+    monkeypatch.setenv("TURN_REPO", str(tmp_path))
+    from turn.skills.library import SKILLS, install_builtin_skill
+
+    for skill_id in SKILLS:
+        install_builtin_skill(skill_id, tmp_path)
+    first = {"nodes": [{"key": "old", "objective": "Old branch"}]}
+    second = {
+        "project_name": "Revised project",
+        "nodes": [
+            {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
+            {"key": "write", "objective": "Write chapters", "executor": "echo", "depends_on": ["chapters"]},
+        ],
+    }
+
+    args = parser().parse_args(["agent", "submit", "--kind", "plan", "--stdin"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(first)))
+    assert agent_command(args) == 0
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan", "--payload", json.dumps(second)
+    ])
+    assert agent_command(args) == 0
+
+    assert json.loads(handoff.read_text()) == second
+    assert json.loads(status.read_text())["state"] == "working"
+
+
+def test_agent_cli_does_not_clobber_a_handoff_on_malformed_stdin(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.plan.json"
+    original = {"nodes": [{"key": "old", "objective": "Old branch"}]}
+    handoff.write_text(json.dumps(original))
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+
+    args = parser().parse_args(["agent", "submit", "--kind", "plan", "--stdin"])
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+    with pytest.raises(SystemExit, match="invalid agent submission"):
+        agent_command(args)
+
+    assert json.loads(handoff.read_text()) == original
+
+
+def test_agent_cli_accepts_verification_stdin_and_completes_status(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+
+    handoff = tmp_path / "node.verification.json"
+    status = tmp_path / "node.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", "node-1")
+    payload = {
+        "decision": "APPROVE",
+        "summary": "verified",
+        "findings": [],
+        "required_changes": [],
+        "evidence_refs": [],
+        "target_node_id": None,
+    }
+
+    args = parser().parse_args(["agent", "verify", "--stdin"])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert agent_command(args) == 0
+    assert json.loads(handoff.read_text()) == payload
+    assert json.loads(status.read_text())["state"] == "complete"
+
+
 def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, monkeypatch):
     from turn.__main__ import agent_command
 

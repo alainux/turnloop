@@ -8,7 +8,7 @@ from turn.server.runtime import TurnRuntime
 from turn.skills.library import install_builtin_skill
 from turn.tests.fakes import FakeHerdrAdapter
 from turn.workers.base import NodeExecutionContext
-from turn.workers.fake_harness import FakeHarnessWorker
+from turn.workers.fake_harness import FakeHarnessPlanner, FakeHarnessWorker
 from turn.workers.terminal import LocalPtyTransport
 
 
@@ -61,6 +61,27 @@ async def test_process_fake_harness_uses_a_real_process_and_retains_sessions(tmp
     third = await worker.execute(ctx)
     assert third.session_id is not None
     assert third.session_id != first.session_id
+
+
+async def test_fake_planner_installs_project_skill_contract(tmp_path):
+    project_id = uuid.uuid4()
+    node = Node(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        objective="Create a tiny deterministic plan",
+        agent=AgentConfig(harness=HarnessKind.FAKE, type_id=AgentType.PLANNER),
+    )
+    ctx = NodeExecutionContext(
+        node=node,
+        repo_path=str(tmp_path),
+        terminal=LocalPtyTransport(),
+        timeout_seconds=5,
+    )
+
+    plan = await FakeHarnessPlanner(Settings(default_run_timeout_seconds=5)).plan(ctx)
+
+    assert plan.nodes
+    assert (tmp_path / ".turn" / "skills" / "turn-planning" / "SKILL.md").is_file()
 
 
 async def test_fake_capability_is_only_exposed_by_test_runtime(tmp_path, monkeypatch):
