@@ -68,8 +68,8 @@ def present_node(
         )
     if node.status == NodeStatus.BLOCKED:
         return NodePresentation(
-            UIState.WAITING_DEPENDENCY,
-            # A dependency-waiting node cannot execute or regenerate its
+            UIState.WAITING_SEQUENCE,
+            # A sequence-waiting node cannot execute or regenerate its
             # descendants. Keep inspection/editing available, but do not
             # project a run-like action that the graph will render as
             # "Run again".

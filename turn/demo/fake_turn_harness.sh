@@ -33,7 +33,7 @@ case "$handoff_kind" in
     if [[ -n "${TURN_FAKE_PLAN_FILE:-}" && -f "$TURN_FAKE_PLAN_FILE" ]]; then
       payload="$(cat "$TURN_FAKE_PLAN_FILE")"
     else
-      payload='{"nodes":[{"key":"work","objective":"Create the tiny greeting app","executor":"fake","generated_prompt":"FAKE_COMPLETE_GREETING"},{"key":"review","objective":"Verify the tiny greeting app","executor":"fake","agent_type":"verifier","generated_prompt":"FAKE_VERIFY_REJECT","depends_on":["work"]},{"key":"release","objective":"Publish the tiny greeting app","executor":"fake","generated_prompt":"FAKE_COMPLETE_RELEASE","depends_on":["review"]}]}'
+      payload='{"nodes":[{"key":"work","objective":"Create the tiny greeting app","executor":"fake","generated_prompt":"FAKE_COMPLETE_GREETING"},{"key":"review","objective":"Verify the tiny greeting app","executor":"fake","agent_type":"verifier","generated_prompt":"FAKE_VERIFY_REJECT","follows":["work"]},{"key":"release","objective":"Publish the tiny greeting app","executor":"fake","generated_prompt":"FAKE_COMPLETE_RELEASE","follows":["review"]}]}'
     fi
     ;;
   verification)
@@ -46,7 +46,7 @@ case "$handoff_kind" in
     elif [[ "$prompt" == *"FAKE_EXPANDED_B"* ]]; then
       payload='{"outcome":"COMPLETE","summary":"Expanded part B complete."}'
     elif [[ "$prompt" == *"FAKE_EXPAND"* ]]; then
-      payload='{"outcome":"EXPAND","summary":"Expansion produced two child tasks.","children":{"nodes":[{"key":"part-a","objective":"Complete expanded part A","executor":"fake","generated_prompt":"FAKE_EXPANDED_A"},{"key":"part-b","objective":"Complete expanded part B","executor":"fake","generated_prompt":"FAKE_EXPANDED_B","depends_on":["part-a"]}]}}'
+      payload='{"outcome":"EXPAND","summary":"Expansion produced two child tasks.","children":{"nodes":[{"key":"part-a","objective":"Complete expanded part A","executor":"fake","generated_prompt":"FAKE_EXPANDED_A"},{"key":"part-b","objective":"Complete expanded part B","executor":"fake","generated_prompt":"FAKE_EXPANDED_B","follows":["part-a"]}]}}'
     elif [[ "$prompt" == *"FAKE_RERUN"* && "$attempt" == "1" ]]; then
       payload='{"outcome":"COMPLETE","summary":"First pass complete.","artifacts":[{"name":"first-pass","content":"old output"}]}'
     elif [[ "$prompt" == *"FAKE_RERUN"* ]]; then

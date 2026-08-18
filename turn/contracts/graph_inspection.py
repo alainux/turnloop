@@ -75,7 +75,7 @@ class GraphInspectionNode(BaseModel):
     document_refs: list[DocumentRef] = Field(default_factory=list)
     subgraph_refs: list[SubgraphRef] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
-    depends_on: list[uuid.UUID] = Field(default_factory=list)
+    follows: list[uuid.UUID] = Field(default_factory=list)
     children: list[uuid.UUID] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     artifacts: list[GraphInspectionArtifact] = Field(default_factory=list)
@@ -87,7 +87,7 @@ class GraphInspection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 5
+    schema_version: int = 6
     project_id: uuid.UUID
     nodes: list[GraphInspectionNode] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

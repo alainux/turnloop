@@ -58,11 +58,11 @@ describe("graph node controls", () => {
     expect(nodeRunLabel(false, "run", true)).toBe("Run again");
   });
 
-  it("does not create a run control for a dependency-waiting node", () => {
+  it("does not create a run control for a sequence-waiting node", () => {
     expect(
       primaryNodeAction(
         node({
-          ui_state: "waiting_dependency",
+          ui_state: "waiting_sequence",
           allowed_actions: ["pause", "edit"],
         }),
       ),

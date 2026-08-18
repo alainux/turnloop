@@ -84,12 +84,12 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
     parsed_artifacts = [Artifact.model_validate(item) for item in raw.get("artifacts", [])]
 
     children: dict[str, list[str]] = {}
-    dependencies: dict[uuid.UUID, list[uuid.UUID]] = {}
+    predecessors: dict[uuid.UUID, list[uuid.UUID]] = {}
     for parsed_edge in parsed_edges:
         if parsed_edge.type.value == "CONTAINS":
             children.setdefault(parsed_edge.src.hex, []).append(parsed_edge.dst.hex)
-        elif parsed_edge.type.value == "DEPENDS_ON":
-            dependencies.setdefault(parsed_edge.dst, []).append(parsed_edge.src)
+        elif parsed_edge.type.value == "FOLLOWS":
+            predecessors.setdefault(parsed_edge.dst, []).append(parsed_edge.src)
 
     artifacts_by_node: dict[uuid.UUID, list[Artifact]] = {}
     for artifact in parsed_artifacts:
@@ -125,7 +125,7 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 document_refs=node.document_refs,
                 subgraph_refs=node.subgraph_refs,
                 artifact_refs=node.artifact_refs,
-                depends_on=dependencies.get(node.id, []),
+                follows=predecessors.get(node.id, []),
                 children=[uuid.UUID(child) for child in children.get(node.id.hex, [])],
                 files=_files_for(
                     [(artifact.name, artifact.kind.value, artifact.ref) for artifact in node_artifacts]
@@ -183,8 +183,8 @@ def _summary(item: dict) -> str:
     line = f"[{item['id']}] [{item['status']}|{item['executor']}] {item['objective']}"
     if item.get("parent_id"):
         line += f"  parent={item['parent_id']}"
-    if item.get("depends_on"):
-        line += "\n  depends_on: " + ", ".join(item["depends_on"])
+    if item.get("follows"):
+        line += "\n  follows: " + ", ".join(item["follows"])
     if item.get("verification"):
         decision = item["verification"].get("decision", "unknown")
         line += f"\n  verification: {decision} — {item['verification'].get('summary', '')}"

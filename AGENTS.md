@@ -19,6 +19,7 @@
 - Agent Capability Plugins are packages of skills and mcps that follow Agent Plugins 1.0 spec and can be used to add skills and mcps to agents.
 - Capability plugins are procured and pre-loaded by the planner agent, and installed to the specific harness at launch time.
 - Turn maintains a catalog of capabilities that planners can load from. Our catalog grows from contributions by agents.
+- The graph is _not a dependency graph_. It is a workflow graph. It has sequence, fans-out, and convergence points, nothing more.
 
 ### Agents
 
@@ -35,7 +36,7 @@ Everything else is a capability plugin or a harness/runtime concern.
 - Re-run: Re-launches the harness with a predeployed prompt, clearing the session.
 - Manual stop, failure, finish: Next action is only "Re-run".
 - Continuation scenarios like rejection flows: Next action is "Run".
-- Waiting for dependency: No action is possible. 
+- Waiting for a preceding sequence stage: No action is possible.
 
 ## Architecture
 

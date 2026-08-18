@@ -43,6 +43,8 @@ from turn.domain.schemas import (
     RunStatus,
     SubgraphRef,
     Usage,
+    NODE_OBJECTIVE_MAX_LENGTH,
+    concise_node_title,
 )
 from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
@@ -58,15 +60,6 @@ from turn.logging import EventLog
 
 PLANNER_EXECUTOR = "planner"
 STATE_VERSION = 3
-
-
-def _concise_title(prompt: str, limit: int = 72) -> str:
-    """Derive navigation copy while preserving the full authored prompt."""
-    clean = " ".join(prompt.split())
-    if len(clean) <= limit:
-        return clean
-    shortened = clean[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
-    return f"{shortened}…"
 
 
 def _jsonable(value: Any) -> Any:
@@ -224,7 +217,17 @@ class Store:
         normalized = False
         edge_keys: set[tuple[uuid.UUID, uuid.UUID, EdgeType]] = set()
         for item in raw.get("nodes", []):
-            node = Node.model_validate(item)
+            node_payload = dict(item)
+            # Older planners sometimes put the full assignment in the graph
+            # label. Preserve that text as the worker prompt and migrate the
+            # persisted label to the same concise form used for new nodes.
+            objective = node_payload.get("objective")
+            if isinstance(objective, str) and len(objective) > NODE_OBJECTIVE_MAX_LENGTH:
+                node_payload["objective"] = concise_node_title(objective)
+                if not node_payload.get("generated_prompt"):
+                    node_payload["generated_prompt"] = objective
+                normalized = True
+            node = Node.model_validate(node_payload)
             state.nodes[node.id] = node
         for item in raw.get("edges", []):
             edge = Edge.model_validate(item)
@@ -411,7 +414,7 @@ class Store:
         ]))
         root_agent.session_id = None
         explicit_name = name.strip() if name and name.strip() else None
-        display_name = explicit_name or _concise_title(prompt)
+        display_name = explicit_name or concise_node_title(prompt)
         node = Node(
             id=root_id,
             project_id=root_id,
@@ -507,14 +510,14 @@ class Store:
         node_map = {node.id: node for node in nodes}
         children: dict[uuid.UUID | None, list[uuid.UUID]] = {}
         parents: dict[uuid.UUID, Optional[uuid.UUID]] = {}
-        deps: dict[uuid.UUID, list[uuid.UUID]] = {}
+        predecessors: dict[uuid.UUID, list[uuid.UUID]] = {}
         for node in nodes:
             children.setdefault(node.parent_id, []).append(node.id)
             parents[node.id] = node.parent_id
         for edge in edges:
-            if edge.type == EdgeType.DEPENDS_ON:
-                deps.setdefault(edge.dst, []).append(edge.src)
-        return node_map, children, parents, deps
+            if edge.type == EdgeType.FOLLOWS:
+                predecessors.setdefault(edge.dst, []).append(edge.src)
+        return node_map, children, parents, predecessors
 
     async def ancestry(self, node_id: uuid.UUID) -> list[Node]:
         current = await self.get_node(node_id)
@@ -530,12 +533,12 @@ class Store:
         nodes, edges, _ = await self.get_workgraph(current.project_id)
         return GraphWalker(nodes, edges).descendants(node_id)
 
-    async def prerequisites(self, node_id: uuid.UUID) -> list[Node]:
+    async def predecessors(self, node_id: uuid.UUID) -> list[Node]:
         current = await self.get_node(node_id)
         if current is None:
             return []
         nodes, edges, _ = await self.get_workgraph(current.project_id)
-        return GraphWalker(nodes, edges).prerequisites(node_id)
+        return GraphWalker(nodes, edges).predecessors(node_id)
 
     # -- node writes ------------------------------------------------------
 

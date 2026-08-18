@@ -13,7 +13,14 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
-from turn.domain.schemas import PlanResult, VerificationResult, WorkerResult
+from turn.domain.schemas import (
+    NODE_OBJECTIVE_MAX_LENGTH,
+    PlanResult,
+    VerificationResult,
+    WorkerResult,
+    concise_node_title,
+)
+from turn.graph.logic import validate_single_workflow_leaf
 
 # The domain models are the single source of truth. Artifact strings are the
 # one intentionally compact wire form accepted by the agent CLI; they are
@@ -76,6 +83,7 @@ def validate_subgraph_sources(
     def visit(current: PlanResult, source: Path | None, depth: int) -> None:
         if depth > max_depth:
             raise ValueError(f"subgraph reference depth exceeds {max_depth}")
+        validate_single_workflow_leaf(current)
         references = [
             *current.subgraph_refs,
             *(reference for node in current.nodes for reference in node.subgraph_refs),
@@ -129,9 +137,9 @@ def plan_handoff_example() -> str:
     Sections intentionally contain only a title and Markdown text (plus
     optional nesting). Substantial prose belongs in an ordinary project
     document submitted as an artifact by the worker that creates it; the
-    structured index is deliberately small. Dependencies belong in node
-    ``depends_on``; omitting the redundant top-level ``edges`` field avoids a
-    second enum-shaped way for planners to describe the same relationship.
+    structured index is deliberately small. Sequence predecessors belong in
+    node ``follows``; omitting the redundant top-level ``edges`` field avoids
+    a second enum-shaped way for planners to describe the same relationship.
     """
     return json.dumps(
         {
@@ -143,7 +151,7 @@ def plan_handoff_example() -> str:
                     "agent_type": "executor",
                     "plan": False,
                     "generated_prompt": "Detailed instructions",
-                    "depends_on": [],
+                    "follows": [],
                 }
             ],
             "project_name": "Short project name",
@@ -164,6 +172,13 @@ def _normalize_payload(value: dict[str, Any]) -> dict[str, Any]:
     payload["subgraph_refs"] = _normalize_subgraph_refs(payload.get("subgraph_refs"))
     payload["artifacts"] = _normalize_artifacts(payload.get("artifacts"))
     payload["document_refs"] = _normalize_document_refs(payload.get("document_refs"))
+    edges = payload.get("edges")
+    if isinstance(edges, list):
+        payload["edges"] = [
+            {**edge, "type": edge.get("type", "FOLLOWS")}
+            if isinstance(edge, dict) else edge
+            for edge in edges
+        ]
     nodes = payload.get("nodes")
     if isinstance(nodes, list):
         normalized_nodes = []
@@ -182,6 +197,11 @@ def _normalize_payload(value: dict[str, Any]) -> dict[str, Any]:
             item["document_refs"] = _normalize_document_refs(item.get("document_refs"))
             item["subgraph_refs"] = _normalize_subgraph_refs(item.get("subgraph_refs"))
             item["artifacts"] = _normalize_artifacts(item.get("artifacts"))
+            objective = item.get("objective")
+            if isinstance(objective, str) and len(objective) > NODE_OBJECTIVE_MAX_LENGTH:
+                item["objective"] = concise_node_title(objective)
+                if not item.get("generated_prompt"):
+                    item["generated_prompt"] = objective
             normalized_nodes.append(item)
         payload["nodes"] = normalized_nodes
     children = payload.get("children")

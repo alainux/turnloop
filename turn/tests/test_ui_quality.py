@@ -55,7 +55,7 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "node-breathe" not in css
     assert "displayEdges" in graph and "visibleEdges" in graph
     assert "GRAPH_PADDING" in graph
-    assert "pathBetween(a, b, edge.type)" in graph
+    assert "layout.edgePaths.get(edge.id)" in graph
     assert "returnPathBetween(a, b)" in graph
     assert 'data-flow-edge="true"' in graph
     assert "flow_edges" in app
@@ -215,7 +215,7 @@ def test_object_context_menus_edges_and_theme_are_wired_to_real_actions():
     assert 'role="menu"' in app and "Delete project" in app
     assert "onContextMenu" in graph and "node-menu-trigger" in graph
     assert "GRAPH_PADDING" in layout and "edge-workflow" in graph
-    assert "displayEdges" in layout and "hasAlternativePath" in layout
+    assert "displayEdges" in layout and "sequenceProjection" in layout
     assert "applyAppearance(settings)" in app
     assert "Next stage" in app and "Auto-run" in app
 

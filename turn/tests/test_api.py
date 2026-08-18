@@ -193,7 +193,7 @@ async def test_api_projects_transient_rejection_return_flow(tmp_path):
             NodeSpec(key="work", objective="Build product", executor="echo"),
             NodeSpec(
                 key="check", objective="Verify product", executor="echo",
-                agent_type=AgentType.VERIFIER, depends_on=["work"],
+                agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ]))
         work, verifier = created_nodes

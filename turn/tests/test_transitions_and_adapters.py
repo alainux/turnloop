@@ -199,14 +199,14 @@ async def _runtime(tmp_path, worker: Worker):
 
 
 def test_plan_contract_rejects_missing_references_and_cycles():
-    with pytest.raises(ValidationError, match="unknown dependency key"):
-        PlanResult(nodes=[NodeSpec(key="a", objective="a", depends_on=["missing"])])
+    with pytest.raises(ValidationError, match="unknown sequence key"):
+        PlanResult(nodes=[NodeSpec(key="a", objective="a", follows=["missing"])])
     with pytest.raises(ValidationError, match="cycle"):
         PlanResult(
             nodes=[NodeSpec(key="a", objective="a"), NodeSpec(key="b", objective="b")],
             edges=[
-                EdgeSpec(type=EdgeType.DEPENDS_ON, src="a", dst="b"),
-                EdgeSpec(type=EdgeType.DEPENDS_ON, src="b", dst="a"),
+                EdgeSpec(type=EdgeType.FOLLOWS, src="a", dst="b"),
+                EdgeSpec(type=EdgeType.FOLLOWS, src="b", dst="a"),
             ],
         )
 
@@ -657,7 +657,7 @@ async def test_cli_plan_revision_replaces_an_expanded_subtree(tmp_path, monkeypa
         json.dumps({
             "nodes": [
                 {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
-                {"key": "write", "objective": "Write chapters", "executor": "echo", "depends_on": ["chapters"]},
+                {"key": "write", "objective": "Write chapters", "executor": "echo", "follows": ["chapters"]},
             ],
         }),
     ])
@@ -1203,7 +1203,7 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
         status=NodeStatus.BLOCKED,
     )
     state = store._states[root.id]
-    dependency = Edge(src=worker.id, dst=dependent.id, type=EdgeType.DEPENDS_ON)
+    dependency = Edge(src=worker.id, dst=dependent.id, type=EdgeType.FOLLOWS)
     state["edges"][dependency.id] = dependency
     await store._persist_project(root.id)
     await store.set_agent_status(worker.id, state="working", message="writing the domain")
@@ -1231,7 +1231,7 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
     assert worker_view["agent_message"] == "writing the domain"
     assert worker_view["runs"][0]["session_id"] == "worker-session"
     assert worker_view["files"] == ["domain.py"]
-    assert dependent_view["depends_on"] == [str(worker.id)]
+    assert dependent_view["follows"] == [str(worker.id)]
     assert children[root.id.hex] == [worker.id.hex, dependent.id.hex]
     summary = graph_explorer._summary(worker_view)
     assert str(worker.id) in summary
@@ -1315,14 +1315,14 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "objective": "Validate market research",
                 "executor": "codex",
                 "agent_type": "verifier",
-                "depends_on": ["market_research"],
+                "follows": ["market_research"],
             },
             {
                 "key": "ui_ux_design",
                 "objective": "Design the experience",
                 "executor": "codex",
                 "agent_type": "executor",
-                "depends_on": ["market_validation"],
+                "follows": ["market_validation"],
                 "capabilities": ["turn-executing"],
             },
             {
@@ -1331,7 +1331,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "executor": "planner",
                 "agent_type": "planner",
                 "plan": True,
-                "depends_on": ["ui_ux_design"],
+                "follows": ["ui_ux_design"],
                 "capabilities": ["turn-planning"],
             },
             {
@@ -1340,7 +1340,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "executor": "planner",
                 "agent_type": "planner",
                 "plan": True,
-                "depends_on": ["development_architecture"],
+                "follows": ["development_architecture"],
                 "capabilities": ["turn-integrating"],
             },
         ],
@@ -1358,7 +1358,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
     ]
     assert plan.nodes[1].agent_type is AgentType.VERIFIER
     assert plan.nodes[3].agent_type is AgentType.PLANNER and plan.nodes[3].plan
-    assert plan.nodes[4].depends_on == ["development_architecture"]
+    assert plan.nodes[4].follows == ["development_architecture"]
     assert plan.document_refs == []
     assert all(not node.artifacts for node in plan.nodes)
     assert [node.capabilities for node in plan.nodes] == [
@@ -1482,14 +1482,14 @@ def test_bare_schema_plan_is_accepted_and_explicit_edges_follow_domain_direction
     assert parsing.first_plan_json(bare)["nodes"][0]["key"] == "a"
     plan = AgentPlanner._parse_plan(bare)
     assert plan is not None
-    assert plan.nodes[0].depends_on == []
-    assert plan.nodes[1].depends_on == ["a"]
+    assert plan.nodes[0].follows == []
+    assert plan.nodes[1].follows == ["a"]
 
 
-def test_plan_parser_preserves_dependencies_when_nodes_are_not_topologically_ordered():
+def test_plan_parser_preserves_sequence_when_nodes_are_not_topologically_ordered():
     payload = {
         "nodes": [
-            {"key": "development", "objective": "Plan development", "depends_on": ["research"]},
+            {"key": "development", "objective": "Plan development", "follows": ["research"]},
             {"key": "research", "objective": "Research the product"},
         ]
     }
@@ -1497,7 +1497,34 @@ def test_plan_parser_preserves_dependencies_when_nodes_are_not_topologically_ord
     plan = AgentPlanner._parse_plan(json.dumps(payload))
 
     assert plan is not None
-    assert plan.nodes[0].depends_on == ["research"]
+    assert plan.nodes[0].follows == ["research"]
+
+
+def test_plan_parser_accepts_document_only_and_empty_graph_handoffs():
+    plan = AgentPlanner._parse_plan(json.dumps({
+        "nodes": [],
+        "document_refs": [{"ref": "docs/architecture.md"}],
+        "artifacts": ["docs/architecture.md"],
+    }))
+
+    assert plan is not None
+    assert plan.nodes == []
+    assert [item.ref for item in plan.document_refs] == ["docs/architecture.md"]
+    assert [item.ref for item in plan.artifacts] == ["docs/architecture.md"]
+
+
+def test_plan_parser_migrates_prompt_sized_labels_to_prompt_copy():
+    long_label = "x" * 73
+    plan = AgentPlanner._parse_plan(json.dumps({
+        "nodes": [{
+            "key": "work",
+            "objective": long_label,
+        }],
+    }))
+
+    assert plan is not None
+    assert len(plan.nodes[0].objective) <= 72
+    assert plan.nodes[0].generated_prompt == long_label
 
 
 def test_agent_plan_parser_preserves_specializations_and_nested_planners():
@@ -1522,7 +1549,7 @@ def test_agent_plan_parser_preserves_specializations_and_nested_planners():
                 "objective": "Integrate game",
                 "executor": "codex",
                 "agent_type": "integrator",
-                "depends_on": ["world", "systems"],
+                "follows": ["world", "systems"],
             },
         ],
         "edges": [],
@@ -1534,7 +1561,7 @@ def test_agent_plan_parser_preserves_specializations_and_nested_planners():
     assert plan.nodes[1].agent_type is AgentType.PLANNER
     assert plan.nodes[1].plan is True
     assert plan.nodes[2].agent_type is AgentType.INTEGRATOR
-    assert plan.nodes[2].depends_on == ["world", "systems"]
+    assert plan.nodes[2].follows == ["world", "systems"]
 
     from turn.workers.codex_worker import CodexWorker
 

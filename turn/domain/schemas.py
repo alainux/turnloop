@@ -3,7 +3,7 @@
 Primitives
 ----------
 * Node      — a unit of intent (objective, parent, executor, status, inputs, resources, artifacts, lineage)
-* Edge      — CONTAINS (decomposition) or DEPENDS_ON (rare left-to-right stages/joins)
+* Edge      — CONTAINS (composition ownership) or FOLLOWS (sequence/fan-out/fan-in)
 * Run       — one execution attempt for one node
 * Artifact  — any persistent input/output
 
@@ -40,6 +40,18 @@ def _utcnow() -> datetime:
 def _new_id() -> uuid.UUID:
     return uuid.uuid4()
 
+
+NODE_OBJECTIVE_MAX_LENGTH = 72
+
+
+def concise_node_title(value: str, limit: int = NODE_OBJECTIVE_MAX_LENGTH) -> str:
+    """Turn a prompt-shaped label into readable graph navigation copy."""
+    clean = " ".join(value.split())
+    if len(clean) <= limit:
+        return clean
+    shortened = clean[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return f"{shortened}…"
+
 # --------------------------------------------------------------------------
 # Enums
 # --------------------------------------------------------------------------
@@ -49,7 +61,7 @@ class NodeStatus(str, Enum):
     """Lifecycle state of a node, maintained by the runner."""
 
     PENDING = "PENDING"      # created, not yet evaluated
-    BLOCKED = "BLOCKED"      # missing dependency or required input
+    BLOCKED = "BLOCKED"      # incomplete sequence or required input
     RUNNABLE = "RUNNABLE"    # ready to execute now
     RUNNING = "RUNNING"      # a Run is in flight
     EXPANDED = "EXPANDED"    # a container; progress derived from descendants
@@ -67,7 +79,7 @@ class NodeUIState(str, Enum):
     PREPARING = "preparing"
     PAUSED = "paused"
     WAITING_INPUT = "waiting_input"
-    WAITING_DEPENDENCY = "waiting_dependency"
+    WAITING_SEQUENCE = "waiting_sequence"
     COMPLETE = "complete"
     CONTAINER = "container"
     FAILED = "failed"
@@ -88,10 +100,10 @@ class NodeAction(str, Enum):
 
 
 class EdgeType(str, Enum):
-    """Graph relationships used for hierarchy and workflow ordering."""
+    """The two relationships in a structured workflow graph."""
 
-    CONTAINS = "CONTAINS"      # decomposition / visual hierarchy / inherited context
-    DEPENDS_ON = "DEPENDS_ON"  # genuine left-to-right stage / integration join
+    CONTAINS = "CONTAINS"  # composition ownership / fan-out anchor
+    FOLLOWS = "FOLLOWS"    # sequence, fan-out, or fan-in within one boundary
 
 
 class FlowEdgeType(str, Enum):
@@ -179,7 +191,7 @@ class VerificationResult(BaseModel):
 
     ``target_node_id`` is optional for compatibility with the original QA
     contract. When omitted, the runner returns a rejection to the reviewer's
-    only dependency when there is one. A reviewer may name any other node in the same
+    only preceding workflow item when there is one. A reviewer may name any other node in the same
     workgraph explicitly when that is the node that needs correction.
     """
 
@@ -412,11 +424,15 @@ def flatten_document_refs(refs: list[DocumentRef]) -> list[DocumentRef]:
 class Node(BaseModel):
     """A unit of intent. Persisted; workers are temporary."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     id: uuid.UUID = Field(default_factory=_new_id)
     project_id: uuid.UUID  # root ancestor id
     parent_id: Optional[uuid.UUID] = None  # CONTAINS parent
 
-    objective: str
+    # The graph label is intentionally compact. Detailed instructions belong
+    # in generated_prompt, documents, or artifacts rather than on the card.
+    objective: str = Field(min_length=1, max_length=NODE_OBJECTIVE_MAX_LENGTH)
     project_name: Optional[str] = None  # concise root-only navigation identity
     generated_prompt: Optional[str] = None  # prompt handed to the worker
     # --- repo (per-project working directory) ---------------------------
@@ -467,11 +483,11 @@ class Node(BaseModel):
 
 
 class Edge(BaseModel):
-    """A relationship between two nodes. Only CONTAINS or DEPENDS_ON."""
+    """A relationship between two nodes in the structured workflow."""
 
     id: uuid.UUID = Field(default_factory=_new_id)
-    # For CONTAINS: src is the parent, dst is the child.
-    # For DEPENDS_ON: src is the prerequisite, dst is the dependent.
+    # For CONTAINS: src is the composition anchor, dst is an owned node.
+    # For FOLLOWS: src is an earlier workflow item, dst is the next item.
     src: uuid.UUID
     dst: uuid.UUID
     type: EdgeType
@@ -591,7 +607,8 @@ class NodeSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key: str
-    objective: str
+    # Keep graph labels readable; put execution detail in generated_prompt.
+    objective: str = Field(min_length=1, max_length=NODE_OBJECTIVE_MAX_LENGTH)
     generated_prompt: Optional[str] = None
     executor: Optional[str] = None
     agent: Optional[Agent] = None
@@ -612,10 +629,10 @@ class NodeSpec(BaseModel):
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
-    # Workflow sequencing is deliberately independent from containment. A
-    # verifier is a normal sibling in the graph and names the work it checks
-    # through one or more ordinary prerequisite relations.
-    depends_on: list[str] = Field(default_factory=list)  # prior left-to-right stage keys
+    # Sequence is deliberately independent from ownership. Multiple nodes may
+    # follow one node (fan-out), and one node may follow multiple nodes
+    # (fan-in), but sequence never crosses a composition boundary.
+    follows: list[str] = Field(default_factory=list)  # prior sequence keys
     # When True (or executor == "planner") the created node is itself a
     # sub-planner: the runner will decompose it again on its next turn instead
     # of executing it as a leaf. This is intentionally available for very
@@ -632,7 +649,11 @@ class EdgeSpec(BaseModel):
 
 
 class PlanResult(BaseModel):
-    """The output of the Plan operation: schema-valid nodes + edges."""
+    """The output of the Plan operation.
+
+    ``nodes`` may be empty. That represents a valid no-op or document-only
+    planning handoff, which preserves any existing child composition.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -665,8 +686,10 @@ class PlanResult(BaseModel):
             raise ValueError("plan node keys must be unique")
 
         containment: dict[str, set[str]] = {key: set() for key in keys}
-        dependencies: dict[str, set[str]] = {key: set() for key in keys}
+        sequence: dict[str, set[str]] = {key: set() for key in keys}
         adjacency: dict[str, set[str]] = {key: set() for key in keys}
+        boundaries = {node.key: node.parent_key for node in self.nodes}
+        sequence_pairs: set[tuple[str, str]] = set()
         for node in self.nodes:
             for capability_id in node.capabilities:
                 validate_capability_id(capability_id)
@@ -677,20 +700,18 @@ class PlanResult(BaseModel):
                     raise ValueError(f"node {node.key} cannot contain itself")
                 containment[node.parent_key].add(node.key)
                 adjacency[node.parent_key].add(node.key)
-            for dependency in node.depends_on:
-                if dependency not in known:
-                    raise ValueError(f"unknown dependency key: {dependency}")
-                if dependency == node.key:
-                    raise ValueError(f"node {node.key} cannot depend on itself")
-                dependencies[dependency].add(node.key)
-                adjacency[dependency].add(node.key)
-            requested_type = node.agent_type or (
-                node.agent.type_id if node.agent is not None else None
-            )
-            if requested_type is AgentType.VERIFIER and node.parent_key:
-                raise ValueError(
-                    f"verifier node {node.key} must use depends_on, not parent_key"
-                )
+            for predecessor in node.follows:
+                if predecessor not in known:
+                    raise ValueError(f"unknown sequence key: {predecessor}")
+                if predecessor == node.key:
+                    raise ValueError(f"node {node.key} cannot follow itself")
+                if boundaries[predecessor] != boundaries[node.key]:
+                    raise ValueError(
+                        f"sequence edge {predecessor}->{node.key} crosses a composition boundary"
+                    )
+                sequence[predecessor].add(node.key)
+                adjacency[predecessor].add(node.key)
+                sequence_pairs.add((predecessor, node.key))
 
         for edge in self.edges:
             if edge.src not in known or edge.dst not in known:
@@ -698,6 +719,13 @@ class PlanResult(BaseModel):
                 raise ValueError(f"unknown edge key: {missing}")
             if edge.src == edge.dst:
                 raise ValueError(f"node {edge.src} cannot link to itself")
+            if edge.type is EdgeType.FOLLOWS:
+                if boundaries[edge.src] != boundaries[edge.dst]:
+                    raise ValueError(
+                        f"sequence edge {edge.src}->{edge.dst} crosses a composition boundary"
+                    )
+                sequence[edge.src].add(edge.dst)
+                sequence_pairs.add((edge.src, edge.dst))
             adjacency[edge.src].add(edge.dst)
 
         def cycle_path(graph: dict[str, set[str]]) -> list[str] | None:
@@ -732,15 +760,35 @@ class PlanResult(BaseModel):
             raise ValueError(
                 "containment cycle: " + " -> ".join(containment_cycle)
             )
-        dependency_cycle = cycle_path(dependencies)
-        if dependency_cycle:
+        sequence_cycle = cycle_path(sequence)
+        if sequence_cycle:
             raise ValueError(
-                "dependency cycle: " + " -> ".join(dependency_cycle)
+                "sequence cycle: " + " -> ".join(sequence_cycle)
             )
+
+        def has_alternative_sequence_path(source: str, target: str) -> bool:
+            pending = [child for child in sequence[source] if (source, child) != (source, target)]
+            visited: set[str] = set()
+            while pending:
+                current = pending.pop()
+                if current == target:
+                    return True
+                if current in visited:
+                    continue
+                visited.add(current)
+                pending.extend(sequence[current])
+            return False
+
+        for source, target in sorted(sequence_pairs):
+            if has_alternative_sequence_path(source, target):
+                raise ValueError(
+                    f"sequence edge {source}->{target} is a transitive shortcut; "
+                    "connect the adjacent workflow stages instead"
+                )
         combined_cycle = cycle_path(adjacency)
         if combined_cycle:
             raise ValueError(
-                "graph cycle across containment/dependency edges: "
+                "graph cycle across composition/sequence edges: "
                 + " -> ".join(combined_cycle)
             )
         return self

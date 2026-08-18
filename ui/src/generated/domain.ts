@@ -61,7 +61,7 @@ export interface EdgeSpec {
   dst: string;
 }
 
-export type EdgeType = "CONTAINS" | "DEPENDS_ON";
+export type EdgeType = "CONTAINS" | "FOLLOWS";
 
 export interface Executor {
   id: string;
@@ -196,13 +196,13 @@ export interface NodeSpec {
   artifacts: Array<ArtifactSpec>;
   capabilities: Array<string>;
   parent_key: string | null;
-  depends_on: Array<string>;
+  follows: Array<string>;
   plan: boolean;
 }
 
 export type NodeStatus = "PENDING" | "BLOCKED" | "RUNNABLE" | "RUNNING" | "EXPANDED" | "COMPLETE" | "FAILED" | "CANCELLED";
 
-export type NodeUIState = "queued" | "ready" | "running" | "preparing" | "paused" | "waiting_input" | "waiting_dependency" | "complete" | "container" | "failed" | "cancelled";
+export type NodeUIState = "queued" | "ready" | "running" | "preparing" | "paused" | "waiting_input" | "waiting_sequence" | "complete" | "container" | "failed" | "cancelled";
 
 export type Outcome = "COMPLETE" | "EXPAND" | "BLOCK" | "FAIL";
 

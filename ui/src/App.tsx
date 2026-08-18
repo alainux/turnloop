@@ -492,11 +492,6 @@ export default function App() {
                 />
               ) : (
                 <div id="graph" className="graph">
-                  <div className="graph-guide" aria-label="Graph guide">
-                    <span><i className="legend-line contains" /> nesting</span>
-                    <span><i className="legend-line depends" /> dependency — must finish first</span>
-                    <span>same stage = can run in parallel</span>
-                  </div>
                   <GraphCanvas
                     nodes={graph!.nodes}
                     edges={graph!.edges}
@@ -545,10 +540,10 @@ export default function App() {
             refreshKey={(() => {
               const node = graph?.nodes.find((item) => item.id === selected);
               return node
-                // Dependency evaluation can change the projected UI state
+                // Sequence evaluation can change the projected UI state
                 // without changing the node's persisted timestamp. Include
                 // that projection so a selected inspector never keeps saying
-                // "waiting dependency" after its parents complete.
+                // "waiting sequence" after its predecessors complete.
                 ? `${node.updated_at}:${node.status}:${node.ui_state}:${node.state_reason}:${node.generation_active}`
                 : selected;
             })()}

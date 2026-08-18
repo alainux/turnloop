@@ -49,14 +49,14 @@ async def main() -> None:
                 key="polish",
                 objective="Middle: polish the integration",
                 executor="echo",
-                depends_on=["foundation"],
+                follows=["foundation"],
             ),
             NodeSpec(
                 key="review",
                 objective="Review: reject back to Start",
                 executor="echo",
                 agent_type=AgentType.EXECUTOR,
-                depends_on=["polish"],
+                follows=["polish"],
             ),
         ]),
     )

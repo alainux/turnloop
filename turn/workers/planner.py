@@ -33,7 +33,10 @@ from turn.domain.schemas import (
     NodeSpec,
     PlanResult,
     Resource,
+    SubgraphRef,
     Usage,
+    NODE_OBJECTIVE_MAX_LENGTH,
+    concise_node_title,
 )
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
 from turn.workers.harnesses import recover_session_id
@@ -128,13 +131,13 @@ class HeuristicPlanner(Planner):
                 ),
                 executor=exe,
                 agent_type="integrator",
-                depends_on=["core", "inputs", "outputs"],
+                follows=["core", "inputs", "outputs"],
             ),
         ]
         edges = [
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="core", dst="integrate"),
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="inputs", dst="integrate"),
-            EdgeSpec(type=EdgeType.DEPENDS_ON, src="outputs", dst="integrate"),
+            EdgeSpec(type=EdgeType.FOLLOWS, src="core", dst="integrate"),
+            EdgeSpec(type=EdgeType.FOLLOWS, src="inputs", dst="integrate"),
+            EdgeSpec(type=EdgeType.FOLLOWS, src="outputs", dst="integrate"),
         ]
         return PlanResult(
             nodes=nodes,
@@ -164,7 +167,7 @@ class CodexPlanner(Planner):
             forbidden_session_id=ctx.forbidden_session_id,
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
-        if plan is not None and plan.nodes:
+        if plan is not None:
             self._validate_setup_scope(ctx, plan)
             plan.usage = usage
             plan.session_id = session_id
@@ -359,7 +362,7 @@ class AgentPlanner(Planner):
         prompt = self.codex._build_prompt(ctx)
         text = await self._call_harness(agent, prompt, ctx)
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
-        if plan is not None and plan.nodes:
+        if plan is not None:
             CodexPlanner._validate_setup_scope(ctx, plan)
             plan.session_id = agent.session_id
             return plan
@@ -535,6 +538,10 @@ class AgentPlanner(Planner):
                 raise ValueError(
                     f"plan node {index} uses removed skills/mcp_servers fields; use capabilities"
                 )
+            if isinstance(node, dict) and "depends_on" in node:
+                raise ValueError(
+                    f"plan node {index} uses removed depends_on; use immediate follows stages"
+                )
 
         def document_refs(values):
             return [
@@ -561,11 +568,34 @@ class AgentPlanner(Planner):
                     specs.append(ArtifactSpec.model_validate(item))
             return specs
 
+        def subgraph_refs(values):
+            if values is None:
+                return []
+            if isinstance(values, str):
+                values = [values]
+            return [
+                item
+                if isinstance(item, SubgraphRef)
+                else SubgraphRef(ref=item)
+                if isinstance(item, str)
+                else SubgraphRef.model_validate(item)
+                for item in values
+            ]
+
+        def objective(value):
+            return concise_node_title(value)
+
+        def generated_prompt(node):
+            raw = node["objective"]
+            return node.get("generated_prompt") or (
+                raw if len(raw) > NODE_OBJECTIVE_MAX_LENGTH else None
+            )
+
         raw_nodes = [
             NodeSpec(
                 key=n["key"],
-                objective=n["objective"],
-                generated_prompt=n.get("generated_prompt"),
+                objective=objective(n["objective"]),
+                generated_prompt=generated_prompt(n),
                 executor=n.get("executor"),
                 agent=n.get("agent"),
                 agent_type=n.get("agent_type"),
@@ -580,10 +610,13 @@ class AgentPlanner(Planner):
                 ],
                 resource_refs=list(n.get("resource_refs", [])),
                 document_refs=document_refs(n.get("document_refs")),
+                subgraph_refs=subgraph_refs(
+                    n.get("subgraph_refs", n.get("graph_file"))
+                ),
                 artifacts=artifact_specs(n.get("artifacts")),
                 capabilities=list(n.get("capabilities", [])),
                 parent_key=n.get("parent_key"),
-                depends_on=list(n.get("depends_on", [])),
+                follows=list(n.get("follows", [])),
                 plan=bool(n.get("plan", False)),
             )
             for n in data.get("nodes", [])
@@ -611,26 +644,41 @@ class AgentPlanner(Planner):
 
         nodes = [n for n in raw_nodes if n.key not in drop]
 
-        # 2) Collect dependencies from both per-node depends_on and explicit
-        #    edges (domain convention: src is prerequisite, dst dependent).
-        #    Declaration order is presentation, not semantics. Preserve a
-        #    dependency even when the model listed its prerequisite later; the
-        #    PlanResult validator owns missing-reference and cycle errors.
-        deps: dict[str, list[str]] = {
-            n.key: list(dict.fromkeys(n.depends_on)) for n in nodes
+        # 2) Canonicalize the two structural relationships. Declaration order
+        #    is presentation, not semantics. CONTAINS becomes parent_key and
+        #    FOLLOWS becomes an immediate predecessor in follows.
+        follows: dict[str, list[str]] = {
+            n.key: list(dict.fromkeys(n.follows)) for n in nodes
         }
-        for e in data.get("edges", []):
-            s, d = e.get("src"), e.get("dst")
-            if s in deps and d in deps and s != d:
-                if s not in deps[d]:
-                    deps[d].append(s)
+        by_key = {node.key: node for node in nodes}
+        for index, raw_edge in enumerate(data.get("edges", [])):
+            if not isinstance(raw_edge, dict):
+                raise ValueError(f"plan edge {index} must be an object")
+            edge = EdgeSpec.model_validate(
+                {**raw_edge, "type": raw_edge.get("type", EdgeType.FOLLOWS.value)}
+            )
+            if edge.src not in by_key or edge.dst not in by_key:
+                missing = edge.src if edge.src not in by_key else edge.dst
+                raise ValueError(f"unknown edge key: {missing}")
+            if edge.type is EdgeType.CONTAINS:
+                child = by_key[edge.dst]
+                if child.parent_key not in (None, edge.src):
+                    raise ValueError(
+                        f"node {edge.dst} has conflicting composition parents"
+                    )
+                child.parent_key = edge.src
+            elif edge.src not in follows[edge.dst]:
+                follows[edge.dst].append(edge.src)
         for n in nodes:
-            n.depends_on = list(dict.fromkeys(deps[n.key]))
+            n.follows = list(dict.fromkeys(follows[n.key]))
 
         return PlanResult(
             nodes=nodes,
             project_name=data.get("project_name"),
             document_refs=document_refs(data.get("document_refs")),
+            subgraph_refs=subgraph_refs(
+                data.get("subgraph_refs", data.get("graph_file"))
+            ),
             artifacts=artifact_specs(data.get("artifacts")),
             edges=[],
             notes=data.get("notes"),

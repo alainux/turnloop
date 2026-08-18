@@ -44,7 +44,7 @@ def _scenario(
         ),
     )
     nodes = [target, verifier]
-    edges = [Edge(src=target.id, dst=verifier.id, type=EdgeType.DEPENDS_ON)]
+    edges = [Edge(src=target.id, dst=verifier.id, type=EdgeType.FOLLOWS)]
     if extra_target:
         other = Node(
             id=uuid.uuid4(),
@@ -54,13 +54,13 @@ def _scenario(
             agent=AgentConfig(harness=HarnessKind.ECHO),
         )
         nodes.append(other)
-        edges.append(Edge(src=other.id, dst=verifier.id, type=EdgeType.DEPENDS_ON))
+        edges.append(Edge(src=other.id, dst=verifier.id, type=EdgeType.FOLLOWS))
     return nodes, edges, target, verifier
 
 
 def test_rejected_verifier_derives_a_stable_transient_return_edge():
     nodes, edges, target, verifier = _scenario()
-    edges.append(Edge(src=target.id, dst=verifier.id, type=EdgeType.DEPENDS_ON))
+    edges.append(Edge(src=target.id, dst=verifier.id, type=EdgeType.FOLLOWS))
 
     first = derive_flow_edges(nodes, edges)
     second = derive_flow_edges(nodes, edges)
@@ -69,7 +69,7 @@ def test_rejected_verifier_derives_a_stable_transient_return_edge():
     assert first[0].type is FlowEdgeType.RETURN
     assert (first[0].src, first[0].dst) == (verifier.id, target.id)
     assert first[0].id == second[0].id
-    assert all(edge.type is EdgeType.DEPENDS_ON for edge in edges)
+    assert all(edge.type is EdgeType.FOLLOWS for edge in edges)
 
 
 def test_return_edge_stays_visible_while_repair_is_active_and_disappears_afterward():

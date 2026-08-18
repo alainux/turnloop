@@ -50,7 +50,7 @@ const edge = (src: string, dst: string): Edge => ({
   id: `${src}-${dst}`,
   src,
   dst,
-  type: "DEPENDS_ON",
+  type: "FOLLOWS",
   created_at: "",
 });
 
@@ -121,7 +121,7 @@ describe("document specification ordering", () => {
     expect(orderDocumentNodes(nodes, [], "narrative").map((item) => item.id)).toEqual(["choices"]);
   });
 
-  it("projects a verifier below its dependency without changing graph semantics", () => {
+  it("projects a verifier after its sequence stage without changing graph semantics", () => {
     const nodes = [
       node("root", null),
       node("implementation", "root"),
@@ -188,9 +188,9 @@ describe("document specification ordering", () => {
     const source = parseGraphSource({
       project_name: "Root graph",
       nodes: [
-        { key: "integrate", objective: "Integrate", depends_on: ["world"], parent_key: null },
+        { key: "integrate", objective: "Integrate", follows: ["world"], parent_key: null },
         { key: "world", objective: "World", parent_key: null },
-        { key: "verify", objective: "Verify world", depends_on: ["author"], parent_key: "world" },
+        { key: "verify", objective: "Verify world", follows: ["author"], parent_key: "world" },
         { key: "author", objective: "Author world", parent_key: "world" },
       ],
     });
@@ -280,5 +280,34 @@ describe("document specification ordering", () => {
     expect(rendered).toContain("COMPLETE");
     expect(rendered).toContain("finished");
     expect(rendered).not.toContain("<details open");
+  });
+
+  it("associates a submission response with its editable graph source", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(ArtifactLinks, {
+        projectId: "root",
+        sourceRefs: [{
+          ref: ".turn/graphs/planner.json",
+          title: "planner.json",
+          media_type: "application/json",
+          managed: false,
+        }],
+        artifacts: [{
+          kind: "json",
+          name: "plan-submission",
+          ref: null,
+          content: { nodes: [{ key: "work" }] },
+        }],
+        onOpenDocument: () => undefined,
+      }),
+    );
+
+    expect(rendered).toContain("plan-submission");
+    expect(rendered).toContain("Submitted graph source");
+    expect(rendered).toContain("/api/projects/root/documents/.turn/graphs/planner.json");
+    expect(rendered).toContain("View response");
+    expect(rendered).toContain("&quot;node_count&quot;: 1");
+    expect(rendered).not.toContain("&quot;key&quot;: &quot;work&quot;");
+    expect(rendered).not.toContain("target=\"_blank\"");
   });
 });

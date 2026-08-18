@@ -161,7 +161,7 @@ def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch)
         "project_name": "Revised project",
         "nodes": [
             {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
-            {"key": "write", "objective": "Write chapters", "executor": "echo", "depends_on": ["chapters"]},
+            {"key": "write", "objective": "Write chapters", "executor": "echo", "follows": ["chapters"]},
         ],
     }
 
@@ -234,8 +234,8 @@ def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, 
     args = parser().parse_args([
         "agent", "submit", "--kind", "plan",
         "--payload", (
-            '{"nodes":[{"key":"a","objective":"A","depends_on":["b"]},'
-            '{"key":"b","objective":"B","depends_on":["a"]}],"edges":[]}'
+            '{"nodes":[{"key":"a","objective":"A","follows":["b"]},'
+            '{"key":"b","objective":"B","follows":["a"]}],"edges":[]}'
         ),
     ])
     with pytest.raises(SystemExit, match="invalid plan submission"):

@@ -83,14 +83,14 @@ async def main() -> None:
                     key="polish",
                     objective="Polish the integration",
                     executor="echo",
-                    depends_on=["foundation"],
+                    follows=["foundation"],
                 ),
                 NodeSpec(
                     key="review",
                     objective="Review the integration",
                     executor="echo",
                     agent_type=AgentType.EXECUTOR,
-                    depends_on=["polish"],
+                    follows=["polish"],
                 ),
             ]),
         )

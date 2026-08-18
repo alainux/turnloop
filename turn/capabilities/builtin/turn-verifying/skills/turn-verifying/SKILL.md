@@ -33,8 +33,8 @@ turn agent verify --payload '<JSON_OBJECT>'
 The JSON object must contain `decision` (`APPROVE` or `REJECT`) and `summary`.
 For a rejection, include concise `findings`, concrete `required_changes`, and
 `evidence_refs` where useful. By default, a rejection returns to this node's
-only dependency when there is exactly one. A verifier may depend on multiple
-work items; when that happens, set `target_node_id` explicitly after inspecting
+only preceding workflow item when there is exactly one. When verification
+follows multiple work items, set `target_node_id` explicitly after inspecting
 `turn graph --format json`. Prefer an integrator before verification when
 several branches need to be reviewed as one cohesive result, but this is a
 planning recommendation, not a CLI requirement. Keep findings actionable and

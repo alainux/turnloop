@@ -18,6 +18,7 @@ from turn.domain.schemas import (
     Graph,
     Node,
     NodeStatus,
+    PlanResult,
     VerificationDecision,
     VerificationResult,
 )
@@ -26,26 +27,77 @@ from turn.domain.schemas import (
 @dataclass
 class Indexes:
     node_by_id: dict
-    children: dict  # CONTAINS: parent -> [child]
-    parents: dict   # child -> parent
-    deps: dict      # dependent -> [prerequisite]
-    dependents: dict  # prerequisite -> [dependent]
+    children: dict       # CONTAINS: anchor -> [owned node]
+    parents: dict        # owned node -> anchor
+    predecessors: dict   # FOLLOWS: next node -> [previous node]
+    successors: dict     # FOLLOWS: previous node -> [next node]
+
+
+def workflow_leaves(plan: PlanResult) -> dict[str | None, tuple[str, ...]]:
+    """Return terminal workflow keys for each composition boundary.
+
+    ``CONTAINS`` describes ownership, not workflow progress. A leaf is
+    therefore a node with no local ``FOLLOWS`` successor. Boundaries are
+    checked independently so a composed anchor may own its own one-leaf
+    workflow while still being one stage in its parent's workflow.
+    """
+    keys = {node.key for node in plan.nodes}
+    successors: dict[str, set[str]] = {key: set() for key in keys}
+    boundaries: dict[str | None, list[str]] = {}
+    for node in plan.nodes:
+        boundaries.setdefault(node.parent_key, []).append(node.key)
+        for predecessor in node.follows:
+            if predecessor in keys:
+                successors[predecessor].add(node.key)
+    for edge in plan.edges:
+        if edge.type is EdgeType.FOLLOWS and edge.src in keys and edge.dst in keys:
+            successors[edge.src].add(edge.dst)
+    return {
+        boundary: tuple(key for key in members if not successors[key])
+        for boundary, members in boundaries.items()
+    }
+
+
+def validate_single_workflow_leaf(plan: PlanResult) -> None:
+    """Reject a non-empty boundary that leaves multiple workflow terminals.
+
+    This is deliberately the smallest submission-time shape guard. It does
+    not prescribe the final role, require a particular number of branches, or
+    reject a valid one-node plan. It only catches the fundamental planning
+    mistake of fanning out and stopping without a single fan-in destination.
+    Empty plans remain valid no-op/document-only handoffs.
+    """
+    invalid = [
+        (boundary, leaves)
+        for boundary, leaves in workflow_leaves(plan).items()
+        if len(leaves) != 1
+    ]
+    if not invalid:
+        return
+    details = "; ".join(
+        f"{boundary or 'root'} has {len(leaves)} leaves ({', '.join(leaves)})"
+        for boundary, leaves in invalid
+    )
+    raise ValueError(
+        "each non-empty workflow boundary must end in exactly one leaf; "
+        + details
+    )
 
 
 def build_indexes(nodes: list[Node], edges: list[Edge]) -> Indexes:
     node_by_id = {n.id: n for n in nodes}
     children: dict = {}
     parents: dict = {}
-    deps: dict = {}
-    dependents: dict = {}
+    predecessors: dict = {}
+    successors: dict = {}
     for e in edges:
         if e.type == EdgeType.CONTAINS:
             children.setdefault(e.src, []).append(e.dst)
             parents[e.dst] = e.src
-        elif e.type == EdgeType.DEPENDS_ON:
-            deps.setdefault(e.dst, []).append(e.src)
-            dependents.setdefault(e.src, []).append(e.dst)
-    return Indexes(node_by_id, children, parents, deps, dependents)
+        elif e.type == EdgeType.FOLLOWS:
+            predecessors.setdefault(e.dst, []).append(e.src)
+            successors.setdefault(e.src, []).append(e.dst)
+    return Indexes(node_by_id, children, parents, predecessors, successors)
 
 
 def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
@@ -66,12 +118,7 @@ def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
 
 
 def _execution_container_ids(idx: Indexes) -> set:
-    """Return every node that contains graph children.
-
-    Verification has no special containment semantics. A verifier is a
-    sibling at its planning boundary and becomes ordered solely by its
-    ordinary DEPENDS_ON edge.
-    """
+    """Return every node that contains a nested workflow."""
     return set(idx.children)
 
 
@@ -80,7 +127,7 @@ def is_runnable(
     idx: Indexes,
     effective_status: dict | None = None,
 ) -> tuple[bool, str]:
-    """A node is runnable when active, not paused, deps satisfied, inputs present."""
+    """A node is runnable when active, sequence satisfied, inputs present."""
     node = idx.node_by_id.get(node_id)
     if node is None:
         return False, "missing"
@@ -100,15 +147,15 @@ def is_runnable(
         return False, "in flight"
     if node.status == NodeStatus.EXPANDED:
         return False, "container"
-    for p in idx.deps.get(node_id, []):
+    for p in idx.predecessors.get(node_id, []):
         pn = idx.node_by_id.get(p)
-        prerequisite_status = (
+        predecessor_status = (
             effective_status.get(p, pn.status)
             if effective_status is not None and pn is not None
             else pn.status if pn is not None else None
         )
-        if pn is None or prerequisite_status != NodeStatus.COMPLETE:
-            return False, "dependency incomplete"
+        if pn is None or predecessor_status != NodeStatus.COMPLETE:
+            return False, "sequence incomplete"
     for inp in node.required_inputs:
         if inp.satisfied_by is None:
             return False, f"missing input: {inp.label}"
@@ -129,7 +176,7 @@ class GraphWalker:
     """Read-only graph traversal service.
 
     The store owns persistence and the runner owns scheduling, but neither
-    should reimplement CONTAINS/DEPENDS_ON traversal.  This object is pure and
+    should reimplement CONTAINS/FOLLOWS traversal.  This object is pure and
     therefore can be used unchanged by the server, CLI, and deterministic
     tests.
     """
@@ -155,11 +202,11 @@ class GraphWalker:
     def descendants(self, node_id) -> list[Node]:
         return _collect_descendants(self.indexes, node_id)
 
-    def prerequisites(self, node_id) -> list[Node]:
+    def predecessors(self, node_id) -> list[Node]:
         return [
-            self.indexes.node_by_id[dependency]
-            for dependency in self.indexes.deps.get(node_id, [])
-            if dependency in self.indexes.node_by_id
+            self.indexes.node_by_id[predecessor]
+            for predecessor in self.indexes.predecessors.get(node_id, [])
+            if predecessor in self.indexes.node_by_id
         ]
 
     def depth(self, node_id) -> int:
@@ -176,13 +223,13 @@ def derive_flow_edges(
 ) -> list[FlowEdge]:
     """Derive transient edges for a workflow whose next step changed.
 
-    Persistent graph edges describe dependency semantics and must remain a DAG.
+    Persistent graph edges describe forward workflow semantics and must remain a DAG.
     A rejection temporarily sends its selected target back to the worker, so
     that direction is represented separately as a render-only flow edge. The
     edge is present only while that target is the next runnable or active step;
     once the target completes, normal forward flow is restored and this
-    projection becomes empty. Verifiers use their only dependency when no
-    explicit target is supplied; a verifier with multiple dependencies must
+    projection becomes empty. Verifiers use their only predecessor when no
+    explicit target is supplied; a verifier with multiple predecessors must
     use ``target_node_id`` to point at the node that needs correction.
     """
     indexes = build_indexes(nodes, edges)
@@ -223,8 +270,8 @@ def rejection_target(
 
     The explicit target is deliberately an ordinary node id rather than a
     persistent edge: returning work must not mutate the DAG or introduce a
-    cycle. Omitting it selects the reviewer's only dependency; a verifier with
-    multiple dependencies must identify its correction target explicitly.
+    cycle. Omitting it selects the reviewer's only predecessor; a verifier with
+    multiple predecessors must identify its correction target explicitly.
     """
     if decision.target_node_id is not None:
         target = indexes.node_by_id.get(decision.target_node_id)
@@ -232,7 +279,7 @@ def rejection_target(
             return None
         return target
 
-    target_ids = list(dict.fromkeys(indexes.deps.get(reviewer.id, [])))
+    target_ids = list(dict.fromkeys(indexes.predecessors.get(reviewer.id, [])))
     if len(target_ids) != 1:
         return None
     return indexes.node_by_id.get(target_ids[0])
@@ -247,8 +294,8 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
 
     # A planner/subplanner remains EXPANDED in persisted state because it is a
     # container, but its completion is derived from its descendant leaves.
-    # Compute that projection before checking dependency joins so an ordinary
-    # integrator can depend on a completed architectural branch.
+    # Compute that projection before checking sequence joins so an ordinary
+    # integrator can follow a completed architectural branch.
     container_ids = _execution_container_ids(idx)
     for n in nodes:
         if n.id not in container_ids:
@@ -332,9 +379,9 @@ def ancestry_path(idx: Indexes, node_id) -> list[Node]:
 
 
 def topo_order(nodes: list[Node], edges: list[Edge]) -> list[Node]:
-    """Return nodes ordered so prerequisites come before dependents.
+    """Return nodes ordered so predecessors come before successors.
 
-    Used when dispatching, so a dependency join is respected even within a
+    Used when dispatching, so a fan-in is respected even within a
     single scheduling pass. Falls back to insertion order on cycles.
     """
     idx = build_indexes(nodes, edges)
@@ -345,7 +392,7 @@ def topo_order(nodes: list[Node], edges: list[Edge]) -> list[Node]:
         if nid in visited:
             return
         visited.add(nid)
-        for p in idx.deps.get(nid, []):
+        for p in idx.predecessors.get(nid, []):
             visit(p)
         if nid in idx.node_by_id:
             order.append(idx.node_by_id[nid])

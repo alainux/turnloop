@@ -46,13 +46,13 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
                     key="verify",
                     objective="Verify the fixture",
                     agent_type=AgentType.VERIFIER,
-                    depends_on=["build"],
+                    follows=["build"],
                 ),
             ],
             edges=[],
         ),
     )
-    # The plan above intentionally exercises containment/dependency edges from
+    # The plan above intentionally exercises containment/sequence edges from
     # node declarations; add a durable run and a user artifact as well.
     run = await store.create_run(created[0], "echo")
     await store.update_run(run.id, summary="fixture", session_id="session-1")

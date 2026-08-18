@@ -88,7 +88,17 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             parent.project_name = candidate_name
             parent.objective = candidate_name
     if not plan.nodes:
-        parent.status = NodeStatus.COMPLETE
+        # An empty handoff is a valid no-op/document-only planning turn. It
+        # must not close a composition that was already planned by an earlier
+        # handoff: the existing children and their source links remain the
+        # authoritative graph. A genuinely childless boundary is complete
+        # because there is no work left for it to introduce.
+        has_existing_children = any(
+            item.id != parent.id and item.parent_id == parent.id
+            for item in state.nodes.values()
+        )
+        if not has_existing_children:
+            parent.status = NodeStatus.COMPLETE
         state.nodes[parent.id] = parent.model_copy(deep=True)
         append_artifacts(state, parent.id, plan.artifacts)
         return []
@@ -171,8 +181,8 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
     for spec in plan.nodes:
         if spec.parent_key:
             add_edge(keys_to_ids[spec.parent_key], keys_to_ids[spec.key], EdgeType.CONTAINS)
-        for dep in spec.depends_on:
-            add_edge(keys_to_ids[dep], keys_to_ids[spec.key], EdgeType.DEPENDS_ON)
+        for predecessor in spec.follows:
+            add_edge(keys_to_ids[predecessor], keys_to_ids[spec.key], EdgeType.FOLLOWS)
     for item in plan.edges:
         add_edge(keys_to_ids[item.src], keys_to_ids[item.dst], item.type)
     parent.status = NodeStatus.EXPANDED

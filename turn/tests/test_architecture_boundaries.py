@@ -159,7 +159,7 @@ def test_dag_contract_codecs_reject_invalid_graphs_and_parse_deterministically()
     plan = parse_plan({
         "nodes": [{"key": "build", "objective": "Build", "generated_prompt": None,
                    "executor": "echo", "required_inputs": [], "resource_refs": [],
-                   "parent_key": None, "depends_on": [], "plan": False}],
+                   "parent_key": None, "follows": [], "plan": False}],
         "edges": [],
     })
     assert plan.nodes[0].key == "build"

@@ -43,8 +43,8 @@ class ScriptedPlanner(Planner):
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
         # a: runnable, completes
-        # b: depends on a, blocks requesting a decision
-        # c: depends on b, completes (dependency join)
+        # b: follows a, blocks requesting a decision
+        # c: follows b, completes (sequence join)
         return PlanResult(
             nodes=[
                 NodeSpec(
@@ -57,7 +57,7 @@ class ScriptedPlanner(Planner):
                     key="b",
                     objective="Confirm the key decision",
                     executor="echo",
-                    depends_on=["a"],
+                    follows=["a"],
                     required_inputs=[
                         InputSpec(
                             id="decision_x",
@@ -71,13 +71,13 @@ class ScriptedPlanner(Planner):
                     key="c",
                     objective="Produce the deliverable",
                     executor="echo",
-                    depends_on=["b"],
+                    follows=["b"],
                     generated_prompt='{"outcome":"COMPLETE","summary":"produced"}',
                 ),
             ],
             edges=[
-                EdgeSpec(type=EdgeType.DEPENDS_ON, src="a", dst="b"),
-                EdgeSpec(type=EdgeType.DEPENDS_ON, src="b", dst="c"),
+                EdgeSpec(type=EdgeType.FOLLOWS, src="a", dst="b"),
+                EdgeSpec(type=EdgeType.FOLLOWS, src="b", dst="c"),
             ],
         )
 

@@ -191,7 +191,7 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
             refreshed = (await client.get(f"/api/projects/{rejection.id}/graph")).json()
             assert next(node for node in refreshed["nodes"] if node["id"] == str(work.id))["status"] == "RUNNABLE"
             release_view = next(node for node in refreshed["nodes"] if node["id"] == str(release.id))
-            assert release_view["ui_state"] == "waiting_dependency"
+            assert release_view["ui_state"] == "waiting_sequence"
             assert not ({"run", "retry", "regenerate"} & set(release_view["allowed_actions"]))
             assert next(node for node in refreshed["nodes"] if node["id"] == str(work.id))["agent"]["session_id"] == work_session
             assert any(
@@ -327,7 +327,7 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                             "executor": "fake",
                             "agent_type": "verifier",
                             "generated_prompt": "FAKE_VERIFY_REJECT",
-                            "depends_on": ["build"],
+                            "follows": ["build"],
                         },
                     ]
                 }),
@@ -374,20 +374,20 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                         "key": "chapter_a",
                         "objective": "Write chapter A",
                         "executor": "fake",
-                        "depends_on": ["chapter_plan"],
+                        "follows": ["chapter_plan"],
                     },
                     {
                         "key": "chapter_b",
                         "objective": "Write chapter B",
                         "executor": "fake",
-                        "depends_on": ["chapter_plan"],
+                        "follows": ["chapter_plan"],
                     },
                     {
                         "key": "verify_chapters",
                         "objective": "Verify both chapters",
                         "executor": "fake",
                         "agent_type": "verifier",
-                        "depends_on": ["chapter_a", "chapter_b"],
+                        "follows": ["chapter_a", "chapter_b"],
                     },
                 ],
             })
@@ -431,8 +431,8 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
             assert revised_root.agent_message is None
 
             fan_in = next(node for node in revised if node.objective == "Verify both chapters")
-            prerequisites = await store.prerequisites(fan_in.id)
-            assert {node.objective for node in prerequisites} == {"Write chapter A", "Write chapter B"}
+            predecessors = await store.predecessors(fan_in.id)
+            assert {node.objective for node in predecessors} == {"Write chapter A", "Write chapter B"}
 
             deleted = await client.request(
                 "DELETE",

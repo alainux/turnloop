@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Usage } from "../domain";
 import {
   displayNodeTitle,
@@ -12,7 +12,6 @@ import {
   NODE_HEIGHT,
   NODE_WIDTH,
   GRAPH_PADDING,
-  pathBetween,
   returnPathBetween,
   displayEdges,
 } from "../layout";
@@ -75,13 +74,26 @@ export function Graph({
   onContextMenu,
 }: Props) {
   const visibleEdges = useMemo(() => displayEdges(nodes, edges), [nodes, edges]);
-  // `displayEdges` is a rendering projection: it expands container
-  // dependencies and removes transitive shortcuts. Layout needs the source
-  // graph so it can build its own stage/containment projection exactly once.
-  // Passing the projected set back through `displayEdges` made partial graph
-  // updates recursively expand synthetic terminal edges and could place a
-  // long edge through an intermediate card until the next update arrived.
-  const layout = useMemo(() => layoutDendrogram(nodes, edges), [nodes, edges]);
+  // `displayEdges` is the single workflow projection: it keeps composition
+  // entry branches and all reduced handoffs, so layout and rendering share
+  // the same sequence/fan-out/fan-in geometry.
+  const [layout, setLayout] = useState<Awaited<ReturnType<typeof layoutDendrogram>> | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void layoutDendrogram(nodes, edges)
+      .then((nextLayout) => {
+        if (!cancelled) setLayout(nextLayout);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) console.error("[Turn] Unable to lay out workgraph", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nodes, edges]);
+  if (!layout) {
+    return <div className="graph-canvas graph-layout-pending" aria-label="Arranging workgraph" />;
+  }
   const finalDepth = layout.stageCount - 1;
   const finalStageNodeCount = [...layout.positions.values()].filter(
     (position) => position.depth === finalDepth,
@@ -100,7 +112,7 @@ export function Graph({
             key={depth}
             className="graph-stage-label"
             style={{
-              left: depth * (NODE_WIDTH + 54) + GRAPH_PADDING,
+              left: (layout.stageXs[depth] ?? depth * (NODE_WIDTH + 54)) + GRAPH_PADDING,
             }}
           >
             {depth === 0
@@ -121,7 +133,7 @@ export function Graph({
       >
         <defs>
           <marker
-            id="dependency-arrow"
+            id="workflow-arrow"
             viewBox="0 0 6 6"
             refX="5"
             refY="3"
@@ -130,7 +142,7 @@ export function Graph({
             orient="auto-start-reverse"
             markerUnits="strokeWidth"
           >
-            <path d="M0,0 L6,3 L0,6 z" fill="var(--amber)" />
+            <path d="M0,0 L6,3 L0,6 z" fill="var(--border-strong)" />
           </marker>
           <marker
             id="return-arrow"
@@ -148,13 +160,13 @@ export function Graph({
         {visibleEdges.map((edge) => {
           const a = layout.positions.get(edge.src),
             b = layout.positions.get(edge.dst);
-          return a && b ? (
+          const path = layout.edgePaths.get(edge.id);
+          return a && b && path ? (
             <path
               key={edge.id}
-              className={`edge-workflow ${edge.type === "DEPENDS_ON" ? "edge-depends" : "edge-contains"}`}
-              d={pathBetween(a, b, edge.type)}
-              data-edge-type={edge.type}
-              markerEnd={edge.type === "DEPENDS_ON" ? "url(#dependency-arrow)" : undefined}
+              className="edge-workflow"
+              d={path}
+              markerEnd="url(#workflow-arrow)"
             />
           ) : null;
         })}

@@ -9,7 +9,7 @@ metadata:
 
 Use this skill only for the initial planner at the project root. Set up the
 board by interpreting the user's actual request and choosing the minimum
-  complete set of agents, capability plugins, dependencies, and ownership boundaries that
+  complete set of agents, capability plugins, sequence stages, and ownership boundaries that
 preserves the requested outcome and scale. Do not invent a venture, software
 product, or organization when the request does not state one. Explicit scope
 and scale words are binding. This skill must not be inherited by nested
@@ -40,19 +40,15 @@ planners.
 - A small or atomic request should remain small. Do not add organizational
   stages merely because they are available when the request did not ask for
   organization-scale scope.
-- Set up direct board nodes, dependencies, agent types, and selected capability plugins.
+- Set up direct board nodes, sequence stages, agent types, and selected capability plugins.
   Stop at nested planner boundaries; those planners own their own subtrees.
 
-## Sequence by information, not by habit
+## Topology ownership
 
-Before submitting, inspect the proposed handoffs one by one. A node is
-parallel only if it can make its decision or create its output without another
-node's research, requirements, design, or other durable decision. When a
-downstream engineering or delivery stage needs an upstream product direction,
-make the dependency explicit. For a different domain, use its equivalent
-information flow. This may produce a staged plan, several independent lanes,
-or a small single-node plan; do not force a universal pipeline or parallel
-branches.
+Use `$turn-planning` as the authoritative contract for decomposition and graph
+topology. This root-only skill supplies scope, capability procurement, and
+ownership boundaries; do not duplicate topology rules here or put them in
+worker prompts.
 
 ## Root setup contract
 
@@ -98,7 +94,7 @@ a descendant's implementation, research, or verification work.
 - Workers own the files and outputs described by their capability plugins and prompts.
   Verifiers inspect their assigned boundary and report evidence; they do not
   repair another stage or redesign the graph outside that boundary.
-- Use real dependencies for real handoffs. Do not serialize unrelated work
+- Use real sequence stages for real handoffs. Do not serialize unrelated work
   merely to make a checklist.
 
 ## Documents are produced by workers, not reserved by setup
@@ -107,5 +103,5 @@ Do not name, reserve, register, or fabricate future document filenames,
 document references, or artifacts. Agents create their own outputs when they
 work, according to their assigned skills and prompts. A worker submits an
 explicit artifact only after it has created the actual output. The setup plan
-contains topology, ownership, dependencies, and skill assignment—not a catalog
+contains topology, ownership, sequence, and skill assignment—not a catalog
 of files that later agents may or may not produce.

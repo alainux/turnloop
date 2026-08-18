@@ -98,7 +98,7 @@ async def test_direct_files_are_available_to_downstream_nodes(tmp_path) -> None:
             return PlanResult(
                 nodes=[
                     NodeSpec(key="write", objective="write a source file", executor="echo"),
-                    NodeSpec(key="read", objective="assemble the source file", executor="echo", depends_on=["write"]),
+                    NodeSpec(key="read", objective="assemble the source file", executor="echo", follows=["write"]),
                 ]
             )
 
@@ -124,7 +124,7 @@ async def test_direct_files_are_available_to_downstream_nodes(tmp_path) -> None:
         await asyncio.gather(*runner._running.values(), return_exceptions=True)
     nodes, edges, _ = await store.get_workgraph(root.id)
     assert len(nodes) == 3
-    assert any(edge.type == EdgeType.DEPENDS_ON for edge in edges)
+    assert any(edge.type == EdgeType.FOLLOWS for edge in edges)
     assert all(node.repo_path is None or node.repo_path == str(project_dir) for node in nodes)
     await store.dispose()
 
@@ -143,7 +143,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
         "Create output surface",
         "Integrate the deliverable",
     ]
-    assert plan.nodes[-1].depends_on == ["core", "inputs", "outputs"]
+    assert plan.nodes[-1].follows == ["core", "inputs", "outputs"]
     assert all(not node.required_inputs for node in plan.nodes)
     created = await store.apply_plan(root, plan)
     nodes, edges, _ = await store.get_workgraph(root.id)
@@ -155,7 +155,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     assert "turn-integrating" in integrator.agent.capabilities
     assert all(node.id in evaluation.runnable for node in parallel)
     assert integrator.id not in evaluation.runnable
-    assert {edge.src for edge in edges if edge.dst == integrator.id and edge.type == EdgeType.DEPENDS_ON} == {
+    assert {edge.src for edge in edges if edge.dst == integrator.id and edge.type == EdgeType.FOLLOWS} == {
         node.id for node in parallel
     }
     await store.dispose()
@@ -213,7 +213,7 @@ async def test_auto_runner_dispatches_all_independent_lanes_together(tmp_path) -
     await store.dispose()
 
 
-async def test_manual_step_uses_dependency_order_not_uuid_order(tmp_path) -> None:
+async def test_manual_step_uses_sequence_order_not_uuid_order(tmp_path) -> None:
     store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
@@ -234,8 +234,8 @@ async def test_manual_step_uses_dependency_order_not_uuid_order(tmp_path) -> Non
     created = await store.apply_plan(
         root,
         PlanResult(nodes=[
-            NodeSpec(key="finish", objective="finish", executor="echo", depends_on=["middle"]),
-            NodeSpec(key="middle", objective="middle", executor="echo", depends_on=["first"]),
+            NodeSpec(key="finish", objective="finish", executor="echo", follows=["middle"]),
+            NodeSpec(key="middle", objective="middle", executor="echo", follows=["first"]),
             NodeSpec(key="first", objective="first", executor="echo"),
         ]),
     )
@@ -275,7 +275,7 @@ async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> Non
                     key="integrate",
                     objective="integrate",
                     executor="echo",
-                    depends_on=["world", "systems"],
+                    follows=["world", "systems"],
                 ),
             ]
         ),

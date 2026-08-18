@@ -20,10 +20,10 @@ there for dependent nodes.
 2. Run `turn project info` from the project root when you need project identity,
    role defaults, loaded capabilities, or native harness discovery metadata.
 3. Run `turn graph <project-id> --requester <node-id> --tree` before planning or
-   changing work. Use `--format json` when exact node, dependency, run, prompt,
+   changing work. Use `--format json` when exact node, sequence, run, prompt,
    artifact, or document data is needed.
-4. Read prerequisite artifacts from the project directory. A dependency edge
-   means its work already ran before yours; do not ask the user to paste it.
+4. Read preceding-stage artifacts from the project directory. A `FOLLOWS` edge
+   means that stage runs before yours; do not ask the user to paste it.
 
 Use the harness-native skill and MCP surfaces that Turn prepared. Do not read a
 capability's `SKILL.md` to simulate activation and do not write directly to
@@ -65,18 +65,11 @@ Keep reports concise. Use project Markdown plus `document_refs` when evidence
 is too large for a handoff summary. Continue using the harness terminal for
 ordinary work and keep the session available for follow-up when possible.
 
-## Composable graph handoffs
+Use a short objective for every planned node (at most 72 characters). The
+objective is the graph/card label; put detailed instructions in
+`generated_prompt` or a project document.
 
-Planner graph boundaries are source files by default. Write the complete
-`PlanResult` to a project-relative `.json` file, then submit that source with:
-
-```sh
-turn agent submit --kind plan --graph-file .turn/graphs/<boundary>.json
-```
-
-Turn validates the file and records its link on the planner node that owns the
-boundary. Linked nested graphs remain links; they are not silently flattened
-into graph exploration. When revising a boundary, edit its source file and
-submit it again. Preserve every `subgraph_refs` entry unless the replacement
-is intentional and use `--force` only when deliberately removing composed
-subgraphs. A replacement is rejected while any descendant is running.
+Graph construction is a planner concern. Planners must use `$turn-planning` for
+topology, ownership, and source-file handoffs; executors, integrators, and
+verifiers inspect the graph but do not author or revise it unless they are
+explicitly assigned a planning boundary.

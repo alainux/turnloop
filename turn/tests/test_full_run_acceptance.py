@@ -118,7 +118,7 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                     state_files.append(Path(graph["nodes"][0]["repo_path"]) / ".turn" / "state.json")
                     assert len(graph["nodes"]) == 5
                     assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 0
-                    assert sum(edge["type"] == "DEPENDS_ON" for edge in graph["edges"]) == 3
+                    assert sum(edge["type"] == "FOLLOWS" for edge in graph["edges"]) == 3
                     assert all(
                         node["agent"]["harness"] == "fake" and node["agent"]["model"] == "deterministic"
                         for node in graph["nodes"] if node["parent_id"]

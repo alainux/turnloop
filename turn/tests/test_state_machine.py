@@ -71,7 +71,7 @@ def test_pause_overrides_execution_status_without_destroying_it():
     assert paused.status == NodeStatus.RUNNABLE
 
 
-def test_human_input_is_distinct_from_dependency_waiting():
+def test_human_input_is_distinct_from_sequence_waiting():
     node = Node(
         project_id="00000000-0000-0000-0000-000000000001",
         objective="x",
@@ -80,19 +80,19 @@ def test_human_input_is_distinct_from_dependency_waiting():
     )
     assert present_node(node).state == UIState.WAITING_INPUT
     dependency = node.model_copy(update={"required_inputs": []})
-    assert present_node(dependency, blocked_reason="dependency incomplete").state == UIState.WAITING_DEPENDENCY
+    assert present_node(dependency, blocked_reason="sequence incomplete").state == UIState.WAITING_SEQUENCE
 
 
-def test_waiting_dependency_does_not_expose_a_primary_run_action():
+def test_waiting_sequence_does_not_expose_a_primary_run_action():
     node = Node(
         project_id="00000000-0000-0000-0000-000000000001",
         objective="wait for prerequisite",
         status=NodeStatus.BLOCKED,
     )
 
-    projected = present_node(node, blocked_reason="dependency incomplete")
+    projected = present_node(node, blocked_reason="sequence incomplete")
 
-    assert projected.state == UIState.WAITING_DEPENDENCY
+    assert projected.state == UIState.WAITING_SEQUENCE
     assert not ({Action.RUN, Action.RETRY, Action.REGENERATE} & set(projected.actions))
 
 
@@ -107,7 +107,7 @@ def test_graph_projection_never_reclassifies_a_running_node_as_runnable():
     assert node.id not in result.runnable
 
 
-def test_incomplete_dependency_blocks_dispatch_and_reopens_complete_parent():
+def test_incomplete_sequence_blocks_dispatch_and_reopens_complete_parent():
     root = Node(id="00000000-0000-0000-0000-000000000001", project_id="00000000-0000-0000-0000-000000000001", objective="root", status=NodeStatus.COMPLETE)
     prerequisite = Node(id="00000000-0000-0000-0000-000000000002", project_id=root.id, parent_id=root.id, objective="incomplete prerequisite", status=NodeStatus.PENDING)
     dependent = Node(id="00000000-0000-0000-0000-000000000003", project_id=root.id, parent_id=root.id, objective="use accepted result", status=NodeStatus.PENDING)
@@ -115,15 +115,15 @@ def test_incomplete_dependency_blocks_dispatch_and_reopens_complete_parent():
     edges = [
         Edge(src=root.id, dst=prerequisite.id, type=EdgeType.CONTAINS),
         Edge(src=root.id, dst=dependent.id, type=EdgeType.CONTAINS),
-        Edge(src=prerequisite.id, dst=dependent.id, type=EdgeType.DEPENDS_ON),
+        Edge(src=prerequisite.id, dst=dependent.id, type=EdgeType.FOLLOWS),
     ]
     result = evaluate([root, prerequisite, dependent], edges)
     assert dependent.id not in result.runnable
-    assert result.blocked_reason[dependent.id] == "dependency incomplete"
+    assert result.blocked_reason[dependent.id] == "sequence incomplete"
     assert result.status[root.id] == NodeStatus.EXPANDED
 
 
-def test_completed_container_satisfies_integrator_dependency():
+def test_completed_container_satisfies_integrator_sequence():
     root = Node(
         id="00000000-0000-0000-0000-000000000011",
         project_id="00000000-0000-0000-0000-000000000011",
@@ -156,7 +156,7 @@ def test_completed_container_satisfies_integrator_dependency():
         Edge(src=root.id, dst=branch.id, type=EdgeType.CONTAINS),
         Edge(src=branch.id, dst=executor.id, type=EdgeType.CONTAINS),
         Edge(src=root.id, dst=integrator.id, type=EdgeType.CONTAINS),
-        Edge(src=branch.id, dst=integrator.id, type=EdgeType.DEPENDS_ON),
+        Edge(src=branch.id, dst=integrator.id, type=EdgeType.FOLLOWS),
     ]
 
     result = evaluate([root, branch, executor, integrator], edges)
@@ -207,7 +207,7 @@ def test_integrator_waits_for_every_nested_branch_output():
         Edge(src=branch.id, dst=first.id, type=EdgeType.CONTAINS),
         Edge(src=branch.id, dst=second.id, type=EdgeType.CONTAINS),
         Edge(src=root.id, dst=integrator.id, type=EdgeType.CONTAINS),
-        Edge(src=branch.id, dst=integrator.id, type=EdgeType.DEPENDS_ON),
+        Edge(src=branch.id, dst=integrator.id, type=EdgeType.FOLLOWS),
     ]
 
     waiting = evaluate([root, branch, first, second, integrator], edges)

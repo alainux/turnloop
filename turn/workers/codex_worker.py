@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from turn.config import settings
-from turn.contracts.dag import parse_result
+from turn.contracts.dag import parse_plan, parse_result
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
@@ -352,49 +352,4 @@ class CodexWorker(Worker):
 
     @staticmethod
     def _to_plan(plan_json: dict) -> PlanResult:
-        nodes = [
-            NodeSpec(
-                key=n["key"],
-                objective=n["objective"],
-                generated_prompt=n.get("generated_prompt"),
-                executor=n.get("executor"),
-                agent=n.get("agent"),
-                agent_type=n.get("agent_type"),
-                required_inputs=[
-                    InputSpec(
-                        id=i["id"],
-                        label=i.get("label", i["id"]),
-                        kind=parsing.safe_input_kind(i.get("kind")),
-                        description=i.get("description"),
-                    )
-                    for i in n.get("required_inputs", [])
-                ],
-                resource_refs=list(n.get("resource_refs", [])),
-                parent_key=n.get("parent_key"),
-                depends_on=list(n.get("depends_on", [])),
-                plan=bool(n.get("plan", False)),
-            )
-            for n in plan_json.get("nodes", [])
-        ]
-        edges = [
-            EdgeSpec(type=EdgeType(e["type"]), src=e["src"], dst=e["dst"])
-            for e in plan_json.get("edges", [])
-        ]
-        return PlanResult(
-            nodes=nodes,
-            document_refs=[
-                item if isinstance(item, DocumentRef) else DocumentRef(ref=item)
-                if isinstance(item, str) else DocumentRef.model_validate(item)
-                for item in plan_json.get("document_refs", [])
-            ],
-            artifacts=[
-                item if isinstance(item, ArtifactSpec) else ArtifactSpec(
-                    kind=ArtifactKind.FILE,
-                    name=item.rsplit("/", 1)[-1] or item,
-                    ref=item,
-                ) if isinstance(item, str) else ArtifactSpec.model_validate(item)
-                for item in plan_json.get("artifacts", [])
-            ],
-            edges=edges,
-            notes=plan_json.get("notes"),
-        )
+        return parse_plan(plan_json)

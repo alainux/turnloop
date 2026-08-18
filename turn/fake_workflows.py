@@ -36,7 +36,7 @@ def _leaf(
     objective: str,
     marker: str,
     *,
-    depends_on: list[str] | None = None,
+    follows: list[str] | None = None,
     agent_type: AgentType | None = None,
 ) -> NodeSpec:
     return NodeSpec(
@@ -44,7 +44,7 @@ def _leaf(
         objective=objective,
         executor="fake",
         generated_prompt=marker,
-        depends_on=depends_on or [],
+        follows=follows or [],
         agent_type=agent_type,
     )
 
@@ -70,14 +70,14 @@ def fake_workflow_definitions() -> tuple[FakeWorkflowDefinition, ...]:
                         "review",
                         "Reject the change and return it to work",
                         "FAKE_VERIFY_REJECT",
-                        depends_on=["work"],
+                        follows=["work"],
                         agent_type=AgentType.VERIFIER,
                     ),
                     _leaf(
                         "release",
                         "Publish the accepted change",
                         "FAKE_COMPLETE_RELEASE",
-                        depends_on=["review"],
+                        follows=["review"],
                     ),
                 ],
             ),
@@ -133,7 +133,7 @@ def fake_workflow_definitions() -> tuple[FakeWorkflowDefinition, ...]:
                         "skipped-dependent",
                         "Only run after the long task completes",
                         "FAKE_COMPLETE_DEPENDENT",
-                        depends_on=["long-task"],
+                        follows=["long-task"],
                     ),
                 ],
             ),

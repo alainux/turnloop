@@ -32,7 +32,7 @@ tool calls. Turn keeps the plan, execution, and evidence in one visible control
 surface:
 
 - **Start with intent.** Describe the outcome instead of manually inventing a task list.
-- **See the decomposition.** Turn renders containment, dependencies, parallel branches, and integration points as a workgraph.
+- **See the decomposition.** Turn renders containment, sequencing, fan-out, fan-in, and integration points as a workgraph.
 - **Run with control.** Choose step-by-step or auto-run execution, pause between stages, retry failures, and provide human input when needed.
 - **Inspect the work.** Open the document view, terminal, logs, artifacts, costs, and durable agent sessions from the same project.
 - **Keep ownership local.** Project state lives on disk, while planner and worker adapters keep harness-specific behavior replaceable.
@@ -45,7 +45,7 @@ the path matters as much as the final artifact.
 | Surface | What it gives you |
 | --- | --- |
 | Project authoring | Prompt-first creation, project explorer, attachments, and working-directory selection |
-| Workgraph | A deterministic left-to-right graph with parallel branches and explicit dependencies |
+| Workgraph | A deterministic left-to-right graph with explicit sequencing, fan-out, and fan-in |
 | Execution | Auto/step policies, retries, timeouts, cancellation, recovery, and human-input gates |
 | Agent workspace | Durable PTY-backed terminals, reconnectable sessions, and provider-neutral transport |
 | Evidence | Document view, logs, artifacts, diffs, token/cost usage, and server-projected UI state |
@@ -72,8 +72,8 @@ Codex, Claude Code, OpenCode, and Pi.
 The storage, graph, runner, terminal, and harness boundaries are independent so
 new providers, scheduling policies, and evidence types can be added without
 making the UI own orchestration state. The graph also models derived flow
-edges, such as review rejection returns, separately from the durable
-dependency topology.
+edges, such as review rejection returns, separately from the durable workflow
+topology.
 
 ## Screenshots
 
@@ -115,7 +115,7 @@ planner ──▶ PlanResult ──▶ workgraph ──▶ runner ──▶ harn
 
 For broad requests, a plan can carry an executive summary, approach, typed
 sections, decisions, risks, acceptance criteria, and optional diagrams. The
-document view renders that metadata alongside the dependency graph, and worker
+document view renders that metadata alongside the workflow graph, and worker
 nodes receive the same graph-owned context.
 
 The main boundaries are deliberately small:

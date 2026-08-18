@@ -1106,12 +1106,12 @@ form.composer:has(.composer-config-panel) {
 .document-node.depth-2 { --document-indent: 18px; }
 .document-node.depth-3 { --document-indent: 24px; }
 .document-node.depth-4 { --document-indent: 30px; }
-.document-dependencies {
+.document-sequence-predecessors {
   margin: 0 0 14px;
   color: var(--text-3);
   font-size: 10px;
 }
-.document-dependencies span {
+.document-sequence-predecessors span {
   margin-right: 6px;
   color: var(--amber);
   font-weight: 650;
@@ -1293,25 +1293,6 @@ form.composer:has(.composer-config-panel) {
   min-height: 100%;
   color: var(--text-3);
 }
-.graph-guide {
-  flex: 0 0 auto;
-  align-self: stretch;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 12px;
-  min-height: 28px;
-  padding: 4px 12px;
-  color: var(--text-3);
-  font-size: 9px;
-  letter-spacing: 0.02em;
-}
-.graph-guide span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
 .graph-canvas {
   flex: 0 0 auto;
   align-self: flex-start;
@@ -1327,14 +1308,9 @@ form.composer:has(.composer-config-panel) {
 }
 .edge-workflow {
   fill: none;
+  stroke: var(--border-strong);
   stroke-width: 1.25;
   stroke-linejoin: round;
-}
-.edge-contains {
-  stroke: var(--border-strong);
-}
-.edge-depends {
-  stroke: var(--amber);
 }
 .edge-flow-return {
   fill: none;
@@ -1654,7 +1630,7 @@ form.composer:has(.composer-config-panel) {
 }
 .badge.verifying,
 .badge.waiting_input,
-.badge.waiting_dependency {
+.badge.waiting_sequence {
   color: var(--amber);
 }
 .badge.failed,
@@ -3170,6 +3146,11 @@ img.icon {
   font-size: 7px;
   color: var(--text-3);
   text-transform: none;
+}
+.node-copy small:last-child {
+  box-sizing: border-box;
+  width: calc(100% - 48px);
+  min-width: 0;
 }
 .node-copy small:first-of-type {
   color: var(--text-2);

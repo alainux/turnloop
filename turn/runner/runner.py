@@ -25,6 +25,7 @@ from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
     ArtifactSpec,
+    EdgeType,
     HarnessKind,
     Node,
     NodeStatus,
@@ -65,6 +66,55 @@ def _dump(obj):
     if hasattr(obj, "model_dump"):
         return obj.model_dump(mode="json")
     return obj
+
+
+def _plan_submission_artifact(plan: PlanResult) -> ArtifactSpec:
+    """Persist the planner receipt together with its editable source link."""
+    source_refs: list[dict[str, object]] = []
+    seen_refs: set[str] = set()
+    for reference in [
+        *plan.subgraph_refs,
+        *(reference for node in plan.nodes for reference in node.subgraph_refs),
+    ]:
+        if reference.ref in seen_refs:
+            continue
+        seen_refs.add(reference.ref)
+        source_refs.append(reference.model_dump(mode="json"))
+    sequence_edges = {
+        (predecessor, node.key)
+        for node in plan.nodes
+        for predecessor in node.follows
+    }
+    composition_edges = {
+        (node.parent_key, node.key)
+        for node in plan.nodes
+        if node.parent_key
+    }
+    for edge in plan.edges:
+        target = sequence_edges if edge.type is EdgeType.FOLLOWS else composition_edges
+        target.add((edge.src, edge.dst))
+    receipt = {
+        "subgraph_refs": source_refs,
+        "project_name": plan.project_name,
+        "node_count": len(plan.nodes),
+        # The canonical source form stores local sequence predecessors on each
+        # node and composition ownership in parent_key. Count the effective
+        # graph here rather than only the optional, pre-normalization edges
+        # array, which is normally empty by the time a plan is accepted.
+        "edge_count": len(sequence_edges | composition_edges),
+        "sequence_edge_count": len(sequence_edges),
+        "composition_edge_count": len(composition_edges),
+        "document_ref_count": len(plan.document_refs),
+        "artifact_count": len(plan.artifacts),
+    }
+    if plan.session_id:
+        receipt["session_id"] = plan.session_id
+    return ArtifactSpec(
+        kind=ArtifactKind.JSON,
+        name="plan-submission",
+        content=receipt,
+        ref=plan.subgraph_refs[0].ref if plan.subgraph_refs else None,
+    )
 
 
 class Runner:
@@ -479,6 +529,14 @@ class Runner:
     async def _apply_plan_revision(
         self, node_id: uuid.UUID, project_id: uuid.UUID, plan: PlanResult, *, force: bool = False
     ) -> list[Node]:
+        """Apply an explicit source-file replacement for this boundary.
+
+        This is intentionally different from a normal planner handoff with
+        ``nodes=[]``. The CLI watcher calls this method for a submitted plan
+        file, so an intentionally empty replacement still clears descendants;
+        the normal planner path uses ``Store.apply_plan`` directly and keeps
+        an existing composition intact.
+        """
         node = await self.store.get_node(node_id)
         if node is None:
             return []
@@ -508,11 +566,7 @@ class Runner:
         created = await self.store.apply_plan(node, plan)
         artifacts = await self.store.add_artifacts(
             node.id,
-            [ArtifactSpec(
-                kind=ArtifactKind.JSON,
-                name="plan-submission",
-                content=plan.model_dump(mode="json"),
-            )],
+            [_plan_submission_artifact(plan)],
         )
         for artifact in artifacts:
             await self._emit("artifact.created", project_id, _dump(artifact))
@@ -707,11 +761,7 @@ class Runner:
             created = await self.store.apply_plan(node, plan)
             submitted = await self.store.add_artifacts(
                 node.id,
-                [ArtifactSpec(
-                    kind=ArtifactKind.JSON,
-                    name="plan-submission",
-                    content=plan.model_dump(mode="json"),
-                )],
+                [_plan_submission_artifact(plan)],
             )
             for artifact in submitted:
                 await self._emit("artifact.created", project_id, _dump(artifact))
@@ -954,6 +1004,12 @@ class Runner:
         repo = await self._project_repo(node.project_id)
         if not repo:
             return plan
+        # Empty plans are intentional: a planner may only submit documents or
+        # acknowledge an already-planned boundary. Do not create a misleading
+        # empty graph source for that handoff. A source is created by default
+        # when this turn actually introduces graph nodes.
+        if not plan.nodes:
+            return plan
         if plan.subgraph_refs:
             return plan
         relative = Path(".turn") / "graphs" / f"{node.id}-{uuid.uuid4().hex}.json"
@@ -999,7 +1055,7 @@ class Runner:
             target = rejection_target(current, decision, walker.indexes)
             if target is None:
                 raise RuntimeError(
-                    "rejection requires a valid target_node_id when the verifier has multiple dependencies"
+                    "rejection requires a valid target_node_id when the verifier has multiple preceding stages"
                 )
             await self._notify_rejection(target, reviewer, decision)
             # A reviewer may be the active member of a manual Step barrier.
@@ -1010,8 +1066,8 @@ class Runner:
             self._manual_stages.pop(project_id, None)
             # A rejection invalidates the target, the review node, and every
             # dependent result reachable from either. The graph replays them
-            # in dependency order; the target is runnable immediately and the
-            # reviewer becomes runnable again after its prerequisites settle.
+            # in sequence order; the target is runnable immediately and the
+            # reviewer becomes runnable again after its predecessors settle.
             invalidated: list[Node] = []
             pending = [target.id, reviewer.id]
             seen: set[uuid.UUID] = set()
@@ -1023,7 +1079,7 @@ class Runner:
                 dependent = walker.indexes.node_by_id.get(dependent_id)
                 if dependent is not None:
                     invalidated.append(dependent)
-                    pending.extend(walker.indexes.dependents.get(dependent_id, []))
+                    pending.extend(walker.indexes.successors.get(dependent_id, []))
             for item in invalidated:
                 if item.id == target.id or item.id == reviewer.id or item.status != NodeStatus.RUNNING:
                     item.status = NodeStatus.RUNNABLE if item.id == target.id else NodeStatus.PENDING

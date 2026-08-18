@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from turn.config import Settings
 from turn.db.store import Store
@@ -38,24 +39,31 @@ from turn.workers.registry import WorkerRegistry
 from turn.workers.terminal import TerminalResult
 
 
-def test_verifier_contract_allows_multiple_dependency_targets():
+def test_verifier_contract_allows_sequence_fan_in_and_rejects_cross_boundary_links():
     plan = PlanResult(nodes=[
         NodeSpec(key="design", objective="Design product"),
         NodeSpec(key="implementation", objective="Implement product"),
         NodeSpec(
             key="check", objective="Verify product", agent_type=AgentType.VERIFIER,
-            depends_on=["design", "implementation"],
+            follows=["design", "implementation"],
         ),
     ])
-    assert plan.nodes[2].depends_on == ["design", "implementation"]
+    assert plan.nodes[2].follows == ["design", "implementation"]
 
-    with pytest.raises(ValueError, match="must use depends_on"):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        NodeSpec.model_validate({
+            "key": "legacy",
+            "objective": "Legacy dependency field",
+            "depends_on": ["design"],
+        })
+
+    with pytest.raises(ValueError, match="crosses a composition boundary"):
         PlanResult(nodes=[
             NodeSpec(
                 key="work", objective="Build product"),
             NodeSpec(
                 key="check", objective="Check", agent_type=AgentType.VERIFIER,
-                parent_key="work", depends_on=["work"],
+                parent_key="work", follows=["work"],
             ),
         ])
     decision = VerificationResult(
@@ -65,6 +73,15 @@ def test_verifier_contract_allows_multiple_dependency_targets():
         required_changes=["Mount the authored scene before the first render"],
     )
     assert decision.decision is VerificationDecision.REJECT
+
+
+def test_sequence_rejects_long_range_shortcuts():
+    with pytest.raises(ValueError, match="transitive shortcut"):
+        PlanResult(nodes=[
+            NodeSpec(key="start", objective="Start"),
+            NodeSpec(key="middle", objective="Middle", follows=["start"]),
+            NodeSpec(key="finish", objective="Finish", follows=["middle", "start"]),
+        ])
 
 
 def test_verification_artifact_is_the_submitted_result_not_terminal_transcript():
@@ -82,19 +99,19 @@ def test_verification_artifact_is_the_submitted_result_not_terminal_transcript()
     assert "\\x1b" not in rendered
 
 
-def test_verifier_target_is_canonical_workflow_dependency():
+def test_verifier_target_is_canonical_workflow_sequence():
     plan = PlanResult(nodes=[
         NodeSpec(key="work", objective="Build product", executor="echo"),
         NodeSpec(
             key="check", objective="Verify product", executor="echo",
-            agent_type=AgentType.VERIFIER, depends_on=["work"],
+            agent_type=AgentType.VERIFIER, follows=["work"],
         ),
     ])
     assert plan.nodes[1].parent_key is None
-    assert plan.nodes[1].depends_on == ["work"]
+    assert plan.nodes[1].follows == ["work"]
 
 
-async def test_rejection_notifies_target_and_replays_entire_dependency_chain(tmp_path):
+async def test_rejection_notifies_target_and_replays_entire_sequence_chain(tmp_path):
     store = Store(tmp_path / "state")
     await store.init()
     root = await store.create_project("Build a verified product", repo_path=str(tmp_path / "repo"))
@@ -102,11 +119,11 @@ async def test_rejection_notifies_target_and_replays_entire_dependency_chain(tmp
         NodeSpec(key="work", objective="Build product", executor="echo"),
         NodeSpec(
             key="check-one", objective="Verify product", executor="echo",
-            agent_type=AgentType.VERIFIER, depends_on=["work"],
+            agent_type=AgentType.VERIFIER, follows=["work"],
         ),
         NodeSpec(
             key="check-two", objective="Verify release", executor="echo",
-            agent_type=AgentType.VERIFIER, depends_on=["check-one"],
+            agent_type=AgentType.VERIFIER, follows=["check-one"],
         ),
     ])
     created = await store.apply_plan(root, plan)
@@ -144,9 +161,9 @@ async def test_rejection_notifies_target_and_replays_entire_dependency_chain(tmp
     assert "\x03" in str(terminal.snapshot(work.id)["output"])
 
     _, edges, _ = await store.get_workgraph(root.id)
-    assert {edge.type for edge in edges} <= {EdgeType.CONTAINS, EdgeType.DEPENDS_ON}
+    assert {edge.type for edge in edges} <= {EdgeType.CONTAINS, EdgeType.FOLLOWS}
     assert sum(
-        edge.type is EdgeType.DEPENDS_ON
+        edge.type is EdgeType.FOLLOWS
         and edge.src == work.id
         and edge.dst == check_one.id
         for edge in edges
@@ -157,7 +174,7 @@ async def test_rejection_notifies_target_and_replays_entire_dependency_chain(tmp
     )
 
     # A corrected submission from the same parent conversation reopens the
-    # verifier as the next ordinary dependency stage.
+    # verifier as the next ordinary sequence stage.
     await store.set_status(work.id, NodeStatus.RUNNING)
     resubmission = await store.create_run(work, "echo")
     assert resubmission.session_id == "old-session"
@@ -189,7 +206,7 @@ async def test_rejection_respects_auto_step_and_manual_progression(tmp_path):
             NodeSpec(key="work", objective="Build product", executor="echo"),
             NodeSpec(
                 key="check", objective="Verify product", executor="echo",
-                agent_type=AgentType.VERIFIER, depends_on=["work"],
+                agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ])
         work, verifier = await store.apply_plan(root, plan)
@@ -237,7 +254,7 @@ async def test_rejection_respects_auto_step_and_manual_progression(tmp_path):
     await asyncio.gather(*runner._running.values())
     await store.dispose()
 
-    # Step mode advances one dependency frontier at a time. The old rejected
+    # Step mode advances one sequence frontier at a time. The old rejected
     # verifier cannot leave a stale manual barrier behind.
     store, runner, root, work, verifier = await make_runtime("step", auto_run=False)
     assert await runner.step(root.id) == [work.id]
@@ -275,7 +292,7 @@ async def test_any_node_can_reject_and_route_to_an_arbitrary_node(tmp_path):
             objective="Review the integration",
             executor="echo",
             agent_type=AgentType.EXECUTOR,
-            depends_on=["polish"],
+            follows=["polish"],
         ),
     ], edges=[])
     foundation, polish, review = await store.apply_plan(root, plan)
@@ -343,7 +360,7 @@ async def test_echo_server_rejection_does_not_require_a_provider_session(tmp_pat
                 key="review",
                 objective="Review",
                 executor="echo",
-                depends_on=["work"],
+                follows=["work"],
             ),
         ]),
     )
@@ -428,7 +445,7 @@ async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path
         NodeSpec(key="work", objective="Build product", executor="echo"),
         NodeSpec(
             key="check", objective="Verify product", executor="echo",
-            agent_type=AgentType.VERIFIER, depends_on=["work"],
+            agent_type=AgentType.VERIFIER, follows=["work"],
         ),
     ])
     work, verifier = await store.apply_plan(root, plan)
@@ -494,7 +511,7 @@ async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_pat
             NodeSpec(key="work", objective="Build product", executor="echo"),
             NodeSpec(
                 key="verify", objective="Verify product", executor="echo",
-                agent_type=AgentType.VERIFIER, depends_on=["work"],
+                agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ]),
     )

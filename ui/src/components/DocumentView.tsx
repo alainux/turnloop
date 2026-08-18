@@ -51,7 +51,7 @@ export interface GraphSourceNode {
   subgraph_refs: SubgraphRef[];
   artifacts: GraphSourceArtifact[];
   parent_key: string | null;
-  depends_on: string[];
+  follows: string[];
   plan: boolean;
 }
 
@@ -155,8 +155,8 @@ function sourceNode(value: unknown, index: number): GraphSourceNode {
     subgraph_refs: parseSubgraphReferences(record?.subgraph_refs),
     artifacts: parseGraphArtifacts(record?.artifacts),
     parent_key: stringValue(record?.parent_key),
-    depends_on: Array.isArray(record?.depends_on)
-      ? record.depends_on.filter((item): item is string => typeof item === "string")
+    follows: Array.isArray(record?.follows)
+      ? record.follows.filter((item): item is string => typeof item === "string")
       : [],
     plan: record?.plan === true,
   };
@@ -198,11 +198,11 @@ export function orderGraphSourceNodes(
   const position = new Map(siblings.map((node, index) => [node.key, index]));
   const outgoing = new Map<string, string[]>();
   const indegree = new Map(siblings.map((node) => [node.key, 0]));
-  const dependencies = new Map<string, string[]>();
-  for (const node of nodes) dependencies.set(node.key, [...node.depends_on]);
+  const predecessors = new Map<string, string[]>();
+  for (const node of nodes) predecessors.set(node.key, [...node.follows]);
   for (const edge of edges) {
-    if (edge.type !== "DEPENDS_ON") continue;
-    dependencies.set(edge.dst, [...(dependencies.get(edge.dst) ?? []), edge.src]);
+    if (edge.type !== "FOLLOWS") continue;
+    predecessors.set(edge.dst, [...(predecessors.get(edge.dst) ?? []), edge.src]);
   }
   const directChild = (key: string): string | null => {
     let current = key;
@@ -216,11 +216,11 @@ export function orderGraphSourceNodes(
     }
     return siblingIds.has(current) ? current : null;
   };
-  for (const [dependent, prerequisites] of dependencies) {
-    const target = directChild(dependent);
+  for (const [successor, predecessorsForNode] of predecessors) {
+    const target = directChild(successor);
     if (!target) continue;
-    for (const prerequisite of prerequisites) {
-      const source = directChild(prerequisite);
+    for (const predecessor of predecessorsForNode) {
+      const source = directChild(predecessor);
       if (!source || source === target) continue;
       if (!outgoing.get(source)?.includes(target)) {
         outgoing.set(source, [...(outgoing.get(source) ?? []), target]);
@@ -253,7 +253,7 @@ export function orderGraphSourceNodes(
 }
 
 /**
- * Order nodes within one containment section by their explicit dependencies.
+ * Order nodes within one composition section by their explicit sequence.
  * The document is a projection of the graph: it never invents workflow order
  * when the graph does not provide one.
  */
@@ -269,11 +269,11 @@ export function orderDocumentNodes(
   const outgoing = new Map<string, string[]>();
   const indegree = new Map(siblings.map((node) => [node.id, 0]));
   for (const edge of edges) {
-    if (edge.type !== "DEPENDS_ON") continue;
+    if (edge.type !== "FOLLOWS") continue;
 
-    // Dependencies can cross a projected child boundary. Compare the direct
-    // children of this document section so an integrator remains after the
-    // complete implementation → verifier subtree.
+    // Sequence can be projected through a child boundary. Compare the direct
+    // children of this document section so a reintegration remains after the
+    // complete nested workflow.
     const directChild = (id: string): string | null => {
       let current = id;
       const visited = new Set<string>();
@@ -316,7 +316,7 @@ export function orderDocumentNodes(
 
 /**
  * Project verification into the document hierarchy without changing the
- * graph. A verifier is still an ordinary DEPENDS_ON node for scheduling; in
+ * graph. A verifier is still an ordinary FOLLOWS node for scheduling; in
  * the read-only specification it is shown beneath the implementation it
  * inspects so the sequence is legible.
  */
@@ -325,14 +325,14 @@ export function documentParentMap(nodes: GraphNode[], edges: Edge[]): Map<string
   for (const node of nodes) {
     parentOf.set(node.id, node.parent_id);
   }
-  // A verifier is a normal dependency in the graph, never a special graph
+  // A verifier is a normal sequence item in the graph, never a special graph
   // relation. The document projection nests it below the work item it
   // verifies so the specification reads as implementation → verification.
   // This changes presentation only; scheduling and graph edges stay intact.
   for (const node of nodes) {
     if (node.agent?.type_id !== "verifier") continue;
     const target = edges.find(
-      (edge) => edge.type === "DEPENDS_ON" && edge.dst === node.id,
+      (edge) => edge.type === "FOLLOWS" && edge.dst === node.id,
     )?.src;
     if (target && parentOf.has(target)) parentOf.set(node.id, target);
   }
@@ -348,10 +348,10 @@ function statusLabel(node: GraphNode): string {
   return node.ui_state.replaceAll("_", " ");
 }
 
-function dependencyLabels(node: GraphNode, nodes: GraphNode[], edges: Edge[]): string[] {
+function sequenceLabels(node: GraphNode, nodes: GraphNode[], edges: Edge[]): string[] {
   const names = new Map(nodes.map((item) => [item.id, displayNodeTitle(item)]));
   return edges
-    .filter((edge) => edge.type === "DEPENDS_ON" && edge.dst === node.id)
+    .filter((edge) => edge.type === "FOLLOWS" && edge.dst === node.id)
     .map((edge) => names.get(edge.src))
     .filter((name): name is string => Boolean(name));
 }
@@ -449,10 +449,12 @@ export function ArtifactLinks({
   artifacts,
   projectId,
   onOpenDocument,
+  sourceRefs = [],
 }: {
   artifacts: ArtifactLike[];
   projectId?: string;
   onOpenDocument?: (reference: DocumentTarget) => void;
+  sourceRefs?: SubgraphRef[];
 }) {
   if (!artifacts.length || !projectId) return null;
   return (
@@ -473,10 +475,22 @@ export function ArtifactLinks({
           const graphSource = Boolean(artifact.ref && isGraphSourceReference(artifact.ref));
           const documentArtifact = Boolean(artifact.ref && isDocumentArtifact(artifact.ref));
           const submission = artifact.name.toLowerCase().includes("submission");
-          const inReader = graphSource || documentArtifact;
+          const submittedSource = submission
+            ? uniqueReferences(sourceRefs).find((item) => isGraphSourceReference(item.ref))
+            : undefined;
+          const sourceReference = reference ?? (submittedSource ? {
+            ref: submittedSource.ref,
+            title: subgraphReferenceLabel(submittedSource),
+            media_type: submittedSource.media_type,
+            imports: [],
+            kind: "graph" as const,
+          } satisfies DocumentTarget : null);
+          const inReader = graphSource || documentArtifact || Boolean(submittedSource);
           const external = reference ? isExternalDocumentReference(reference) : false;
           const hasContent = submission && artifact.content !== null && artifact.content !== undefined;
-          const content = hasContent ? formatArtifactContent(artifact.content) : null;
+          const content = hasContent
+            ? formatSubmissionContent(artifact.content, sourceRefs)
+            : null;
           const iconName = graphSource
             ? "workflow"
             : artifact.kind === "file"
@@ -487,14 +501,14 @@ export function ArtifactLinks({
               <Icon name={iconName} className="document-reference-icon" />
               <span className="document-reference-copy">
                 <span className="document-reference-main">
-                  {reference ? (
+                  {sourceReference ? (
                     <a
-                      href={documentReferenceHref(reference, projectId)}
+                      href={documentReferenceHref(sourceReference, projectId)}
                       target={external || !inReader ? "_blank" : undefined}
                       rel={external || !inReader ? "noreferrer" : undefined}
                       onClick={external || !inReader || !onOpenDocument ? undefined : (event) => {
                         event.preventDefault();
-                        onOpenDocument(reference);
+                        onOpenDocument(sourceReference);
                       }}
                     >
                       {label}
@@ -503,6 +517,9 @@ export function ArtifactLinks({
                     <span>{label}</span>
                   )}
                   <small className="document-reference-kind">{artifact.kind}</small>
+                  {submittedSource && (
+                    <small className="document-reference-hint">Submitted graph source</small>
+                  )}
                 </span>
                 {content !== null && (
                   <details className="document-artifact-content">
@@ -526,6 +543,38 @@ function formatArtifactContent(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function formatSubmissionContent(value: unknown, sourceRefs: SubgraphRef[]): string {
+  const record = objectRecord(value);
+  const nodes = record?.nodes;
+  // Older plan receipts stored the complete PlanResult. The source file is
+  // now the canonical graph document, so keep the receipt useful without
+  // duplicating the entire graph inside the artifact disclosure.
+  if (!record || !Array.isArray(nodes) || record.outcome !== undefined) {
+    return formatArtifactContent(value);
+  }
+  const refs = uniqueReferences([
+    ...parseSubgraphReferences(record.subgraph_refs),
+    ...sourceRefs,
+  ]);
+  const receipt: Record<string, unknown> = {
+    subgraph_refs: refs.map((reference) => ({
+      ref: reference.ref,
+      title: reference.title,
+      media_type: reference.media_type,
+      managed: reference.managed,
+    })),
+    project_name: stringValue(record.project_name),
+    node_count: nodes.length,
+    edge_count: Array.isArray(record.edges) ? record.edges.length : 0,
+    document_ref_count: Array.isArray(record.document_refs) ? record.document_refs.length : 0,
+    artifact_count: Array.isArray(record.artifacts) ? record.artifacts.length : 0,
+  };
+  if (typeof record.session_id === "string" && record.session_id.trim()) {
+    receipt.session_id = record.session_id;
+  }
+  return formatArtifactContent(receipt);
 }
 
 function markdownText(value: ReactNode): string {
@@ -708,14 +757,14 @@ function uniqueArtifacts(artifacts: ArtifactLike[]): ArtifactLike[] {
   });
 }
 
-function sourceNodeDependencies(
+function sourceNodePredecessors(
   node: GraphSourceNode,
   edges: GraphSource["edges"],
 ): string[] {
   return uniqueReferences([
-    ...node.depends_on.map((key) => ({ ref: key })),
+    ...node.follows.map((key) => ({ ref: key })),
     ...edges
-      .filter((edge) => edge.type === "DEPENDS_ON" && edge.dst === node.key)
+      .filter((edge) => edge.type === "FOLLOWS" && edge.dst === node.key)
       .map((edge) => ({ ref: edge.src })),
   ].map((item) => ({ ref: item.ref }))).map((item) => item.ref);
 }
@@ -754,7 +803,7 @@ function GraphSourceNodeView({
   );
   const children = orderGraphSourceNodes(nodes, edges, node.key);
   const names = new Map(nodes.map((item) => [item.key, item.objective]));
-  const dependencies = sourceNodeDependencies(node, edges)
+  const predecessors = sourceNodePredecessors(node, edges)
     .map((key) => names.get(key) ?? key);
   const documentRefs = uniqueReferences([
     ...node.document_refs,
@@ -789,14 +838,19 @@ function GraphSourceNodeView({
         </span>
       </summary>
       <div className="document-node-body">
-        {dependencies.length > 0 && (
-          <p className="document-dependencies">
-            <span>Depends on</span> {dependencies.join(" · ")}
+        {predecessors.length > 0 && (
+          <p className="document-sequence-predecessors">
+            <span>Follows</span> {predecessors.join(" · ")}
           </p>
         )}
         <DocumentLinks refs={documentRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
         <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
-        <ArtifactLinks artifacts={artifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <ArtifactLinks
+          artifacts={artifacts}
+          sourceRefs={subgraphRefs}
+          projectId={projectId}
+          onOpenDocument={onOpenDocument}
+        />
         {node.generated_prompt?.trim() && (
           <div className="document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{node.generated_prompt.trim()}</ReactMarkdown>
@@ -865,7 +919,7 @@ export function GraphSourceDocument({
       <p className="document-reader-path">{reference.ref}</p>
       <div className="document-meta">
         <span>{source.nodes.length} work items</span>
-        <span>Sequence follows dependencies</span>
+        <span>Sequence is explicit</span>
       </div>
       {source.notes?.trim() && (
         <div className="document-intent document-markdown">
@@ -874,7 +928,12 @@ export function GraphSourceDocument({
       )}
       <DocumentLinks refs={documentRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
       <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
-      <ArtifactLinks artifacts={artifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
+      <ArtifactLinks
+        artifacts={artifacts}
+        sourceRefs={contextRoot?.subgraph_refs ?? []}
+        projectId={projectId}
+        onOpenDocument={onOpenDocument}
+      />
       <div id="work-specification" className="document-flow">
         <div className="document-flow-heading">
           <span>Work breakdown</span>
@@ -1004,7 +1063,7 @@ function DocumentNode({
   const children = node.subgraph_refs?.length
     ? []
     : orderDocumentNodes(nodes, edges, node.id);
-  const dependencies = dependencyLabels(node, nodes, edges);
+  const predecessors = sequenceLabels(node, nodes, edges);
   const prompt = node.generated_prompt?.trim();
   const nodeArtifacts = artifacts.filter((artifact) => node.artifact_refs.includes(artifact.id));
   return (
@@ -1029,15 +1088,20 @@ function DocumentNode({
         </span>
       </summary>
       <div className="document-node-body">
-        {dependencies.length > 0 && (
-          <p className="document-dependencies">
-            <span>Depends on</span> {dependencies.join(" · ")}
+        {predecessors.length > 0 && (
+          <p className="document-sequence-predecessors">
+            <span>Follows</span> {predecessors.join(" · ")}
           </p>
         )}
         <DocumentCapabilities node={node} />
         <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
         <SubgraphLinks refs={node.subgraph_refs ?? []} projectId={projectId} onOpenDocument={onOpenDocument} />
-        <ArtifactLinks artifacts={nodeArtifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <ArtifactLinks
+          artifacts={nodeArtifacts}
+          sourceRefs={node.subgraph_refs ?? []}
+          projectId={projectId}
+          onOpenDocument={onOpenDocument}
+        />
         {prompt && (
           <div className="document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{prompt}</ReactMarkdown>
@@ -1149,7 +1213,7 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
         <div className="document-meta">
           <span className={`badge ${root.ui_state}`}>{statusLabel(root)}</span>
           <span>{nodes.length} work items</span>
-          <span>Sequence follows dependencies</span>
+          <span>Sequence is explicit</span>
         </div>
         {root.generated_prompt?.trim() && (
           <div className="document-intent document-markdown">
@@ -1170,6 +1234,7 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
         />
         <ArtifactLinks
           artifacts={rootArtifacts}
+          sourceRefs={root.subgraph_refs ?? []}
           projectId={projectId ?? root.project_id}
           onOpenDocument={openDocument}
         />
