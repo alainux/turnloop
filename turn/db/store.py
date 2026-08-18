@@ -41,13 +41,19 @@ from turn.domain.schemas import (
     Run,
     RunPolicy,
     RunStatus,
+    SubgraphRef,
     Usage,
 )
 from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
 from turn.db.state import ProjectState
 from turn.graph.logic import GraphWalker
-from turn.graph.mutations import append_artifacts, apply_plan as apply_graph_plan, merge_document_refs
+from turn.graph.mutations import (
+    append_artifacts,
+    apply_plan as apply_graph_plan,
+    merge_document_refs,
+    merge_subgraph_refs,
+)
 from turn.logging import EventLog
 
 PLANNER_EXECUTOR = "planner"
@@ -255,7 +261,78 @@ class Store:
             if filtered != node.artifact_refs:
                 node.artifact_refs = filtered
                 normalized = True
+        # A planner handoff is the source of truth for its composition link.
+        # Older daemon instances persisted the submitted graph but omitted the
+        # link from the parent node. Recover that invariant from the durable
+        # accepted CLI event so restarting the server repairs the projection
+        # without importing or rewriting any referenced graph.
+        if self._recover_handoff_source_links(state):
+            normalized = True
         return state, normalized
+
+    def _recover_handoff_source_links(self, state: ProjectState) -> bool:
+        if self.logs is None:
+            return False
+        project_ids = {node.project_id for node in state.nodes.values()}
+        if len(project_ids) != 1:
+            return False
+        project_id = next(iter(project_ids))
+        changed = False
+        pending: dict[uuid.UUID, str] = {}
+        accepted: dict[uuid.UUID, list[str]] = {}
+        for record in self.logs.read(project_id):
+            if (
+                record.get("kind") != "agent.action"
+                or record.get("action") != "agent.submit"
+            ):
+                continue
+            data = record.get("data")
+            if not isinstance(data, dict) or data.get("kind") != "plan":
+                continue
+            raw_node_id = data.get("node_id")
+            if not raw_node_id:
+                continue
+            try:
+                node_id = uuid.UUID(str(raw_node_id))
+            except (ValueError, TypeError):
+                continue
+            status = record.get("status")
+            raw_ref = data.get("graph_file")
+            if status == "started" and isinstance(raw_ref, str):
+                pending[node_id] = raw_ref
+                continue
+            if status == "error":
+                pending.pop(node_id, None)
+                continue
+            if status != "ok":
+                continue
+            ref = pending.pop(node_id, None)
+            if ref is not None:
+                accepted.setdefault(node_id, []).append(ref)
+
+        for node_id, refs in accepted.items():
+            node = state.nodes.get(node_id)
+            if node is None:
+                continue
+            sources: list[SubgraphRef] = []
+            for raw_ref in refs:
+                try:
+                    normalized = Path(raw_ref).as_posix()
+                    sources.append(
+                        SubgraphRef(
+                            ref=normalized,
+                            title=Path(normalized).name,
+                            managed=False,
+                        )
+                    )
+                except (ValueError, TypeError):
+                    continue
+            if not sources:
+                continue
+            before = {item.ref for item in node.subgraph_refs}
+            node.subgraph_refs = merge_subgraph_refs(node.subgraph_refs, sources)
+            changed = changed or before != {item.ref for item in node.subgraph_refs}
+        return changed
 
     def _encode_state(self, project_id: uuid.UUID) -> dict[str, Any]:
         state = self._states[project_id]
@@ -713,7 +790,13 @@ class Store:
         node.artifact_refs = list(node.artifact_refs) + [artifact.id]
         return await self._save_node(node)
 
-    async def replace_descendants(self, node_id: uuid.UUID) -> list[uuid.UUID]:
+    async def replace_descendants(
+        self,
+        node_id: uuid.UUID,
+        *,
+        force: bool = False,
+        preserved_refs: set[str] | None = None,
+    ) -> list[uuid.UUID]:
         """Remove an old generated tree before planning it again.
 
         Regeneration is intentionally destructive in the MVP: there is no
@@ -725,6 +808,25 @@ class Store:
         if node is None:
             return []
         descendants = await self.descendants(node_id)
+        running = [item for item in descendants if item.status is NodeStatus.RUNNING]
+        if running:
+            ids = ", ".join(str(item.id) for item in running)
+            raise RuntimeError(
+                "cannot replace a graph containing running nodes: "
+                f"{ids}; wait for them to finish or cancel them first"
+            )
+        existing_refs = {
+            reference.ref
+            for item in [node, *descendants]
+            for reference in item.subgraph_refs
+            if not reference.managed
+        }
+        missing_refs = existing_refs - (preserved_refs or set())
+        if missing_refs and not force:
+            raise RuntimeError(
+                "graph contains composed subgraphs; preserve their links or "
+                "resubmit with --force to replace them"
+            )
         ids = {item.id for item in descendants}
         state = self._state(node.project_id)
         for key in list(state.nodes):
@@ -895,6 +997,36 @@ class Store:
         await self._persist_project(project_id)
         await self._log(project_id, kind="state.changed", action="document_refs.updated", message="document references updated", data={"node_id": str(node_id), "references": [item.model_dump(mode="json") for item in refs]})
         return []
+
+    async def add_subgraph_refs(self, node_id: uuid.UUID, refs) -> Optional[Node]:
+        """Attach composed graph source links without importing their nodes."""
+        found = self._project_for_node(node_id)
+        if not found:
+            return None
+        project_id, _ = found
+        state = self._states[project_id]
+        node = state.nodes.get(node_id)
+        if node is None:
+            return None
+        node.subgraph_refs = merge_subgraph_refs(node.subgraph_refs, refs)
+        await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="state.changed",
+            action="subgraph_refs.updated",
+            message="subgraph references updated",
+            data={"node_id": str(node_id), "references": [item.model_dump(mode="json") for item in refs]},
+        )
+        return node.model_copy(deep=True)
+
+    async def replace_subgraph_refs(self, node_id: uuid.UUID, refs) -> Optional[Node]:
+        """Replace the source links owned by one planning boundary."""
+        found = self._project_for_node(node_id)
+        if not found:
+            return None
+        node = found[1].model_copy(deep=True)
+        node.subgraph_refs = list(refs)
+        return await self._save_node(node)
 
     async def get_artifacts(self, node_id: uuid.UUID) -> list[Artifact]:
         found = self._project_for_node(node_id)

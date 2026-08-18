@@ -189,6 +189,14 @@ future outputs.
 Every descendant worker receives the paths from the graph and can open them
 when needed.
 
+For graph boundaries, use the composable source-file handoff by default:
+write the `PlanResult` to a project-relative JSON file and submit it with
+`turn agent submit --kind plan --graph-file <path>`. The source link belongs to
+the planner node that owns the boundary. Nested `subgraph_refs` are validated
+but remain references during exploration; they are not flattened into the
+parent graph. Revisions edit and resubmit the owning source file, preserving
+links unless an explicit `--force` replacement is intended.
+
 Project documentation is optional for a genuinely atomic request. It is not
 optional merely because the planner wants to avoid doing the architectural
 thinking for a broad request.

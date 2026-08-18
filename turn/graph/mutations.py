@@ -16,6 +16,7 @@ from turn.domain.schemas import (
     Node,
     NodeStatus,
     PlanResult,
+    SubgraphRef,
 )
 
 PLANNER_EXECUTOR = "planner"
@@ -23,6 +24,18 @@ PLANNER_EXECUTOR = "planner"
 
 def merge_document_refs(existing, incoming):
     merged = []
+    seen: set[str] = set()
+    for ref in [*existing, *incoming]:
+        if ref.ref in seen:
+            continue
+        seen.add(ref.ref)
+        merged.append(ref)
+    return merged
+
+
+def merge_subgraph_refs(existing: list[SubgraphRef], incoming: list[SubgraphRef]) -> list[SubgraphRef]:
+    """Merge source links by path while preserving first-seen metadata."""
+    merged: list[SubgraphRef] = []
     seen: set[str] = set()
     for ref in [*existing, *incoming]:
         if ref.ref in seen:
@@ -68,6 +81,7 @@ def append_artifacts(state: Any, node_id: uuid.UUID, specs: list[ArtifactSpec]) 
 def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
     """Apply a validated PlanResult to a ProjectState-like aggregate."""
     parent.document_refs = merge_document_refs(parent.document_refs, plan.document_refs)
+    parent.subgraph_refs = merge_subgraph_refs(parent.subgraph_refs, plan.subgraph_refs)
     if parent.parent_id is None and parent.project_name is None and plan.project_name:
         candidate_name = plan.project_name.strip()
         if candidate_name:
@@ -147,6 +161,7 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             required_inputs=spec.required_inputs,
             resource_refs=spec.resource_refs,
             document_refs=spec.document_refs,
+            subgraph_refs=spec.subgraph_refs,
         )
         state.nodes[node.id] = node
         append_artifacts(state, node.id, spec.artifacts)

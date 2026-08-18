@@ -70,6 +70,22 @@ describe("dendrogram", () => {
     expect(path.endsWith(`H${child.x + GRAPH_PADDING}`)).toBe(true);
   });
 
+  it("routes skipped-stage edges above intermediate cards", () => {
+    const source = { x: 0, y: 0, depth: 0 };
+    const target = { x: (NODE_WIDTH + 54) * 2, y: NODE_HEIGHT + 18, depth: 2 };
+    const path = pathBetween(source, target, "DEPENDS_ON");
+
+    expect(path).toContain(`V${GRAPH_PADDING / 2}`);
+    expect(path).toBe(
+      `M${GRAPH_PADDING + NODE_WIDTH} ${GRAPH_PADDING + NODE_HEIGHT / 2}` +
+        `H${GRAPH_PADDING + NODE_WIDTH + 27}` +
+        `V${GRAPH_PADDING / 2}` +
+        `H${target.x + GRAPH_PADDING - 27}` +
+        `V${target.y + GRAPH_PADDING + NODE_HEIGHT / 2}` +
+        `H${target.x + GRAPH_PADDING}`,
+    );
+  });
+
   it("curves a return flow from the verifier back into the executor", () => {
     const verifier = { x: 278, y: 20, depth: 1 };
     const executor = { x: 0, y: 20, depth: 0 };

@@ -24,7 +24,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from turn.domain.capability_contracts import (
     BUILTIN_CAPABILITY_IDS,
@@ -358,6 +358,48 @@ class DocumentRef(BaseModel):
         return self
 
 
+class SubgraphRef(BaseModel):
+    """A project-relative JSON source for a composed graph boundary.
+
+    The server stores this identity on the composition anchor. It does not
+    read the referenced file while projecting graph state; importing a source
+    is an explicit planner/CLI operation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str = Field(min_length=1)
+    title: Optional[str] = None
+    media_type: Optional[str] = "application/json"
+    # Turn-generated handoff sources are still visible/editable links, but
+    # replacing the same planner boundary does not require --force merely to
+    # rotate that managed source. User-authored composition links remain
+    # guarded by the replacement policy.
+    managed: bool = False
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "SubgraphRef":
+        parsed = urlsplit(self.ref)
+        if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+            raise ValueError("subgraph references only support relative paths or http(s) URLs")
+        if parsed.scheme:
+            if not parsed.netloc:
+                raise ValueError("http(s) subgraph references must include a host")
+            return self
+        if parsed.netloc:
+            raise ValueError("subgraph references cannot use network-path URLs")
+        path = parsed.path.replace("\\", "/")
+        if path.startswith("/") or Path(path).is_absolute() or PureWindowsPath(path).is_absolute():
+            raise ValueError("subgraph references must be project-relative")
+        if any(part == ".." for part in path.split("/")):
+            raise ValueError("subgraph references cannot escape the project")
+        if not path or path == ".":
+            raise ValueError("subgraph references must identify a JSON file")
+        if Path(path).suffix.lower() != ".json":
+            raise ValueError("subgraph references must point to .json files")
+        return self
+
+
 def flatten_document_refs(refs: list[DocumentRef]) -> list[DocumentRef]:
     """Return a stable depth-first view of nested document imports."""
     flattened: list[DocumentRef] = []
@@ -399,6 +441,10 @@ class Node(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    subgraph_refs: list[SubgraphRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("subgraph_refs", "graph_refs", "graph_files", "graph_ref", "graph_file"),
+    )
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -556,6 +602,10 @@ class NodeSpec(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    subgraph_refs: list[SubgraphRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("subgraph_refs", "graph_refs", "graph_files", "graph_ref", "graph_file"),
+    )
     artifacts: list["ArtifactSpec"] = Field(default_factory=list)
     # Capability plugin ids loaded by the planner into the project.
     capabilities: list[str] = Field(default_factory=list)
@@ -591,6 +641,10 @@ class PlanResult(BaseModel):
     # as the navigation name when the user did not provide one at creation.
     project_name: Optional[str] = Field(default=None, min_length=1, max_length=72)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    subgraph_refs: list[SubgraphRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("subgraph_refs", "graph_refs", "graph_files", "graph_ref", "graph_file"),
+    )
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
     edges: list[EdgeSpec] = Field(default_factory=list)
     notes: Optional[str] = None
@@ -717,6 +771,10 @@ class WorkerResult(BaseModel):
     summary: str = ""
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    subgraph_refs: list[SubgraphRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("subgraph_refs", "graph_refs", "graph_files", "graph_ref", "graph_file"),
+    )
 
     # EXPAND
     children: Optional[PlanResult] = None

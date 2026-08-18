@@ -75,7 +75,13 @@ export function Graph({
   onContextMenu,
 }: Props) {
   const visibleEdges = useMemo(() => displayEdges(nodes, edges), [nodes, edges]);
-  const layout = useMemo(() => layoutDendrogram(nodes, visibleEdges), [nodes, visibleEdges]);
+  // `displayEdges` is a rendering projection: it expands container
+  // dependencies and removes transitive shortcuts. Layout needs the source
+  // graph so it can build its own stage/containment projection exactly once.
+  // Passing the projected set back through `displayEdges` made partial graph
+  // updates recursively expand synthetic terminal edges and could place a
+  // long edge through an intermediate card until the next update arrived.
+  const layout = useMemo(() => layoutDendrogram(nodes, edges), [nodes, edges]);
   const finalDepth = layout.stageCount - 1;
   const finalStageNodeCount = [...layout.positions.values()].filter(
     (position) => position.depth === finalDepth,

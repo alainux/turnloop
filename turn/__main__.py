@@ -13,7 +13,11 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from turn.config import settings
-from turn.contracts.dag import compact_validation_error, validate_agent_submission
+from turn.contracts.dag import (
+    compact_validation_error,
+    validate_agent_submission,
+    validate_subgraph_sources,
+)
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, Node, ReasoningLevel, RunPolicy
 from turn.logging import EventLog
@@ -48,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
     )
     project_info.add_argument("--format", choices=["json", "text"], default="json")
     graph = sub.add_parser("graph", help="print a project's workgraph as JSON")
-    graph.add_argument("project_id", type=uuid.UUID)
+    graph.add_argument("project_id", type=uuid.UUID, nargs="?")
     graph.add_argument(
         "--state-file",
         help="explicit local state path; normally discovered from the current directory",
@@ -57,6 +61,10 @@ def parser() -> argparse.ArgumentParser:
     graph.add_argument("--children", help="show direct children of a local node")
     graph.add_argument("--ancestors", help="show the parent chain of a local node")
     graph.add_argument("--requester", help="node id performing this read")
+    graph.add_argument(
+        "--subgraph-file", "--import-file", dest="subgraph_file",
+        help="explore a linked subgraph source without flattening it into the project graph",
+    )
     graph.add_argument("--format", choices=["tree", "json"], default="json")
     graph.add_argument("--tree", action="store_const", dest="format", const="tree")
     run = sub.add_parser("run", help="execute a project headlessly until settled")
@@ -77,6 +85,14 @@ def parser() -> argparse.ArgumentParser:
     payload = submit.add_mutually_exclusive_group(required=True)
     payload.add_argument("--payload", help="JSON object supplied to the Turn protocol")
     payload.add_argument("--stdin", action="store_true", help="read the JSON object from stdin")
+    payload.add_argument(
+        "--graph-file", "--file", dest="graph_file",
+        help="submit a planner graph from this project-relative JSON source file",
+    )
+    submit.add_argument(
+        "--force", action="store_true",
+        help="allow replacing a composed graph after preserving links has been checked",
+    )
     verify = agent_sub.add_parser("verify", help="submit an approve/reject review decision")
     verification_payload = verify.add_mutually_exclusive_group(required=True)
     verification_payload.add_argument("--payload", help="verification JSON object")
@@ -115,7 +131,21 @@ def _agent_protocol_path(kind: str) -> Path:
 
 def _read_agent_object(args) -> dict:
     try:
-        raw = sys.stdin.read() if args.stdin else args.payload
+        if getattr(args, "graph_file", None):
+            project_root = Path(os.getenv("TURN_REPO") or Path.cwd()).expanduser().resolve()
+            source = Path(args.graph_file).expanduser()
+            if not source.is_absolute():
+                source = project_root / source
+            source = source.resolve()
+            try:
+                source.relative_to(project_root)
+            except ValueError as error:
+                raise ValueError("--graph-file must point inside TURN_REPO") from error
+            if source.suffix.lower() != ".json":
+                raise ValueError("--graph-file must point to a .json file")
+            raw = source.read_text(encoding="utf-8")
+        else:
+            raw = sys.stdin.read() if args.stdin else args.payload
         if not raw:
             raise ValueError("empty submission")
         value = json.loads(raw)
@@ -123,6 +153,21 @@ def _read_agent_object(args) -> dict:
         raise SystemExit(f"invalid agent submission: {error}") from error
     if not isinstance(value, dict):
         raise SystemExit("agent submission must be a JSON object")
+    if getattr(args, "graph_file", None):
+        project_root = Path(os.getenv("TURN_REPO") or Path.cwd()).expanduser().resolve()
+        source = Path(args.graph_file).expanduser()
+        if not source.is_absolute():
+            source = project_root / source
+        relative = source.resolve().relative_to(project_root).as_posix()
+        refs = value.setdefault("subgraph_refs", [])
+        if not isinstance(refs, list):
+            raise SystemExit("subgraph_refs must be a JSON array")
+        if not any(
+            (item == relative)
+            or (isinstance(item, dict) and item.get("ref") == relative)
+            for item in refs
+        ):
+            refs.append({"ref": relative, "title": Path(relative).name})
     return value
 
 
@@ -233,7 +278,7 @@ def _cli_invocation_data(args: argparse.Namespace) -> dict[str, object]:
         "node_id": os.getenv("TURN_NODE_ID"),
         "command": _cli_action(args),
     }
-    for name in ("kind", "state", "query", "capability", "format", "project_id"):
+    for name in ("kind", "state", "query", "capability", "format", "project_id", "graph_file", "force"):
         value = getattr(args, name, None)
         if value is not None:
             data[name] = value
@@ -288,6 +333,8 @@ def agent_command(args) -> int:
         logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=str(error), data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID")})
         raise
     try:
+        if getattr(args, "graph_file", None) and kind != "plan":
+            raise ValueError("--graph-file is only valid for plan submissions")
         validated = validate_agent_submission(kind, value)
         plan_to_validate = validated if kind == "plan" else getattr(validated, "children", None)
         if plan_to_validate is not None:
@@ -313,6 +360,7 @@ def agent_command(args) -> int:
                     if item
                 ],
             )
+            validate_subgraph_sources(plan_to_validate, project_root)
     except (TypeError, ValueError) as error:
         detail = (
             compact_validation_error(error)
@@ -326,7 +374,10 @@ def agent_command(args) -> int:
     except SystemExit as error:
         logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=str(error), data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID"), "kind": kind})
         raise
-    _write_agent_json(target, value)
+    handoff_value = dict(value)
+    if getattr(args, "force", False):
+        handoff_value["__turn_force"] = True
+    _write_agent_json(target, handoff_value)
     status_path = os.getenv("TURN_STATUS_FILE")
     if status_path:
         _write_agent_json(Path(status_path), {
@@ -456,7 +507,17 @@ async def local_graph_command(args) -> int:
     """Read a project-local graph through the installed Turn CLI."""
     from turn.tools import graph_explorer
 
+    if getattr(args, "subgraph_file", None):
+        payload = graph_explorer.read_subgraph_file(args.subgraph_file)
+        if args.format == "json":
+            print(json.dumps(payload, indent=2))
+        else:
+            graph_explorer.print_subgraph_tree(payload)
+        return 0
+
     state_file = args.state_file or str(discover_project_state())
+    if args.project_id is None:
+        raise SystemExit("graph project_id is required unless --subgraph-file is used")
     query = (
         "node" if args.node
         else "children" if args.children

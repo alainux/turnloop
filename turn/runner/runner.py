@@ -33,6 +33,7 @@ from turn.domain.schemas import (
     Resource,
     Run,
     RunStatus,
+    SubgraphRef,
     VerificationDecision,
     WorkerResult,
 )
@@ -52,7 +53,12 @@ from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, Terminal
 from turn.workers.registry import WorkerRegistry, build_registry
 
 from turn.config import Settings, settings as default_settings
-from turn.contracts.dag import parse_plan, parse_result, parse_verification
+from turn.contracts.dag import (
+    parse_plan,
+    parse_result,
+    parse_verification,
+    validate_subgraph_sources,
+)
 
 
 def _dump(obj):
@@ -400,16 +406,17 @@ class Runner:
         """Apply later plan, result, or verification submissions."""
         try:
             while not self._stop:
-                submission: tuple[str, Path, dict] | None = None
+                submission: tuple[str, Path, dict, bool] | None = None
                 for path in paths:
                     payload = read_result_file(path)
                     if payload is not None:
-                        submission = (self._handoff_kind(path), path, payload)
+                        force = bool(payload.pop("__turn_force", False))
+                        submission = (self._handoff_kind(path), path, payload, force)
                         break
                 if submission is None:
                     await asyncio.sleep(0.05)
                     continue
-                kind, path, payload = submission
+                kind, path, payload, force = submission
                 # Claim the current atomic handoff before processing it. A
                 # user may submit a second correction while this one is
                 # updating the graph; deleting in ``finally`` would erase
@@ -432,7 +439,8 @@ class Runner:
                             repo_path,
                             planner_capabilities=current.agent.capabilities if current.agent else None,
                         )
-                        await self._apply_plan_revision(node_id, project_id, plan)
+                        validate_subgraph_sources(plan, repo_path)
+                        await self._apply_plan_revision(node_id, project_id, plan, force=force)
                     elif kind == "verification" or (
                         kind == "result"
                         and "decision" in payload
@@ -469,12 +477,21 @@ class Runner:
                 self._handoff_watchers.pop(node_id, None)
 
     async def _apply_plan_revision(
-        self, node_id: uuid.UUID, project_id: uuid.UUID, plan: PlanResult
+        self, node_id: uuid.UUID, project_id: uuid.UUID, plan: PlanResult, *, force: bool = False
     ) -> list[Node]:
         node = await self.store.get_node(node_id)
         if node is None:
             return []
-        removed = await self._remove_descendants_before_replan(node_id)
+        incoming_refs = {
+            reference.ref
+            for reference in [
+                *plan.subgraph_refs,
+                *(reference for item in plan.nodes for reference in item.subgraph_refs),
+            ]
+        }
+        removed = await self._remove_descendants_before_replan(
+            node_id, force=force, preserved_refs=incoming_refs
+        )
         node = await self.store.get_node(node_id)
         if node is None:
             return []
@@ -484,6 +501,10 @@ class Runner:
         # message left by an earlier failed submission.
         node.agent_state = None
         node.agent_message = None
+        # A replacement owns the exact source links in the submitted plan.
+        # The guard above has already required user-authored links to be
+        # preserved or explicitly forced away.
+        node.subgraph_refs = []
         created = await self.store.apply_plan(node, plan)
         artifacts = await self.store.add_artifacts(
             node.id,
@@ -554,8 +575,42 @@ class Runner:
             WorkerResult(outcome=Outcome.COMPLETE, verification=decision),
         )
 
-    async def _remove_descendants_before_replan(self, node_id: uuid.UUID) -> list[uuid.UUID]:
+    async def _remove_descendants_before_replan(
+        self,
+        node_id: uuid.UUID,
+        *,
+        force: bool = False,
+        preserved_refs: set[str] | None = None,
+    ) -> list[uuid.UUID]:
         descendants = await self.store.descendants(node_id)
+        running = [
+            descendant
+            for descendant in descendants
+            if descendant.status is NodeStatus.RUNNING
+        ]
+        if running:
+            ids = ", ".join(str(item.id) for item in running)
+            raise RuntimeError(
+                "cannot replace a graph containing running nodes: "
+                f"{ids}; wait for them to finish or cancel them first"
+            )
+        composed = [
+            item
+            for item in [*descendants, await self.store.get_node(node_id)]
+            if item is not None and item.subgraph_refs
+        ]
+        existing_refs = {
+            reference.ref
+            for item in composed
+            for reference in item.subgraph_refs
+            if not reference.managed
+        }
+        missing_refs = existing_refs - (preserved_refs or set())
+        if missing_refs and not force:
+            raise RuntimeError(
+                "graph contains composed subgraphs; preserve their links or "
+                "resubmit with --force to replace them"
+            )
         cancelling: list[asyncio.Task] = []
         for descendant in descendants:
             await self._stop_handoff_watcher(descendant.id)
@@ -568,7 +623,11 @@ class Runner:
             await asyncio.gather(*cancelling, return_exceptions=True)
         for descendant in descendants:
             await self.terminal.close_persistent_session(descendant.id)
-        return await self.store.replace_descendants(node_id)
+        return await self.store.replace_descendants(
+            node_id,
+            force=force,
+            preserved_refs=preserved_refs,
+        )
 
     async def _finish_provider_terminal(
         self, node_id: uuid.UUID, project_id: uuid.UUID
@@ -643,6 +702,8 @@ class Runner:
                     ctx.repo_path,
                     planner_capabilities=node.agent.capabilities if node.agent else None,
                 )
+                validate_subgraph_sources(plan, ctx.repo_path)
+            plan = await self._ensure_plan_source(node, plan)
             created = await self.store.apply_plan(node, plan)
             submitted = await self.store.add_artifacts(
                 node.id,
@@ -665,7 +726,8 @@ class Runner:
                 session_id=plan.session_id,
             )
             await self._remember_session(node, plan.session_id)
-            await self._emit("plan.applied", project_id, {"parent": _dump(node), "created": len(created)})
+            applied_parent = await self.store.get_node(node.id) or node
+            await self._emit("plan.applied", project_id, {"parent": _dump(applied_parent), "created": len(created)})
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
             await self._ensure_handoff_watcher(node.id, project_id, ctx.repo_path)
@@ -809,6 +871,8 @@ class Runner:
                     repo_path,
                     planner_capabilities=node.agent.capabilities if node.agent else None,
                 )
+                validate_subgraph_sources(plan, repo_path)
+            plan = await self._ensure_plan_source(node, plan)
             created = await self.store.apply_plan(node, plan)
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.EXPAND,
@@ -818,7 +882,8 @@ class Runner:
             await self._remember_session(node, result.session_id)
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
-            await self._emit("plan.applied", project_id, {"parent": _dump(node), "created": len(created)})
+            applied_parent = await self.store.get_node(node.id) or node
+            await self._emit("plan.applied", project_id, {"parent": _dump(applied_parent), "created": len(created)})
 
         elif result.outcome == Outcome.BLOCK:
             node = await self.store.get_node(node.id)
@@ -873,10 +938,32 @@ class Runner:
     ) -> list[Artifact]:
         """Persist concise output identities without retaining terminal transcripts."""
         linked = await self.store.add_document_refs(node_id, result.document_refs)
+        await self.store.add_subgraph_refs(node_id, result.subgraph_refs)
         explicit = await self.store.add_artifacts(node_id, result.artifacts)
         for artifact in [*linked, *explicit]:
             await self._emit("artifact.created", project_id, _dump(artifact))
         return [*linked, *explicit]
+
+    async def _ensure_plan_source(self, node: Node, plan: PlanResult) -> PlanResult:
+        """Give every provider-created planning handoff an editable source file.
+
+        CLI submissions already carry their source link and remain untouched.
+        Provider-returned inline plans get a unique project-relative source so
+        a later correction can edit that file and submit it again.
+        """
+        repo = await self._project_repo(node.project_id)
+        if not repo:
+            return plan
+        if plan.subgraph_refs:
+            return plan
+        relative = Path(".turn") / "graphs" / f"{node.id}-{uuid.uuid4().hex}.json"
+        target = Path(repo).resolve() / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = plan.model_dump(mode="json")
+        await asyncio.to_thread(target.write_text, json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
+        return plan.model_copy(update={
+            "subgraph_refs": [SubgraphRef(ref=relative.as_posix(), managed=True)],
+        })
 
     async def _handle_verification(
         self, reviewer: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
@@ -1069,7 +1156,7 @@ class Runner:
         self.wake()
 
     async def regenerate_descendants(
-        self, node_id: uuid.UUID, *, fresh_session: bool = False
+        self, node_id: uuid.UUID, *, fresh_session: bool = False, force: bool = False
     ) -> dict:
         node = await self.store.get_node(node_id)
         if node is None:
@@ -1087,7 +1174,7 @@ class Runner:
             claimed = True
         try:
             await self._stop_handoff_watcher(node_id)
-            removed = await self._remove_descendants_before_replan(node_id)
+            removed = await self._remove_descendants_before_replan(node_id, force=force)
             # Re-plan through the same execution path as an initial planner
             # run. The request task is registered in _running for the whole
             # operation, so the scheduler cannot orphan its run and Stop can
@@ -1107,6 +1194,8 @@ class Runner:
                     self.sessions.retire_fresh_session(node_id, forbidden_session_id)
                 node = await self.store.get_node(node_id) or node
             await self.store.clear_generated_artifacts(node_id)
+            node.subgraph_refs = []
+            await self.store.replace_subgraph_refs(node_id, [])
             created = await self._plan_node(
                 node,
                 node.project_id,
@@ -1431,13 +1520,23 @@ class Runner:
             self.wake()
             return
         task = self._running.get(node_id)
-        if task is not None:
+        if task is not None and not task.done():
             # Stop the provider before cancelling Turn's awaiter. This makes
             # Stop effective even when the task is inside a native harness
             # call rather than inside the runner's Python bookkeeping.
             await self.terminal.stop(node_id)
+            await self.store.set_status(node_id, NodeStatus.CANCELLED)
+            await self._emit(
+                "node.updated", node.project_id, _dump(await self.store.get_node(node_id))
+            )
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            current = await self.store.get_node(node_id)
+            if current is not None and current.status is NodeStatus.RUNNING:
+                await self.store.set_status(node_id, NodeStatus.CANCELLED)
+                await self._emit(
+                    "node.updated", node.project_id, _dump(await self.store.get_node(node_id))
+                )
         else:
             await self.terminal.stop(node_id)
             await self.store.set_status(node_id, NodeStatus.CANCELLED)

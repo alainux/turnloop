@@ -64,3 +64,19 @@ TURN_PAYLOAD
 Keep reports concise. Use project Markdown plus `document_refs` when evidence
 is too large for a handoff summary. Continue using the harness terminal for
 ordinary work and keep the session available for follow-up when possible.
+
+## Composable graph handoffs
+
+Planner graph boundaries are source files by default. Write the complete
+`PlanResult` to a project-relative `.json` file, then submit that source with:
+
+```sh
+turn agent submit --kind plan --graph-file .turn/graphs/<boundary>.json
+```
+
+Turn validates the file and records its link on the planner node that owns the
+boundary. Linked nested graphs remain links; they are not silently flattened
+into graph exploration. When revising a boundary, edit its source file and
+submit it again. Preserve every `subgraph_refs` entry unless the replacement
+is intentional and use `--force` only when deliberately removing composed
+subgraphs. A replacement is rejected while any descendant is running.

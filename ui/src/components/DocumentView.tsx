@@ -2,25 +2,254 @@ import { useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
+  Artifact,
   DocumentRef,
   Edge,
   GraphNode,
+  SubgraphRef,
 } from "../domain";
 import {
   displayNodeTitle,
   documentReferenceContentHref,
   documentReferenceHref,
   documentReferenceLabel,
+  subgraphReferenceHref,
+  subgraphReferenceLabel,
   isExternalDocumentReference,
   capabilityCatalogHref,
   capabilityDeploymentLabel,
   stripMarkdown,
 } from "../domain";
+import { Icon } from "./Icon";
 
 interface Props {
   nodes: GraphNode[];
   edges: Edge[];
+  artifacts: Artifact[];
   projectId?: string;
+}
+
+export type DocumentTarget = DocumentRef & {
+  kind?: "document" | "graph";
+};
+
+type GraphSourceArtifact = {
+  kind: string;
+  name: string;
+  ref: string | null;
+  content: unknown | null;
+};
+
+export interface GraphSourceNode {
+  key: string;
+  objective: string;
+  generated_prompt: string | null;
+  executor: string | null;
+  agent_type: string | null;
+  capabilities: string[];
+  document_refs: DocumentRef[];
+  subgraph_refs: SubgraphRef[];
+  artifacts: GraphSourceArtifact[];
+  parent_key: string | null;
+  depends_on: string[];
+  plan: boolean;
+}
+
+export interface GraphSource {
+  project_name: string | null;
+  notes: string | null;
+  nodes: GraphSourceNode[];
+  document_refs: DocumentRef[];
+  subgraph_refs: SubgraphRef[];
+  artifacts: GraphSourceArtifact[];
+  edges: Array<{ type: string; src: string; dst: string }>;
+}
+
+type ArtifactLike = {
+  kind: string;
+  name: string;
+  ref: string | null;
+  content?: unknown | null;
+};
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function parseDocumentReferences(value: unknown): DocumentRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string" && item.trim()) {
+      return [{ ref: item, title: null, media_type: null, imports: [] }];
+    }
+    const record = objectRecord(item);
+    const ref = stringValue(record?.ref);
+    if (!ref) return [];
+    return [{
+      ref,
+      title: stringValue(record?.title),
+      media_type: stringValue(record?.media_type),
+      imports: parseDocumentReferences(record?.imports),
+    }];
+  });
+}
+
+function parseSubgraphReferences(value: unknown): SubgraphRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string" && item.trim()) {
+      return [{ ref: item, title: null, media_type: "application/json", managed: false }];
+    }
+    const record = objectRecord(item);
+    const ref = stringValue(record?.ref);
+    if (!ref) return [];
+    return [{
+      ref,
+      title: stringValue(record?.title),
+      media_type: stringValue(record?.media_type) ?? "application/json",
+      managed: record?.managed === true,
+    }];
+  });
+}
+
+function parseGraphArtifacts(value: unknown): GraphSourceArtifact[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (typeof item === "string" && item.trim()) {
+      return [{
+        kind: "file",
+        name: item.split("/").pop() || item,
+        ref: item,
+        content: null,
+      }];
+    }
+    const record = objectRecord(item);
+    const name = stringValue(record?.name) ?? stringValue(record?.ref);
+    if (!name) return [];
+    return [{
+      kind: stringValue(record?.kind) ?? "file",
+      name,
+      ref: stringValue(record?.ref),
+      content: record?.content ?? null,
+    }];
+  });
+}
+
+function sourceNode(value: unknown, index: number): GraphSourceNode {
+  const record = objectRecord(value);
+  const key = stringValue(record?.key) ?? `node-${index + 1}`;
+  return {
+    key,
+    objective: stringValue(record?.objective) ?? key,
+    generated_prompt: stringValue(record?.generated_prompt),
+    executor: stringValue(record?.executor),
+    agent_type: stringValue(record?.agent_type),
+    capabilities: Array.isArray(record?.capabilities)
+      ? record.capabilities.filter((item): item is string => typeof item === "string")
+      : [],
+    document_refs: parseDocumentReferences(record?.document_refs),
+    subgraph_refs: parseSubgraphReferences(record?.subgraph_refs),
+    artifacts: parseGraphArtifacts(record?.artifacts),
+    parent_key: stringValue(record?.parent_key),
+    depends_on: Array.isArray(record?.depends_on)
+      ? record.depends_on.filter((item): item is string => typeof item === "string")
+      : [],
+    plan: record?.plan === true,
+  };
+}
+
+export function parseGraphSource(value: unknown): GraphSource {
+  const record = objectRecord(value);
+  if (!record || !Array.isArray(record.nodes)) {
+    throw new Error("graph source must contain a nodes array");
+  }
+  const edges = Array.isArray(record.edges)
+    ? record.edges.flatMap((item) => {
+        const edge = objectRecord(item);
+        const type = stringValue(edge?.type);
+        const src = stringValue(edge?.src);
+        const dst = stringValue(edge?.dst);
+        return type && src && dst ? [{ type, src, dst }] : [];
+      })
+    : [];
+  return {
+    project_name: stringValue(record.project_name),
+    notes: stringValue(record.notes),
+    nodes: record.nodes.map(sourceNode),
+    document_refs: parseDocumentReferences(record.document_refs),
+    subgraph_refs: parseSubgraphReferences(record.subgraph_refs),
+    artifacts: parseGraphArtifacts(record.artifacts),
+    edges,
+  };
+}
+
+export function orderGraphSourceNodes(
+  nodes: GraphSourceNode[],
+  edges: GraphSource["edges"],
+  parentKey: string | null,
+): GraphSourceNode[] {
+  const parentOf = new Map(nodes.map((node) => [node.key, node.parent_key]));
+  const siblings = nodes.filter((node) => (node.parent_key ?? null) === parentKey);
+  const siblingIds = new Set(siblings.map((node) => node.key));
+  const position = new Map(siblings.map((node, index) => [node.key, index]));
+  const outgoing = new Map<string, string[]>();
+  const indegree = new Map(siblings.map((node) => [node.key, 0]));
+  const dependencies = new Map<string, string[]>();
+  for (const node of nodes) dependencies.set(node.key, [...node.depends_on]);
+  for (const edge of edges) {
+    if (edge.type !== "DEPENDS_ON") continue;
+    dependencies.set(edge.dst, [...(dependencies.get(edge.dst) ?? []), edge.src]);
+  }
+  const directChild = (key: string): string | null => {
+    let current = key;
+    const visited = new Set<string>();
+    while (parentOf.has(current) && parentOf.get(current) !== parentKey) {
+      if (visited.has(current)) return null;
+      visited.add(current);
+      const parent = parentOf.get(current);
+      if (!parent) return null;
+      current = parent;
+    }
+    return siblingIds.has(current) ? current : null;
+  };
+  for (const [dependent, prerequisites] of dependencies) {
+    const target = directChild(dependent);
+    if (!target) continue;
+    for (const prerequisite of prerequisites) {
+      const source = directChild(prerequisite);
+      if (!source || source === target) continue;
+      if (!outgoing.get(source)?.includes(target)) {
+        outgoing.set(source, [...(outgoing.get(source) ?? []), target]);
+        indegree.set(target, (indegree.get(target) ?? 0) + 1);
+      }
+    }
+  }
+  const compare = (a: string, b: string) =>
+    (position.get(a) ?? 0) - (position.get(b) ?? 0);
+  const ready = siblings
+    .filter((node) => indegree.get(node.key) === 0)
+    .map((node) => node.key)
+    .sort(compare);
+  const ordered: string[] = [];
+  while (ready.length) {
+    const key = ready.shift()!;
+    ordered.push(key);
+    for (const dependent of outgoing.get(key) ?? []) {
+      const next = (indegree.get(dependent) ?? 0) - 1;
+      indegree.set(dependent, next);
+      if (next === 0) ready.push(dependent);
+    }
+    ready.sort(compare);
+  }
+  const keys = ordered.length === siblings.length
+    ? ordered
+    : siblings.map((node) => node.key);
+  const byKey = new Map(siblings.map((node) => [node.key, node]));
+  return keys.map((key) => byKey.get(key)!).filter(Boolean);
 }
 
 /**
@@ -134,7 +363,7 @@ export function DocumentLinks({
 }: {
   refs: DocumentRef[];
   projectId?: string;
-  onOpenDocument?: (reference: DocumentRef) => void;
+  onOpenDocument?: (reference: DocumentTarget) => void;
 }) {
   if (!refs.length || !projectId) return null;
   const render = (reference: DocumentRef) => {
@@ -167,6 +396,138 @@ export function DocumentLinks({
   );
 }
 
+export function SubgraphLinks({
+  refs,
+  projectId,
+  onOpenDocument,
+}: {
+  refs: SubgraphRef[];
+  projectId?: string;
+  onOpenDocument?: (reference: DocumentTarget) => void;
+}) {
+  if (!refs.length || !projectId) return null;
+  return (
+    <section className="document-links document-subgraph-links" aria-label="Composed subgraphs">
+      <h3>Composed subgraphs</h3>
+      <ul>
+        {refs.map((reference) => {
+          const href = subgraphReferenceHref(reference, projectId);
+          const documentReference: DocumentTarget = {
+            ref: reference.ref,
+            title: subgraphReferenceLabel(reference),
+            media_type: reference.media_type,
+            imports: [],
+            kind: "graph",
+          };
+          return (
+            <li className="document-reference-row document-subgraph-row" key={`${reference.ref}:${reference.title ?? ""}`}>
+              <Icon name="workflow" className="document-reference-icon" />
+              <span className="document-reference-copy">
+                <span className="document-reference-main">
+                  <a
+                    href={href}
+                    onClick={!onOpenDocument ? undefined : (event) => {
+                      event.preventDefault();
+                      onOpenDocument(documentReference);
+                    }}
+                  >
+                    {subgraphReferenceLabel(reference)}
+                  </a>
+                  <small className="document-reference-kind">graph source</small>
+                </span>
+                <small className="document-reference-hint">Open work breakdown</small>
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+export function ArtifactLinks({
+  artifacts,
+  projectId,
+  onOpenDocument,
+}: {
+  artifacts: ArtifactLike[];
+  projectId?: string;
+  onOpenDocument?: (reference: DocumentTarget) => void;
+}) {
+  if (!artifacts.length || !projectId) return null;
+  return (
+    <section className="document-links document-artifact-links" aria-label="Artifacts">
+      <h3>Artifacts</h3>
+      <ul>
+        {artifacts.map((artifact, index) => {
+          const reference = artifact.ref ? {
+            ref: artifact.ref,
+            title: artifact.name,
+            media_type: null,
+            imports: [],
+            kind: isGraphSourceReference(artifact.ref)
+              ? "graph" as const
+              : "document" as const,
+          } satisfies DocumentTarget : null;
+          const label = artifact.name || artifact.ref || `artifact-${index + 1}`;
+          const graphSource = Boolean(artifact.ref && isGraphSourceReference(artifact.ref));
+          const documentArtifact = Boolean(artifact.ref && isDocumentArtifact(artifact.ref));
+          const submission = artifact.name.toLowerCase().includes("submission");
+          const inReader = graphSource || documentArtifact;
+          const external = reference ? isExternalDocumentReference(reference) : false;
+          const hasContent = submission && artifact.content !== null && artifact.content !== undefined;
+          const content = hasContent ? formatArtifactContent(artifact.content) : null;
+          const iconName = graphSource
+            ? "workflow"
+            : artifact.kind === "file"
+              ? "file"
+              : "braces";
+          return (
+            <li className="document-reference-row document-artifact-row" key={`${artifact.name}:${artifact.ref ?? index}`}>
+              <Icon name={iconName} className="document-reference-icon" />
+              <span className="document-reference-copy">
+                <span className="document-reference-main">
+                  {reference ? (
+                    <a
+                      href={documentReferenceHref(reference, projectId)}
+                      target={external || !inReader ? "_blank" : undefined}
+                      rel={external || !inReader ? "noreferrer" : undefined}
+                      onClick={external || !inReader || !onOpenDocument ? undefined : (event) => {
+                        event.preventDefault();
+                        onOpenDocument(reference);
+                      }}
+                    >
+                      {label}
+                    </a>
+                  ) : (
+                    <span>{label}</span>
+                  )}
+                  <small className="document-reference-kind">{artifact.kind}</small>
+                </span>
+                {content !== null && (
+                  <details className="document-artifact-content">
+                    <summary>{artifact.name.toLowerCase().includes("submission") ? "View response" : "View content"}</summary>
+                    <pre>{content}</pre>
+                  </details>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+function formatArtifactContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function markdownText(value: ReactNode): string {
   if (typeof value === "string" || typeof value === "number") return String(value);
   if (Array.isArray(value)) return value.map(markdownText).join("");
@@ -183,6 +544,16 @@ function headingId(value: string): string {
 function splitDocumentReference(value: string): { path: string; suffix: string } {
   const match = /^([^?#]*)([?#].*)?$/.exec(value);
   return { path: match?.[1] ?? value, suffix: match?.[2] ?? "" };
+}
+
+function isGraphSourceReference(value: string): boolean {
+  const { path } = splitDocumentReference(value);
+  return /(?:^|\/)\.turn\/graphs\/[^/]+\.json$/i.test(path);
+}
+
+function isDocumentArtifact(value: string): boolean {
+  const { path } = splitDocumentReference(value);
+  return /\.(?:md|markdown|mdown|txt|rst)$/i.test(path);
 }
 
 function resolveDocumentPath(value: string, baseReference: string): string {
@@ -203,10 +574,7 @@ function resolveDocumentPath(value: string, baseReference: string): string {
 }
 
 function projectPathHref(path: string, projectId: string): string {
-  return documentReferenceHref(
-    { ref: path, title: null, media_type: null, imports: [] },
-    projectId,
-  );
+  return documentReferenceHref({ ref: path }, projectId);
 }
 
 export function DocumentCapabilities({ node }: { node: GraphNode }) {
@@ -245,7 +613,7 @@ function MarkdownContent({
   content: string;
   baseReference: string;
   projectId: string;
-  onOpenDocument?: (reference: DocumentRef) => void;
+  onOpenDocument?: (reference: DocumentTarget) => void;
 }) {
   return (
     <ReactMarkdown
@@ -266,11 +634,12 @@ function MarkdownContent({
           if (external || value.startsWith("#") || !onOpenDocument) {
             return <a href={external ? resolved : value} {...props}>{children}</a>;
           }
-          const reference: DocumentRef = {
+          const reference: DocumentTarget = {
             ref: resolved,
             title: markdownText(children) || resolved,
             media_type: null,
             imports: [],
+            kind: isGraphSourceReference(resolved) ? "graph" : "document",
           };
           return (
             <a
@@ -320,6 +689,259 @@ function useProjectDocument(projectId: string, reference: DocumentRef) {
   return { content, error };
 }
 
+function uniqueReferences<T extends { ref: string }>(references: T[]): T[] {
+  const seen = new Set<string>();
+  return references.filter((reference) => {
+    if (seen.has(reference.ref)) return false;
+    seen.add(reference.ref);
+    return true;
+  });
+}
+
+function uniqueArtifacts(artifacts: ArtifactLike[]): ArtifactLike[] {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    const key = `${artifact.name}:${artifact.ref ?? ""}:${artifact.kind}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function sourceNodeDependencies(
+  node: GraphSourceNode,
+  edges: GraphSource["edges"],
+): string[] {
+  return uniqueReferences([
+    ...node.depends_on.map((key) => ({ ref: key })),
+    ...edges
+      .filter((edge) => edge.type === "DEPENDS_ON" && edge.dst === node.key)
+      .map((edge) => ({ ref: edge.src })),
+  ].map((item) => ({ ref: item.ref }))).map((item) => item.ref);
+}
+
+function sourceArtifactState(
+  node: GraphNode | undefined,
+  artifacts: Artifact[],
+): Artifact[] {
+  if (!node) return [];
+  const ids = new Set(node.artifact_refs);
+  return artifacts.filter((artifact) => ids.has(artifact.id));
+}
+
+function GraphSourceNodeView({
+  node,
+  nodes,
+  edges,
+  path,
+  projectId,
+  onOpenDocument,
+  contextNodes,
+  stateArtifacts,
+}: {
+  node: GraphSourceNode;
+  nodes: GraphSourceNode[];
+  edges: GraphSource["edges"];
+  path: number[];
+  projectId: string;
+  onOpenDocument: (reference: DocumentTarget) => void;
+  contextNodes: GraphNode[];
+  stateArtifacts: Artifact[];
+}) {
+  const [open, setOpen] = useState(false);
+  const contextNode = contextNodes.find(
+    (item) => stripMarkdown(item.objective) === stripMarkdown(node.objective),
+  );
+  const children = orderGraphSourceNodes(nodes, edges, node.key);
+  const names = new Map(nodes.map((item) => [item.key, item.objective]));
+  const dependencies = sourceNodeDependencies(node, edges)
+    .map((key) => names.get(key) ?? key);
+  const documentRefs = uniqueReferences([
+    ...node.document_refs,
+    ...(contextNode?.document_refs ?? []),
+  ]);
+  const subgraphRefs = uniqueReferences([
+    ...node.subgraph_refs,
+    ...(contextNode?.subgraph_refs ?? []),
+  ]);
+  const artifacts = uniqueArtifacts([
+    ...node.artifacts,
+    ...sourceArtifactState(contextNode, stateArtifacts),
+  ]);
+  return (
+    <details
+      className={`document-node depth-${Math.min(Math.max(path.length - 1, 0), 4)}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="document-node-summary">
+        <span className="document-sequence">{path.join(".")}</span>
+        <span
+          className="document-node-copy"
+          role="heading"
+          aria-level={Math.min(path.length + 1, 6)}
+        >
+          <strong>{stripMarkdown(node.objective)}</strong>
+          <small>{node.plan ? "planner" : "planned"}</small>
+        </span>
+        <span className="document-agent">
+          {node.agent_type ?? node.executor ?? "agent"}
+        </span>
+      </summary>
+      <div className="document-node-body">
+        {dependencies.length > 0 && (
+          <p className="document-dependencies">
+            <span>Depends on</span> {dependencies.join(" · ")}
+          </p>
+        )}
+        <DocumentLinks refs={documentRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <ArtifactLinks artifacts={artifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
+        {node.generated_prompt?.trim() && (
+          <div className="document-markdown">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{node.generated_prompt.trim()}</ReactMarkdown>
+          </div>
+        )}
+        {children.length > 0 && (
+          <div className="document-children">
+            {children.map((child, index) => (
+              <GraphSourceNodeView
+                key={child.key}
+                node={child}
+                nodes={nodes}
+                edges={edges}
+                projectId={projectId}
+                onOpenDocument={onOpenDocument}
+                contextNodes={contextNodes}
+                stateArtifacts={stateArtifacts}
+                path={[...path, index + 1]}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+export function GraphSourceDocument({
+  source,
+  reference,
+  projectId,
+  contextNodes,
+  stateArtifacts,
+  onOpenDocument,
+  onBack,
+}: {
+  source: GraphSource;
+  reference: DocumentTarget;
+  projectId: string;
+  contextNodes: GraphNode[];
+  stateArtifacts: Artifact[];
+  onOpenDocument: (reference: DocumentTarget) => void;
+  onBack: () => void;
+}) {
+  const contextRoot = contextNodes.find((node) =>
+    node.subgraph_refs?.some((linked) => linked.ref === reference.ref),
+  ) ?? contextNodes.find((node) => node.parent_id === null);
+  const documentRefs = uniqueReferences([
+    ...source.document_refs,
+    ...(contextRoot?.document_refs ?? []),
+  ]);
+  const subgraphRefs = uniqueReferences([
+    ...source.subgraph_refs,
+    ...(contextRoot?.subgraph_refs ?? []).filter((linked) => linked.ref !== reference.ref),
+  ]);
+  const artifacts = uniqueArtifacts([
+    ...source.artifacts,
+    ...sourceArtifactState(contextRoot, stateArtifacts),
+  ]);
+  const children = orderGraphSourceNodes(source.nodes, source.edges, null);
+  return (
+    <article className="document-reader document-graph-source">
+      <button className="document-reader-back" type="button" onClick={onBack}>← Back to previous document</button>
+      <div className="document-kicker">Graph work breakdown</div>
+      <h1>{stripMarkdown(source.project_name ?? documentReferenceLabel(reference))}</h1>
+      <p className="document-reader-path">{reference.ref}</p>
+      <div className="document-meta">
+        <span>{source.nodes.length} work items</span>
+        <span>Sequence follows dependencies</span>
+      </div>
+      {source.notes?.trim() && (
+        <div className="document-intent document-markdown">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{source.notes.trim()}</ReactMarkdown>
+        </div>
+      )}
+      <DocumentLinks refs={documentRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
+      <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
+      <ArtifactLinks artifacts={artifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
+      <div id="work-specification" className="document-flow">
+        <div className="document-flow-heading">
+          <span>Work breakdown</span>
+          <small>Every linked graph is another navigable document boundary.</small>
+        </div>
+        {children.map((child, index) => (
+          <GraphSourceNodeView
+            key={child.key}
+            node={child}
+            nodes={source.nodes}
+            edges={source.edges}
+            projectId={projectId}
+            onOpenDocument={onOpenDocument}
+            contextNodes={contextNodes}
+            stateArtifacts={stateArtifacts}
+            path={[index + 1]}
+          />
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function GraphSourceReader({
+  projectId,
+  reference,
+  contextNodes,
+  stateArtifacts,
+  onBack,
+  onOpenDocument,
+}: {
+  projectId: string;
+  reference: DocumentTarget;
+  contextNodes: GraphNode[];
+  stateArtifacts: Artifact[];
+  onBack: () => void;
+  onOpenDocument: (reference: DocumentTarget) => void;
+}) {
+  const { content, error } = useProjectDocument(projectId, reference);
+  let source: GraphSource | null = null;
+  let sourceError = error;
+  if (!sourceError && content !== null) {
+    try {
+      source = parseGraphSource(JSON.parse(content) as unknown);
+    } catch (reason: unknown) {
+      sourceError = `Unable to read graph source: ${String(reason)}`;
+    }
+  }
+  return (
+    <div className="document-view" aria-label="Graph work breakdown">
+      {sourceError && <p className="document-reader-error">{sourceError}</p>}
+      {!sourceError && content === null && <p className="document-reader-loading">Loading graph…</p>}
+      {!sourceError && source && (
+        <GraphSourceDocument
+          source={source}
+          reference={reference}
+          projectId={projectId}
+          contextNodes={contextNodes}
+          stateArtifacts={stateArtifacts}
+          onOpenDocument={onOpenDocument}
+          onBack={onBack}
+        />
+      )}
+    </div>
+  );
+}
+
 function DocumentReader({
   projectId,
   reference,
@@ -327,9 +949,9 @@ function DocumentReader({
   onOpenDocument,
 }: {
   projectId: string;
-  reference: DocumentRef;
+  reference: DocumentTarget;
   onBack: () => void;
-  onOpenDocument?: (reference: DocumentRef) => void;
+  onOpenDocument?: (reference: DocumentTarget) => void;
 }) {
   const { content, error } = useProjectDocument(projectId, reference);
 
@@ -362,6 +984,7 @@ function DocumentNode({
   node,
   nodes,
   edges,
+  artifacts,
   path,
   projectId,
   onOpenDocument,
@@ -369,16 +992,21 @@ function DocumentNode({
   node: GraphNode;
   nodes: GraphNode[];
   edges: Edge[];
+  artifacts: Artifact[];
   path: number[];
   projectId?: string;
-  onOpenDocument?: (reference: DocumentRef) => void;
+  onOpenDocument?: (reference: DocumentTarget) => void;
 }) {
-  const [open, setOpen] = useState(
-    path.length < 2 || (node.capability_status?.length ?? 0) > 0,
-  );
-  const children = orderDocumentNodes(nodes, edges, node.id);
+  const [open, setOpen] = useState(false);
+  // The graph view intentionally expands imported nodes. The document view
+  // starts at the source boundary instead, so a composed subtree is reached
+  // through its explicit graph link and is not duplicated in this document.
+  const children = node.subgraph_refs?.length
+    ? []
+    : orderDocumentNodes(nodes, edges, node.id);
   const dependencies = dependencyLabels(node, nodes, edges);
   const prompt = node.generated_prompt?.trim();
+  const nodeArtifacts = artifacts.filter((artifact) => node.artifact_refs.includes(artifact.id));
   return (
     <details
       className={`document-node depth-${Math.min(Math.max(path.length - 1, 0), 4)}`}
@@ -408,6 +1036,8 @@ function DocumentNode({
         )}
         <DocumentCapabilities node={node} />
         <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <SubgraphLinks refs={node.subgraph_refs ?? []} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <ArtifactLinks artifacts={nodeArtifacts} projectId={projectId} onOpenDocument={onOpenDocument} />
         {prompt && (
           <div className="document-markdown">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{prompt}</ReactMarkdown>
@@ -421,6 +1051,7 @@ function DocumentNode({
                 node={child}
                 nodes={nodes}
                 edges={edges}
+                artifacts={artifacts}
                 projectId={projectId}
                 onOpenDocument={onOpenDocument}
                 path={[...path, index + 1]}
@@ -433,10 +1064,43 @@ function DocumentNode({
   );
 }
 
-export function DocumentView({ nodes, edges, projectId }: Props) {
-  const [documentReference, setDocumentReference] = useState<DocumentRef | null>(null);
+function documentTargetFromHistory(state: unknown): DocumentTarget | null {
+  const record = objectRecord(state);
+  const target = objectRecord(record?.document);
+  if (typeof target?.ref !== "string") return null;
+  return {
+    ref: target.ref,
+    title: stringValue(target.title),
+    media_type: stringValue(target.media_type),
+    imports: [],
+    kind: target.kind === "graph" ? "graph" : "document",
+  };
+}
+
+function documentTargetFromLocation(): DocumentTarget | null {
+  if (typeof window === "undefined") return null;
+  const marker = "#document=";
+  if (!window.location.hash.startsWith(marker)) return null;
+  const ref = decodeURIComponent(window.location.hash.slice(marker.length));
+  if (!ref) return null;
+  return {
+    ref,
+    title: null,
+    media_type: null,
+    imports: [],
+    kind: isGraphSourceReference(ref) ? "graph" : "document",
+  };
+}
+
+export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
+  const [documentReference, setDocumentReference] = useState<DocumentTarget | null>(() =>
+    documentTargetFromHistory(typeof window === "undefined" ? null : window.history.state)
+      ?? documentTargetFromLocation(),
+  );
   useEffect(() => {
-    const onPopState = () => setDocumentReference(null);
+    const onPopState = (event: PopStateEvent) => {
+      setDocumentReference(documentTargetFromHistory(event.state));
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -445,20 +1109,38 @@ export function DocumentView({ nodes, edges, projectId }: Props) {
     return <div className="document-empty">No specification is available.</div>;
   }
   const children = orderDocumentNodes(nodes, edges, root.id);
-  const openDocument = (reference: DocumentRef) => {
+  const openDocument = (reference: DocumentTarget) => {
     setDocumentReference(reference);
-    window.history.pushState({ document: reference.ref }, "", `#document=${encodeURIComponent(reference.ref)}`);
+    window.history.pushState({ document: reference }, "", `#document=${encodeURIComponent(reference.ref)}`);
   };
   if (documentReference) {
+    const onBack = () => window.history.back();
+    if (documentReference.kind === "graph") {
+      return (
+        <GraphSourceReader
+          projectId={projectId ?? root.project_id}
+          reference={documentReference}
+          contextNodes={nodes}
+          stateArtifacts={artifacts}
+          onOpenDocument={openDocument}
+          onBack={onBack}
+        />
+      );
+    }
     return (
       <div className="document-view" aria-label="Project document">
-        <DocumentReader projectId={projectId ?? root.project_id} reference={documentReference} onOpenDocument={openDocument} onBack={() => {
-          window.history.back();
-          setDocumentReference(null);
-        }} />
+        <DocumentReader
+          projectId={projectId ?? root.project_id}
+          reference={documentReference}
+          onOpenDocument={openDocument}
+          onBack={onBack}
+        />
       </div>
     );
   }
+  const rootHasComposedSource = (root.subgraph_refs?.length ?? 0) > 0;
+  const visibleChildren = rootHasComposedSource ? [] : children;
+  const rootArtifacts = artifacts.filter((artifact) => root.artifact_refs.includes(artifact.id));
   return (
     <div className="document-view" aria-label="Read-only specification">
       <article className="document-spec">
@@ -481,23 +1163,36 @@ export function DocumentView({ nodes, edges, projectId }: Props) {
           projectId={projectId ?? root.project_id}
           onOpenDocument={openDocument}
         />
-        <div id="work-specification" className="document-flow">
-          <div className="document-flow-heading">
-            <span>Work specification</span>
-            <small>Nested sections are collapsible. This view is read-only.</small>
+        <SubgraphLinks
+          refs={root.subgraph_refs ?? []}
+          projectId={projectId ?? root.project_id}
+          onOpenDocument={openDocument}
+        />
+        <ArtifactLinks
+          artifacts={rootArtifacts}
+          projectId={projectId ?? root.project_id}
+          onOpenDocument={openDocument}
+        />
+        {visibleChildren.length > 0 && (
+          <div id="work-specification" className="document-flow">
+            <div className="document-flow-heading">
+              <span>Work specification</span>
+              <small>Nested sections are collapsible. Composed work is reached through its graph link.</small>
+            </div>
+            {visibleChildren.map((child, index) => (
+              <DocumentNode
+                key={child.id}
+                node={child}
+                nodes={nodes}
+                edges={edges}
+                artifacts={artifacts}
+                projectId={projectId ?? root.project_id}
+                onOpenDocument={openDocument}
+                path={[index + 1]}
+              />
+            ))}
           </div>
-          {children.map((child, index) => (
-            <DocumentNode
-              key={child.id}
-              node={child}
-              nodes={nodes}
-              edges={edges}
-              projectId={projectId ?? root.project_id}
-              onOpenDocument={openDocument}
-              path={[index + 1]}
-            />
-          ))}
-        </div>
+        )}
       </article>
     </div>
   );

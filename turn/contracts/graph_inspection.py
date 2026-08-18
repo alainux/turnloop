@@ -17,6 +17,7 @@ from turn.domain.schemas import (
     Outcome,
     RunPolicy,
     RunStatus,
+    SubgraphRef,
     VerificationResult,
 )
 
@@ -72,6 +73,7 @@ class GraphInspectionNode(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    subgraph_refs: list[SubgraphRef] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
     depends_on: list[uuid.UUID] = Field(default_factory=list)
     children: list[uuid.UUID] = Field(default_factory=list)

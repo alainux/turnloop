@@ -14,6 +14,7 @@ import type {
   ReasoningLevel,
   Run,
   RunPolicy,
+  SubgraphRef,
   Usage,
 } from "./generated/domain";
 
@@ -36,13 +37,18 @@ export type {
   ReasoningLevel,
   Run,
   RunPolicy,
+  SubgraphRef,
   Usage,
 } from "./generated/domain";
 
 /** UI aliases are generated contract types, kept short at call sites. */
-export type GraphNode = GraphNodeView;
+export type GraphNode = Omit<GraphNodeView, "subgraph_refs"> & {
+  subgraph_refs?: SubgraphRef[];
+};
 export type Graph = GraphView;
-export type Project = Node;
+export type Project = Omit<Node, "subgraph_refs"> & {
+  subgraph_refs?: SubgraphRef[];
+};
 export type HarnessId = HarnessKind;
 export type Reasoning = ReasoningLevel;
 export type UIState = NodeUIState;
@@ -91,7 +97,7 @@ export function capabilityDeploymentLabel(item: CapabilityStatus): string {
 }
 
 /** Render a document reference as a project-scoped link without reading it. */
-export function documentReferenceHref(reference: DocumentRef, projectId: string): string {
+export function documentReferenceHref(reference: { ref: string }, projectId: string): string {
   if (/^https?:\/\//i.test(reference.ref)) return reference.ref;
   const match = /^([^?#]*)([?#].*)?$/.exec(reference.ref);
   const path = match?.[1] ?? reference.ref;
@@ -109,6 +115,15 @@ export function documentReferenceContentHref(reference: DocumentRef, projectId: 
 }
 
 export function documentReferenceLabel(reference: DocumentRef): string {
+  return reference.title?.trim() || reference.ref;
+}
+
+/** Render a composed graph source as a project-scoped link without ingesting it. */
+export function subgraphReferenceHref(reference: SubgraphRef, projectId: string): string {
+  return documentReferenceHref(reference, projectId);
+}
+
+export function subgraphReferenceLabel(reference: SubgraphRef): string {
   return reference.title?.trim() || reference.ref;
 }
 

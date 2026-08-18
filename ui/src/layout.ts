@@ -353,11 +353,29 @@ export function pathBetween(
     ay = a.y + GRAPH_PADDING,
     bx = b.x + GRAPH_PADDING,
     by = b.y + GRAPH_PADDING;
-  const x1 = ax + NODE_WIDTH,
+  const sourceCenter = ax + NODE_WIDTH / 2;
+  const targetCenter = bx + NODE_WIDTH / 2;
+  const forward = targetCenter >= sourceCenter;
+  const x1 = forward ? ax + NODE_WIDTH : ax,
     y1 = ay + NODE_HEIGHT / 2,
-    x2 = bx,
-    y2 = by + NODE_HEIGHT / 2,
-    elbow = x1 + (x2 - x1) / 2;
+    x2 = forward ? bx : bx + NODE_WIDTH,
+    y2 = by + NODE_HEIGHT / 2;
+  const horizontalDistance = Math.abs(x2 - x1);
+
+  // A midpoint elbow is safe for adjacent stages, but for a dependency that
+  // skips a stage it falls inside the skipped card column. Route those edges
+  // through the clear strip above the cards instead. Cards always start at
+  // GRAPH_PADDING, so this route remains inside the SVG and cannot overlap a
+  // node, including during an incremental graph update.
+  if (horizontalDistance > NODE_WIDTH + 54) {
+    const direction = forward ? 1 : -1;
+    const laneStart = x1 + direction * 27;
+    const laneEnd = x2 - direction * 27;
+    const routeY = GRAPH_PADDING / 2;
+    return `M${x1} ${y1}H${laneStart}V${routeY}H${laneEnd}V${y2}H${x2}`;
+  }
+
+  const elbow = x1 + (x2 - x1) / 2;
   return `M${x1} ${y1}H${elbow}V${y2}H${x2}`;
 }
 

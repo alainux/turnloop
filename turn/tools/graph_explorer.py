@@ -19,6 +19,7 @@ from turn.contracts.graph_inspection import (
     GraphInspectionNode,
     GraphInspectionRun,
 )
+from turn.contracts.dag import parse_plan
 from turn.domain.schemas import Artifact, Edge, Node, Run
 
 _DELIVERABLE_KINDS = {"file", "code_diff", "log", "evidence"}
@@ -39,6 +40,29 @@ def _load_state(location: str, project_id: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"project state file not found: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_subgraph_file(location: str) -> dict:
+    """Read and validate one linked graph source without importing it."""
+    path = Path(location).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"subgraph source file not found: {path}")
+    plan = parse_plan(json.loads(path.read_text(encoding="utf-8")))
+    return plan.model_dump(mode="json")
+
+
+def print_subgraph_tree(payload: dict) -> None:
+    """Print a compact source-file view, including nested source links."""
+    for node in payload.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        print(f"- [{node.get('key')}] {node.get('objective')}")
+        for ref in node.get("subgraph_refs", []):
+            if isinstance(ref, dict):
+                print(f"  subgraph: {ref.get('ref')}")
+    for ref in payload.get("subgraph_refs", []):
+        if isinstance(ref, dict):
+            print(f"- subgraph: {ref.get('ref')}")
 
 
 async def _query(state_file: str, project_id: str, requester: str | None = None, query: str = "tree"):
@@ -99,6 +123,7 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 required_inputs=node.required_inputs,
                 resource_refs=node.resource_refs,
                 document_refs=node.document_refs,
+                subgraph_refs=node.subgraph_refs,
                 artifact_refs=node.artifact_refs,
                 depends_on=dependencies.get(node.id, []),
                 children=[uuid.UUID(child) for child in children.get(node.id.hex, [])],
@@ -188,6 +213,10 @@ def _summary(item: dict) -> str:
         line += "\n  document_refs: " + ", ".join(
             ref["ref"] for ref in item["document_refs"]
         )
+    if item.get("subgraph_refs"):
+        line += "\n  subgraphs: " + ", ".join(
+            ref["ref"] for ref in item["subgraph_refs"]
+        )
     if item.get("agent_state") or item.get("agent_message"):
         line += "\n  working: " + " — ".join(
             value for value in (item.get("agent_state"), item.get("agent_message")) if value
@@ -224,9 +253,18 @@ async def _main_async():
     parser.add_argument("--children", help="Show only the direct children of this node id.")
     parser.add_argument("--ancestors", help="Show only the parent chain of this node id.")
     parser.add_argument("--requester", help="Node id performing this read (not persisted).")
+    parser.add_argument("--subgraph-file", "--import-file", dest="subgraph_file", help="Explore a linked JSON subgraph source.")
     parser.add_argument("--format", default="tree", choices=["tree", "json"])
     parser.add_argument("--tree", action="store_const", dest="format", const="tree")
     args = parser.parse_args()
+
+    if args.subgraph_file:
+        payload = read_subgraph_file(args.subgraph_file)
+        if args.format == "json":
+            print(json.dumps(payload, indent=2))
+        else:
+            print_subgraph_tree(payload)
+        return 0
 
     query = "node" if args.node else "children" if args.children else "ancestors" if args.ancestors else args.format
     nodes, children = await _query(args.state_file, args.project, args.requester, query)

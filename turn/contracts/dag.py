@@ -7,6 +7,7 @@ this boundary so planners and workers do not each invent their own coercion.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import tempfile
 from typing import Any, Literal
 
@@ -57,6 +58,54 @@ def validate_agent_submission(
     return parse_result(value)
 
 
+def validate_subgraph_sources(
+    plan: PlanResult,
+    project_root: str | Path,
+    *,
+    max_depth: int = 32,
+) -> None:
+    """Validate every local source link without ingesting linked subgraphs.
+
+    A linked file is parsed as an independent plan contract so malformed
+    sources are rejected at submission time. Its nodes are intentionally not
+    merged into the current graph; only the submitted boundary is applied.
+    """
+    root = Path(project_root).expanduser().resolve()
+    visiting: set[Path] = set()
+
+    def visit(current: PlanResult, source: Path | None, depth: int) -> None:
+        if depth > max_depth:
+            raise ValueError(f"subgraph reference depth exceeds {max_depth}")
+        references = [
+            *current.subgraph_refs,
+            *(reference for node in current.nodes for reference in node.subgraph_refs),
+        ]
+        for reference in references:
+            raw = reference.ref
+            if raw.startswith(("http://", "https://")):
+                continue
+            target = (root / raw.split("?", 1)[0].split("#", 1)[0]).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError as error:
+                raise ValueError(f"subgraph reference escapes project: {raw}") from error
+            if not target.is_file():
+                raise ValueError(f"subgraph source does not exist: {raw}")
+            if target in visiting:
+                continue
+            visiting.add(target)
+            try:
+                try:
+                    nested = parse_plan(json.loads(target.read_text(encoding="utf-8")))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                    raise ValueError(f"invalid subgraph source {raw}: {error}") from error
+                visit(nested, target, depth + 1)
+            finally:
+                visiting.remove(target)
+
+    visit(plan, None, 0)
+
+
 def compact_validation_error(error: ValidationError, *, limit: int = 8) -> str:
     """Render contract failures compactly enough for an agent to act on.
 
@@ -105,6 +154,14 @@ def plan_handoff_example() -> str:
 
 def _normalize_payload(value: dict[str, Any]) -> dict[str, Any]:
     payload = dict(value)
+    if "subgraph_refs" not in payload:
+        for alias in ("graph_refs", "graph_files", "graph_ref", "graph_file"):
+            if alias in payload:
+                payload["subgraph_refs"] = payload[alias]
+                break
+    for alias in ("graph_refs", "graph_files", "graph_ref", "graph_file"):
+        payload.pop(alias, None)
+    payload["subgraph_refs"] = _normalize_subgraph_refs(payload.get("subgraph_refs"))
     payload["artifacts"] = _normalize_artifacts(payload.get("artifacts"))
     payload["document_refs"] = _normalize_document_refs(payload.get("document_refs"))
     nodes = payload.get("nodes")
@@ -115,7 +172,15 @@ def _normalize_payload(value: dict[str, Any]) -> dict[str, Any]:
                 normalized_nodes.append(node)
                 continue
             item = dict(node)
+            if "subgraph_refs" not in item:
+                for alias in ("graph_refs", "graph_files", "graph_ref", "graph_file"):
+                    if alias in item:
+                        item["subgraph_refs"] = item[alias]
+                        break
+            for alias in ("graph_refs", "graph_files", "graph_ref", "graph_file"):
+                item.pop(alias, None)
             item["document_refs"] = _normalize_document_refs(item.get("document_refs"))
+            item["subgraph_refs"] = _normalize_subgraph_refs(item.get("subgraph_refs"))
             item["artifacts"] = _normalize_artifacts(item.get("artifacts"))
             normalized_nodes.append(item)
         payload["nodes"] = normalized_nodes
@@ -158,6 +223,24 @@ def _normalize_document_refs(raw: Any) -> Any:
             value = dict(item)
             value["imports"] = _normalize_document_refs(value.get("imports")) or []
             refs.append(value)
+        else:
+            refs.append(item)
+    return refs
+
+
+def _normalize_subgraph_refs(raw: Any) -> Any:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [{"ref": raw}]
+    if not isinstance(raw, list):
+        return raw
+    refs: list[Any] = []
+    for item in raw:
+        if isinstance(item, str):
+            refs.append({"ref": item})
+        elif isinstance(item, dict):
+            refs.append(dict(item))
         else:
             refs.append(item)
     return refs

@@ -184,6 +184,11 @@ function ResizeHandle({
   );
 }
 
+function clearDocumentNavigation() {
+  if (typeof window === "undefined" || !window.location.hash.startsWith("#document=")) return;
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -245,6 +250,7 @@ export default function App() {
   useEffect(() => {
     setSelected(null);
     setViewMode("graph");
+    clearDocumentNavigation();
     setPolicyOpen(false);
     if (!projectId) {
       return;
@@ -420,7 +426,10 @@ export default function App() {
                     role="tab"
                     aria-selected={viewMode === "graph"}
                     className={viewMode === "graph" ? "selected" : ""}
-                    onClick={() => setViewMode("graph")}
+                    onClick={() => {
+                      clearDocumentNavigation();
+                      setViewMode("graph");
+                    }}
                   >
                     Graph
                   </button>
@@ -429,6 +438,7 @@ export default function App() {
                     aria-selected={viewMode === "document"}
                     className={viewMode === "document" ? "selected" : ""}
                     onClick={() => {
+                      clearDocumentNavigation();
                       setSelected(null);
                       setViewMode("document");
                     }}
@@ -477,6 +487,7 @@ export default function App() {
                 <DocumentView
                   nodes={graph!.nodes}
                   edges={graph!.edges}
+                  artifacts={graph!.artifacts}
                   projectId={projectId}
                 />
               ) : (

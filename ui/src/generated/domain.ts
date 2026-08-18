@@ -108,6 +108,7 @@ export interface GraphNodeView {
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
   document_refs: Array<DocumentRef>;
+  subgraph_refs: Array<SubgraphRef>;
   artifact_refs: Array<string>;
   created_at: string;
   updated_at: string;
@@ -170,6 +171,7 @@ export interface Node {
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
   document_refs: Array<DocumentRef>;
+  subgraph_refs: Array<SubgraphRef>;
   artifact_refs: Array<string>;
   created_at: string;
   updated_at: string;
@@ -190,6 +192,7 @@ export interface NodeSpec {
   required_inputs: Array<InputSpec>;
   resource_refs: Array<string>;
   document_refs: Array<DocumentRef>;
+  subgraph_refs: Array<SubgraphRef>;
   artifacts: Array<ArtifactSpec>;
   capabilities: Array<string>;
   parent_key: string | null;
@@ -207,6 +210,7 @@ export interface PlanResult {
   nodes: Array<NodeSpec>;
   project_name: string | null;
   document_refs: Array<DocumentRef>;
+  subgraph_refs: Array<SubgraphRef>;
   artifacts: Array<ArtifactSpec>;
   edges: Array<EdgeSpec>;
   notes: string | null;
@@ -257,6 +261,13 @@ export interface RunPolicy {
 
 export type RunStatus = "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";
 
+export interface SubgraphRef {
+  ref: string;
+  title: string | null;
+  media_type: string | null;
+  managed: boolean;
+}
+
 export interface Usage {
   input_tokens: number;
   cached_input_tokens: number;
@@ -291,6 +302,7 @@ export interface WorkerResult {
   summary: string;
   artifacts: Array<ArtifactSpec>;
   document_refs: Array<DocumentRef>;
+  subgraph_refs: Array<SubgraphRef>;
   children: PlanResult | null;
   missing_inputs: Array<InputSpec>;
   error: string | null;
