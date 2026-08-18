@@ -176,9 +176,12 @@ When run from a project directory, `turn create` uses that current directory as
 the project directory. The UI/server uses `TURN_PROJECTS_DIR` for its default
 project root.
 
-Operational history is written as rotated JSONL files under `./turn/logs/`.
-Each file is project-scoped and named with the project id and UTC timestamp;
-the server and CLI stitch those files in order. Configure rotation with
+Workspace configuration is stored in `./.turn/config.json`. Project state and
+operational history are stored inside each project at
+`./projects/<project_name>/.turn/`; logs are rotated JSONL files in that
+project's `.turn/logs/` directory. Each file is project-scoped and named with
+the project id and UTC timestamp; the server and CLI stitch those files in
+order. Configure rotation with
 `TURN_LOG_MAX_RECORDS` or the Workspace settings panel. Records include graph
 transitions, state/configuration changes, agent CLI responses, harness launch
 and return details, decisions, and errors, so external JSONL tooling can read

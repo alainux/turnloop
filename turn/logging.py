@@ -18,13 +18,32 @@ from typing import Any, Iterator
 
 
 class EventLog:
-    """One process-owned writer and a stitched reader for project JSONL logs."""
+    """One process-owned writer and stitched reader for project JSONL logs.
+
+    ``data_dir`` is the workspace runtime directory (``.turn`` at the
+    development root). Project records are bound to the project's own
+    ``.turn/logs`` directory by the server-owned store. Unbound records use
+    the workspace directory for genuinely workspace-scoped events.
+    """
 
     def __init__(self, data_dir: str | Path, max_records: int = 1000):
-        self.directory = Path(data_dir).expanduser().resolve() / "logs"
+        self.workspace_directory = Path(data_dir).expanduser().resolve() / "logs"
         self._max_records = max(1, int(max_records))
         self._lock = threading.Lock()
         self._subscribers: set[asyncio.Queue] = set()
+        self._project_roots: dict[str, Path] = {}
+
+    @property
+    def directory(self) -> Path:
+        """Backward-compatible alias for the workspace log directory."""
+        return self.workspace_directory
+
+    def bind_project(self, project_id: uuid.UUID | str, project_root: str | Path) -> None:
+        """Bind a project id to its project-local ``.turn`` directory."""
+        self._project_roots[str(project_id)] = Path(project_root).expanduser().resolve()
+
+    def unbind_project(self, project_id: uuid.UUID | str) -> None:
+        self._project_roots.pop(str(project_id), None)
 
     @property
     def max_records(self) -> int:
@@ -37,21 +56,30 @@ class EventLog:
     def _project_key(project_id: uuid.UUID | str | None) -> str:
         return str(project_id) if project_id is not None else "workspace"
 
+    def _directory(self, project_id: uuid.UUID | str | None) -> Path:
+        if project_id is None:
+            return self.workspace_directory
+        project_root = self._project_roots.get(str(project_id))
+        if project_root is None:
+            return self.workspace_directory
+        return project_root / ".turn" / "logs"
+
     def _files(self, project_id: uuid.UUID | str | None) -> list[Path]:
         key = self._project_key(project_id)
-        return sorted(self.directory.glob(f"project-{key}-*.jsonl"))
+        return sorted(self._directory(project_id).glob(f"project-{key}-*.jsonl"))
 
     def _next_path(self, project_id: uuid.UUID | str | None) -> Path:
         key = self._project_key(project_id)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        return self.directory / f"project-{key}-{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
+        return self._directory(project_id) / f"project-{key}-{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
 
     def _append(self, record: dict[str, Any]) -> None:
         """Append one line; all filesystem failures are intentionally ignored."""
         try:
             project_id = record.get("project_id")
             with self._lock:
-                self.directory.mkdir(parents=True, exist_ok=True)
+                directory = self._directory(project_id)
+                directory.mkdir(parents=True, exist_ok=True)
                 files = self._files(project_id)
                 target = files[-1] if files else None
                 count = 0

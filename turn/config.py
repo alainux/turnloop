@@ -1,7 +1,8 @@
 """Runtime configuration for Turn.
 
-Turn keeps durable preferences in ``./turn/config.json`` by default and keeps
-each project's graph in that project's own ``.turn/state.json`` file.
+Turn keeps workspace preferences in ``./.turn/config.json`` by default and
+keeps each project's graph, runs, and logs in that project's own ``.turn``
+directory.
 """
 from __future__ import annotations
 
@@ -84,7 +85,7 @@ def _load_env_file() -> None:
 class Settings:
     # --- storage ---------------------------------------------------------
     data_dir: str = field(
-        default_factory=lambda: os.getenv("TURN_DATA_DIR", str(Path.cwd() / "turn"))
+        default_factory=lambda: os.getenv("TURN_DATA_DIR", str(Path.cwd() / ".turn"))
     )
 
     # --- execution -------------------------------------------------------

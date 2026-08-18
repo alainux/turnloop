@@ -167,6 +167,33 @@ def _cli_project_id(args: argparse.Namespace | None = None) -> str | None:
     return None
 
 
+def _cli_project_root(project_id: str | None) -> Path | None:
+    """Resolve a project root for CLI log routing."""
+    repo = os.getenv("TURN_REPO")
+    if repo:
+        return Path(repo).expanduser().resolve()
+    if not project_id:
+        return None
+    config_path = Path(os.getenv("TURN_DATA_DIR", settings.data_dir)).expanduser() / "config.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        project_path = (raw.get("projects") or {}).get(project_id)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return Path(project_path).expanduser().resolve() if project_path else None
+
+
+def _cli_event_log(project_id: str | None) -> EventLog:
+    log = EventLog(
+        os.getenv("TURN_DATA_DIR", settings.data_dir),
+        _configured_log_limit(),
+    )
+    project_root = _cli_project_root(project_id)
+    if project_id and project_root is not None:
+        log.bind_project(project_id, project_root)
+    return log
+
+
 def _emit_cli_event(
     project_id: str | None,
     *,
@@ -177,10 +204,7 @@ def _emit_cli_event(
 ) -> None:
     """Write a best-effort event for a command executed by an agent."""
     try:
-        EventLog(
-            os.getenv("TURN_DATA_DIR", settings.data_dir),
-            _configured_log_limit(),
-        ).emit_sync(
+        _cli_event_log(project_id).emit_sync(
             project_id,
             kind="agent.action",
             action=action,
@@ -240,8 +264,8 @@ def agent_command(args) -> int:
     internal record. Agents never write status or outcome files themselves;
     terminal output is never used as an API.
     """
-    logger = EventLog(os.getenv("TURN_DATA_DIR", settings.data_dir), _configured_log_limit())
     project_id = _cli_project_id(args)
+    logger = _cli_event_log(project_id)
     action = f"agent.{args.agent_command}"
     logger.emit_sync(project_id, kind="agent.action", action=action, status="started", source="cli", message="agent CLI action started", data=_cli_invocation_data(args))
     if args.agent_command == "status":
@@ -316,11 +340,15 @@ def agent_command(args) -> int:
 
 def logs_command(args) -> int:
     project_id = args.project_id
+    project_root = None
     if project_id is None:
         state_file = discover_project_state()
         raw = json.loads(state_file.read_text(encoding="utf-8"))
         project_id = uuid.UUID(str(raw.get("project_id") or next(item["project_id"] for item in raw.get("nodes", []) if item.get("parent_id") is None)))
-    log = EventLog(os.getenv("TURN_DATA_DIR", settings.data_dir), _configured_log_limit())
+        project_root = state_file.parent.parent
+    log = _cli_event_log(str(project_id))
+    if project_root is not None:
+        log.bind_project(str(project_id), project_root)
     records = log.follow(project_id, search=args.search, poll_seconds=max(0.05, args.poll)) if args.follow else iter(log.read(project_id, search=args.search, limit=100_000))
     try:
         for record in records:

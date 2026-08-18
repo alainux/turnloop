@@ -6,7 +6,7 @@ format is intentionally boring:
 
 * ``<project>/.turn/state.json`` contains that project's nodes, edges, runs,
   and artifacts.
-* ``./turn/config.json`` contains cross-project preferences and the project
+* ``./.turn/config.json`` contains cross-project preferences and the project
   path index.
 
 Writes use a temporary file followed by ``os.replace`` so a process stop never
@@ -82,7 +82,7 @@ class Store:
         projects_dir: str | Path | None = None,
         logs: EventLog | None = None,
     ):
-        raw = str(data_dir or location or (Path.cwd() / "turn"))
+        raw = str(data_dir or location or (Path.cwd() / ".turn"))
         self.data_dir = self._resolve_data_dir(raw)
         self.config_path = Path(config_path).expanduser().resolve() if config_path else self.data_dir / "config.json"
         self.projects_dir = (
@@ -172,7 +172,11 @@ class Store:
             projects = config.get("projects") or {}
             for project_id, path in projects.items():
                 try:
-                    self._project_paths[uuid.UUID(str(project_id))] = Path(path).expanduser().resolve()
+                    pid = uuid.UUID(str(project_id))
+                    project_path = Path(path).expanduser().resolve()
+                    self._project_paths[pid] = project_path
+                    if self.logs is not None:
+                        self.logs.bind_project(pid, project_path)
                 except (ValueError, TypeError):
                     continue
 
@@ -183,7 +187,10 @@ class Store:
                 try:
                     data = json.loads(state_path.read_text(encoding="utf-8"))
                     project_id = self._project_id_from_state(data)
-                    self._project_paths.setdefault(project_id, state_path.parent.parent)
+                    project_path = state_path.parent.parent
+                    self._project_paths.setdefault(project_id, project_path)
+                    if self.logs is not None:
+                        self.logs.bind_project(project_id, project_path)
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     continue
 
@@ -351,6 +358,8 @@ class Store:
         for capability_id in node.agent.capabilities:
             catalog.load_into_project(capability_id, project_path)
         self._project_paths[root_id] = project_path
+        if self.logs is not None:
+            self.logs.bind_project(root_id, project_path)
         state = self._empty_state()
         state.nodes[node.id] = node
         self._states[root_id] = state
@@ -372,6 +381,8 @@ class Store:
             self._project_paths.pop(project_id, None)
             await self._persist_config()
         await self._log(project_id, kind="project.deleted", action="delete_project", message="project deleted")
+        if self.logs is not None:
+            self.logs.unbind_project(project_id)
 
     async def clear_projects(self) -> None:
         self._states.clear()

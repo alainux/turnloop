@@ -19,6 +19,19 @@ def test_event_log_rotates_and_stitches_jsonl(tmp_path):
     assert all(json.loads(line)["project_id"] == str(project_id) for path in files for line in path.read_text().splitlines())
 
 
+def test_project_events_use_the_project_dot_turn_log_directory(tmp_path):
+    project_id = uuid.uuid4()
+    project_root = tmp_path / "project"
+    log = EventLog(tmp_path / "workspace", max_records=2)
+    log.bind_project(project_id, project_root)
+
+    log.emit_sync(project_id, kind="project.created")
+
+    assert list((project_root / ".turn" / "logs").glob("*.jsonl"))
+    assert not (tmp_path / "workspace" / "logs").exists()
+    assert len(log.read(project_id)) == 1
+
+
 @pytest.mark.asyncio
 async def test_store_records_project_state_and_session_decisions(tmp_path):
     log = EventLog(tmp_path / "turn", max_records=100)

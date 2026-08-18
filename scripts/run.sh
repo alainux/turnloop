@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-export TURN_DATA_DIR="${TURN_DATA_DIR:-$(pwd)/turn}"
+export TURN_DATA_DIR="${TURN_DATA_DIR:-$(pwd)/.turn}"
 export TURN_PROJECTS_DIR="${TURN_PROJECTS_DIR:-$(pwd)/projects}"
 export TURN_PLANNER="${TURN_PLANNER:-codex}"
 export TURN_DEFAULT_EXECUTOR="${TURN_DEFAULT_EXECUTOR:-codex}"

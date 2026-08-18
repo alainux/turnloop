@@ -374,7 +374,9 @@ async def test_agent_and_capability_cli_actions_are_logged(tmp_path, monkeypatch
         "--payload", '{"outcome":"COMPLETE","summary":"done","artifacts":[]}',
     ]))
 
-    records = EventLog(data_dir).read(project_id)
+    reader = EventLog(data_dir)
+    reader.bind_project(project_id, project_root)
+    records = reader.read(project_id)
     actions = [record["action"] for record in records if record.get("kind") == "agent.action"]
     assert actions == [
         "capabilities.search",
