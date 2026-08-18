@@ -11,6 +11,7 @@ from turn.__main__ import discover_project_state
 from turn.config import Settings
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, Node, RunPolicy
+from turn.logging import EventLog
 from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 
 
@@ -340,3 +341,52 @@ async def test_capabilities_cli_deletes_a_catalog_package(tmp_path, monkeypatch)
 
     assert await async_main(args) == 0
     assert not (catalog_root / "created").exists()
+
+
+@pytest.mark.asyncio
+async def test_agent_and_capability_cli_actions_are_logged(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command, async_main
+
+    data_dir = tmp_path / "turn-data"
+    project_id = uuid.uuid4()
+    project_root = tmp_path / "project"
+    (project_root / ".turn").mkdir(parents=True)
+    (project_root / ".turn" / "state.json").write_text(
+        json.dumps({"project_id": str(project_id), "nodes": []})
+    )
+    monkeypatch.setenv("TURN_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("TURN_PROJECT_ID", str(project_id))
+    monkeypatch.setenv("TURN_REPO", str(project_root))
+
+    await async_main(parser().parse_args(["capabilities", "search", "secret"]))
+    await async_main(parser().parse_args(["capabilities", "load", "secret-word"]))
+
+    handoff = tmp_path / "node.result.json"
+    status = tmp_path / "node.status.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_STATUS_FILE", str(status))
+    monkeypatch.setenv("TURN_NODE_ID", "node-1")
+    agent_command(parser().parse_args([
+        "agent", "status", "--state", "working", "--message", "searching capabilities"
+    ]))
+    agent_command(parser().parse_args([
+        "agent", "submit", "--kind", "result",
+        "--payload", '{"outcome":"COMPLETE","summary":"done","artifacts":[]}',
+    ]))
+
+    records = EventLog(data_dir).read(project_id)
+    actions = [record["action"] for record in records if record.get("kind") == "agent.action"]
+    assert actions == [
+        "capabilities.search",
+        "capabilities.search",
+        "capabilities.load",
+        "capabilities.load",
+        "agent.status",
+        "agent.status",
+        "agent.submit",
+        "agent.submit",
+    ]
+    assert records[1]["data"]["response_status"] == "accepted"
+    assert records[1]["data"]["query"] == "secret"
+    assert records[3]["data"]["operation"] == "load"
+    assert records[-1]["data"]["response_status"] == "accepted"

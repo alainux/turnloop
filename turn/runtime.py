@@ -10,6 +10,7 @@ from typing import Any
 from turn.config import Settings, test_modes_enabled, validate_server_settings
 from turn.db.store import Store
 from turn.runner.events import EventBus
+from turn.logging import EventLog
 from turn.runner.prefect_adapter import get_execution_adapter
 from turn.runner.runner import Runner
 from turn.workers.herdr import HerdrAdapter
@@ -24,6 +25,7 @@ class RuntimeComponents:
 
     store: Store
     events: EventBus
+    logs: EventLog
     runner: Runner
     test_mode: bool
     capabilities: list[dict[str, Any]]
@@ -51,8 +53,13 @@ class TurnRuntime:
         test_mode: bool | None = None,
     ):
         self.settings = settings
-        self.store = store or Store(settings.data_dir, projects_dir=settings.projects_dir)
-        self.events = events or EventBus()
+        self.logs = EventLog(settings.data_dir, settings.log_max_records)
+        self.store = store or Store(settings.data_dir, projects_dir=settings.projects_dir, logs=self.logs)
+        if store is not None and getattr(self.store, "logs", None) is None:
+            self.store.logs = self.logs
+        self.events = events or EventBus(self.logs)
+        if events is not None and getattr(self.events, "logs", None) is None:
+            self.events.logs = self.logs
         self._registry = registry
         self._execution_adapter = execution_adapter
         self._herdr_adapter = herdr_adapter
@@ -67,6 +74,7 @@ class TurnRuntime:
             return self.components
         await self.store.init()
         await self._restore_settings()
+        self.logs.set_max_records(self.settings.log_max_records)
         if not self.test_mode:
             validate_server_settings(self.settings)
         # Discover provider capabilities once during daemon startup. The UI
@@ -127,7 +135,7 @@ class TurnRuntime:
     def components(self) -> RuntimeComponents:
         if self.runner is None:
             raise RuntimeError("Turn runtime has not been started")
-        return RuntimeComponents(self.store, self.events, self.runner, self.test_mode, self.capabilities)
+        return RuntimeComponents(self.store, self.events, self.logs, self.runner, self.test_mode, self.capabilities)
 
     async def _restore_settings(self) -> None:
         """Restore durable preferences before constructing the runner."""
@@ -138,6 +146,7 @@ class TurnRuntime:
             "timeout_seconds": float,
             "stall_timeout_seconds": float,
             "retry_choked_models": lambda v: str(v).lower() in ("1", "true", "yes"),
+            "log_max_records": int,
         }
         targets = {
             "max_retries": "max_retries",
@@ -146,6 +155,7 @@ class TurnRuntime:
             "timeout_seconds": "default_run_timeout_seconds",
             "stall_timeout_seconds": "stall_timeout_seconds",
             "retry_choked_models": "retry_choked_models",
+            "log_max_records": "log_max_records",
         }
         for key, cast in casts.items():
             raw = await self.store.get_setting(key)

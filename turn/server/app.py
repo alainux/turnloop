@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
+import uuid
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.runtime = runtime
     app.state.store = components.store
     app.state.events = components.events
+    app.state.logs = components.logs
     app.state.runner = components.runner
     app.state.capabilities = components.capabilities
     app.state.test_mode = components.test_mode
@@ -43,6 +45,47 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Turn", version="0.1.0", lifespan=lifespan)
 app.add_middleware(LocalOnlyMiddleware)
+
+
+@app.middleware("http")
+async def log_application_requests(request, call_next):
+    """Make request failures visible without changing the response path."""
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        logs = getattr(request.app.state, "logs", None)
+        if logs is not None:
+            await logs.emit(
+                _request_project_id(request),
+                kind="application.error",
+                action=f"{request.method} {request.url.path}",
+                message=str(error),
+                status="error",
+                source="http",
+            )
+        raise
+    if response.status_code >= 400:
+        logs = getattr(request.app.state, "logs", None)
+        if logs is not None:
+            await logs.emit(
+                _request_project_id(request),
+                kind="application.error",
+                action=f"{request.method} {request.url.path}",
+                message=f"HTTP {response.status_code}",
+                status="error",
+                source="http",
+            )
+    return response
+
+
+def _request_project_id(request):
+    for part in request.url.path.split("/"):
+        try:
+            return str(uuid.UUID(part))
+        except (ValueError, AttributeError):
+            continue
+
+
 app.include_router(api.router)
 
 if XTERM_DIR.exists():

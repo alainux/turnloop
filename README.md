@@ -166,12 +166,23 @@ turn create "Build an adaptive narrative engine" --harness codex --run
 turn projects
 turn graph PROJECT_UUID --tree
 turn run PROJECT_UUID
+turn logs PROJECT_UUID                 # stitched JSONL event history
+turn logs PROJECT_UUID --search error  # free-text search
+turn logs PROJECT_UUID --follow         # JSONL live feed; pipe to jq or another reader
 turn serve --port 8000
 ```
 
 When run from a project directory, `turn create` uses that current directory as
 the project directory. The UI/server uses `TURN_PROJECTS_DIR` for its default
 project root.
+
+Operational history is written as rotated JSONL files under `./turn/logs/`.
+Each file is project-scoped and named with the project id and UTC timestamp;
+the server and CLI stitch those files in order. Configure rotation with
+`TURN_LOG_MAX_RECORDS` or the Workspace settings panel. Records include graph
+transitions, state/configuration changes, agent CLI responses, harness launch
+and return details, decisions, and errors, so external JSONL tooling can read
+the same stream as Turn.
 
 ## Verification
 
@@ -234,7 +245,7 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Arbitrary node reject
 - [x] Architecture / Hygiene & Cleanups
 - [x] Skills / MCP via Capabilities / Agent Plugins 1.0
-- [ ] Live Logs / State & Graph Transitions
+- [x] Live Logs / State & Graph Transitions
 - [ ] Composable graph
 - [ ] Triggers
 - [ ] Decision-based Routing

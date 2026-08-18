@@ -604,6 +604,13 @@ class Runner:
         run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
+        await self._emit("harness.launch", project_id, {
+            "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
+            "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
+            "session_id": node.agent.session_id if node.agent else None, "attempt": run.attempt,
+            "timeout_seconds": ctx.timeout_seconds, "purpose": "plan", "repo_path": ctx.repo_path,
+            "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
+        })
 
         async def remember_live_session(session_id: str) -> None:
             if not session_id:
@@ -624,6 +631,7 @@ class Runner:
             if planner is None:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
+            await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
             if forbidden_session_id and plan.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
             if ctx.repo_path:
@@ -673,6 +681,7 @@ class Runner:
             )
             raise
         except Exception as error:
+            await self._emit("application.error", project_id, {"run_id": str(run.id), "node_id": str(node.id), "phase": "planner", "error": str(error)})
             await self.store.update_run(
                 run.id,
                 status=RunStatus.FAILED,
@@ -709,6 +718,13 @@ class Runner:
         ctx.attempt = run.attempt
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
+        await self._emit("harness.launch", project_id, {
+            "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
+            "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
+            "session_id": node.agent.session_id if node.agent else None, "attempt": run.attempt,
+            "timeout_seconds": ctx.timeout_seconds, "purpose": "execute", "repo_path": ctx.repo_path,
+            "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
+        })
 
         async def remember_live_session(session_id: str) -> None:
             if not session_id:
@@ -732,6 +748,7 @@ class Runner:
                 if root and root.run_policy else self.s.stall_timeout_seconds
             )
             result: WorkerResult = await self.exec_adapter.run(worker, ctx, timeout=timeout)
+            await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": result.outcome.value, "session_id": result.session_id, "summary": result.summary, "error": result.error, "usage": _dump(result.usage)})
             if forbidden_session_id and result.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
         except asyncio.TimeoutError:
@@ -749,6 +766,7 @@ class Runner:
             raise
         except Exception as e:
             logger.exception("worker failed for node %s", node.id)
+            await self._emit("application.error", project_id, {"run_id": str(run.id), "node_id": str(node.id), "phase": "worker", "error": str(e)})
             await self.store.update_run(
                 run.id, status=RunStatus.FAILED, outcome=Outcome.FAIL, error=str(e)
             )
@@ -1626,6 +1644,7 @@ class Runner:
         previous = fresh.agent.session_id
         if previous:
             await self.store.clear_agent_session(node_id)
+            await self._emit("decision.session_cleared", fresh.project_id, {"node_id": str(node_id), "session_id": previous, "reason": "fresh_run"})
         return previous
 
     async def _prepare_fresh_run(self, node_id: uuid.UUID) -> Node | None:
@@ -1651,6 +1670,19 @@ class Runner:
         await self.events.publish(
             {"type": etype, "project_id": str(project_id), "data": data}
         )
+
+    @staticmethod
+    def _launch_flags(node: Node, *, resume: bool) -> list[str]:
+        """Expose provider-neutral launch intent without leaking secrets."""
+        agent = node.agent
+        flags: list[str] = []
+        if agent is not None and agent.model:
+            flags.extend(["--model", agent.model])
+        if agent is not None and agent.reasoning:
+            flags.extend(["--reasoning", agent.reasoning.value])
+        if resume:
+            flags.append("--resume-session")
+        return flags
 
 
 class DirectExecutionAdapter:

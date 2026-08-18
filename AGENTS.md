@@ -85,7 +85,7 @@ Everything else is a capability plugin or a harness/runtime concern.
 
 ## Documentation
 
-- This document and the real implementation may diverge. This document is the only authoritative source of truth for the project.
+- This document is the main authoritative source of truth for the project.
 - The README.md roadmap section contains future work.
 
 ## Permissions
@@ -130,5 +130,13 @@ Everything else is a capability plugin or a harness/runtime concern.
 - https://vibe-stack.github.io/vibe3d
 
 
-# Common corrections and mistakes
-- Don't launch projects in /tmp, use the repo dir so we can inspect the state and artifacts
+# Directories and files
+- ~/.turn holds user global data
+- <root>/.turn holds config data for this workspace
+- `/projects/<project_name>/.turn` - that project’s state, runs, logs, etc.
+- For development, we use `./projects` for projects, and we also have `./turn` for configs, because we both use and develop the product. Don't be confused by this. 
+- Don't launch projects in /tmp, use the `./projects` repo dir instead, so we can inspect the state and artifacts
+
+# Cautionary notes
+
+- This document and the real implementation may diverge. When that happens, steer it back to match this document.

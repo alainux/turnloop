@@ -39,6 +39,7 @@ import { Graph as GraphCanvas } from "./components/Graph";
 import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
+import { LogsPanel } from "./components/LogsPanel";
 import { ModelControl } from "./components/ModelControl";
 import { deriveStatus } from "./state";
 
@@ -199,6 +200,7 @@ export default function App() {
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const { sidebarWidth, inspectorWidth, beginResize, adjustResize } = usePanelResize();
   const [nodeMenu, setNodeMenu] = useState<{
@@ -556,6 +558,11 @@ export default function App() {
               : "Ready"}
         </span>
         <span className="status-spacer" />
+        {projectId && (
+          <button className="status-action" onClick={() => setLogsOpen(true)} title="Open project logs">
+            <Icon name="file" /> Logs
+          </button>
+        )}
         {graphReady && graph && (
           <>
             <span>{graph.nodes.length} nodes</span>
@@ -563,6 +570,9 @@ export default function App() {
           </>
         )}
       </footer>
+      {logsOpen && projectId && (
+        <LogsPanel projectId={projectId} onClose={() => setLogsOpen(false)} />
+      )}
       {settingsOpen && (
         <Settings
           capabilities={capabilities}
@@ -1302,6 +1312,20 @@ function Settings({
               <option value="light">Light</option>
               <option value="system">System</option>
             </select>
+          </label>
+        </section>
+        <section className="settings-section">
+          <h3>Logging</h3>
+          <p className="settings-hint">Rotate each project JSONL file after this many records.</p>
+          <label className="field">
+            <span>Maximum records per file</span>
+            <input
+              type="number"
+              min={1}
+              max={1000000}
+              value={Number(settings.log_max_records ?? 1000)}
+              onChange={(event) => setSettings({ ...settings, log_max_records: Number(event.target.value) })}
+            />
           </label>
         </section>
         <section className="settings-section">

@@ -48,6 +48,7 @@ from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids
 from turn.db.state import ProjectState
 from turn.graph.logic import GraphWalker
 from turn.graph.mutations import append_artifacts, apply_plan as apply_graph_plan, merge_document_refs
+from turn.logging import EventLog
 
 PLANNER_EXECUTOR = "planner"
 STATE_VERSION = 3
@@ -79,6 +80,7 @@ class Store:
         data_dir: str | Path | None = None,
         config_path: str | Path | None = None,
         projects_dir: str | Path | None = None,
+        logs: EventLog | None = None,
     ):
         raw = str(data_dir or location or (Path.cwd() / "turn"))
         self.data_dir = self._resolve_data_dir(raw)
@@ -94,6 +96,11 @@ class Store:
         self._loaded = False
         self._write_lock = asyncio.Lock()
         self._project_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self.logs = logs
+
+    async def _log(self, project_id: uuid.UUID | str | None, **kwargs: Any) -> None:
+        if self.logs is not None:
+            await self.logs.emit(project_id, **kwargs)
 
     @staticmethod
     def _resolve_data_dir(raw: str) -> Path:
@@ -349,6 +356,7 @@ class Store:
         self._states[root_id] = state
         await self._persist_project(root_id)
         await self._persist_config()
+        await self._log(root_id, kind="project.created", action="create_project", message="project created", data={"objective": prompt, "repo_path": repo_path})
         return node.model_copy(deep=True)
 
     async def list_projects(self) -> list[Node]:
@@ -363,6 +371,7 @@ class Store:
             self._states.pop(project_id, None)
             self._project_paths.pop(project_id, None)
             await self._persist_config()
+        await self._log(project_id, kind="project.deleted", action="delete_project", message="project deleted")
 
     async def clear_projects(self) -> None:
         self._states.clear()
@@ -445,16 +454,26 @@ class Store:
     async def _save_node(self, node: Node) -> Node:
         if node.project_id not in self._states:
             return node
+        previous = self._states[node.project_id].nodes.get(node.id)
         saved = node.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
         self._states[node.project_id].nodes[node.id] = saved
         await self._persist_project(node.project_id)
+        if previous is not None:
+            before = previous.model_dump(mode="json")
+            after = saved.model_dump(mode="json")
+            changed = {key: {"from": before.get(key), "to": after.get(key)} for key in before if key != "updated_at" and before.get(key) != after.get(key)}
+            if changed:
+                await self._log(node.project_id, kind="state.changed", action="node.update", message=f"node {node.id} state changed", data={"node_id": str(node.id), "changes": changed})
         return saved.model_copy(deep=True)
 
     async def set_status(self, node_id: uuid.UUID, status: NodeStatus) -> Optional[Node]:
         node = await self.get_node(node_id)
         if node is None:
             return None
+        previous = node.status
         node.status = status
+        if previous != status:
+            await self._log(node.project_id, kind="graph.transition", action="node.status", message=f"{previous.value} -> {status.value}", data={"node_id": str(node_id), "from": previous.value, "to": status.value})
         return await self._save_node(node)
 
     async def set_status_if_current(
@@ -470,6 +489,8 @@ class Store:
                 return None
             node = current.model_copy(deep=True)
             node.status = status
+            if current.status != status:
+                await self._log(project_id, kind="graph.transition", action="node.status", message=f"{current.status.value} -> {status.value}", data={"node_id": str(node_id), "from": current.status.value, "to": status.value})
             return await self._save_node(node)
 
     async def set_agent_status(
@@ -555,7 +576,10 @@ class Store:
             node.agent = agent.model_copy(deep=True)
         if node.agent is None:
             node.agent = AgentConfig()
+        previous = node.agent.session_id
         node.agent.session_id = session_id
+        if previous != session_id:
+            await self._log(node.project_id, kind="decision.session", action="session.cleared" if session_id is None else "session.set", message="agent session cleared" if session_id is None else "agent session saved", data={"node_id": str(node_id), "previous_session_id": previous, "session_id": session_id})
         return await self._save_node(node)
 
     async def clear_agent_session(self, node_id: uuid.UUID) -> Optional[Node]:
@@ -594,8 +618,11 @@ class Store:
         return self._settings.get(key, default)
 
     async def set_setting(self, key: str, value: str) -> None:
+        previous = self._settings.get(key)
         self._settings[key] = value
         await self._persist_config()
+        if previous != value:
+            await self._log(None, kind="configuration.changed", action=f"settings.{key}", message=f"setting {key} changed", data={"key": key, "from": previous, "to": value})
 
     # -- graph construction ----------------------------------------------
 
@@ -624,6 +651,7 @@ class Store:
             edge = Edge(src=parent_id, dst=node.id, type=EdgeType.CONTAINS)
             state.edges[edge.id] = edge
         await self._persist_project(project_id)
+        await self._log(project_id, kind="graph.transition", action="node.created", message="graph node created", data={"node_id": str(node.id), "parent_id": str(parent_id) if parent_id else None, "objective": objective})
         return node.model_copy(deep=True)
 
     async def edit_node(
@@ -717,6 +745,7 @@ class Store:
             for capability_id in capability_ids_for_agent_type(node.agent.type_id):
                 catalog.load_into_project(capability_id, project_root)
         await self._persist_project(parent.project_id)
+        await self._log(parent.project_id, kind="graph.transition", action="plan.applied", message=f"plan applied; created {len(created)} node(s)", data={"parent_id": str(parent.id), "created_node_ids": [str(item.id) for item in created]})
         return created
 
     # -- runs -------------------------------------------------------------
@@ -734,6 +763,7 @@ class Store:
         )
         self._state(node.project_id).runs[run.id] = run
         await self._persist_project(node.project_id)
+        await self._log(node.project_id, kind="harness.run", action="run.created", message="harness run created", data={"run_id": str(run.id), "node_id": str(node.id), "worker": worker, "attempt": attempt, "session_id": run.session_id})
         return run.model_copy(deep=True)
 
     def _project_for_run(self, run_id: uuid.UUID) -> tuple[uuid.UUID, Run] | None:
@@ -780,6 +810,7 @@ class Store:
         if status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED):
             run.ended_at = datetime.now(timezone.utc)
         await self._persist_project(project_id)
+        await self._log(project_id, kind="harness.return", action="run.updated", message=summary or error or f"run {run.status.value}", status="error" if run.status is RunStatus.FAILED else "ok" if run.status is RunStatus.COMPLETE else "info", data={"run_id": str(run.id), "node_id": str(run.node_id), "status": run.status.value, "outcome": _jsonable(run.outcome), "error": run.error, "summary": run.summary, "session_id": run.session_id, "usage": _jsonable(run.usage)})
         return run.model_copy(deep=True)
 
     async def get_runs(self, node_id: uuid.UUID) -> list[Run]:
@@ -830,6 +861,8 @@ class Store:
         state = self._states[project_id]
         artifacts = append_artifacts(state, node_id, specs)
         await self._persist_project(project_id)
+        if artifacts:
+            await self._log(project_id, kind="state.changed", action="artifact.created", message=f"created {len(artifacts)} artifact(s)", data={"node_id": str(node_id), "artifact_ids": [str(item.id) for item in artifacts]})
         return [artifact.model_copy(deep=True) for artifact in artifacts]
 
     async def add_document_refs(self, node_id: uuid.UUID, refs: list[DocumentRef]) -> list[Artifact]:
@@ -849,6 +882,7 @@ class Store:
             return []
         node.document_refs = merge_document_refs(node.document_refs, refs)
         await self._persist_project(project_id)
+        await self._log(project_id, kind="state.changed", action="document_refs.updated", message="document references updated", data={"node_id": str(node_id), "references": [item.model_dump(mode="json") for item in refs]})
         return []
 
     async def get_artifacts(self, node_id: uuid.UUID) -> list[Artifact]:
@@ -886,6 +920,7 @@ class Store:
             if artifact_id in state.artifacts
         ]
         await self._persist_project(project_id)
+        await self._log(project_id, kind="state.changed", action="artifacts.cleared", message=f"cleared {len(removed)} generated artifact(s)", data={"node_id": str(node_id), "artifact_ids": [str(item) for item in removed]})
         return removed
 
     async def get_artifact(self, artifact_id: uuid.UUID) -> Optional[Artifact]:

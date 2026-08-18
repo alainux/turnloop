@@ -117,6 +117,9 @@ class Settings:
     delay_between_jobs_ms: int = field(
         default_factory=lambda: int(os.getenv("TURN_JOB_DELAY_MS", "0"))
     )
+    log_max_records: int = field(
+        default_factory=lambda: max(1, int(os.getenv("TURN_LOG_MAX_RECORDS", "1000")))
+    )
     retry_backoff_ms: int = field(
         default_factory=lambda: int(os.getenv("TURN_RETRY_BACKOFF_MS", "750"))
     )

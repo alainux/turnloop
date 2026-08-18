@@ -155,6 +155,7 @@ class SettingsUpdate(BaseModel):
     retry_backoff_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     delay_between_jobs_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     retry_choked_models: Optional[bool] = None
+    log_max_records: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     agent_defaults: Optional[dict[str, dict[str, str]]] = None
 
 
@@ -397,6 +398,7 @@ async def get_settings(request: Request):
         "retry_backoff_ms": app_settings.retry_backoff_ms,
         "delay_between_jobs_ms": app_settings.delay_between_jobs_ms,
         "retry_choked_models": app_settings.retry_choked_models,
+        "log_max_records": int(await store.get_setting("log_max_records", str(app_settings.log_max_records))),
         "projects_dir": str(Path(app_settings.projects_dir).resolve()),
     }
 
@@ -441,13 +443,69 @@ async def update_settings(body: SettingsUpdate, request: Request):
         "retry_backoff_ms": "retry_backoff_ms",
         "delay_between_jobs_ms": "delay_between_jobs_ms",
         "retry_choked_models": "retry_choked_models",
+        "log_max_records": "log_max_records",
     }
     for incoming, target in live_fields.items():
         value = getattr(body, incoming)
         if value is not None:
             setattr(app_settings, target, value)
             await store.set_setting(incoming, str(value))
+            if incoming == "log_max_records":
+                logs = getattr(request.app.state, "logs", None)
+                if logs is not None:
+                    logs.set_max_records(value)
     return {"ok": True}
+
+
+@router.get("/api/projects/{project_id}/logs")
+async def get_project_logs(project_id: str, request: Request, search: str = "", limit: int = 5000):
+    """Return one stitched project history, optionally filtered by free text."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    records = await asyncio.to_thread(
+        request.app.state.logs.read, pid, search=search, limit=max(1, min(limit, 100_000))
+    )
+    return {
+        "project_id": project_id,
+        "records": records,
+        "max_records": request.app.state.logs.max_records,
+    }
+
+
+@router.get("/api/projects/{project_id}/logs/stream")
+async def stream_project_logs(project_id: str, request: Request, search: str = ""):
+    """Stream a stitched history followed by newly written records."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    logs = request.app.state.logs
+
+    async def generator():
+        for record in await asyncio.to_thread(logs.read, pid, search=search, limit=100_000):
+            yield _sse({"type": "log", "record": record})
+        queue = logs.subscribe()
+        needle = search.casefold().strip()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    record = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if str(record.get("project_id")) != project_id:
+                    continue
+                if needle and needle not in json.dumps(record, default=str).casefold():
+                    continue
+                yield _sse({"type": "log", "record": record})
+        finally:
+            logs.unsubscribe(queue)
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
 
 
 @router.get("/api/capabilities")

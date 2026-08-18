@@ -16,6 +16,7 @@ from turn.config import settings
 from turn.contracts.dag import compact_validation_error, validate_agent_submission
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, Node, ReasoningLevel, RunPolicy
+from turn.logging import EventLog
 
 
 def parser() -> argparse.ArgumentParser:
@@ -60,6 +61,12 @@ def parser() -> argparse.ArgumentParser:
     graph.add_argument("--tree", action="store_const", dest="format", const="tree")
     run = sub.add_parser("run", help="execute a project headlessly until settled")
     run.add_argument("project_id", type=uuid.UUID)
+    logs = sub.add_parser("logs", help="read a project's stitched JSONL event history")
+    logs.add_argument("project_id", nargs="?", type=uuid.UUID, help="defaults to the project in the current directory")
+    logs.add_argument("--search", default="", help="free-text search across structured records")
+    logs.add_argument("--follow", action="store_true", help="continue polling for new records")
+    logs.add_argument("--format", choices=["jsonl", "text"], default="jsonl")
+    logs.add_argument("--poll", type=float, default=0.25)
     agent = sub.add_parser("agent", help="small local protocol used by a running agent")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     status = agent_sub.add_parser("status", help="publish the agent's current state")
@@ -119,6 +126,96 @@ def _read_agent_object(args) -> dict:
     return value
 
 
+def _configured_log_limit() -> int:
+    """Read the durable limit without starting the server runtime."""
+    config_path = Path(os.getenv("TURN_DATA_DIR", settings.data_dir)).expanduser() / "config.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        value = raw.get("settings", {}).get("log_max_records")
+        return max(1, int(value)) if value is not None else settings.log_max_records
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return settings.log_max_records
+
+
+def _cli_project_id(args: argparse.Namespace | None = None) -> str | None:
+    """Resolve the project identity carried by an agent CLI invocation."""
+    explicit = os.getenv("TURN_PROJECT_ID")
+    if explicit:
+        return explicit
+
+    project_argument = getattr(args, "project_id", None) if args is not None else None
+    if project_argument is not None:
+        return str(project_argument)
+
+    repo = os.getenv("TURN_REPO")
+    if not repo:
+        return None
+    state_path = Path(repo).expanduser() / ".turn" / "state.json"
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    project_id = raw.get("project_id")
+    if project_id:
+        return str(project_id)
+    roots = [
+        item for item in raw.get("nodes", [])
+        if isinstance(item, dict) and item.get("parent_id") is None
+    ]
+    if len(roots) == 1 and roots[0].get("project_id"):
+        return str(roots[0]["project_id"])
+    return None
+
+
+def _emit_cli_event(
+    project_id: str | None,
+    *,
+    action: str,
+    status: str,
+    message: str,
+    data: dict[str, object] | None = None,
+) -> None:
+    """Write a best-effort event for a command executed by an agent."""
+    try:
+        EventLog(
+            os.getenv("TURN_DATA_DIR", settings.data_dir),
+            _configured_log_limit(),
+        ).emit_sync(
+            project_id,
+            kind="agent.action",
+            action=action,
+            status=status,
+            source="cli",
+            message=message,
+            data=data,
+        )
+    except Exception:
+        # An operational log must never change the CLI result.
+        return
+
+
+def _cli_action(args: argparse.Namespace) -> str:
+    parts = [str(args.command)]
+    for name in ("agent_command", "capabilities_command", "project_command"):
+        value = getattr(args, name, None)
+        if value:
+            parts.append(str(value))
+    return "cli." + ".".join(parts)
+
+
+def _cli_invocation_data(args: argparse.Namespace) -> dict[str, object]:
+    """Return safe command metadata without recording submitted payloads."""
+    data: dict[str, object] = {
+        "node_id": os.getenv("TURN_NODE_ID"),
+        "command": _cli_action(args),
+    }
+    for name in ("kind", "state", "query", "capability", "format", "project_id"):
+        value = getattr(args, name, None)
+        if value is not None:
+            data[name] = value
+    return data
+
+
 def _write_agent_json(path: Path, value: dict) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -143,9 +240,14 @@ def agent_command(args) -> int:
     internal record. Agents never write status or outcome files themselves;
     terminal output is never used as an API.
     """
+    logger = EventLog(os.getenv("TURN_DATA_DIR", settings.data_dir), _configured_log_limit())
+    project_id = _cli_project_id(args)
+    action = f"agent.{args.agent_command}"
+    logger.emit_sync(project_id, kind="agent.action", action=action, status="started", source="cli", message="agent CLI action started", data=_cli_invocation_data(args))
     if args.agent_command == "status":
         raw = os.getenv("TURN_STATUS_FILE")
         if not raw:
+            logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message="TURN_STATUS_FILE is not set", data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID")})
             raise SystemExit("TURN_STATUS_FILE is not set; this command must run inside a Turn agent")
         path = Path(raw).expanduser()
         _write_agent_json(path, {
@@ -153,9 +255,14 @@ def agent_command(args) -> int:
             "state": args.state,
             "message": args.message,
         })
+        logger.emit_sync(project_id, kind="agent.action", action=action, status="ok", source="cli", message="agent status published", data={"node_id": os.getenv("TURN_NODE_ID"), "state": args.state, "message": args.message, "response_status": "accepted"})
         return 0
     kind = "verification" if args.agent_command == "verify" else args.kind
-    value = _read_agent_object(args)
+    try:
+        value = _read_agent_object(args)
+    except SystemExit as error:
+        logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=str(error), data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID")})
+        raise
     try:
         validated = validate_agent_submission(kind, value)
         plan_to_validate = validated if kind == "plan" else getattr(validated, "children", None)
@@ -188,8 +295,13 @@ def agent_command(args) -> int:
             if isinstance(error, ValidationError)
             else str(error)
         )
+        logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=detail, data={"node_id": os.getenv("TURN_NODE_ID"), "kind": kind, "response_status": "rejected"})
         raise SystemExit(f"invalid {kind} submission: {detail}") from error
-    target = _agent_protocol_path(kind)
+    try:
+        target = _agent_protocol_path(kind)
+    except SystemExit as error:
+        logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=str(error), data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID"), "kind": kind})
+        raise
     _write_agent_json(target, value)
     status_path = os.getenv("TURN_STATUS_FILE")
     if status_path:
@@ -198,7 +310,102 @@ def agent_command(args) -> int:
             "state": "complete" if kind in {"result", "verification"} else "working",
             "message": "submission received",
         })
+    logger.emit_sync(project_id, kind="agent.action", action=action, status="ok", source="cli", message="agent submission published", data={"node_id": os.getenv("TURN_NODE_ID"), "kind": kind, "response_status": "accepted"})
     return 0
+
+
+def logs_command(args) -> int:
+    project_id = args.project_id
+    if project_id is None:
+        state_file = discover_project_state()
+        raw = json.loads(state_file.read_text(encoding="utf-8"))
+        project_id = uuid.UUID(str(raw.get("project_id") or next(item["project_id"] for item in raw.get("nodes", []) if item.get("parent_id") is None)))
+    log = EventLog(os.getenv("TURN_DATA_DIR", settings.data_dir), _configured_log_limit())
+    records = log.follow(project_id, search=args.search, poll_seconds=max(0.05, args.poll)) if args.follow else iter(log.read(project_id, search=args.search, limit=100_000))
+    try:
+        for record in records:
+            if args.format == "text":
+                print(f"{record.get('timestamp', '')} {record.get('status', 'info'):>5} {record.get('kind', '')}: {record.get('message', '')}", flush=True)
+            else:
+                print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def capabilities_command(args) -> int:
+    """Run a capability CLI action and record its response status."""
+    from turn.capabilities.catalog import CapabilityCatalog
+    from turn.capabilities.plugin import load_capability_plugin
+
+    project_id = _cli_project_id(args)
+    action = f"capabilities.{args.capabilities_command}"
+    invocation = _cli_invocation_data(args)
+    _emit_cli_event(
+        project_id,
+        action=action,
+        status="started",
+        message="capability CLI action started",
+        data=invocation,
+    )
+    catalog = CapabilityCatalog(
+        Path(os.getenv("TURN_DATA_DIR", settings.data_dir)) / "capabilities"
+    )
+
+    def finish(data: dict[str, object]) -> int:
+        _emit_cli_event(
+            project_id,
+            action=action,
+            status="ok",
+            message="capability CLI action completed",
+            data={**invocation, **data, "response_status": "accepted"},
+        )
+        return 0
+
+    try:
+        if args.capabilities_command == "list":
+            entries = [entry.as_dict() for entry in catalog.list()]
+            print(json.dumps(entries, indent=2))
+            return finish({"result_count": len(entries)})
+        if args.capabilities_command == "search":
+            entries = [entry.as_dict() for entry in catalog.search(args.query)]
+            print(json.dumps(entries, indent=2))
+            return finish({"result_count": len(entries)})
+        if args.capabilities_command == "show":
+            candidate = Path(args.capability).expanduser()
+            plugin = load_capability_plugin(candidate) if candidate.is_dir() else catalog.get(args.capability)
+            print(json.dumps({
+                "id": plugin.id,
+                "version": plugin.version,
+                "description": plugin.description,
+                "path": str(plugin.path),
+                "skills": [{"name": item.name, "description": item.description, "path": str(item.path)} for item in plugin.skills],
+                "mcps": [{"name": item.name, "config": item.config} for item in plugin.mcp_servers],
+            }, indent=2))
+            return finish({"capability_id": plugin.id})
+        if args.capabilities_command == "delete":
+            deleted = catalog.delete(args.capability)
+            print(json.dumps({"id": args.capability, "deleted": True, "catalog_path": str(deleted)}, indent=2))
+            return finish({"capability_id": args.capability, "deleted": True})
+
+        candidate = Path(args.capability).expanduser()
+        if candidate.is_dir():
+            plugin = catalog.import_directory(candidate)
+            print(json.dumps({"catalog_path": str(plugin.path), "id": plugin.id}, indent=2))
+            return finish({"capability_id": plugin.id, "operation": "import"})
+        project_root = os.getenv("TURN_REPO") or str(Path.cwd())
+        target = catalog.load_into_project(args.capability, project_root)
+        print(json.dumps({"project_path": str(target), "id": args.capability}, indent=2))
+        return finish({"capability_id": args.capability, "project_path": str(target), "operation": "load"})
+    except BaseException as error:
+        _emit_cli_event(
+            project_id,
+            action=action,
+            status="error",
+            message=str(error),
+            data={**invocation, "response_status": "error", "error_type": type(error).__name__},
+        )
+        raise
 
 
 def discover_project_state(start: Path | None = None) -> Path:
@@ -324,9 +531,44 @@ def local_project_info_command(args) -> int:
     return 0
 
 
+def _run_logged_cli(args: argparse.Namespace) -> int:
+    """Run a non-protocol CLI command with an outcome event."""
+    project_id = _cli_project_id(args)
+    action = _cli_action(args)
+    invocation = _cli_invocation_data(args)
+    _emit_cli_event(
+        project_id,
+        action=action,
+        status="started",
+        message="CLI command started",
+        data=invocation,
+    )
+    try:
+        result = asyncio.run(async_main(args))
+    except BaseException as error:
+        _emit_cli_event(
+            project_id,
+            action=action,
+            status="error",
+            message=str(error),
+            data={**invocation, "response_status": "error", "error_type": type(error).__name__},
+        )
+        raise
+    _emit_cli_event(
+        project_id,
+        action=action,
+        status="ok",
+        message="CLI command completed",
+        data={**invocation, "response_status": "accepted", "return_code": result},
+    )
+    return result
+
+
 async def async_main(args) -> int:
     if args.command == "agent":
         return agent_command(args)
+    if args.command == "logs":
+        return logs_command(args)
     if args.command == "graph":
         return await local_graph_command(args)
     if args.command == "project":
@@ -344,43 +586,7 @@ async def async_main(args) -> int:
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "capabilities":
-        from turn.capabilities.catalog import CapabilityCatalog
-        from turn.capabilities.plugin import load_capability_plugin
-
-        catalog = CapabilityCatalog(
-            Path(os.getenv("TURN_DATA_DIR", settings.data_dir)) / "capabilities"
-        )
-        if args.capabilities_command == "list":
-            print(json.dumps([entry.as_dict() for entry in catalog.list()], indent=2))
-            return 0
-        if args.capabilities_command == "search":
-            print(json.dumps([entry.as_dict() for entry in catalog.search(args.query)], indent=2))
-            return 0
-        if args.capabilities_command == "show":
-            candidate = Path(args.capability).expanduser()
-            plugin = load_capability_plugin(candidate) if candidate.is_dir() else catalog.get(args.capability)
-            print(json.dumps({
-                "id": plugin.id,
-                "version": plugin.version,
-                "description": plugin.description,
-                "path": str(plugin.path),
-                "skills": [{"name": item.name, "description": item.description, "path": str(item.path)} for item in plugin.skills],
-                "mcps": [{"name": item.name, "config": item.config} for item in plugin.mcp_servers],
-            }, indent=2))
-            return 0
-        if args.capabilities_command == "delete":
-            deleted = catalog.delete(args.capability)
-            print(json.dumps({"id": args.capability, "deleted": True, "catalog_path": str(deleted)}, indent=2))
-            return 0
-        candidate = Path(args.capability).expanduser()
-        if candidate.is_dir():
-            plugin = catalog.import_directory(candidate)
-            print(json.dumps({"catalog_path": str(plugin.path), "id": plugin.id}, indent=2))
-        else:
-            project_root = os.getenv("TURN_REPO") or str(Path.cwd())
-            target = catalog.load_into_project(args.capability, project_root)
-            print(json.dumps({"project_path": str(target), "id": args.capability}, indent=2))
-        return 0
+        return capabilities_command(args)
     async with TurnCore(settings) as core:
         if args.command == "projects":
             projects = await core.store.list_projects()
@@ -416,7 +622,9 @@ def main() -> None:
             port=getattr(args, "port", 8000),
         )
         return
-    raise SystemExit(asyncio.run(async_main(args)))
+    if args.command in {"agent", "capabilities", "logs"}:
+        raise SystemExit(asyncio.run(async_main(args)))
+    raise SystemExit(_run_logged_cli(args))
 
 
 if __name__ == "__main__":
