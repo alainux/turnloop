@@ -238,15 +238,18 @@ async def test_project_document_endpoint_is_scoped_and_serves_markdown(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_builtin_skill_endpoint_serves_the_actual_skill_file():
+async def test_capability_catalog_serves_the_actual_skill_file():
     app = FastAPI()
     app.include_router(router)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        served = await client.get("/api/skills/turn-executing")
+        catalog = await client.get("/api/capability-catalog/turn-executing")
+        assert catalog.status_code == 200
+        source = catalog.json()["skills"][0]["source"]
+        served = await client.get(source)
         assert served.status_code == 200
         assert "# Turn executing skill" in served.text
-        missing = await client.get("/api/skills/not-a-skill")
+        missing = await client.get("/api/capability-catalog/not-a-capability")
         assert missing.status_code == 404

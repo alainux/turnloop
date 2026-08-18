@@ -15,21 +15,19 @@ from turn.workers.interactive import (
     prepare_result_file,
     read_codex_session_usage,
     read_result_file,
-    result_handoff,
     run_until_result,
 )
 from turn.tests.fakes import FakeHerdrAdapter
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 from turn.workers.terminal import HerdrPtyTransport, LocalPtyTransport, TerminalResult
 from turn.domain.schemas import AgentConfig
 
 
 @pytest.fixture(autouse=True)
-def install_builtin_skills(tmp_path):
+def load_builtin_capability_plugins(tmp_path):
     # Direct worker tests bypass the planner boundary; production workers only
     # receive projects whose planner has already installed these files.
-    for skill_id in SKILLS:
-        install_builtin_skill(skill_id, tmp_path)
+    load_builtin_capabilities(tmp_path)
 
 
 async def test_injected_command_clears_partial_shell_input(tmp_path, monkeypatch):
@@ -44,25 +42,6 @@ async def test_injected_command_clears_partial_shell_input(tmp_path, monkeypatch
     assert transport.adapter.run_commands[-1][1] == (
         "export TURN_PROJECT_ID=project; codex --model test"
     )
-
-
-def test_agent_handoff_prompt_uses_shell_safe_cli_stdin_submission():
-    for plan in (False, True):
-        prompt = result_handoff(plan=plan)
-        assert "agent submit" in prompt
-        assert "agent submit --kind" in prompt
-        assert "--stdin <<'TURN_PAYLOAD'" in prompt
-        assert "TURN_PAYLOAD\n" in prompt
-        assert "filesystem output as a protocol" in prompt
-        assert "TURN_HANDOFF_FILE" not in prompt
-        assert "TURN_STATUS_FILE" not in prompt
-        assert "--file" not in prompt
-        assert "--payload" not in prompt
-        assert "TURN_CLI agent" not in prompt
-        assert ".turn/" not in prompt
-        if plan:
-            assert '"artifacts":["ARCHITECTURE.md"]' in prompt
-            assert "`path` is not a" in prompt
 
 
 def test_worker_environment_uses_the_inherited_turn_command(tmp_path):
@@ -81,14 +60,12 @@ def test_worker_environment_uses_the_inherited_turn_command(tmp_path):
     assert "submit" in completed.stdout
 
 
-def test_worker_environment_rejects_an_unprocured_external_skill(tmp_path):
+def test_worker_environment_rejects_an_unloaded_capability(tmp_path):
     node_id = uuid.uuid4()
     handoff = prepare_result_file(str(tmp_path), node_id, "result")
-    agent = AgentConfig(
-        skill_ids=["https://github.com/example/skills/tree/main/visual-qa"]
-    )
+    agent = AgentConfig(capabilities=["visual-qa"])
 
-    with pytest.raises(ValueError, match="not installed by the planner"):
+    with pytest.raises(ValueError, match="not loaded"):
         agent_environment(str(tmp_path), node_id, "result", handoff, agent=agent)
 
 
@@ -100,12 +77,6 @@ def test_verifier_environment_uses_verification_handoff(tmp_path):
     assert handoff.name.endswith(".verification.json")
     assert environment["TURN_HANDOFF_KIND"] == "verification"
     assert environment["TURN_HANDOFF_FILE"] == str(handoff)
-    prompt = result_handoff(verification=True)
-    assert "agent verify --stdin <<'TURN_PAYLOAD'" in prompt
-    assert "agent submit --kind verification" not in prompt
-    assert "TURN_CLI agent" not in prompt
-
-
 def test_stdin_handoff_prompt_is_safe_for_apostrophes(tmp_path):
     handoff = tmp_path / "node.result.json"
     environment = os.environ.copy()
@@ -224,7 +195,8 @@ async def test_codex_verifier_round_trips_verification_handoff(tmp_path, monkeyp
     async def fake_run_until_result(_transport, _node_id, _command, **kwargs):
         assert kwargs["environment"]["TURN_HANDOFF_KIND"] == "verification"
         assert kwargs["result_path"].name.endswith(".verification.json")
-        assert "agent verify --stdin" in _command[-1]
+        assert "agent verify --stdin" not in _command[-1]
+        assert "TURN_CONTEXT" in _command[-1]
         assert "initial_input" not in kwargs
         kwargs["result_path"].write_text(
             '{"decision":"REJECT","summary":"The game is not playable",'

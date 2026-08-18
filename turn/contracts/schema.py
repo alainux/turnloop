@@ -5,6 +5,7 @@ from turn.domain.schemas import (
     Agent,
     Artifact,
     ArtifactSpec,
+    CapabilityStatus,
     Edge,
     EdgeSpec,
     FlowEdge,
@@ -28,6 +29,7 @@ from turn.domain.schemas import (
 
 PUBLIC_DOMAIN_MODELS = {
     "Agent": Agent,
+    "CapabilityStatus": CapabilityStatus,
     "Planner": Planner,
     "Executor": Executor,
     "Integrator": Integrator,

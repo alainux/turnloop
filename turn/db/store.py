@@ -42,14 +42,15 @@ from turn.domain.schemas import (
     RunPolicy,
     RunStatus,
     Usage,
-    SETUP_SKILL_ID,
 )
+from turn.capabilities.catalog import CapabilityCatalog
+from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
 from turn.db.state import ProjectState
 from turn.graph.logic import GraphWalker
 from turn.graph.mutations import append_artifacts, apply_plan as apply_graph_plan, merge_document_refs
 
 PLANNER_EXECUTOR = "planner"
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def _concise_title(prompt: str, limit: int = 72) -> str:
@@ -236,20 +237,6 @@ class Store:
             artifact_keys.add(key)
             state.artifacts[artifact.id] = artifact
         for node in state.nodes.values():
-            if node.parent_id is None and node.agent is not None:
-                # The root setup contract no longer includes imagegen. Older
-                # projects were persisted with it, and validating a later
-                # planner submission against that stale list makes an
-                # otherwise valid graph edit fail before it reaches the
-                # mutation layer.
-                skill_ids = [skill_id for skill_id in node.agent.skill_ids if skill_id != "imagegen"]
-                skills = [path for path in node.agent.skills if Path(path).name != "imagegen.md"]
-                if skill_ids != node.agent.skill_ids or skills != node.agent.skills:
-                    # Agent assignment validation restores built-in type
-                    # skills, so this migration must bypass that validator.
-                    object.__setattr__(node.agent, "skill_ids", skill_ids)
-                    object.__setattr__(node.agent, "skills", skills)
-                    normalized = True
             filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state.artifacts]
             if filtered != node.artifact_refs:
                 node.artifact_refs = filtered
@@ -318,22 +305,19 @@ class Store:
         root_config = agent.model_copy(deep=True) if agent else AgentConfig()
         # Initial setup is a root-project concern. Keep it as an explicit
         # selection so nested planner nodes receive only their normal planner
-        # contract plus the domain skills chosen for their subtree.
-        root_config.skill_ids = list(dict.fromkeys([
-            *root_config.skill_ids,
-            SETUP_SKILL_ID,
+        # contract plus the capabilities chosen for their subtree.
+        root_config.capabilities = list(dict.fromkeys([
+            *root_config.capabilities,
+            SETUP_CAPABILITY_ID,
         ]))
         root_agent = root_config.as_type(AgentType.PLANNER)
-        # The root setup agent interprets the request and chooses the board; it
-        # does not need the planner-only conceptual image-generation skill.
-        # Nested planners are specialized through ``as_type`` below and retain
-        # the normal planner contract when their scope needs it.
-        root_agent.skill_ids = [
-            skill_id for skill_id in root_agent.skill_ids if skill_id != "imagegen"
-        ]
-        root_agent.skills = [
-            path for path in root_agent.skills if Path(path).name != "imagegen.md"
-        ]
+        # ``turn-setup`` belongs to the project root only. ``as_type`` keeps
+        # role contracts exact, so restore this root-only capability after
+        # specialization rather than allowing it to cascade to descendants.
+        root_agent.capabilities = list(dict.fromkeys([
+            *root_agent.capabilities,
+            SETUP_CAPABILITY_ID,
+        ]))
         root_agent.session_id = None
         explicit_name = name.strip() if name and name.strip() else None
         display_name = explicit_name or _concise_title(prompt)
@@ -354,21 +338,11 @@ class Store:
             run_policy=policy,
             repo_path=repo_path,
         )
-        # Node validation restores type defaults, so apply the root setup
-        # contract once more after construction before persisting the node.
-        if node.agent is not None:
-            object.__setattr__(
-                node.agent,
-                "skill_ids",
-                [skill_id for skill_id in node.agent.skill_ids if skill_id != "imagegen"],
-            )
-            object.__setattr__(
-                node.agent,
-                "skills",
-                [path for path in node.agent.skills if Path(path).name != "imagegen.md"],
-            )
         project_path = Path(repo_path).expanduser().resolve() if repo_path else self.data_dir / "projects" / f"proj-{root_id.hex[:8]}"
         project_path.mkdir(parents=True, exist_ok=True)
+        catalog = CapabilityCatalog(self.data_dir / "capabilities")
+        for capability_id in node.agent.capabilities:
+            catalog.load_into_project(capability_id, project_path)
         self._project_paths[root_id] = project_path
         state = self._empty_state()
         state.nodes[node.id] = node
@@ -680,7 +654,7 @@ class Store:
                 # Inspector saves usually send the editable configuration
                 # without the runtime session id. Do not accidentally erase
                 # the resumable conversation while changing model, reasoning,
-                # skills, or tools.
+                # capabilities or tools.
                 updated_agent.session_id = node.agent.session_id
             node.agent = updated_agent
             if node.executor == PLANNER_EXECUTOR:
@@ -731,7 +705,17 @@ class Store:
 
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
         """Persist a validated graph mutation without interpreting its policy."""
+        project_root = self.project_path(parent.project_id)
+        if plan.nodes and project_root is None:
+            raise RuntimeError(f"project directory is not known: {parent.project_id}")
         created = apply_graph_plan(self._state(parent.project_id), parent, plan)
+        # Role capabilities are part of Turn's agent contract.  They are
+        # project-scoped packages, so materialize them as nodes are created;
+        # user-selected capabilities remain subject to plan validation.
+        catalog = CapabilityCatalog(self.data_dir / "capabilities")
+        for node in created:
+            for capability_id in capability_ids_for_agent_type(node.agent.type_id):
+                catalog.load_into_project(capability_id, project_root)
         await self._persist_project(parent.project_id)
         return created
 

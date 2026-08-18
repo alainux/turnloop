@@ -30,13 +30,12 @@ from turn.workers.filesystem import init_project_directory
 from turn.workers.registry import WorkerRegistry
 from turn.workers.planner import HeuristicPlanner
 from turn.tests.fakes import FakeHerdrAdapter
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 
 
-def seed_project_skills(store: Store, project_id: uuid.UUID) -> None:
+def seed_project_capabilities(store: Store, project_id: uuid.UUID) -> None:
     project_root = store._project_paths[project_id]
-    for skill_id in SKILLS:
-        install_builtin_skill(skill_id, project_root)
+    load_builtin_capabilities(project_root)
 
 
 def test_project_directory_does_not_initialize_git(tmp_path) -> None:
@@ -79,7 +78,7 @@ async def test_pause_respected() -> None:
         herdr_adapter=FakeHerdrAdapter(),
     )
     root = await store.create_project("x")
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     await store.set_auto_run(root.id, True)
     await runner.step(root.id)
     if runner._running:
@@ -118,7 +117,7 @@ async def test_direct_files_are_available_to_downstream_nodes(tmp_path) -> None:
         herdr_adapter=FakeHerdrAdapter(),
     )
     root = await store.create_project("demo", repo_path=str(project_dir))
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     await runner.set_mode(root.id, False)
     await runner.step(root.id)
     if runner._running:
@@ -134,7 +133,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     store = Store(tmp_path / "turn")
     await store.init()
     root = await store.create_project("Build a modular reading log")
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     plan = await HeuristicPlanner("echo").plan(
         NodeExecutionContext(node=root.model_copy(update={"generated_prompt": root.objective}))
     )
@@ -153,7 +152,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     integrator = next(node for node in created if node.objective == "Integrate the deliverable")
     assert integrator.agent is not None
     assert integrator.agent.type_id.value == "integrator"
-    assert any(path.endswith("turn-integrating.md") for path in integrator.agent.skills)
+    assert "turn-integrating" in integrator.agent.capabilities
     assert all(node.id in evaluation.runnable for node in parallel)
     assert integrator.id not in evaluation.runnable
     assert {edge.src for edge in edges if edge.dst == integrator.id and edge.type == EdgeType.DEPENDS_ON} == {
@@ -195,7 +194,7 @@ async def test_auto_runner_dispatches_all_independent_lanes_together(tmp_path) -
         herdr_adapter=FakeHerdrAdapter(),
     )
     root = await store.create_project("parallel demo", run_policy=RunPolicy(auto_run=True))
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     await store.apply_plan(
         root,
         PlanResult(
@@ -231,7 +230,7 @@ async def test_manual_step_uses_dependency_order_not_uuid_order(tmp_path) -> Non
         agent=AgentConfig(harness=HarnessKind.ECHO),
         run_policy=RunPolicy(auto_run=False),
     )
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     created = await store.apply_plan(
         root,
         PlanResult(nodes=[
@@ -265,7 +264,7 @@ async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> Non
         agent=AgentConfig(harness=HarnessKind.ECHO),
         run_policy=RunPolicy(auto_run=False),
     )
-    seed_project_skills(store, root.id)
+    seed_project_capabilities(store, root.id)
     created = await store.apply_plan(
         root,
         PlanResult(

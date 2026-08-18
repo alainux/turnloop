@@ -21,6 +21,7 @@ const base: GraphNode = {
   agent_message: null,
   allowed_actions: [],
   generation_active: false,
+  capability_status: [],
   paused: false,
   auto_run: false,
   required_inputs: [],

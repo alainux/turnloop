@@ -5,7 +5,7 @@ import uuid
 from turn.config import Settings
 from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, Node
 from turn.server.runtime import TurnRuntime
-from turn.skills.library import install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 from turn.tests.fakes import FakeHerdrAdapter
 from turn.workers.base import NodeExecutionContext
 from turn.workers.fake_harness import FakeHarnessPlanner, FakeHarnessWorker
@@ -13,8 +13,7 @@ from turn.workers.terminal import LocalPtyTransport
 
 
 async def test_process_fake_harness_uses_a_real_process_and_retains_sessions(tmp_path):
-    install_builtin_skill("turn-executing", tmp_path)
-    install_builtin_skill("turn-verifying", tmp_path)
+    load_builtin_capabilities(tmp_path, ["turn-basics", "turn-executing", "turn-verifying"])
     project_id = uuid.uuid4()
     node = Node(
         id=uuid.uuid4(),
@@ -63,7 +62,7 @@ async def test_process_fake_harness_uses_a_real_process_and_retains_sessions(tmp
     assert third.session_id != first.session_id
 
 
-async def test_fake_planner_installs_project_skill_contract(tmp_path):
+async def test_fake_planner_loads_project_capability_contract(tmp_path):
     project_id = uuid.uuid4()
     node = Node(
         id=uuid.uuid4(),
@@ -81,7 +80,7 @@ async def test_fake_planner_installs_project_skill_contract(tmp_path):
     plan = await FakeHarnessPlanner(Settings(default_run_timeout_seconds=5)).plan(ctx)
 
     assert plan.nodes
-    assert (tmp_path / ".turn" / "skills" / "turn-planning" / "SKILL.md").is_file()
+    assert (tmp_path / ".turn" / "capabilities" / "turn-planning" / "plugin.json").is_file()
 
 
 async def test_fake_capability_is_only_exposed_by_test_runtime(tmp_path, monkeypatch):

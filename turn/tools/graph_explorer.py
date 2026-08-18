@@ -177,15 +177,10 @@ def _summary(item: dict) -> str:
             for key in ("type_id", "harness", "model", "reasoning", "session_id")
         )
         line += "\n  agent: " + config
-        if agent.get("skills"):
-            line += "\n  skills: " + ", ".join(agent["skills"])
+        if agent.get("capabilities"):
+            line += "\n  capabilities: " + ", ".join(agent["capabilities"])
         if agent.get("tools"):
             line += "\n  tools: " + ", ".join(agent["tools"])
-        if agent.get("mcp_servers"):
-            line += "\n  mcp_servers: " + ", ".join(
-                item.get("name", "") if isinstance(item, dict) else str(item)
-                for item in agent["mcp_servers"]
-            )
     if item.get("instructions"):
         instructions = str(item["instructions"]).strip()
         line += "\n  instructions:\n" + "\n".join(f"    {part}" for part in instructions.splitlines())

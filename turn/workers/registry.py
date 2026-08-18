@@ -61,7 +61,7 @@ def build_registry(
         )
 
     if test_mode and settings.planner == "heuristic":
-        planner: Planner = HeuristicPlanner(default_executor=executor)
+        planner: Planner = HeuristicPlanner(default_executor=executor, settings=settings)
     elif test_mode and settings.planner == "echo":
         planner = EchoPlanner()
     elif test_mode and settings.planner == "fake":

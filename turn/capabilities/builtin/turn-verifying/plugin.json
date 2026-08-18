@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "turn-verifying",
+  "version": "1.0.0",
+  "description": "Code and visual inspection with approve/reject decisions."
+}

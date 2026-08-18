@@ -33,7 +33,7 @@ def _assert_package_does_not_import(package: str, forbidden: tuple[str, ...]) ->
 
 def test_domain_and_graph_dependencies_point_inward():
     _assert_package_does_not_import(
-        "domain", ("turn.skills", "turn.db", "turn.runner", "turn.server", "turn.workers", "turn.mcp")
+        "domain", ("turn.capabilities", "turn.db", "turn.runner", "turn.server", "turn.workers")
     )
     _assert_package_does_not_import("graph", ("turn.db", "turn.runner", "turn.server", "turn.workers"))
     _assert_package_does_not_import("db", ("turn.runner", "turn.server"))

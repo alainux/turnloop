@@ -1723,6 +1723,71 @@ form.composer:has(.composer-config-panel) {
 .agent-resources b {
   font-weight: 520;
 }
+.capability-section {
+  margin-top: 12px;
+}
+.capability-table {
+  display: grid;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+}
+.capability-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px 42px;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 6px;
+  color: var(--text-2);
+  text-decoration: none;
+}
+.capability-plugin {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.capability-row .icon {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+}
+.capability-header {
+  min-height: 22px;
+  color: var(--text-3);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.capability-row:not(.capability-header):hover {
+  background: var(--surface-2);
+}
+.capability-installed {
+  color: var(--green, var(--accent));
+}
+.capability-loaded {
+  color: var(--amber);
+}
+.capability-not-loaded {
+  color: var(--red);
+}
+.capability-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+}
+.capability-state .icon {
+  width: 10px;
+  height: 10px;
+}
+.capability-save {
+  margin-top: 12px;
+}
 .agent-config .config-edit {
   justify-self: start;
   margin-top: 0;
@@ -2933,7 +2998,7 @@ img.icon {
 .node-copy small:first-of-type {
   color: var(--text-2);
 }
-.node-skill-indicator {
+.node-capability-indicator {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2941,21 +3006,10 @@ img.icon {
   height: 18px;
   color: var(--text-3);
 }
-.node-skill-indicator .icon {
-  width: 9px;
-  height: 9px;
-}
-.node-mcp-indicator {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  color: var(--accent);
-}
-.node-mcp-indicator .icon {
+.node-capability-indicator .icon {
   width: 10px;
   height: 10px;
+  color: var(--accent);
 }
 .node-run {
   position: absolute;
@@ -3447,41 +3501,6 @@ img.icon {
 }
 .agent-resources {
   margin: 2px 0 10px;
-}
-.agent-skill-list {
-  display: grid;
-  gap: 5px;
-  margin: 0 0 12px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-}
-.agent-skill-heading {
-  color: var(--text-3);
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-.agent-skill {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-2);
-  font-size: 11px;
-  text-decoration: none;
-}
-.agent-skill:hover {
-  color: var(--accent);
-}
-.agent-skill .icon {
-  width: 13px;
-  height: 13px;
-}
-.agent-skill span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .cascade-option {
   width: 100%;

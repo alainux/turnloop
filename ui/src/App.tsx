@@ -58,10 +58,8 @@ const emptyAgent: Agent = {
   harness: "codex",
   model: null,
   reasoning: "default",
-  skills: [],
-  skill_ids: [],
   tools: [],
-  mcp_servers: [],
+  capabilities: [],
   session_id: null,
 };
 

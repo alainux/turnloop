@@ -233,9 +233,9 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] MCP basic
 - [x] Arbitrary node reject
 - [x] Architecture / Hygiene & Cleanups
+- [x] Skills / MCP via Capabilities / Agent Plugins 1.0
 - [ ] Live Logs / State & Graph Transitions
 - [ ] Composable graph
-- [ ] Skills / MCP via Capabilities / Agent Plugins 1.0
 - [ ] Triggers
 - [ ] Decision-based Routing
 - [ ] Skipped / Locked nodes for Repeatable organizations

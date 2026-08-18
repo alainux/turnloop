@@ -51,15 +51,14 @@ from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
 import turn.workers.planner as planner_module
 from turn.workers.terminal import LocalPtyTransport, TerminalResult
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 
 
 @pytest.fixture(autouse=True)
-def install_builtin_skills(tmp_path):
+def load_builtin_capability_plugins(tmp_path):
     # Direct worker tests bypass the planner boundary.
     for project_root in (tmp_path, tmp_path / "project"):
-        for skill_id in SKILLS:
-            install_builtin_skill(skill_id, project_root)
+        load_builtin_capabilities(project_root)
 
 
 def test_codex_model_discovery_handles_long_lived_server_bytes(monkeypatch):
@@ -275,6 +274,19 @@ def test_local_cli_harnesses_use_native_commands_for_the_browser_terminal():
     assert opencode[-2:] == ["--prompt", "do the work"]
 
 
+def test_opencode_machine_command_keeps_prompt_positional_when_transport_can_inject():
+    command = HarnessCommandFactory().worker_command(
+        HarnessKind.OPENCODE,
+        AgentConfig(harness=HarnessKind.OPENCODE, model="opencode/test-model"),
+        "structured initial prompt",
+        "/workspace/project",
+        prompt_via_stdin=True,
+    )
+    assert command[-1] == "structured initial prompt"
+    assert "-" not in command
+    assert command[command.index("--format") + 1] == "json"
+
+
 @pytest.mark.parametrize("harness", [HarnessKind.CLAUDE, HarnessKind.OPENCODE, HarnessKind.PI])
 def test_native_harness_commands_deploy_prompt_and_resume_saved_session(harness):
     worker = CLIHarnessWorker(harness)
@@ -353,7 +365,8 @@ async def test_native_executor_persists_provider_session_before_result(
     assert seen and seen[-1] == session_id
 
 
-def test_reconnect_commands_use_native_provider_sessions():
+def test_reconnect_commands_use_native_provider_sessions(tmp_path):
+    load_builtin_capabilities(tmp_path, ["turn-executing"])
     runner = Runner(
         Store(Path("/tmp/turn-reconnect-test")),
         WorkerRegistry(),
@@ -369,7 +382,7 @@ def test_reconnect_commands_use_native_provider_sessions():
         executor="codex",
         agent=AgentConfig(model="gpt-5.6-luna", session_id="session-123"),
     )
-    codex = runner._reconnect_command(node, "/tmp/project", "session-123")
+    codex = runner._reconnect_command(node, str(tmp_path), "session-123")
     assert codex is not None
     assert codex[1] == "resume"
     assert "exec" not in codex and "--json" not in codex
@@ -377,14 +390,16 @@ def test_reconnect_commands_use_native_provider_sessions():
     assert "model_reasoning_effort=\"default\"" not in codex
 
     node.agent = AgentConfig(harness=HarnessKind.PI, model="nous/tencent/hy3:free")
-    pi = runner._reconnect_command(node, "/tmp/project", "pi-session")
-    assert pi == ["pi", "--session", "pi-session", "--model", "nous/tencent/hy3:free"]
+    pi = runner._reconnect_command(node, str(tmp_path), "pi-session")
+    assert pi[:3] == ["pi", "--session", "pi-session"]
+    assert "--skill" in pi
+    assert pi[-2:] == ["--model", "nous/tencent/hy3:free"]
 
     node.agent = AgentConfig(
         harness=HarnessKind.OPENCODE,
         model="opencode/deepseek-v4-flash-free",
     )
-    opencode = runner._reconnect_command(node, "/tmp/project", "opencode-session")
+    opencode = runner._reconnect_command(node, str(tmp_path), "opencode-session")
     assert opencode is not None
     assert opencode[:3] == ["opencode", "--session", "opencode-session"]
     assert "run" not in opencode and "--format" not in opencode and "--auto" not in opencode
@@ -539,8 +554,9 @@ def test_non_codex_planner_commands_keep_resumable_sessions():
         AgentConfig(harness=HarnessKind.OPENCODE, session_id="opencode-session"),
         "plan this",
     )
-    assert "--format" not in opencode
+    assert opencode[1:4] == ["run", "--format", "json"]
     assert opencode[opencode.index("--session") + 1] == "opencode-session"
+    assert opencode[-1] == "plan this"
 
 
 async def test_agent_planner_uses_the_selected_opencode_harness(monkeypatch):
@@ -1124,15 +1140,19 @@ async def test_graph_explorer_is_read_only_and_integrators_get_glue_contract(tmp
     root = await store.create_project("Assemble the adventure")
     ctx = NodeExecutionContext(node=root)
     block = render_context_block(ctx)
-    assert "    turn graph " in block
+    assert block.startswith("TURN_CONTEXT\n")
     assert shutil.which("turn") is not None
     assert "graph_explorer.py" not in block
-    assert "turn graph" in block
+    assert "turn graph" not in block
     assert "--state-file" not in block
-    assert f"--requester {root.id}" in block
-    assert "INTEGRATOR CONTRACT" in block
-    assert "Limit changes to assembly" in block
-    assert "integrator-only directory" in block
+    assert "INTEGRATOR CONTRACT" not in block
+    assert "integrator-only directory" not in block
+    project_root = store.project_path(root.id)
+    assert project_root is not None
+    basics = project_root / ".turn" / "capabilities" / "turn-basics" / "skills" / "turn-basics" / "SKILL.md"
+    integrating = Path.cwd() / "turn" / "capabilities" / "builtin" / "turn-integrating" / "skills" / "turn-integrating" / "SKILL.md"
+    assert "turn graph" in basics.read_text()
+    assert "integrator-specific directory" in integrating.read_text()
 
     state_file = data_dir / "projects" / f"proj-{root.id.hex[:8]}" / ".turn" / "state.json"
     await graph_explorer._query(str(state_file), str(root.id), str(root.id), "tree")
@@ -1227,8 +1247,7 @@ def test_planner_honors_editable_planning_instructions():
         generated_prompt="Use two nested planning branches and a small integration leaf.",
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
-    assert "PLANNING INSTRUCTIONS FOR THIS NODE" in prompt
-    assert "Use two nested planning branches" in prompt
+    assert "instructions=Use two nested planning branches" in prompt
 
 
 def test_initial_setup_planner_chooses_a_domain_appropriate_board():
@@ -1239,45 +1258,8 @@ def test_initial_setup_planner_chooses_a_domain_appropriate_board():
     )
     root_prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=root))
 
-    assert "setup planner" in root_prompt
-    for phrase in (
-        "Set up the board",
-        "interpreting the user's actual request",
-        "smallest complete topology",
-        "top-level PlanResult field",
-        "preserve it and do not",
-        "lean MVP or demo",
-        "book-writing workflow",
-        "routine\n  automation",
-        "find-skills",
-        "stack- and runtime-specific architecture",
-        "Do not name, reserve, or register files",
-        "Stop at each nested planner",
-        "never invent, replace, or edit its future",
-    ):
-        assert phrase in root_prompt
-    for future_filename in ("MARKET_RESEARCH.md", "DESIGN.md", "ARCHITECTURE.md", "DISTRIBUTION_PLAN.md"):
-        assert future_filename not in root_prompt
-    for phrase in (
-        "one\n  focused worker",
-        "broad product",
-        "research, design, engineering",
-        "This is a\n  decision, not a mandatory pipeline",
-        "Do not assume a generic\n  architecture skill is needed",
-        "INFORMATION-FLOW AUDIT",
-        "discovery and product/design work precede architecture",
-        "not a mandatory pipeline",
-    ):
-        assert phrase in root_prompt
-    for phrase in (
-        "Explicit scope and scale are binding",
-        "smallest complete topology",
-        "An app factory is organization-scale by definition",
-        "not one app and\n  not a research assignment",
-        "Do not collapse that scope into one research, design, or",
-        "research or discovery leaf",
-    ):
-        assert phrase in root_prompt
+    assert "instructions=Build a product for a clearly defined audience." in root_prompt
+    assert "Set up the board" not in root_prompt
 
     nested = Node(
         project_id=root.project_id,
@@ -1286,12 +1268,8 @@ def test_initial_setup_planner_chooses_a_domain_appropriate_board():
         generated_prompt="Turn the validated product direction into an implementation plan.",
     )
     nested_prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=nested))
-    assert "scoped planner" in nested_prompt
-    assert "SCOPED PLANNING" in nested_prompt
-    assert "SETUP — this is the project-root setup planner:" not in nested_prompt
-    assert "ancestor-owned edges" in nested_prompt
-    assert "sibling stages" in nested_prompt and "later stages" in nested_prompt
-    assert "board owner" in nested_prompt
+    assert "instructions=Turn the validated product direction into an implementation plan." in nested_prompt
+    assert "SCOPED PLANNING" not in nested_prompt
 
 
 def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
@@ -1330,7 +1308,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "objective": "Research the market",
                 "executor": "codex",
                 "agent_type": "executor",
-                "skills": ["turn-research"],
+                "capabilities": ["secret-word"],
             },
             {
                 "key": "market_validation",
@@ -1345,7 +1323,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "executor": "codex",
                 "agent_type": "executor",
                 "depends_on": ["market_validation"],
-                "skills": ["turn-product-design"],
+                "capabilities": ["turn-executing"],
             },
             {
                 "key": "development_architecture",
@@ -1354,7 +1332,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "agent_type": "planner",
                 "plan": True,
                 "depends_on": ["ui_ux_design"],
-                "skills": ["turn-architecture-research"],
+                "capabilities": ["turn-planning"],
             },
             {
                 "key": "distribution_planning",
@@ -1363,7 +1341,7 @@ def test_setup_plan_shape_preserves_stage_handoffs():
                 "agent_type": "planner",
                 "plan": True,
                 "depends_on": ["development_architecture"],
-                "skills": ["turn-plan-distribution"],
+                "capabilities": ["turn-integrating"],
             },
         ],
     }
@@ -1383,12 +1361,12 @@ def test_setup_plan_shape_preserves_stage_handoffs():
     assert plan.nodes[4].depends_on == ["development_architecture"]
     assert plan.document_refs == []
     assert all(not node.artifacts for node in plan.nodes)
-    assert [node.skills for node in plan.nodes] == [
-        ["turn-research"],
+    assert [node.capabilities for node in plan.nodes] == [
+        ["secret-word"],
         [],
-        ["turn-product-design"],
-        ["turn-architecture-research"],
-        ["turn-plan-distribution"],
+        ["turn-executing"],
+        ["turn-planning"],
+        ["turn-integrating"],
     ]
 
 
@@ -1399,11 +1377,8 @@ def test_initial_setup_planner_can_use_nested_planners_for_broad_stages():
         generated_prompt="Build a product for one user request.",
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
-    assert "setup planner" in prompt
-    assert "broad domain needs its own evolving subtree" in prompt
-    assert "nested planners" in prompt
-    assert "complete finished product" in prompt
-    assert "Do not silently convert it into an MVP" in prompt
+    assert "instructions=Build a product for one user request." in prompt
+    assert "complete finished product" not in prompt
 
 
 def test_planner_only_uses_limited_delivery_scope_when_user_requests_it():
@@ -1413,24 +1388,22 @@ def test_planner_only_uses_limited_delivery_scope_when_user_requests_it():
         generated_prompt="Build an MVP with the smallest demonstrable slice.",
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
-    assert "complete finished product" in prompt
-    assert "If a limited scope is explicitly requested" in prompt
-    assert "Keep explicitly small work small" in prompt
+    assert "instructions=Build an MVP with the smallest demonstrable slice." in prompt
+    assert "complete finished product" not in prompt
 
 
-def test_planner_requires_skill_research_and_visual_references_when_relevant():
+def test_planner_requires_capability_research_and_visual_references_when_relevant():
     node = Node(
         project_id=uuid.uuid4(),
         objective="Build a visual interactive game",
         generated_prompt="Create a coherent playable visual experience.",
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
-    assert "turn skills show find-skills" in prompt
-    assert "image embeds" in prompt
-    assert "normal file artifact" in prompt
+    assert "turn capabilities search" not in prompt
+    assert "image embeds" not in prompt
 
 
-def test_planner_does_not_turn_project_prompt_into_a_skill():
+def test_planner_does_not_turn_project_prompt_into_a_capability():
     node = Node(
         project_id=uuid.uuid4(),
         objective="Build a greeting CLI",
@@ -1440,12 +1413,8 @@ def test_planner_does_not_turn_project_prompt_into_a_skill():
     )
     prompt = CodexPlanner()._build_prompt(NodeExecutionContext(node=node))
 
-    assert "do not create a project skill merely to carry the assignment" in prompt
-    assert "must never contain the user's request" in prompt
-    assert "this node's objective or generated_prompt" in prompt
-    assert "Do not paste skill text into the prompt" in prompt
-    assert "Agents already receive their node" in prompt
-    assert "can inspect the live graph" in prompt
+    assert "instructions=Create the complete command" in prompt
+    assert "do not create a project capability merely to carry the assignment" not in prompt
 
 
 def test_worker_context_delivers_assignment_and_live_graph_access():
@@ -1458,10 +1427,10 @@ def test_worker_context_delivers_assignment_and_live_graph_access():
     )
     prompt = CodexWorker()._build_prompt(NodeExecutionContext(node=node))
 
-    assert "OBJECTIVE:\nBuild a greeting CLI" in prompt
-    assert "TASK:\nWrite the executable command and tests." in prompt
-    assert "GRAPH EXPLORATION TOOL" in prompt
-    assert "turn graph" in prompt
+    assert "objective=Build a greeting CLI" in prompt
+    assert "instructions=Write the executable command and tests." in prompt
+    assert "GRAPH EXPLORATION TOOL" not in prompt
+    assert "turn graph" not in prompt
 
 
 def test_codex_choked_output_is_not_a_false_success():

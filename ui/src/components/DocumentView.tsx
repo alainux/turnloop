@@ -12,9 +12,8 @@ import {
   documentReferenceHref,
   documentReferenceLabel,
   isExternalDocumentReference,
-  mcpServerLabel,
-  skillReferenceLabel,
-  skillSourceHref,
+  capabilityCatalogHref,
+  capabilityDeploymentLabel,
   stripMarkdown,
 } from "../domain";
 
@@ -211,68 +210,28 @@ function projectPathHref(path: string, projectId: string): string {
 }
 
 export function DocumentCapabilities({ node }: { node: GraphNode }) {
-  const skills = node.agent?.skill_ids ?? [];
-  const mcpServers = node.agent?.mcp_servers ?? [];
-  if (!skills.length && !mcpServers.length) return null;
+  const capabilities = node.capability_status ?? [];
+  if (!capabilities.length) return null;
 
   return (
     <section className="document-capabilities" aria-label="Agent capabilities">
-      {skills.length > 0 && (
-        <div className="document-capability-group">
-          <span className="document-capability-label">Skills</span>
-          <div className="document-capability-list">
-            {skills.map((reference) => {
-              const href = skillSourceHref(reference);
-              const label = skillReferenceLabel(reference);
-              return href ? (
-                <a
-                  className="document-capability-link"
-                  href={href}
-                  target={/^https?:\/\//i.test(href) ? "_blank" : undefined}
-                  rel={/^https?:\/\//i.test(href) ? "noreferrer" : undefined}
-                  key={reference}
-                  title={href}
-                >
-                  {label}
-                </a>
-              ) : (
-                <span className="document-capability-value" key={reference} title={reference}>
-                  {label}
-                </span>
-              );
-            })}
-          </div>
+      <div className="document-capability-group">
+        <span className="document-capability-label">Capabilities</span>
+        <div className="document-capability-list">
+          {capabilities.map((item) => (
+            <a
+              className="document-capability-link"
+              href={capabilityCatalogHref(item.capability_id)}
+              target="_blank"
+              rel="noreferrer"
+              key={item.capability_id}
+              title={`${item.skills} skills · ${item.mcps} MCP · ${capabilityDeploymentLabel(item)}`}
+            >
+              {item.capability_id} ({item.skills}/{item.mcps})
+            </a>
+          ))}
         </div>
-      )}
-      {mcpServers.length > 0 && (
-        <div className="document-capability-group">
-          <span className="document-capability-label">MCP servers</span>
-          <div className="document-capability-list">
-            {mcpServers.map((server) => (
-              server.source_url ? (
-                <a
-                  className="document-capability-link"
-                  href={server.source_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  key={server.name}
-                  title={server.source_url}
-                >
-                  {mcpServerLabel(server)}
-                </a>
-              ) : (
-                <span
-                  className="document-capability-value"
-                  key={server.name}
-                  title="Configured in the selected harness"
-                >
-                  {mcpServerLabel(server)}
-                </span>
-              )
-            ))}
-          </div>
-        </div>
-      )}
+      </div>
     </section>
   );
 }
@@ -415,7 +374,7 @@ function DocumentNode({
   onOpenDocument?: (reference: DocumentRef) => void;
 }) {
   const [open, setOpen] = useState(
-    path.length < 2 || (node.agent?.mcp_servers.length ?? 0) > 0,
+    path.length < 2 || (node.capability_status?.length ?? 0) > 0,
   );
   const children = orderDocumentNodes(nodes, edges, node.id);
   const dependencies = dependencyLabels(node, nodes, edges);

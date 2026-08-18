@@ -6,13 +6,13 @@ Neither owns Turn's data model — they only read context and emit results.
 """
 from __future__ import annotations
 
-import shlex
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
+from turn.capabilities.plugin import CapabilityPluginError, load_capability_plugin
 from turn.domain.schemas import (
     ArtifactSpec,
     Node,
@@ -20,7 +20,6 @@ from turn.domain.schemas import (
     Resource,
     WorkerResult,
 )
-from turn.workers.harness_catalog import REAL_HARNESS_CATALOG
 from turn.workers.terminal import SessionCallback, StreamCallback, TerminalTransport
 
 
@@ -79,132 +78,53 @@ class Planner(ABC):
         ...
 
 
-def render_context_block(ctx: NodeExecutionContext) -> str:
-    """Render ancestor context + resources into a compact text block."""
-    lines: list[str] = []
-    if ctx.node.agent is not None:
-        agent = ctx.node.agent
-        lines.append("TURN LAUNCH CONFIGURATION:")
-        lines.append(f"- Turn node id: {ctx.node.id}")
-        lines.append(
-            f"- harness: {agent.harness.value}; model: {agent.model or 'harness default'}; "
-            f"reasoning: {agent.reasoning.value}"
-        )
+def _capability_skill_names(ctx: NodeExecutionContext) -> list[str]:
+    """Read skill names from loaded project manifests for launch prompting."""
+    if ctx.repo_path is None or ctx.node.agent is None:
+        return []
+    root = Path(ctx.repo_path).expanduser().resolve() / ".turn" / "capabilities"
+    names: list[str] = []
+    for capability_id in ctx.node.agent.capabilities:
         try:
-            declared = REAL_HARNESS_CATALOG.definition(agent.harness).capabilities
-        except ValueError:
-            declared = ()
-        lines.append(
-            "- harness-provided capabilities (before MCP procurement): "
-            + (", ".join(declared) if declared else "none declared")
-        )
-        if agent.skill_ids:
-            lines.append(
-                "- skills available through the project-scoped Turn library: "
-                + ", ".join(agent.skill_ids)
-            )
-        if agent.tools:
-            lines.append(f"- tools allowed at launch: {', '.join(agent.tools)}")
-        if agent.mcp_servers:
-            lines.append(
-                "- MCP servers assigned at launch: "
-                + ", ".join(server.name for server in agent.mcp_servers)
-            )
-            lines.append(
-                "- MCP source/setup references: "
-                + ", ".join(
-                    f"{server.name} ({server.source_url or 'user-configured'})"
-                    for server in agent.mcp_servers
-                )
-            )
-        lines.append(
-            "- Use `turn skills list`, `turn skills show <id>`, and "
-            "`turn skills install <id>` for library skills. The planner owns "
-            "installing every selected skill under `.turn/skills`; paths are "
-            "listed in TURN_AGENT_SKILLS. Skill text is delivered through the "
-            "project filesystem, not appended to this initial prompt."
-        )
-        lines.append(
-            "- Project-authored skills use `project:<slug>` and live at "
-            "`.turn/skills/<slug>/SKILL.md`; read them from the project filesystem."
-        )
-        lines.append(
-            "- Before acting, read every selected skill file from `TURN_AGENT_SKILLS` "
-            "and apply its contract to this node. Skill text is not a substitute "
-            "for inspecting the graph, predecessor outputs, or the user's outcome."
-        )
-        lines.append("")
-    if ctx.ancestry:
-        lines.append("ANCESTOR CONTEXT (root -> parent):")
-        for a in ctx.ancestry:
-            lines.append(f"- {a.objective}")
-        lines.append("")
-    if ctx.resources:
-        lines.append("ATTACHED RESOURCES / SKILLS:")
-        for r in ctx.resources:
-            body = (r.content or "").strip()
-            if body:
-                lines.append(f"# {r.ref}\n{body}")
-            else:
-                lines.append(f"# {r.ref} (ref only)")
-        lines.append("")
-    document_refs = [*ctx.node.document_refs]
-    for ancestor in ctx.ancestry:
-        document_refs.extend(ancestor.document_refs)
-    if document_refs:
-        lines.append("PROJECT DOCUMENT REFERENCES (paths/URLs only; read explicitly when needed):")
-        seen: set[str] = set()
-        for reference in document_refs:
-            pending = [reference, *reference.imports]
-            while pending:
-                item = pending.pop(0)
-                if item.ref in seen:
-                    continue
-                seen.add(item.ref)
-                lines.append(f"- {item.ref}")
-                pending.extend(item.imports)
-        lines.append("")
-    # GRAPH EXPLORATION TOOL — use the normal installed Turn command. The
-    # agent inherits PATH from the harness launch environment, so do not bake
-    # in an absolute path resolved by the server process.
-    turn_cli = "turn"
-    ge_pid = ctx.node.project_id
-    lines.append("GRAPH EXPLORATION TOOL (query the live project graph at runtime):")
-    lines.append("  Before you plan or write, explore what is already planned/built so you")
-    lines.append("  build on existing work instead of duplicating it. Run this EXACT command:")
-    lines.append(
-        f'    {shlex.quote(turn_cli)} graph {shlex.quote(str(ge_pid))} '
-        f'--requester {shlex.quote(str(ctx.node.id))} --tree'
-    )
-    lines.append("  It prints every node in this project: ids, hierarchy, dependencies, status,")
-    lines.append("  instructions, agent configuration/session, run history, and produced files.")
-    lines.append("  Use --format json when you need the complete machine-readable spec state.")
-    lines.append("  Useful filters:")
-    lines.append("    --node <id>       show one node")
-    lines.append("    --children <id>   show a node's direct children")
-    lines.append("    --ancestors <id>  show a node's parent chain")
-    lines.append("    --format json     machine-readable")
-    lines.append("  If a scope (e.g. 'audio', 'engine', 'HUD') already exists or is planned")
-    lines.append("  elsewhere in the graph, reference or extend that node rather than")
-    lines.append("  recreating it.")
-    lines.append("")
-    objective = ctx.node.objective.lower()
-    agent_type = ctx.node.agent.type_id.value if ctx.node.agent is not None else ""
-    if agent_type == "integrator" or any(
-        word in objective for word in ("assemble", "merge", "integrate", "combine", "stitch")
-    ):
-        lines.append("INTEGRATOR CONTRACT:")
-        lines.append("  Read and reuse all prerequisite outputs already in the assigned working area.")
-        lines.append("  Make those outputs form one coherent result that satisfies the original user objective.")
-        lines.append("  Limit changes to assembly, interfaces, wiring, and necessary integration fixes;")
-        lines.append("  preserve prerequisite domain content and do not create an integrator-only directory.")
-        lines.append("  Verify the real user-facing launch/use path, not only imports or unit tests.")
-        lines.append("")
-    if agent_type == "verifier":
-        lines.append("VERIFIER CONTRACT:")
-        lines.append("  Inspect the target's actual deliverables, graph contracts, invariants, and user-facing behavior.")
-        lines.append("  Approve only when the stated acceptance criteria are evidenced; otherwise reject with concrete findings.")
-        lines.append("  Submit exactly one APPROVE or REJECT decision through `turn agent verify --stdin` using the shell-safe heredoc shown in TURN CONTROL PLANE.")
-        lines.append("  Do not edit the target's work and do not write Turn protocol files directly.")
-        lines.append("")
-    return "\n".join(lines)
+            package = load_capability_plugin(root / capability_id)
+        except (CapabilityPluginError, OSError):
+            continue
+        names.extend(skill.name for skill in package.skills)
+    return list(dict.fromkeys(names))
+
+
+def _skill_invocation_marker(harness: str, skill_name: str) -> str:
+    if harness == "codex":
+        return f"${skill_name}"
+    if harness == "pi":
+        return f"/skill:{skill_name}"
+    return f"/{skill_name}"
+
+
+def render_context_block(ctx: NodeExecutionContext) -> str:
+    """Render the small data envelope sent before the task-specific prompt."""
+    agent = ctx.node.agent
+    if agent is None:
+        return "\n".join([
+            "TURN_CONTEXT",
+            f"project_id={ctx.node.project_id}",
+            f"node_id={ctx.node.id}",
+            f"repo={ctx.repo_path or ''}",
+        ])
+
+    skill_names = _capability_skill_names(ctx)
+    markers = [
+        _skill_invocation_marker(agent.harness.value, name)
+        for name in skill_names
+    ]
+    return "\n".join([
+        "TURN_CONTEXT",
+        f"project_id={ctx.node.project_id}",
+        f"node_id={ctx.node.id}",
+        f"role={agent.type_id.value}",
+        f"repo={ctx.repo_path or ''}",
+        f"harness={agent.harness.value}",
+        f"model={agent.model or ''}",
+        f"reasoning={agent.reasoning.value}",
+        f"activate={' '.join(markers)}",
+    ])

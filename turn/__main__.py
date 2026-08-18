@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from turn.config import settings
 from turn.contracts.dag import compact_validation_error, validate_agent_submission
 from turn.core import TurnCore
-from turn.domain.schemas import AgentConfig, HarnessKind, ReasoningLevel, RunPolicy
+from turn.domain.schemas import AgentConfig, HarnessKind, Node, ReasoningLevel, RunPolicy
 
 
 def parser() -> argparse.ArgumentParser:
@@ -40,6 +40,12 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--run", action="store_true", help="execute until settled or blocked")
 
     sub.add_parser("projects", help="list projects")
+    project = sub.add_parser("project", help="inspect the current local project")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    project_info = project_sub.add_parser(
+        "info", help="show project identity, agent defaults, graph root, and harness surfaces"
+    )
+    project_info.add_argument("--format", choices=["json", "text"], default="json")
     graph = sub.add_parser("graph", help="print a project's workgraph as JSON")
     graph.add_argument("project_id", type=uuid.UUID)
     graph.add_argument(
@@ -68,16 +74,19 @@ def parser() -> argparse.ArgumentParser:
     verification_payload = verify.add_mutually_exclusive_group(required=True)
     verification_payload.add_argument("--payload", help="verification JSON object")
     verification_payload.add_argument("--stdin", action="store_true", help="read verification JSON from stdin")
-    skills = sub.add_parser("skills", help="inspect the project-scoped skill library")
-    skills_sub = skills.add_subparsers(dest="skills_command", required=True)
-    skills_sub.add_parser("list", help="list available skill ids")
-    show_skill = skills_sub.add_parser("show", help="print one skill")
-    show_skill.add_argument("skill_id")
-    install_skill = skills_sub.add_parser(
-        "install", help="copy one built-in skill into the current project"
-    )
-    install_skill.add_argument("skill_id")
-    sub.add_parser("doctor", help="show available coding harnesses")
+    capabilities = sub.add_parser("capabilities", help="browse and load capability plugins")
+    capabilities_sub = capabilities.add_subparsers(dest="capabilities_command", required=True)
+    capabilities_sub.add_parser("list", help="list the local capability catalog")
+    search_capabilities = capabilities_sub.add_parser("search", help="fuzzy-search the local capability catalog")
+    search_capabilities.add_argument("query")
+    show_capability = capabilities_sub.add_parser("show", help="inspect a capability plugin")
+    show_capability.add_argument("capability")
+    load_capability = capabilities_sub.add_parser("load", help="add a directory to the catalog or load an id into this project")
+    load_capability.add_argument("capability")
+    delete_capability = capabilities_sub.add_parser("delete", help="delete a user-authored capability from the local catalog")
+    delete_capability.add_argument("capability")
+    doctor = sub.add_parser("doctor", help="show available coding harnesses")
+    doctor.add_argument("--format", choices=["json", "text"], default="json")
     return root
 
 
@@ -149,14 +158,27 @@ def agent_command(args) -> int:
     value = _read_agent_object(args)
     try:
         validated = validate_agent_submission(kind, value)
-        if kind == "plan":
-            from turn.skills.library import validate_plan_skill_files
+        plan_to_validate = validated if kind == "plan" else getattr(validated, "children", None)
+        if plan_to_validate is not None:
+            if kind == "plan":
+                from turn.workers.harnesses import validate_plan_agent_models
 
-            validate_plan_skill_files(
-                validated.model_dump(mode="json"),
-                os.getenv("TURN_REPO"),
-                planner_skill_ids=[
-                    item for item in os.getenv("TURN_AGENT_SKILL_IDS", "").split(",")
+                validate_plan_agent_models(plan_to_validate.model_dump(mode="json"))
+            from turn.capabilities.catalog import CapabilityCatalog
+
+            project_root = os.getenv("TURN_REPO")
+            if not project_root:
+                raise ValueError("TURN_REPO is required to check loaded capabilities")
+            catalog = CapabilityCatalog(
+                Path(os.getenv("TURN_DATA_DIR", settings.data_dir)) / "capabilities"
+            )
+            payload = plan_to_validate.model_dump(mode="json")
+            catalog.load_plan_role_capabilities(payload, project_root)
+            catalog.validate_plan(
+                payload,
+                project_root,
+                planner_capabilities=[
+                    item for item in os.getenv("TURN_AGENT_CAPABILITIES", "").split(",")
                     if item
                 ],
             )
@@ -236,37 +258,128 @@ async def local_graph_command(args) -> int:
     return 0
 
 
+def _project_info() -> dict:
+    """Read project-local identity plus explicit runtime discovery metadata."""
+    from turn.workers.harness_catalog import REAL_HARNESS_CATALOG
+
+    state_file = discover_project_state()
+    try:
+        raw = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"unable to read project state: {state_file}: {error}") from error
+    nodes = [Node.model_validate(item) for item in raw.get("nodes", [])]
+    roots = [node for node in nodes if node.parent_id is None]
+    if len(roots) != 1:
+        raise SystemExit(f"project state must contain exactly one root node: {state_file}")
+    root = roots[0]
+
+    # The server persists role defaults in the shared local config. Read only
+    # this non-secret setting so this command remains usable without starting
+    # the daemon and without importing the storage event loop.
+    config_file = Path(os.getenv("TURN_DATA_DIR", settings.data_dir)).expanduser() / "config.json"
+    persisted_defaults = None
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        candidate = config.get("settings", {}).get("agent_defaults")
+        if isinstance(candidate, str):
+            candidate = json.loads(candidate)
+        if isinstance(candidate, dict):
+            persisted_defaults = candidate
+    except (OSError, json.JSONDecodeError, TypeError):
+        persisted_defaults = None
+
+    loaded = sorted(
+        path.name
+        for path in (state_file.parent / "capabilities").iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    ) if (state_file.parent / "capabilities").is_dir() else []
+
+    return {
+        "project": {
+            "id": str(root.project_id),
+            "name": root.project_name,
+            "objective": root.objective,
+            "repo_path": root.repo_path or str(state_file.parent.parent),
+            "state_file": str(state_file),
+        },
+        "root_agent": root.agent.model_dump(mode="json") if root.agent else None,
+        "agent_defaults": persisted_defaults or settings.agent_defaults,
+        "loaded_capabilities": loaded,
+        "harnesses": REAL_HARNESS_CATALOG.as_dict(),
+    }
+
+
+def local_project_info_command(args) -> int:
+    info = _project_info()
+    if args.format == "text":
+        project = info["project"]
+        print(f"project: {project['name'] or project['id']}")
+        print(f"id: {project['id']}")
+        print(f"repo: {project['repo_path']}")
+        print(f"root agent: {info['root_agent']}")
+        print(f"agent defaults: {json.dumps(info['agent_defaults'], sort_keys=True)}")
+        print("loaded capabilities: " + (", ".join(info["loaded_capabilities"]) or "none"))
+        return 0
+    print(json.dumps(info, indent=2))
+    return 0
+
+
 async def async_main(args) -> int:
     if args.command == "agent":
         return agent_command(args)
     if args.command == "graph":
         return await local_graph_command(args)
+    if args.command == "project":
+        if args.project_command == "info":
+            return local_project_info_command(args)
+        raise SystemExit(f"unsupported project command: {args.project_command}")
     if args.command == "doctor":
         from turn.workers.harnesses import harness_capabilities
 
-        print(json.dumps({"harnesses": harness_capabilities()}, indent=2))
+        payload = {"harnesses": harness_capabilities()}
+        if args.format == "text":
+            for item in payload["harnesses"]:
+                print(f"{item['id']}: {'available' if item['available'] else 'not found'}")
+            return 0
+        print(json.dumps(payload, indent=2))
         return 0
-    if args.command == "skills":
-        from turn.skills.library import get_skill, install_builtin_skill, list_skills
+    if args.command == "capabilities":
+        from turn.capabilities.catalog import CapabilityCatalog
+        from turn.capabilities.plugin import load_capability_plugin
 
-        if args.skills_command == "list":
-            print(json.dumps([
-                {
-                    "id": item.id,
-                    "title": item.title,
-                    "description": item.description,
-                    "source_url": item.source_url,
-                }
-                for item in list_skills()
-            ], indent=2))
+        catalog = CapabilityCatalog(
+            Path(os.getenv("TURN_DATA_DIR", settings.data_dir)) / "capabilities"
+        )
+        if args.capabilities_command == "list":
+            print(json.dumps([entry.as_dict() for entry in catalog.list()], indent=2))
             return 0
-        if args.skills_command == "install":
+        if args.capabilities_command == "search":
+            print(json.dumps([entry.as_dict() for entry in catalog.search(args.query)], indent=2))
+            return 0
+        if args.capabilities_command == "show":
+            candidate = Path(args.capability).expanduser()
+            plugin = load_capability_plugin(candidate) if candidate.is_dir() else catalog.get(args.capability)
+            print(json.dumps({
+                "id": plugin.id,
+                "version": plugin.version,
+                "description": plugin.description,
+                "path": str(plugin.path),
+                "skills": [{"name": item.name, "description": item.description, "path": str(item.path)} for item in plugin.skills],
+                "mcps": [{"name": item.name, "config": item.config} for item in plugin.mcp_servers],
+            }, indent=2))
+            return 0
+        if args.capabilities_command == "delete":
+            deleted = catalog.delete(args.capability)
+            print(json.dumps({"id": args.capability, "deleted": True, "catalog_path": str(deleted)}, indent=2))
+            return 0
+        candidate = Path(args.capability).expanduser()
+        if candidate.is_dir():
+            plugin = catalog.import_directory(candidate)
+            print(json.dumps({"catalog_path": str(plugin.path), "id": plugin.id}, indent=2))
+        else:
             project_root = os.getenv("TURN_REPO") or str(Path.cwd())
-            target = install_builtin_skill(args.skill_id, project_root)
-            print(str(target))
-            return 0
-        item = get_skill(args.skill_id)
-        print(item.source_path.read_text(encoding="utf-8"))
+            target = catalog.load_into_project(args.capability, project_root)
+            print(json.dumps({"project_path": str(target), "id": args.capability}, indent=2))
         return 0
     async with TurnCore(settings) as core:
         if args.command == "projects":

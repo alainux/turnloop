@@ -23,6 +23,7 @@ venv/
 turn/config.json
 turn/herdr-workspaces.json
 turn/server.lock
+turn/demo-data/
 turn-demo-state/
 
 # Per-project repos (user deliverables; each is its own git repository)

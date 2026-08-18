@@ -2,10 +2,9 @@ import { useMemo } from "react";
 import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Usage } from "../domain";
 import {
   displayNodeTitle,
-  mcpTooltip,
   primaryNodeAction,
   primaryNodeActionLabel,
-  skillTooltip,
+  capabilityTooltip,
   tokens,
 } from "../domain";
 import {
@@ -183,8 +182,11 @@ export function Graph({
         const freshRun = node.ui_state === "cancelled";
         const runLabel = runAction ? nodeRunLabel(active, runAction, freshRun) : "";
         const title = displayNodeTitle(node);
-        const skillRefs = node.agent?.skill_ids ?? [];
-        const mcpServers = node.agent?.mcp_servers ?? [];
+        const capabilities = node.capability_status ?? [];
+        const capabilityIds = node.agent?.capabilities ?? [];
+        const capabilityTitle = capabilities.length
+          ? capabilityTooltip(capabilities)
+          : capabilityIds.join("\n");
         const finalNode = p.depth === finalDepth && finalStageNodeCount === 1;
         return (
           <article
@@ -220,24 +222,15 @@ export function Graph({
                     : "—"}
                 </small>
               </span>
-              <span className="node-icons" aria-hidden={skillRefs.length === 0 && mcpServers.length === 0 ? true : undefined}>
+              <span className="node-icons">
                 <span className="node-glyph">
                   <Icon name={nodeAgentIcon(node)} />
                 </span>
-                {skillRefs.length > 0 && (
+                {capabilityIds.length > 0 && (
                   <span
-                    className="node-skill-indicator"
-                    title={skillTooltip(skillRefs)}
-                    aria-label={skillTooltip(skillRefs)}
-                  >
-                    <Icon name="file" />
-                  </span>
-                )}
-                {mcpServers.length > 0 && (
-                  <span
-                    className="node-mcp-indicator"
-                    title={mcpTooltip(mcpServers)}
-                    aria-label={mcpTooltip(mcpServers)}
+                    className="node-capability-indicator"
+                    title={capabilityTitle}
+                    aria-label={capabilityTitle}
                   >
                     <Icon name="plug" />
                   </span>

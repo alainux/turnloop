@@ -2,13 +2,13 @@ import type {
   Agent,
   AgentType,
   Artifact,
+  CapabilityStatus,
   DocumentRef,
   Edge,
   FlowEdge,
   GraphNodeView,
   GraphView,
   HarnessKind,
-  MCPServerAccess,
   Node,
   NodeUIState,
   ReasoningLevel,
@@ -21,13 +21,13 @@ export type {
   Agent,
   AgentType,
   Artifact,
+  CapabilityStatus,
   DocumentRef,
   Edge,
   FlowEdge,
   GraphNodeView,
   GraphView,
   HarnessKind,
-  MCPServerAccess,
   InputSpec,
   Node,
   NodeAction,
@@ -75,51 +75,19 @@ export function displayNodeTitle(node: Project): string {
   return stripMarkdown(node.objective);
 }
 
-/** Keep skill references readable without hiding their source in a tooltip. */
-export function skillReferenceLabel(reference: string): string {
-  if (!/^https?:\/\//i.test(reference)) return reference;
-  const path = reference.split(/[?#]/, 1)[0];
-  const segments = path.split("/").filter(Boolean);
-  const segment = segments.pop();
-  const displaySegment = segment?.toLowerCase() === "skill.md"
-    ? segments.pop()
-    : segment;
-  return displaySegment ? decodeURIComponent(displaySegment) : reference;
+export function capabilityCatalogHref(capabilityId: string): string {
+  return `/api/capability-catalog/${encodeURIComponent(capabilityId)}`;
 }
 
-export function skillTooltip(references: string[]): string {
-  return `Skills (${references.length})\n${references
-    .map(skillReferenceLabel)
-    .join("\n")}`;
+export function capabilityTooltip(capabilities: CapabilityStatus[]): string {
+  return capabilities
+    .map((item) => `${item.capability_id} · ${item.skills} skills · ${item.mcps} MCP`)
+    .join("\n");
 }
 
-/** Resolve skill references to an inspectable source.
- *
- * Built-in Turn skills are served from their actual local files. Only a
- * planner-selected HTTP(S) skill reference points outside the application.
- */
-export function skillSourceHref(reference: string): string | null {
-  if (/^https?:\/\//i.test(reference)) return reference;
-  if (
-    reference === "imagegen" ||
-    reference === "find-skills" ||
-    reference === "find-mcps" ||
-    reference.startsWith("turn-")
-  ) {
-    return `/api/skills/${encodeURIComponent(reference)}`;
-  }
-  return null;
-}
-
-/** Keep MCP references readable while preserving their researched source. */
-export function mcpServerLabel(server: MCPServerAccess): string {
-  return server.name;
-}
-
-export function mcpTooltip(servers: MCPServerAccess[]): string {
-  return `MCP servers (${servers.length})\n${servers
-    .map(mcpServerLabel)
-    .join("\n")}`;
+export function capabilityDeploymentLabel(item: CapabilityStatus): string {
+  if (!item.loaded) return "not loaded";
+  return item.installed ? "installed" : "loaded";
 }
 
 /** Render a document reference as a project-scoped link without reading it. */

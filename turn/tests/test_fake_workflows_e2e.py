@@ -398,7 +398,7 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                 "TURN_REPO": root.repo_path,
                 "TURN_HANDOFF_FILE": str(plan_path),
                 "TURN_STATUS_FILE": str(status_path),
-                "TURN_AGENT_SKILL_IDS": "turn-planning,find-skills,find-mcps,turn-setup",
+                "TURN_AGENT_CAPABILITIES": "turn-planning,turn-authoring-capabilities,turn-setup",
             })
             submitted = await asyncio.to_thread(
                 subprocess.run,

@@ -9,12 +9,11 @@ import type {
 } from "../domain";
 import {
   displayNodeTitle,
+  capabilityCatalogHref,
+  capabilityDeploymentLabel,
   primaryNodeAction,
   primaryNodeActionIcon,
   primaryNodeActionLabel,
-  mcpServerLabel,
-  skillSourceHref,
-  skillReferenceLabel,
 } from "../domain";
 import { editNode, getNodeDetail, provideNodeInput, runNodeAction } from "../api/nodes";
 import { Icon } from "./Icon";
@@ -153,8 +152,7 @@ function Overview({
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const primaryAction = primaryNodeAction(node);
   const freshRun = node.ui_state === "cancelled";
-  const skillRefs = agent?.skill_ids ?? [];
-  const mcpServers = agent?.mcp_servers ?? [];
+  const capabilityStatus = node.capability_status ?? [];
   useEffect(() => {
     setPrompt(node.generated_prompt ?? "");
     setObjective(node.objective);
@@ -295,65 +293,50 @@ function Overview({
             />
           </div>
           <div className="agent-resources">
-            <span>{skillRefs.length} skills</span>
             <span>{agent.tools.length} tools</span>
-            <span>{mcpServers.length} MCP</span>
           </div>
-          {skillRefs.length > 0 && (
-            <div className="agent-skill-list" aria-label="Skills">
-              <span className="agent-skill-heading">Skills</span>
-              {skillRefs.map((reference) => {
-                const sourceHref = skillSourceHref(reference);
-                const label = skillReferenceLabel(reference);
-                return sourceHref ? (
-                  <a
-                    className="agent-skill"
-                    href={sourceHref}
-                    target="_blank"
-                    rel="noreferrer"
-                    key={reference}
-                    title={sourceHref}
-                  >
-                    <Icon name="file" />
-                    <span>{label}</span>
-                  </a>
-                ) : (
-                  <div className="agent-skill" key={reference} title={reference}>
-                    <Icon name="file" />
-                    <span>{label}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          {mcpServers.length > 0 && (
-            <div className="agent-skill-list agent-mcp-list" aria-label="MCP servers">
-              <span className="agent-skill-heading">MCP servers</span>
-              {mcpServers.map((server) => {
-                const label = mcpServerLabel(server);
-                return server.source_url ? (
-                  <a
-                    className="agent-skill"
-                    href={server.source_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    key={server.name}
-                    title={server.source_url}
-                  >
-                    <Icon name="plug" />
-                    <span>{label}</span>
-                  </a>
-                ) : (
-                  <div className="agent-skill" key={server.name} title="Configured in the selected harness">
-                    <Icon name="plug" />
-                    <span>{label}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+          <section className="capability-section" aria-label="Capabilities">
+            <div className="section-heading"><span>Capabilities</span></div>
+            {capabilityStatus.length > 0 ? (
+              <div className="capability-table" role="table">
+                <div className="capability-row capability-header" role="row">
+                  <span role="columnheader">Plugin</span>
+                  <span role="columnheader">Skills</span>
+                  <span role="columnheader">MCP</span>
+                </div>
+                {capabilityStatus.map((item) => {
+                  const state = capabilityDeploymentLabel(item);
+                  return (
+                    <a
+                      className={`capability-row capability-${state.replace(" ", "-")}`}
+                      href={capabilityCatalogHref(item.capability_id)}
+                      target="_blank"
+                      rel="noreferrer"
+                      key={item.capability_id}
+                      role="row"
+                      title={`${item.capability_id}: ${state}`}
+                    >
+                      <span role="cell" className="capability-plugin">
+                        <Icon name="plug" />
+                        <span>{item.capability_id}</span>
+                        <span
+                          className="capability-state"
+                          title={state}
+                          aria-label={state}
+                        >
+                          <Icon name={item.installed ? "check" : item.loaded ? "loader" : "x"} />
+                        </span>
+                      </span>
+                      <span role="cell">{item.skills}</span>
+                      <span role="cell">{item.mcps}</span>
+                    </a>
+                  );
+                })}
+              </div>
+            ) : <p className="detail-empty">No capabilities assigned.</p>}
+          </section>
           <button
-            className="button accent"
+            className="button accent capability-save"
             disabled={!agentDirty}
             onClick={() =>
               mutate(

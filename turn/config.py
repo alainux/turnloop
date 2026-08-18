@@ -171,12 +171,6 @@ class Settings:
         default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", str(Path.cwd() / "projects"))
     )
 
-    # Optional directory of project-local skills / instructions. Files here
-    # are inherited by descendant nodes as resources.
-    skills_dir: str | None = field(default_factory=lambda: os.getenv("TURN_SKILLS_DIR"))
-
-
-
 # A single process-wide settings instance.
 _load_env_file()
 settings = Settings()

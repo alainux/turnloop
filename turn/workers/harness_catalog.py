@@ -9,7 +9,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from turn.domain.schemas import AgentConfig, HarnessKind
-from turn.mcp.runtime import codex_mcp_overrides
+
+
+@dataclass(frozen=True)
+class NativeCapabilitySurface:
+    """Provider-native discovery and activation instructions.
+
+    This is intentionally declarative. Turn does not crawl these locations or
+    invoke interactive catalogs on behalf of a planner; it exposes the
+    provider's supported surfaces so the planner can make an explicit,
+    harness-aware choice in each node prompt.
+    """
+
+    skill_activator: str
+    skill_discovery_commands: tuple[str, ...] = ()
+    skill_paths: tuple[str, ...] = ()
+    mcp_discovery_commands: tuple[str, ...] = ()
+    mcp_paths: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -24,6 +41,7 @@ class HarnessDefinition:
     capabilities: tuple[str, ...] = ()
     supports_sessions: bool = True
     supports_tools: bool = True
+    native: NativeCapabilitySurface = NativeCapabilitySurface(skill_activator="not specified")
 
 
 class HarnessCatalog:
@@ -46,6 +64,14 @@ class HarnessCatalog:
                 "capabilities": list(definition.capabilities),
                 "supports_sessions": definition.supports_sessions,
                 "supports_tools": definition.supports_tools,
+                "native": {
+                    "skill_activator": definition.native.skill_activator,
+                    "skill_discovery_commands": list(definition.native.skill_discovery_commands),
+                    "skill_paths": list(definition.native.skill_paths),
+                    "mcp_discovery_commands": list(definition.native.mcp_discovery_commands),
+                    "mcp_paths": list(definition.native.mcp_paths),
+                    "notes": list(definition.native.notes),
+                },
             }
             for definition in self._definitions.values()
         }
@@ -56,13 +82,78 @@ REAL_HARNESS_CATALOG = HarnessCatalog(
         HarnessDefinition(
             "codex", "Codex", "codex", ("default", "low", "medium", "high", "xhigh", "max"),
             capabilities=("browser", "computer-use"),
+            native=NativeCapabilitySurface(
+                skill_activator="$<skill-id>",
+                skill_discovery_commands=("/skills", "/plugins"),
+                skill_paths=(
+                    ".agents/skills",
+                    "~/.agents/skills",
+                    "~/.codex/skills",
+                    "~/.codex/plugins/**/skills",
+                ),
+                mcp_discovery_commands=("codex mcp list", "codex mcp get <name>"),
+                mcp_paths=("~/.codex/config.toml",),
+                notes=(
+                    "Use /skills or a $skill-id mention in the Codex session.",
+                    "Use /plugins to browse configured plugin marketplaces; start a new session after installing one.",
+                ),
+            ),
         ),
         HarnessDefinition(
             "claude", "Claude Code", "claude", ("default", "low", "medium", "high", "xhigh", "max"),
             capabilities=("browser", "computer-use"),
+            native=NativeCapabilitySurface(
+                skill_activator="/<skill-id>",
+                skill_discovery_commands=("/", "claude plugin list"),
+                skill_paths=(".claude/skills", "~/.claude/skills"),
+                mcp_discovery_commands=("claude mcp list", "claude mcp get <name>", "/mcp"),
+                mcp_paths=(".mcp.json", "~/.claude.json"),
+                notes=(
+                    "The slash catalog lists bundled, project, personal, and plugin skills.",
+                    "Top-level project skill directories may require a new Claude session to appear.",
+                ),
+            ),
         ),
-        HarnessDefinition("opencode", "OpenCode", "opencode", ("default", "low", "medium", "high", "max")),
-        HarnessDefinition("pi", "Pi", "pi", ("default", "low", "medium", "high", "xhigh", "max")),
+        HarnessDefinition(
+            "opencode", "OpenCode", "opencode", ("default", "low", "medium", "high", "max"),
+            native=NativeCapabilitySurface(
+                skill_activator="/<skill-id> (when slash commands are enabled)",
+                skill_discovery_commands=("skill tool metadata", "/ (slash catalog)"),
+                skill_paths=(
+                    ".opencode/skills",
+                    ".agents/skills",
+                    ".claude/skills",
+                    "~/.config/opencode/skills",
+                ),
+                mcp_discovery_commands=("opencode mcp list",),
+                mcp_paths=("opencode.json", "~/.config/opencode/opencode.json"),
+                notes=(
+                    "OpenCode presents skill IDs, names, and descriptions to the model; the skill tool loads the body on demand.",
+                    "A skill may also expose a slash command through opencode/slash metadata.",
+                ),
+            ),
+        ),
+        HarnessDefinition(
+            "pi", "Pi", "pi", ("default", "low", "medium", "high", "xhigh", "max"),
+            native=NativeCapabilitySurface(
+                skill_activator="/skill:<skill-name>",
+                skill_discovery_commands=("/skill:<name>", "pi list (packages only)"),
+                skill_paths=(
+                    ".pi/skills",
+                    ".agents/skills",
+                    "~/.pi/agent/skills",
+                    "~/.agents/skills",
+                    ".pi/settings.json",
+                    "~/.pi/agent/settings.json",
+                ),
+                mcp_discovery_commands=(),
+                mcp_paths=(".pi/settings.json", "~/.pi/agent/settings.json"),
+                notes=(
+                    "Use --skill <path> for an explicit launch-time skill or /skill:<name> in the session.",
+                    "Pi has no first-class MCP list command; inspect explicit project settings/packages or ask the running agent.",
+                ),
+            ),
+        ),
     )
 )
 
@@ -91,6 +182,7 @@ class HarnessCommandFactory:
         native: bool = False,
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
+        skill_paths: list[str] | None = None,
     ) -> list[str]:
         model = agent.model
         reasoning = agent.reasoning.value
@@ -114,19 +206,21 @@ class HarnessCommandFactory:
             # for machine-readable transports.
             return [*cmd, prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
         if harness == HarnessKind.OPENCODE:
+            # The project-root command is OpenCode's interactive TUI. It
+            # accepts --prompt but not --variant, so keep variant handling on
+            # the one-shot run surface used by noninteractive transports.
             cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
             if session:
                 cmd += ["--session", session]
             if model:
                 cmd += ["--model", model]
-            if reasoning != "default":
+            if reasoning != "default" and not native:
                 cmd += ["--variant", reasoning]
-            # OpenCode's interactive TUI owns the initial prompt through its
-            # provider-native --prompt option; do not type into its composer
-            # after startup.
-            return [*cmd, "--prompt", prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            return [*cmd, "--prompt", prompt] if native else [*cmd, prompt]
         if harness == HarnessKind.PI:
             cmd = ["pi"] if native else ["pi", "-p", "--mode", "json"]
+            for skill_path in skill_paths or []:
+                cmd += ["--skill", skill_path]
             if session:
                 cmd += ["--session" if resume else "--session-id", session]
             if model:
@@ -144,18 +238,21 @@ class HarnessCommandFactory:
         self, agent: AgentConfig, prompt: str, *, cwd: str, native: bool, resume: bool,
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
+        skill_paths: list[str] | None = None,
     ) -> list[str]:
         if agent.harness == HarnessKind.OPENCODE:
-            cmd = ["opencode", cwd] if native else ["opencode", "run"]
+            cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
             if agent.session_id:
                 cmd += ["--session", agent.session_id]
             if model := agent.model:
                 cmd += ["--model", model]
-            if agent.reasoning.value != "default":
+            if agent.reasoning.value != "default" and not native:
                 cmd += ["--variant", agent.reasoning.value]
-            return [*cmd, "--prompt", prompt] if native else [*cmd, "-" if prompt_via_stdin else prompt]
+            return [*cmd, "--prompt", prompt] if native else [*cmd, prompt]
         if agent.harness == HarnessKind.PI:
             cmd = ["pi"] if native else ["pi", "--print", "--mode", "text"]
+            for skill_path in skill_paths or []:
+                cmd += ["--skill", skill_path]
             if agent.session_id:
                 cmd += ["--session" if native and resume else "--session-id", agent.session_id]
             if model := agent.model:
@@ -184,21 +281,23 @@ class HarnessCommandFactory:
         *,
         prompt: str | None = None,
         mcp_config: str | None = None,
+        capability_mcp_overrides: tuple[str, ...] = (),
+        skill_paths: list[str] | None = None,
     ) -> list[str] | None:
-        mcp_flags = [
-            item
-            for override in codex_mcp_overrides(agent)
-            for item in ("-c", override)
-        ]
         if agent.harness == HarnessKind.CODEX:
             model = ["--model", agent.model] if agent.model else []
             thinking = (["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
                         if agent.reasoning.value != "default" else [])
+            mcp_flags = [item for override in capability_mcp_overrides for item in ("-c", override)]
             command = [self.codex_binary, "resume", *model, *thinking, *mcp_flags,
                        "--no-alt-screen", "-C", cwd, session_id]
             return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.PI:
-            command = ["pi", "--session", session_id, *(["--model", agent.model] if agent.model else [])]
+            command = ["pi", "--session", session_id]
+            for skill_path in skill_paths or []:
+                command += ["--skill", skill_path]
+            if agent.model:
+                command += ["--model", agent.model]
             return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.OPENCODE:
             command = (

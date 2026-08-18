@@ -9,8 +9,10 @@ from turn.workers.harnesses import (
     HARNESS_CATALOG,
     harness_capabilities,
     reasoning_levels_for,
+    validate_plan_agent_models,
     validate_agent_capabilities,
 )
+from turn.workers.harness_catalog import REAL_HARNESS_CATALOG
 
 
 def test_reasoning_is_resolved_by_harness_and_model_family():
@@ -41,6 +43,16 @@ def test_capability_payload_is_data_driven_and_extensible():
     assert by_id["codex"]["capabilities"] == ["browser", "computer-use"]
     assert by_id["claude"]["capabilities"] == ["browser", "computer-use"]
     assert by_id["pi"]["capabilities"] == []
+
+
+def test_native_discovery_surfaces_are_explicit_and_harness_specific():
+    catalog = REAL_HARNESS_CATALOG.as_dict()
+
+    assert catalog["codex"]["native"]["skill_activator"] == "$<skill-id>"
+    assert catalog["claude"]["native"]["skill_activator"] == "/<skill-id>"
+    assert catalog["opencode"]["native"]["mcp_discovery_commands"] == ["opencode mcp list"]
+    assert catalog["pi"]["native"]["skill_activator"] == "/skill:<skill-name>"
+    assert catalog["pi"]["native"]["mcp_discovery_commands"] == []
 
 
 def test_model_discovery_uses_configured_binary_when_not_on_path(monkeypatch):
@@ -95,6 +107,29 @@ opencode       deepseek-v4-flash-free                            200K
 nous           tencent/hy3:free                                  262.1K
 """
     monkeypatch.setattr("turn.workers.harnesses._resolve_binary", lambda _: "/bin/opencode")
+    observed = {}
+
+    def run(*args, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(stdout=output)
+
+    monkeypatch.setattr("turn.workers.harnesses.subprocess.run", run)
+    from turn.workers.harnesses import _discover_models
+
+    _discover_models.cache_clear()
+    try:
+        assert _discover_models("opencode", "opencode") == [
+            "opencode/deepseek-v4-flash-free",
+            "nous/tencent/hy3:free",
+        ]
+        assert observed["timeout"] == 12
+    finally:
+        _discover_models.cache_clear()
+
+
+def test_opencode_model_discovery_accepts_one_id_per_line(monkeypatch):
+    output = "opencode/gpt-5.6-luna\nopencode/gpt-5.6-sol\nopencode-go/gpt-5.6-luna\n"
+    monkeypatch.setattr("turn.workers.harnesses._resolve_binary", lambda _: "/bin/opencode")
     monkeypatch.setattr(
         "turn.workers.harnesses.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(stdout=output),
@@ -104,11 +139,42 @@ nous           tencent/hy3:free                                  262.1K
     _discover_models.cache_clear()
     try:
         assert _discover_models("opencode", "opencode") == [
-            "opencode/deepseek-v4-flash-free",
-            "nous/tencent/hy3:free",
+            "opencode/gpt-5.6-luna",
+            "opencode/gpt-5.6-sol",
+            "opencode-go/gpt-5.6-luna",
         ]
     finally:
         _discover_models.cache_clear()
+
+
+def test_model_discovery_does_not_drop_provider_ids_after_the_first_250(monkeypatch):
+    output = "\n".join([*(f"opencode/model-{index}" for index in range(260)), "openai/gpt-5.6-luna"])
+    monkeypatch.setattr("turn.workers.harnesses._resolve_binary", lambda _: "/bin/opencode")
+    monkeypatch.setattr(
+        "turn.workers.harnesses.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=output),
+    )
+    from turn.workers.harnesses import _discover_models
+
+    _discover_models.cache_clear()
+    try:
+        discovered = _discover_models("opencode", "opencode")
+        assert discovered[-1] == "openai/gpt-5.6-luna"
+    finally:
+        _discover_models.cache_clear()
+
+
+def test_plan_model_validation_allows_defaults_and_suggests_qualified_ids():
+    capabilities = [
+        {"id": "opencode", "models": [{"id": "opencode/gpt-5.6-luna"}]},
+        {"id": "pi", "models": [{"id": "openai-codex/gpt-5.6-luna"}]},
+    ]
+    validate_plan_agent_models({"nodes": [{"key": "default", "agent": {"harness": "pi"}}]}, capabilities=capabilities)
+    with pytest.raises(ValueError, match="incorrect model.*did you mean: opencode/gpt-5.6-luna"):
+        validate_plan_agent_models(
+            {"nodes": [{"key": "wrong", "agent": {"harness": "opencode", "model": "gpt-5.6-luna"}}]},
+            capabilities=capabilities,
+        )
 
 
 def test_pi_and_opencode_do_not_invent_models_when_catalog_is_empty(monkeypatch):

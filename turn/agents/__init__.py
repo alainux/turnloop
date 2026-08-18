@@ -1,1 +1,1 @@
-"""Filesystem-backed built-in agent skills."""
+"""Namespace for Turn's agent-facing capability package assets."""

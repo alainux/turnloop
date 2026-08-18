@@ -6,11 +6,11 @@ import {
   documentReferenceHref,
   documentReferenceContentHref,
   documentReferenceLabel,
+  capabilityCatalogHref,
+  capabilityDeploymentLabel,
+  capabilityTooltip,
   primaryNodeActionIcon,
   primaryNodeActionLabel,
-  skillReferenceLabel,
-  skillSourceHref,
-  skillTooltip,
   stripMarkdown,
 } from "./domain";
 import type { Project } from "./domain";
@@ -74,19 +74,15 @@ describe("display labels", () => {
     expect(displayPath("/workspace/project")).toBe("/workspace/project");
   });
 
-  it("keeps local skill ids and makes URL skill references readable", () => {
-    expect(skillReferenceLabel("turn-executing")).toBe("turn-executing");
-    expect(skillReferenceLabel("https://example.test/visual/SKILL.md?rev=1")).toBe("visual");
-    expect(skillReferenceLabel("https://raw.example.test/game/vanilla-js-game-dev/SKILL.md"))
-      .toBe("vanilla-js-game-dev");
-    expect(skillTooltip(["turn-executing", "https://example.test/visual/SKILL.md"]))
-      .toContain("Skills (2)");
-    expect(skillSourceHref("find-mcps")).toBe("/api/skills/find-mcps");
-    expect(skillSourceHref("imagegen")).toBe("/api/skills/imagegen");
-    expect(skillSourceHref("turn-executing")).toBe("/api/skills/turn-executing");
-    expect(skillSourceHref("https://example.test/skill/SKILL.md")).toBe(
-      "https://example.test/skill/SKILL.md",
-    );
+  it("labels capability plugins and their deployment state", () => {
+    const capabilities = [
+      { capability_id: "secret-word", skills: 1, mcps: 1, loaded: true, installed: false },
+      { capability_id: "turn-executing", skills: 1, mcps: 0, loaded: true, installed: true },
+    ];
+    expect(capabilityTooltip(capabilities)).toContain("secret-word · 1 skills · 1 MCP");
+    expect(capabilityCatalogHref("secret-word")).toBe("/api/capability-catalog/secret-word");
+    expect(capabilityDeploymentLabel(capabilities[0])).toBe("loaded");
+    expect(capabilityDeploymentLabel(capabilities[1])).toBe("installed");
   });
 
   it("links local documents through the project endpoint and preserves external URLs", () => {

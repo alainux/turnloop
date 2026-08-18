@@ -33,7 +33,7 @@ from turn.workers.echo_worker import EchoWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
 from turn.workers.base import NodeExecutionContext, render_context_block
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 
 
 async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
@@ -101,8 +101,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
             assert {"Agent", "Node", "Edge", "PlanResult", "WorkerResult"} <= set(contract["models"])
             project_id = uuid.UUID(created.json()["project_id"])
             project_root = components.store._project_paths[project_id]
-            for skill_id in SKILLS:
-                install_builtin_skill(skill_id, project_root)
+            load_builtin_capabilities(project_root)
             runner = components.runner
             workspace_id = runner.terminal.project_workspace_id(str(project_id))
             assert workspace_id in herdr.workspaces
@@ -168,37 +167,36 @@ def test_dag_contract_codecs_reject_invalid_graphs_and_parse_deterministically()
     assert result.outcome is Outcome.COMPLETE
 
 
-def test_planner_and_executor_are_agent_types_with_filesystem_skills():
+def test_planner_and_executor_are_agent_types_with_capability_contracts():
     planner = Planner()
     executor = Executor()
     integrator = Integrator()
     assert planner.type_id is AgentType.PLANNER
     assert executor.type_id is AgentType.EXECUTOR
     assert integrator.type_id is AgentType.INTEGRATOR
-    assert planner.skills and all(Path(path).is_file() for path in planner.skills)
-    assert executor.skills and all(Path(path).is_file() for path in executor.skills)
-    assert integrator.skills and all(Path(path).is_file() for path in integrator.skills)
+    assert planner.capabilities and "turn-planning" in planner.capabilities
+    assert executor.capabilities == ["turn-basics", "turn-executing"]
+    assert integrator.capabilities == ["turn-basics", "turn-integrating"]
     planner_context = render_context_block(
         NodeExecutionContext(
             node=Node(project_id=uuid.uuid4(), objective="plan", agent=planner)
         )
     )
-    assert "turn-planning" in planner_context
+    assert "turn-planning" not in planner_context
+    assert "activate=" in planner_context
     assert "turn-setup" not in planner_context
-    assert "turn-architecture-research" not in planner_context
-    assert "turn-product-coherence" not in planner_context
-    assert "find-skills" in planner_context
-    assert "imagegen" in planner_context
-    assert "read every selected skill file" in planner_context
+    assert "turn project info" not in planner_context
+    assert "harness-native capability mechanism" not in planner_context
     assert "AGENT SKILL:" not in planner_context
     integration_context = render_context_block(
         NodeExecutionContext(
             node=Node(project_id=uuid.uuid4(), objective="Integrate result", agent=integrator)
         )
     )
-    assert "turn-integrating" in integration_context
-    assert "turn-product-coherence" not in integration_context
-    assert "integrator-only directory" in integration_context
+    assert "turn-integrating" not in integration_context
+    assert "turn-basics" not in integration_context
+    assert "turn-setup" not in integration_context
+    assert "integrator-only directory" not in integration_context
 
 
 async def test_project_documents_are_persisted_as_dynamic_references_and_visible_to_workers(tmp_path):
@@ -234,7 +232,7 @@ async def test_project_documents_are_persisted_as_dynamic_references_and_visible
     )
     context = await runner._build_context(root)
     rendered = render_context_block(context)
-    assert "PROJECT DOCUMENT REFERENCES" in rendered
-    assert "ARCHITECTURE.md" in rendered
+    assert "PROJECT DOCUMENT REFERENCES" not in rendered
+    assert "ARCHITECTURE.md" not in rendered
 
     await store.dispose()

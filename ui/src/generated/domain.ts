@@ -6,10 +6,8 @@ export interface Agent {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  skills: Array<string>;
-  skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   session_id: string | null;
 }
 
@@ -32,6 +30,14 @@ export interface ArtifactSpec {
   name: string;
   content: unknown | null;
   ref: string | null;
+}
+
+export interface CapabilityStatus {
+  capability_id: string;
+  skills: number;
+  mcps: number;
+  loaded: boolean;
+  installed: boolean;
 }
 
 export interface DocumentRef {
@@ -63,10 +69,8 @@ export interface Executor {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  skills: Array<string>;
-  skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   session_id: string | null;
 }
 
@@ -114,6 +118,7 @@ export interface GraphNodeView {
   allowed_actions: Array<NodeAction>;
   state_reason: string | null;
   generation_active: boolean;
+  capability_status: Array<CapabilityStatus>;
 }
 
 export interface GraphView {
@@ -142,27 +147,10 @@ export interface Integrator {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  skills: Array<string>;
-  skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   session_id: string | null;
 }
-
-export interface MCPServerAccess {
-  name: string;
-  source_url: string | null;
-  transport: MCPTransport;
-  command: string | null;
-  args: Array<string>;
-  url: string | null;
-  env: Record<string, string>;
-  headers: Record<string, string>;
-  bearer_token_env_var: string | null;
-  enabled: boolean;
-}
-
-export type MCPTransport = "configured" | "stdio" | "http" | "sse" | "ws";
 
 export interface Node {
   id: string;
@@ -203,8 +191,7 @@ export interface NodeSpec {
   resource_refs: Array<string>;
   document_refs: Array<DocumentRef>;
   artifacts: Array<ArtifactSpec>;
-  skills: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   parent_key: string | null;
   depends_on: Array<string>;
   plan: boolean;
@@ -233,10 +220,8 @@ export interface Planner {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  skills: Array<string>;
-  skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   session_id: string | null;
 }
 
@@ -296,10 +281,8 @@ export interface Verifier {
   harness: HarnessKind;
   model: string | null;
   reasoning: ReasoningLevel;
-  skills: Array<string>;
-  skill_ids: Array<string>;
   tools: Array<string>;
-  mcp_servers: Array<MCPServerAccess>;
+  capabilities: Array<string>;
   session_id: string | null;
 }
 

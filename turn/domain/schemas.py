@@ -26,11 +26,10 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from turn.domain.skill_contracts import (
-    SETUP_SKILL_ID,
-    skill_ids_for_agent_type,
-    skill_paths_for_agent_type,
-    validate_skill_reference,
+from turn.domain.capability_contracts import (
+    BUILTIN_CAPABILITY_IDS,
+    capability_ids_for_agent_type,
+    validate_capability_id,
 )
 
 
@@ -163,75 +162,11 @@ class ReasoningLevel(str, Enum):
     MAX = "max"
 
 
-class MCPTransport(str, Enum):
-    """MCP connection shape understood by the harness adapters."""
-
-    CONFIGURED = "configured"
-    STDIO = "stdio"
-    HTTP = "http"
-    SSE = "sse"
-    WS = "ws"
-
-
 class AgentType(str, Enum):
     PLANNER = "planner"
     EXECUTOR = "executor"
     INTEGRATOR = "integrator"
     VERIFIER = "verifier"
-
-
-class MCPServerAccess(BaseModel):
-    """A researched MCP assignment and optional launch configuration.
-
-    ``source_url`` is the human-auditable website the planner inspected.
-    ``configured`` means the user has already installed/configured the server
-    in the harness; Turn only carries the assignment into the prompt and
-    environment. Explicit transports are rendered by the selected adapter.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=128)
-    source_url: Optional[str] = None
-    transport: MCPTransport = MCPTransport.CONFIGURED
-    command: Optional[str] = None
-    args: list[str] = Field(default_factory=list)
-    url: Optional[str] = None
-    env: dict[str, str] = Field(default_factory=dict)
-    headers: dict[str, str] = Field(default_factory=dict)
-    bearer_token_env_var: Optional[str] = None
-    enabled: bool = True
-
-    @model_validator(mode="before")
-    @classmethod
-    def accept_legacy_reference(cls, value: Any) -> Any:
-        """Migrate the original string-only ``mcp_servers`` field."""
-        if isinstance(value, str):
-            candidate = value.strip()
-            if not candidate:
-                raise ValueError("MCP server names must not be empty")
-            if urlsplit(candidate).scheme in {"http", "https"} and urlsplit(candidate).netloc:
-                name = urlsplit(candidate).path.rstrip("/").split("/")[-1] or urlsplit(candidate).netloc
-                return {"name": name, "source_url": candidate}
-            return {"name": candidate}
-        return value
-
-    @model_validator(mode="after")
-    def validate_runtime_shape(self) -> "MCPServerAccess":
-        if self.source_url:
-            parsed_source = urlsplit(self.source_url)
-            if parsed_source.scheme not in {"http", "https"} or not parsed_source.netloc:
-                raise ValueError("MCP source_url must be an absolute http(s) URL")
-        if self.transport is MCPTransport.STDIO and not self.command:
-            raise ValueError(f"stdio MCP server {self.name!r} requires command")
-        if self.transport in {MCPTransport.HTTP, MCPTransport.SSE, MCPTransport.WS}:
-            if not self.url:
-                raise ValueError(f"{self.transport.value} MCP server {self.name!r} requires url")
-            parsed_url = urlsplit(self.url)
-            allowed_schemes = {"ws", "wss"} if self.transport is MCPTransport.WS else {"http", "https"}
-            if parsed_url.scheme not in allowed_schemes or not parsed_url.netloc:
-                raise ValueError("MCP url must be an absolute network URL")
-        return self
 
 
 class VerificationDecision(str, Enum):
@@ -259,53 +194,41 @@ class VerificationResult(BaseModel):
 class Agent(BaseModel):
     """Top-level domain object describing one executable agent.
 
-    ``type_id`` names the agent specialization. Planner, executor, and
-    integrator are the built-in types; each receives its filesystem skill
-    contract automatically.
+    ``type_id`` names the agent specialization. Role defaults are expressed as
+    capability plugin ids and are resolved by the capability catalog at launch.
     """
 
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     id: uuid.UUID = Field(default_factory=_new_id)
     type_id: AgentType = AgentType.EXECUTOR
     harness: HarnessKind = HarnessKind.CODEX
     model: Optional[str] = None
     reasoning: ReasoningLevel = ReasoningLevel.DEFAULT
-    # ``skills`` is the project filesystem view used by harness adapters.
-    # ``skill_ids`` is the stable graph/library contract and is project-scoped
-    # into the project's .turn/skills directory before a harness is launched.
-    skills: list[str] = Field(default_factory=list)
-    skill_ids: list[str] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
-    mcp_servers: list[MCPServerAccess] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
     session_id: Optional[str] = None
 
     @model_validator(mode="after")
-    def attach_type_skills(self) -> "Agent":
-        required = skill_paths_for_agent_type(self.type_id)
-        required_ids = skill_ids_for_agent_type(self.type_id)
-        object.__setattr__(self, "skills", list(dict.fromkeys([*required, *self.skills])))
-        references = list(dict.fromkeys([*required_ids, *self.skill_ids]))
-        for reference in references:
-            validate_skill_reference(reference)
-        object.__setattr__(self, "skill_ids", references)
+    def attach_type_capabilities(self) -> "Agent":
+        required = capability_ids_for_agent_type(self.type_id)
+        references = list(dict.fromkeys([
+            *required,
+            *self.capabilities,
+        ]))
+        for capability_id in references:
+            validate_capability_id(capability_id)
+        object.__setattr__(self, "capabilities", references)
         return self
 
     def as_type(self, agent_type: AgentType | str) -> "Agent":
-        """Return this agent as a new specialization with exact skills."""
+        """Return this agent as a new specialization with exact capabilities."""
         target = AgentType(agent_type)
-        built_in = {
-            path
-            for kind in AgentType
-            for path in skill_paths_for_agent_type(kind)
-        }
-        custom_skills = [skill for skill in self.skills if skill not in built_in]
-        built_in_ids = {
-            skill_id
-            for kind in AgentType
-            for skill_id in skill_ids_for_agent_type(kind)
-        }
-        custom_skill_ids = [skill_id for skill_id in self.skill_ids if skill_id not in built_in_ids]
+        custom_capabilities = [
+            capability_id
+            for capability_id in self.capabilities
+            if capability_id not in BUILTIN_CAPABILITY_IDS
+        ]
         agent_model = {
             AgentType.PLANNER: Planner,
             AgentType.INTEGRATOR: Integrator,
@@ -316,8 +239,7 @@ class Agent(BaseModel):
             {
                 **self.model_dump(mode="python"),
                 "type_id": target,
-                "skills": [*skill_paths_for_agent_type(target), *custom_skills],
-                "skill_ids": [*skill_ids_for_agent_type(target), *custom_skill_ids],
+                "capabilities": [*capability_ids_for_agent_type(target), *custom_capabilities],
             }
         )
 
@@ -326,20 +248,30 @@ class AgentConfig(Agent):
     """Request boundary for creating or updating an :class:`Agent`."""
 
 
+class CapabilityStatus(BaseModel):
+    """Project/harness deployment state for one graph-assigned capability."""
+
+    capability_id: str
+    skills: int = Field(ge=0)
+    mcps: int = Field(ge=0)
+    loaded: bool
+    installed: bool
+
+
 class Planner(Agent):
-    """Specialized agent type carrying the turn-planning skill."""
+    """Specialized agent type carrying the turn-planning capability."""
 
     type_id: AgentType = AgentType.PLANNER
 
 
 class Executor(Agent):
-    """Specialized agent type carrying the turn-executing skill."""
+    """Specialized agent type carrying the turn-executing capability."""
 
     type_id: AgentType = AgentType.EXECUTOR
 
 
 class Integrator(Agent):
-    """Specialized agent type carrying the turn-integrating skill."""
+    """Specialized agent type carrying the turn-integrating capability."""
 
     type_id: AgentType = AgentType.INTEGRATOR
 
@@ -577,6 +509,7 @@ class GraphNodeView(Node):
     allowed_actions: list[NodeAction]
     state_reason: Optional[str] = None
     generation_active: bool = False
+    capability_status: list[CapabilityStatus] = Field(default_factory=list)
 
 
 class GraphView(BaseModel):
@@ -590,12 +523,12 @@ class GraphView(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Resources / skills (context, not orchestration)
+# Resources (context, not orchestration)
 # --------------------------------------------------------------------------
 
 
 class Resource(BaseModel):
-    """A piece of context attached to a node (skill, instruction, doc)."""
+    """A piece of context attached to a node (instruction or document)."""
 
     ref: str
     content: Optional[str] = None
@@ -624,12 +557,8 @@ class NodeSpec(BaseModel):
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
     artifacts: list["ArtifactSpec"] = Field(default_factory=list)
-    # Local library ids or project:<slug> references installed by the planner
-    # into the current project's .turn/skills scope.
-    skills: list[str] = Field(default_factory=list)
-    # Researched MCP assignments. The server preserves source_url for audit
-    # and renders explicit runtime definitions through the selected harness.
-    mcp_servers: list[MCPServerAccess] = Field(default_factory=list)
+    # Capability plugin ids loaded by the planner into the project.
+    capabilities: list[str] = Field(default_factory=list)
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
@@ -685,9 +614,8 @@ class PlanResult(BaseModel):
         dependencies: dict[str, set[str]] = {key: set() for key in keys}
         adjacency: dict[str, set[str]] = {key: set() for key in keys}
         for node in self.nodes:
-            if node.skills:
-                for reference in node.skills:
-                    validate_skill_reference(reference)
+            for capability_id in node.capabilities:
+                validate_capability_id(capability_id)
             if node.parent_key:
                 if node.parent_key not in known:
                     raise ValueError(f"unknown parent key: {node.parent_key}")

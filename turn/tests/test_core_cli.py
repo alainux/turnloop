@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 
 import pytest
 
-from turn.__main__ import parser
+from turn.__main__ import _project_info, parser
 from turn.__main__ import discover_project_state
 from turn.config import Settings
 from turn.core import TurnCore
-from turn.domain.schemas import AgentConfig, HarnessKind, RunPolicy
+from turn.domain.schemas import AgentConfig, HarnessKind, Node, RunPolicy
 from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
 
 
@@ -21,7 +22,52 @@ def test_cli_exposes_headless_commands_and_policy_flags():
     assert parsed.harness == "pi" and parsed.reasoning == "high"
     assert parsed.manual and parsed.run
     assert parser().parse_args(["doctor"]).command == "doctor"
+    assert parser().parse_args(["capabilities", "delete", "created"]).capabilities_command == "delete"
+    assert parser().parse_args(["project", "info"]).project_command == "info"
     assert parser().parse_args(["serve", "--port", "9000"]).port == 9000
+
+
+def test_project_info_exposes_defaults_and_native_harness_surfaces(tmp_path, monkeypatch):
+    project_id = uuid.uuid4()
+    project = tmp_path / "project"
+    state_file = project / ".turn" / "state.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(json.dumps({
+        "project_id": str(project_id),
+        "nodes": [Node(
+            project_id=project_id,
+            objective="Native capability demo",
+            project_name="Native capability demo",
+            repo_path=str(project),
+            agent=AgentConfig(type_id="planner", harness="codex", model="gpt-test"),
+        ).model_dump(mode="json")],
+        "edges": [],
+        "runs": [],
+        "artifacts": [],
+    }))
+    data_dir = tmp_path / "turn-data"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({
+        "settings": {
+            "agent_defaults": json.dumps({
+                "planner": {"harness": "claude", "model": "claude-test", "reasoning": "high"},
+                "executor": {"harness": "codex", "model": "", "reasoning": "default"},
+                "integrator": {"harness": "codex", "model": "", "reasoning": "default"},
+                "verifier": {"harness": "codex", "model": "", "reasoning": "default"},
+            })
+        }
+    }))
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("TURN_DATA_DIR", str(data_dir))
+
+    info = _project_info()
+
+    assert info["project"]["id"] == str(project_id)
+    assert info["root_agent"]["harness"] == "codex"
+    assert info["agent_defaults"]["planner"]["harness"] == "claude"
+    assert info["harnesses"]["codex"]["native"]["skill_activator"] == "$<skill-id>"
+    assert "codex mcp list" in info["harnesses"]["codex"]["native"]["mcp_discovery_commands"]
+    assert info["harnesses"]["pi"]["native"]["mcp_discovery_commands"] == []
 
 
 def test_graph_cli_discovers_the_nearest_parent_project_state(tmp_path):
@@ -58,10 +104,9 @@ async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
             agent=AgentConfig(harness=HarnessKind.ECHO),
             run_policy=RunPolicy(auto_run=False),
         )
-        from turn.skills.library import SKILLS, install_builtin_skill
+        from turn.tests.capability_fixtures import load_builtin_capabilities
 
-        for skill_id in SKILLS:
-            install_builtin_skill(skill_id, project.repo_path)
+        load_builtin_capabilities(project.repo_path)
         nodes = await core.run_until_settled(project.id, max_rounds=100)
         root = next(node for node in nodes if node.id == project.id)
         assert root.auto_run is True
@@ -107,10 +152,9 @@ def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch)
     monkeypatch.setenv("TURN_STATUS_FILE", str(status))
     monkeypatch.setenv("TURN_NODE_ID", "node-1")
     monkeypatch.setenv("TURN_REPO", str(tmp_path))
-    from turn.skills.library import SKILLS, install_builtin_skill
+    from turn.tests.capability_fixtures import load_builtin_capabilities
 
-    for skill_id in SKILLS:
-        install_builtin_skill(skill_id, tmp_path)
+    load_builtin_capabilities(tmp_path)
     first = {"nodes": [{"key": "old", "objective": "Old branch"}]}
     second = {
         "project_name": "Revised project",
@@ -197,7 +241,7 @@ def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, 
         agent_command(args)
 
 
-def test_agent_cli_rejects_a_plan_skill_missing_from_the_project(tmp_path, monkeypatch):
+def test_agent_cli_rejects_a_plan_capability_missing_from_the_project(tmp_path, monkeypatch):
     from turn.__main__ import agent_command
 
     handoff = tmp_path / "node.plan.json"
@@ -207,18 +251,41 @@ def test_agent_cli_rejects_a_plan_skill_missing_from_the_project(tmp_path, monke
         "agent", "submit", "--kind", "plan",
         "--payload", (
             '{"nodes":[{"key":"work","objective":"Work",'
-            '"skills":["project:visual-qa"]}]}'
+            '"capabilities":["visual-qa"]}]}'
         ),
     ])
 
-    with pytest.raises(SystemExit, match="project:visual-qa.*not installed"):
+    with pytest.raises(SystemExit, match="visual-qa.*not loaded"):
         agent_command(args)
     assert not handoff.exists()
 
 
-def test_agent_cli_requires_builtin_skill_files_in_the_project(tmp_path, monkeypatch):
+def test_agent_cli_rejects_a_model_not_in_the_selected_harness_catalog(tmp_path, monkeypatch):
     from turn.__main__ import agent_command
-    from turn.skills.library import install_builtin_skill
+
+    handoff = tmp_path / "node.plan.json"
+    monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
+    monkeypatch.setenv("TURN_REPO", str(tmp_path))
+    monkeypatch.setattr(
+        "turn.workers.harnesses.harness_capabilities",
+        lambda: [{"id": "opencode", "models": [{"id": "opencode/gpt-5.6-luna"}]}],
+    )
+    args = parser().parse_args([
+        "agent", "submit", "--kind", "plan",
+        "--payload", (
+            '{"nodes":[{"key":"work","objective":"Work",'
+            '"agent":{"harness":"opencode","model":"gpt-5.6-luna"}}]}'
+        ),
+    ])
+
+    with pytest.raises(SystemExit, match="incorrect model.*did you mean: opencode/gpt-5.6-luna"):
+        agent_command(args)
+    assert not handoff.exists()
+
+
+def test_agent_cli_requires_capability_plugins_in_the_project(tmp_path, monkeypatch):
+    from turn.__main__ import agent_command
+    from turn.tests.capability_fixtures import load_builtin_capabilities
 
     handoff = tmp_path / "node.plan.json"
     monkeypatch.setenv("TURN_HANDOFF_FILE", str(handoff))
@@ -227,21 +294,49 @@ def test_agent_cli_requires_builtin_skill_files_in_the_project(tmp_path, monkeyp
         "agent", "submit", "--kind", "plan",
         "--payload", (
             '{"nodes":[{"key":"work","objective":"Work",'
-            '"skills":["imagegen"]}]}'
+            '"capabilities":["secret-word"]}]}'
         ),
     ])
 
-    install_builtin_skill("imagegen", tmp_path)
-    install_builtin_skill("turn-executing", tmp_path)
+    load_builtin_capabilities(tmp_path, ["secret-word", "turn-executing"])
     assert agent_command(args) == 0
-    assert json.loads(handoff.read_text())["nodes"][0]["skills"] == ["imagegen"]
+    assert json.loads(handoff.read_text())["nodes"][0]["capabilities"] == ["secret-word"]
 
 
-async def test_skills_cli_installs_a_builtin_into_turn_repo(tmp_path, monkeypatch):
+async def test_capabilities_cli_loads_a_builtin_into_turn_repo(tmp_path, monkeypatch):
     from turn.__main__ import async_main
 
     monkeypatch.setenv("TURN_REPO", str(tmp_path))
-    args = parser().parse_args(["skills", "install", "imagegen"])
+    args = parser().parse_args(["capabilities", "load", "secret-word"])
 
     assert await async_main(args) == 0
-    assert (tmp_path / ".turn" / "skills" / "imagegen" / "SKILL.md").is_file()
+    assert (tmp_path / ".turn" / "capabilities" / "secret-word" / "plugin.json").is_file()
+
+
+async def test_capabilities_cli_deletes_a_catalog_package(tmp_path, monkeypatch):
+    from turn.__main__ import async_main
+    from turn.tests.capability_fixtures import load_builtin_capabilities
+
+    data_dir = tmp_path / "turn-data"
+    load_builtin_capabilities(tmp_path, ["secret-word"])
+    catalog_root = data_dir / "capabilities"
+    catalog_root.mkdir(parents=True)
+    source = tmp_path / "created"
+    skill = source / "skills" / "created"
+    skill.mkdir(parents=True)
+    (source / "plugin.json").write_text(json.dumps({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": "created",
+        "description": "Created for deletion",
+    }))
+    (skill / "SKILL.md").write_text(
+        "---\nname: created\ndescription: Created for deletion\n---\nUse it.\n"
+    )
+
+    from turn.capabilities.catalog import CapabilityCatalog
+    CapabilityCatalog(catalog_root).import_directory(source)
+    monkeypatch.setenv("TURN_DATA_DIR", str(data_dir))
+    args = parser().parse_args(["capabilities", "delete", "created"])
+
+    assert await async_main(args) == 0
+    assert not (catalog_root / "created").exists()

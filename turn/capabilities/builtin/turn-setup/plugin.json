@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "turn-setup",
+  "version": "1.0.0",
+  "description": "Interpret a user request and set up the smallest complete workgraph that preserves its scope."
+}

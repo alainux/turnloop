@@ -28,6 +28,7 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   agent_message: null,
   allowed_actions: ["run"],
   generation_active: false,
+  capability_status: [],
   paused: false,
   auto_run: false,
   required_inputs: [],

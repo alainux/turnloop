@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -35,6 +36,14 @@ async def test_herdr_project_space_contract(tmp_path: Path):
     """Exercise creation, durable panes, UI deletion, and external deletion."""
     if shutil.which("herdr") is None:
         pytest.skip("Herdr is required for the integration contract")
+    probe = await asyncio.to_thread(
+        subprocess.run,
+        ["herdr", "workspace", "list"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("Herdr is installed but its daemon is not available to this test")
 
     # The live Herdr daemon is permissioned to the repository's project root;
     # the test intentionally exercises that real boundary rather than using a

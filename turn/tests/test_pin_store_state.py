@@ -73,13 +73,8 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
         result = []
         for item in items:
             payload = item.model_dump(mode="json")
-            # Filesystem skill paths are derived by Agent validation and are
-            # not a durable part of the graph contract. Role defaults are also
-            # reconstructed when a persisted Agent is validated; that existing
-            # behavior is protected by the dedicated skill pins.
-            if payload.get("agent"):
-                payload["agent"].pop("skills", None)
-                payload["agent"].pop("skill_ids", None)
+            # Capability package paths are project-local deployment state, not
+            # part of the durable graph contract.
             result.append(payload)
         return result
 
@@ -92,7 +87,7 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
     ]
     assert await reloaded.get_project_runs(root.id) == await store.get_project_runs(root.id)
     assert set(persisted_before) == {"version", "project_id", "nodes", "edges", "runs", "artifacts"}
-    assert persisted_before["version"] == 2
+    assert persisted_before["version"] == 3
 
 
 async def test_pin_status_compare_and_set_has_one_winner_for_concurrent_calls(tmp_path):

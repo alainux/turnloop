@@ -32,6 +32,7 @@ const node = (overrides: Partial<GraphNode> = {}): GraphNode =>
     allowed_actions: ["run"],
     state_reason: null,
     generation_active: false,
+    capability_status: [],
     ...overrides,
   }) as GraphNode;
 

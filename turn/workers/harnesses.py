@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from functools import lru_cache
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from turn.domain.schemas import (
@@ -47,7 +48,6 @@ from turn.workers.interactive import (
     prepare_result_file,
     read_result_file,
     format_verification_result,
-    result_handoff,
     run_until_result,
 )
 
@@ -218,7 +218,12 @@ def _discover_models(harness: str, binary: str | None = None) -> list[str]:
         return []
     command = [resolved_binary, *command[1:]]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=4)
+        # OpenCode's model catalog may initialize its provider registry before
+        # printing. Four seconds is short enough to turn a healthy install
+        # into an empty catalog, which then hides the provider-qualified ids
+        # the planner needs for explicit model selection.
+        timeout = 12 if harness == "opencode" else 4
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return []
     models: list[str] = []
@@ -228,18 +233,79 @@ def _discover_models(harness: str, binary: str | None = None) -> list[str]:
             continue
         columns = clean.split()
         if harness in {"pi", "opencode"}:
-            # Pi and OpenCode print fixed-width tables: provider, model, then
-            # context metadata. Model IDs are provider-qualified, and the
-            # model column may itself contain additional slash-separated
-            # segments.
-            if len(columns) < 2:
+            # OpenCode prints one fully-qualified id per line (for example
+            # ``opencode/gpt-5.6-luna``), while Pi prints provider/model
+            # columns. Accept both native output shapes without inventing a
+            # provider prefix.
+            if len(columns) == 1 and "/" in columns[0]:
+                candidate = columns[0]
+            elif len(columns) >= 2:
+                # Pi and older OpenCode versions print fixed-width tables:
+                # provider, model, then context metadata.
+                candidate = f"{columns[0]}/{columns[1]}"
+            else:
                 continue
-            candidate = f"{columns[0]}/{columns[1]}"
         else:
             candidate = columns[0]
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{1,160}", candidate):
             models.append(candidate)
-    return list(dict.fromkeys(models))[:250]
+    # Keep the provider catalog complete. Some harnesses list several hundred
+    # ids and provider-qualified OpenAI entries can appear late in the output;
+    # truncating here makes a valid selector value look unavailable.
+    return list(dict.fromkeys(models))
+
+
+def validate_plan_agent_models(
+    payload: dict,
+    *,
+    capabilities: list[dict] | None = None,
+) -> None:
+    """Validate only explicitly selected plan models against live catalogs.
+
+    An omitted model means "use the selected harness's default" and is valid.
+    When a planner provides a model, the same discovered catalog exposed to
+    the UI is authoritative. Errors include nearby ids so the planner can
+    correct and resubmit without embedding provider-specific policy in the
+    planning capability.
+    """
+    catalog = capabilities if capabilities is not None else harness_capabilities()
+    models_by_harness = {
+        str(item.get("id")): [
+            str(model.get("id"))
+            for model in item.get("models", [])
+            if isinstance(model, dict) and isinstance(model.get("id"), str)
+        ]
+        for item in catalog
+        if isinstance(item, dict)
+    }
+    for index, node in enumerate(payload.get("nodes", [])):
+        if not isinstance(node, dict) or not isinstance(node.get("agent"), dict):
+            continue
+        agent = node["agent"]
+        model = agent.get("model")
+        if not isinstance(model, str) or not model.strip():
+            continue
+        harness = str(agent.get("harness") or "")
+        known = models_by_harness.get(harness, [])
+        if not known or model in known:
+            continue
+        query = model.lower()
+        ranked = sorted(
+            known,
+            key=lambda candidate: max(
+                SequenceMatcher(None, query, candidate.lower()).ratio(),
+                SequenceMatcher(None, query, candidate.rsplit("/", 1)[-1].lower()).ratio(),
+                1.0 if query in candidate.lower() else 0.0,
+            ),
+            reverse=True,
+        )
+        suggestions = ranked[:5]
+        hint = ", ".join(suggestions) if suggestions else "a model from `turn doctor --format json`"
+        key = str(node.get("key") or index)
+        raise ValueError(
+            f"node {key}: incorrect model {model!r} for harness {harness!r}; "
+            f"did you mean: {hint}"
+        )
 
 
 def harness_capabilities(
@@ -278,20 +344,11 @@ def harness_capabilities(
     return results
 def _structured_prompt(ctx: NodeExecutionContext, result_path: Path) -> str:
     task = ctx.node.generated_prompt or "Complete the objective using the available tools."
-    verification = bool(ctx.node.agent and ctx.node.agent.type_id is AgentType.VERIFIER)
-    prompt = f"""{render_context_block(ctx)}
-OBJECTIVE:
-{ctx.node.objective}
-
-TASK:
-{task}
-
-Use BLOCK only for genuinely external human input. Continue the existing
-session when a node is rerun; preserve prior context and files.
-    """
-    if verification:
-        prompt += "\n\nVERIFICATION TARGET: this verifier may depend on one or more work items. Use `turn graph` to inspect the full workgraph, the relevant nodes' files, and their run history before deciding. A rejection without `target_node_id` returns to the only dependency when there is exactly one; when several dependencies are present, set `target_node_id` to the specific earlier node that needs correction."
-    return f"{prompt}\n\n{result_handoff(verification=verification)}"
+    return "\n".join([
+        render_context_block(ctx),
+        f"objective={ctx.node.objective}",
+        f"instructions={task}",
+    ])
 
 
 def _json_text_and_session(raw: str) -> tuple[str, str | None, Usage]:
@@ -377,6 +434,7 @@ class CLIHarnessWorker(Worker):
         native: bool = False,
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
+        skill_paths: list[str] | None = None,
     ) -> list[str]:
         return self.commands.worker_command(
             self.harness,
@@ -387,6 +445,7 @@ class CLIHarnessWorker(Worker):
             native=native,
             prompt_via_stdin=prompt_via_stdin,
             mcp_config=mcp_config,
+            skill_paths=skill_paths,
         )
 
     async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
@@ -426,7 +485,9 @@ class CLIHarnessWorker(Worker):
         verification = bool(agent.type_id is AgentType.VERIFIER)
         protocol_kind = "verification" if verification else "result"
         result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
-        environment = agent_environment(cwd, ctx.node.id, protocol_kind, result_path, agent)
+        environment = agent_environment(
+            cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
+        )
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         resume = had_session
         if not agent.session_id and self.harness == HarnessKind.CLAUDE:
@@ -474,14 +535,19 @@ class CLIHarnessWorker(Worker):
             return next((item for item in current if item not in known_opencode_sessions), None)
 
         prompt = _structured_prompt(ctx, result_path)
+        # OpenCode's ``run`` surface accepts its initial message only as a
+        # positional argument. Passing ``-`` and then injecting stdin makes
+        # the CLI display help and exit before the model starts.
+        inject_prompt = bool(getattr(transport, "supports_inject", False)) and self.harness is not HarnessKind.OPENCODE
         cmd = self._command(
             agent,
             prompt,
             cwd,
             resume=resume,
             native=native,
-            prompt_via_stdin=bool(getattr(transport, "supports_inject", False)),
+            prompt_via_stdin=inject_prompt,
             mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
+            skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
         )
         try:
             if native:
@@ -504,7 +570,7 @@ class CLIHarnessWorker(Worker):
                     harness_name=binary,
                     environment=environment,
                 )
-            elif getattr(transport, "supports_inject", False):
+            elif inject_prompt:
                 terminal = await run_until_result(
                     transport,
                     ctx.node.id,

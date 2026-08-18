@@ -22,7 +22,7 @@ from turn.workers.interactive import (
     read_result_file,
     run_until_result,
 )
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.capabilities.catalog import CapabilityCatalog
 from turn.workers.terminal import LocalPtyTransport
 
 
@@ -48,10 +48,11 @@ async def _launch(
         kind,
         result_path,
         ctx.node.agent,
+        data_dir=runtime.data_dir,
     )
     session_id = _session_for(ctx)
     # This fixture deliberately keeps the injected shell command short. The
-    # real harness adapters need the full skills/MCP environment, while this
+    # real harness adapters need the full capability environment, while this
     # process only consumes the control-plane handoff and prompt metadata.
     environment = {
         key: control_environment[key]
@@ -120,13 +121,14 @@ class FakeHarnessPlanner(Planner):
         self.runtime = runtime
 
     async def plan(self, ctx: NodeExecutionContext) -> PlanResult:
-        # Mirror the real planner's project-local skill installation. The
+        # Mirror the real planner's project-local capability loading. The
         # served test-mode authoring flow creates a fresh project directory,
-        # so validation must see the same installed contract as a seeded lab
+        # so validation must see the same loaded contract as a seeded lab
         # project before accepting the submitted plan.
         if ctx.repo_path:
-            for skill_id in SKILLS:
-                install_builtin_skill(skill_id, ctx.repo_path)
+            catalog = CapabilityCatalog(Path(self.runtime.data_dir) / "capabilities")
+            for entry in catalog.list():
+                catalog.load_into_project(entry.id, ctx.repo_path)
         session_id = _session_for(ctx)
         await _remember_session(ctx, session_id)
         payload = await _launch(

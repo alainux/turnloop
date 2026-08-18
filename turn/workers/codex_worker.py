@@ -33,12 +33,10 @@ from turn.workers.interactive import (
     prepare_result_file,
     read_codex_session_usage,
     read_result_file,
-    result_handoff,
     run_until_result,
 )
 from turn.workers import parsing
 from turn.workers.terminal import LocalPtyTransport
-from turn.mcp.runtime import codex_mcp_overrides
 
 logger = logging.getLogger("turn.worker.codex")
 
@@ -69,7 +67,9 @@ class CodexWorker(Worker):
         verification = bool(agent and agent.type_id is AgentType.VERIFIER)
         protocol_kind = "verification" if verification else "result"
         result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
-        environment = agent_environment(cwd, ctx.node.id, protocol_kind, result_path, agent)
+        environment = agent_environment(
+            cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
+        )
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         prompt = self._build_prompt(
             ctx,
@@ -85,7 +85,7 @@ class CodexWorker(Worker):
             reasoning_flags = ["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
         mcp_flags = [
             item
-            for override in codex_mcp_overrides(agent or AgentConfig(harness="codex"))
+            for override in json.loads(environment.get("TURN_AGENT_CODEX_MCP_OVERRIDES", "[]"))
             for item in ("-c", override)
         ]
         session_id = ctx.node.agent.session_id if ctx.node.agent else None
@@ -311,37 +311,11 @@ class CodexWorker(Worker):
         repo = ctx.repo_path
         if cwd and repo and repo != cwd:
             gp = gp.replace(repo, cwd)
-        prompt = f"""{render_context_block(ctx)}
-OBJECTIVE:
-{ctx.node.objective}
-
-TASK:
-{gp}
-
-When you finish, submit the result through the installed `turn` command using
-the shell-safe stdin/heredoc form in the TURN CONTROL PLANE instructions below.
-Do not type `TURN_CLI` as a command or use filesystem output as a protocol.
-Include a small `artifacts` array containing repo-relative files or directories
-that represent the work.
-If the task is too broad to complete directly, use outcome `EXPAND` and put
-the child plan in that same submitted document. Do not print a fenced result
-block and do not use provider JSON-output mode.
-
-Never invent facts you do not have. However, do NOT block merely because a
-prior stage's output is not pasted into this prompt: a "depends_on" edge means
-that stage already ran first and its artifacts are part of your available
-context (read them from the project directory or the provided context blocks).
-Only return outcome "BLOCK" with explicit missing_inputs when a genuine
-EXTERNAL gate is missing — a credential, account, approval, or a file the human
-must supply — something no automated step or your own tools can produce. If you
-can proceed using the objective, the provided context, and your tools, do so
-and return "COMPLETE".
-"""
-        return (
-            f"{prompt}\n\n{result_handoff(verification=verification)}"
-            if result_path
-            else prompt
-        )
+        return "\n".join([
+            render_context_block(ctx),
+            f"objective={ctx.node.objective}",
+            f"instructions={gp}",
+        ])
 
     # -- parsing ---------------------------------------------------------
 

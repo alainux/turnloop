@@ -23,7 +23,7 @@ from turn.domain.schemas import (
     PlanResult,
     RunPolicy,
 )
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.capabilities.catalog import CapabilityCatalog
 from turn.workers.filesystem import init_project_directory
 
 
@@ -150,10 +150,6 @@ async def seed_fake_workflows(store: Store) -> list[str]:
             continue
         root_id = uuid.uuid4()
         repo_path = init_project_directory(root_id, projects_dir=str(store.projects_dir))
-        # Fake fixtures bypass the planner, so seed the same local library
-        # files that a real planner would install before submission.
-        for skill_id in SKILLS:
-            install_builtin_skill(skill_id, repo_path)
         root = await store.create_project(
             definition.prompt,
             name=definition.title,
@@ -166,6 +162,9 @@ async def seed_fake_workflows(store: Store) -> list[str]:
             ),
             run_policy=RunPolicy(auto_run=False),
         )
+        catalog = CapabilityCatalog(store.data_dir / "capabilities")
+        for entry in catalog.list():
+            catalog.load_into_project(entry.id, repo_path)
         plan_path = Path(repo_path) / ".turn" / "fake-plan.json"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(definition.plan.model_dump_json(indent=2) + "\n", encoding="utf-8")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from turn.runner.runner import Runner
 from turn.workers.fake_harness import FakeHarnessWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
-from turn.skills.library import SKILLS, install_builtin_skill
+from turn.tests.capability_fixtures import load_builtin_capabilities
 
 
 async def _await_run(runner: Runner, node_id) -> None:
@@ -29,6 +30,14 @@ async def _await_run(runner: Runner, node_id) -> None:
 async def test_herdr_fake_user_journey_exercises_supported_actions(tmp_path):
     if shutil.which("herdr") is None:
         pytest.skip("Herdr is required for Turn terminal sessions")
+    probe = await asyncio.to_thread(
+        subprocess.run,
+        ["herdr", "workspace", "list"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("Herdr is installed but its daemon is not available to this test")
     project_root = Path(__file__).resolve().parents[2] / "projects"
     project_path = project_root / f".turn-test-fake-journey-{uuid.uuid4().hex}"
     settings = Settings(
@@ -52,8 +61,7 @@ async def test_herdr_fake_user_journey_exercises_supported_actions(tmp_path):
             agent=agent,
             run_policy=RunPolicy(auto_run=False),
         )
-        for skill_id in SKILLS:
-            install_builtin_skill(skill_id, project_path)
+        load_builtin_capabilities(project_path)
         # Creation allocates a durable Herdr shell. Opening, resizing, and
         # detaching it must preserve the same node session.
         assert await runner.ensure_node_terminal(root.id)

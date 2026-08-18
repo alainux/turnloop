@@ -1,6 +1,5 @@
 """Helpers for native, file-completing interactive harness sessions."""
 from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -16,9 +15,11 @@ from typing import Any, Awaitable, Callable
 
 from turn.contracts.dag import plan_handoff_example
 from turn.domain.schemas import Usage, VerificationResult
-from turn.mcp.runtime import prepare_runtime
+from turn.capabilities.catalog import CapabilityCatalog
+from turn.capabilities.plugin import CapabilityPluginError
+from turn.config import settings
+from turn.workers.capabilities import harness_capability_adapter
 from turn.workers.terminal import TerminalResult
-from turn.skills.library import resolve_skill_paths
 
 
 def format_verification_result(result: VerificationResult) -> str:
@@ -148,27 +149,32 @@ def prepare_result_file(cwd: str, node_id: uuid.UUID, kind: str) -> Path:
 
 
 def agent_environment(
-    cwd: str, node_id: uuid.UUID, kind: str, handoff: Path, agent: Any | None = None
+    cwd: str,
+    node_id: uuid.UUID,
+    kind: str,
+    handoff: Path,
+    agent: Any | None = None,
+    *,
+    data_dir: str | Path | None = None,
 ) -> dict[str, str]:
-    """Build the small, harness-neutral control-plane environment.
-
-    The ``TURN_AGENT_*`` values are launch metadata, not a second terminal
-    protocol. They let a harness adapter or a project-local wrapper configure
-    skills, tools, and MCP servers without inspecting terminal output.
-    """
-    skill_ids = list(dict.fromkeys(getattr(agent, "skill_ids", None) or []))
-    scoped_skills = (
-        resolve_skill_paths(skill_ids, cwd, allow_library=kind == "plan")
-        if skill_ids
-        else {}
-    )
-    mcp_runtime = prepare_runtime(cwd, node_id, agent)
-
-    def csv(name: str) -> str:
-        return ",".join(
-            str(getattr(value, "name", value))
-            for value in (getattr(agent, name, None) or [])
-        )
+    """Install loaded capabilities and prepare one native harness launch."""
+    capability_ids = list(dict.fromkeys(getattr(agent, "capabilities", None) or []))
+    catalog = CapabilityCatalog(Path(data_dir or settings.data_dir) / "capabilities")
+    packages = []
+    for capability_id in capability_ids:
+        try:
+            packages.append(catalog.resolve_project(capability_id, cwd))
+        except CapabilityPluginError as error:
+            raise ValueError(str(error)) from error
+    adapter = harness_capability_adapter(getattr(agent, "harness", None))
+    for package in packages:
+        adapter.install(package, cwd)
+        verification = adapter.verify(package, cwd)
+        if not verification.installed:
+            raise ValueError(
+                f"capability {package.id!r} failed {adapter.harness.value} installation verification"
+            )
+    launch = adapter.prepare_launch(packages, cwd, node_id)
 
     # These paths are private server-owned protocol locations. Agents receive
     # the metadata only so the Turn CLI can publish into the control plane;
@@ -178,19 +184,27 @@ def agent_environment(
         "TURN_NODE_ID": str(node_id),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
         "TURN_REPO": str(Path(cwd).resolve()),
+        "TURN_DATA_DIR": str(Path(data_dir or settings.data_dir).expanduser().resolve()),
         "TURN_HANDOFF_KIND": kind,
         "TURN_HANDOFF_FILE": str(handoff),
         "TURN_STATUS_FILE": str(status),
         "TURN_HARNESS": str(getattr(getattr(agent, "harness", None), "value", "") or ""),
         "TURN_AGENT_MODEL": str(getattr(agent, "model", None) or ""),
         "TURN_AGENT_REASONING": str(getattr(getattr(agent, "reasoning", None), "value", "") or ""),
-        "TURN_AGENT_SKILLS": ",".join(str(path) for path in scoped_skills.values()),
-        "TURN_AGENT_SKILL_IDS": ",".join(skill_ids),
-        "TURN_AGENT_SKILL_ROOT": str(Path(cwd) / ".turn" / "skills"),
-        "TURN_AGENT_TOOLS": csv("tools"),
-        "TURN_AGENT_MCP_SERVERS": csv("mcp_servers"),
+        "TURN_AGENT_CAPABILITIES": ",".join(capability_ids),
+        "TURN_AGENT_SKILLS": ",".join(launch.skill_paths),
+        "TURN_AGENT_MCP_SERVERS": ",".join(
+            component.name for package in packages for component in package.mcp_servers
+        ),
     }
-    environment.update(mcp_runtime.environment)
+    if launch.claude_config:
+        environment["TURN_AGENT_MCP_CONFIG"] = launch.claude_config
+    if launch.pi_mcp_config:
+        environment["TURN_AGENT_MCP_CONFIG"] = launch.pi_mcp_config
+    if launch.opencode_config:
+        environment["OPENCODE_CONFIG_CONTENT"] = launch.opencode_config
+    if launch.codex_overrides:
+        environment["TURN_AGENT_CODEX_MCP_OVERRIDES"] = json.dumps(list(launch.codex_overrides))
     return environment
 
 
@@ -543,73 +557,3 @@ async def run_until_result(
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         raise
-
-
-def result_handoff(*, plan: bool = False, verification: bool = False) -> str:
-    """Prompt fragment for the harness-neutral Turn control plane."""
-    turn_cli = "turn"
-    if verification:
-        shape = '{"decision":"APPROVE","summary":"What was verified","findings":[],"required_changes":[],"evidence_refs":[],"target_node_id":null}'
-    elif plan:
-        shape = plan_handoff_example()
-    else:
-        shape = '{"outcome":"COMPLETE","summary":"What happened","missing_inputs":[]}'
-    kind = "verification" if verification else "plan" if plan else "result"
-    completion = (
-        "When the verification is complete, submit the decision and let Turn route it. Omit target_node_id only when there is one dependency; when several dependencies are present, set it to the earlier node id from `turn graph --format json` that needs correction."
-        if verification
-        else "When the plan is complete, submit it and let Turn continue."
-        if plan
-        else "When the work is complete, submit the result through the Turn CLI. Keep the terminal available for follow-up conversation after submission."
-    )
-    artifact_guidance = "" if plan or verification else """
-For execution results, include only a small `artifacts` array of repo-relative
-files or directories that represent the work. Do not list every changed file;
-one directory is better for a large area. Turn will not infer artifacts from
-git status or filesystem scans.
-"""
-    plan_artifact_guidance = "" if not plan else """
-For a planning handoff, include `document_refs` or `artifacts` only for files
-that already exist and were created or linked during this planning turn. The
-simple canonical form is a relative path string, for example:
-`"document_refs":["ARCHITECTURE.md"],"artifacts":["ARCHITECTURE.md"]`.
-An explicit artifact object uses `kind`, `name`, and `ref`; `path` is not a
-schema field. Leave these arrays empty or omitted when no file was created.
-"""
-    return f"""
-TURN CONTROL PLANE:
-This is an ordinary terminal session. Use the harness normally: type, run
-commands, inspect files, and communicate with the user here. Turn does not
-parse or summarize your terminal output, and the harness must not use a
-structured-output or JSON-output mode for this protocol.
-The installed `turn` command is available on PATH; invoke `turn` directly for
-all Turn status and handoff commands. Do not type `TURN_CLI` as a command.
-
-Publish status when useful:
-  {turn_cli} agent status --state working --message "..."
-Keep the status message short: a few words describing the current action.
-
-For the final {kind}, submit one JSON object matching this shape through the
-Turn CLI. The CLI is the only submission interface and writes Turn's internal
-record. Do not use filesystem output as a protocol:
-{shape}
-
-Submit through stdin using this shell-safe heredoc form. Replace the example
-object with the actual single-line JSON object and keep `TURN_PAYLOAD` on its
-own line:
-{turn_cli} agent {'verify' if verification else 'submit --kind ' + kind} --stdin <<'TURN_PAYLOAD'
-{shape}
-TURN_PAYLOAD
-{artifact_guidance}
-{plan_artifact_guidance}
-
-The CLI submission is the only completion signal. Do not finish by printing a
-fenced result block or by relying on provider output formatting.
-
-{completion}
-
-Follow-up edits and resubmissions are allowed in this retained conversation.
-Use them cautiously: downstream work or verification may already have moved on,
-so a late edit can be too late to affect the graph or may have no effect at all.
-When in doubt, prefer an explicit rerun or the normal dependency flow.
-""".strip()

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "turn-integrating",
+  "version": "1.0.0",
+  "description": "Recompose prerequisite work into the real user-facing product."
+}

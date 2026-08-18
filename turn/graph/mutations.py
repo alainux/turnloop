@@ -13,11 +13,9 @@ from turn.domain.schemas import (
     ArtifactSpec,
     Edge,
     EdgeType,
-    MCPServerAccess,
     Node,
     NodeStatus,
     PlanResult,
-    SETUP_SKILL_ID,
 )
 
 PLANNER_EXECUTOR = "planner"
@@ -103,8 +101,10 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
         )
         inherited_agent = parent.agent.model_copy(deep=True) if parent.agent else None
         if inherited_agent:
-            inherited_agent.skill_ids = [
-                skill_id for skill_id in inherited_agent.skill_ids if skill_id != SETUP_SKILL_ID
+            inherited_agent.capabilities = [
+                capability_id
+                for capability_id in inherited_agent.capabilities
+                if capability_id != "turn-setup"
             ]
         generic_leaf = executor != PLANNER_EXECUTOR and executor == "codex"
         if generic_leaf and inherited_agent:
@@ -131,11 +131,10 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             node_agent = node_agent.as_type(
                 AgentType.PLANNER if executor == PLANNER_EXECUTOR else AgentType.EXECUTOR
             )
-        node_agent.skill_ids = list(dict.fromkeys([*node_agent.skill_ids, *spec.skills]))
-        assigned_mcp: dict[str, MCPServerAccess] = {
-            server.name: server for server in [*node_agent.mcp_servers, *spec.mcp_servers]
-        }
-        node_agent.mcp_servers = list(assigned_mcp.values())
+        node_agent.capabilities = list(dict.fromkeys([
+            *node_agent.capabilities,
+            *spec.capabilities,
+        ]))
         node = Node(
             id=node_id,
             project_id=parent.project_id,

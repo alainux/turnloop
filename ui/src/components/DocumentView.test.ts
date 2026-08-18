@@ -33,6 +33,7 @@ const node = (id: string, parent_id: string | null): GraphNode =>
     allowed_actions: [],
     state_reason: null,
     generation_active: false,
+    capability_status: [],
   }) as GraphNode;
 
 const edge = (src: string, dst: string): Edge => ({
@@ -60,36 +61,18 @@ describe("document specification ordering", () => {
     expect(rendered).toContain("/api/projects/root/documents/future.md");
   });
 
-  it("shows clickable skills and MCP sources in document nodes", () => {
+  it("shows clickable capability plugins and component counts in document nodes", () => {
     const capabilityNode = node("build", "root");
-    capabilityNode.agent = {
-      type_id: "verifier",
-      skill_ids: ["turn-verifying", "https://raw.example.test/game/SKILL.md"],
-      mcp_servers: [{
-        name: "playwright",
-        source_url: "https://github.com/microsoft/playwright-mcp",
-        transport: "stdio",
-        command: "npx",
-        args: [],
-        url: null,
-        env: {},
-        headers: {},
-        bearer_token_env_var: null,
-        enabled: true,
-      }],
-    } as unknown as NonNullable<GraphNode["agent"]>;
+    capabilityNode.agent = { type_id: "verifier", capabilities: ["secret-word"] } as unknown as NonNullable<GraphNode["agent"]>;
+    capabilityNode.capability_status = [{ capability_id: "secret-word", skills: 1, mcps: 1, loaded: true, installed: false }];
 
     const rendered = renderToStaticMarkup(
       createElement(DocumentCapabilities, { node: capabilityNode }),
     );
 
-    expect(rendered).toContain("Skills");
-    expect(rendered).toContain("turn-verifying");
-    expect(rendered).toContain("game");
-    expect(rendered).toContain("/api/skills/turn-verifying");
-    expect(rendered).toContain("MCP servers");
-    expect(rendered).toContain("playwright");
-    expect(rendered).toContain("https://github.com/microsoft/playwright-mcp");
+    expect(rendered).toContain("Capabilities");
+    expect(rendered).toContain("secret-word (1/1)");
+    expect(rendered).toContain("/api/capability-catalog/secret-word");
   });
 
   it("puts explicit prerequisites above their integrator", () => {

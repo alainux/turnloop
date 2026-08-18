@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from turn.db.store import Store
+from turn.capabilities.catalog import CapabilityCatalog
 from turn.config import REAL_HARNESSES
 from turn.domain.schemas import (
     AgentConfig,
@@ -29,6 +30,7 @@ from turn.domain.schemas import (
     NodeStatus,
     RunPolicy,
 )
+from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
@@ -43,24 +45,64 @@ from turn.workers.conversations import (
 router = APIRouter()
 
 
+def _capability_catalog(request: Request | None = None) -> CapabilityCatalog:
+    from turn.config import settings
+
+    store = getattr(getattr(request, "app", None), "state", None)
+    store = getattr(store, "store", None)
+    data_dir = getattr(store, "data_dir", Path(settings.data_dir))
+    return CapabilityCatalog(Path(data_dir) / "capabilities")
+
+
 @router.get("/api/schema")
 async def schema():
     """Serve the domain contract consumed by generated web clients."""
     return public_schema()
 
 
-@router.get("/api/skills/{skill_id}")
-async def get_skill_source(skill_id: str):
-    """Serve a built-in skill's actual source file for UI inspection."""
-    from turn.skills.library import get_skill
+@router.get("/api/capability-catalog")
+async def capability_catalog(request: Request, query: str = ""):
+    """Fuzzy-search the local portable capability catalog."""
+    catalog = _capability_catalog(request)
+    return {"capabilities": [entry.as_dict() for entry in catalog.search(query)]}
 
+
+@router.get("/api/capability-catalog/{capability_id}/files/{file_path:path}")
+async def capability_file(capability_id: str, file_path: str, request: Request):
+    catalog = _capability_catalog(request)
     try:
-        skill = get_skill(skill_id)
+        package = catalog.get(capability_id)
     except ValueError as error:
-        raise HTTPException(status_code=404, detail="skill not found") from error
-    if not skill.source_path.is_file():
-        raise HTTPException(status_code=404, detail="skill source not found")
-    return FileResponse(skill.source_path, media_type="text/markdown")
+        raise HTTPException(404, "capability not found") from error
+    candidate = (package.path / file_path).resolve()
+    try:
+        candidate.relative_to(package.path.resolve())
+    except ValueError as error:
+        raise HTTPException(404, "capability file not found") from error
+    if not candidate.is_file():
+        raise HTTPException(404, "capability file not found")
+    return FileResponse(candidate)
+
+
+@router.get("/api/capability-catalog/{capability_id}")
+async def capability_detail(capability_id: str, request: Request):
+    catalog = _capability_catalog(request)
+    try:
+        package = catalog.get(capability_id)
+    except ValueError as error:
+        raise HTTPException(404, "capability not found") from error
+    return {
+        "id": package.id,
+        "version": package.version,
+        "description": package.description,
+        "path": str(package.path),
+        "skills": [
+            {"name": item.name, "description": item.description, "path": str(item.path),
+             "source": f"/api/capability-catalog/{package.id}/files/skills/{item.name}/SKILL.md"}
+            for item in package.skills
+        ],
+        "mcps": [{"name": item.name, "config": item.config} for item in package.mcp_servers],
+    }
 
 
 # -- request bodies --------------------------------------------------------
@@ -167,6 +209,8 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         n.progress = ev.progress.get(n.id)
     root = next((n for n in nodes if n.id == project_id), None)
     serialized = []
+    project_root = store.project_path(project_id)
+    catalog = CapabilityCatalog(store.data_dir / "capabilities")
     for n in nodes:
         effective_status = ev.status.get(n.id, n.status)
         # The root is not user-visible COMPLETE until final shipping has
@@ -195,6 +239,26 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         # Only a runner-owned provider task is generation; an open user shell
         # must not animate a completed node as if the agent were still working.
         item["generation_active"] = generation_active
+        statuses = []
+        if n.agent is not None and project_root is not None:
+            for capability_id in n.agent.capabilities:
+                try:
+                    package = catalog.resolve_project(capability_id, project_root)
+                    loaded = True
+                    skill_count = package.skill_count
+                    mcp_count = package.mcp_count
+                except ValueError:
+                    loaded = False
+                    skill_count = 0
+                    mcp_count = 0
+                statuses.append({
+                    "capability_id": capability_id,
+                    "skills": skill_count,
+                    "mcps": mcp_count,
+                    "loaded": loaded,
+                    "installed": loaded and capability_is_installed(capability_id, n.agent.harness, project_root),
+                })
+        item["capability_status"] = statuses
         serialized.append(item)
     return GraphView.model_validate({
         "project_id": str(project_id),

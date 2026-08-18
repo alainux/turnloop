@@ -20,6 +20,7 @@ from typing import Optional
 logger = logging.getLogger("turn.runner")
 
 from turn.db.store import PLANNER_EXECUTOR, Store
+from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
@@ -46,8 +47,7 @@ from turn.workers.herdr import HerdrAdapter
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.workers.interactive import read_result_file
-from turn.mcp.runtime import prepare_runtime
-from turn.skills.library import validate_plan_skill_files
+from turn.workers.capabilities import CapabilityLaunch, harness_capability_adapter
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
 
@@ -84,7 +84,10 @@ class Runner:
         self._wake = asyncio.Event()
         self._stop = False
         self._task: Optional[asyncio.Task] = None
-        self._last_workspace_reconcile_at = 0.0
+        # Give the first scheduled pass time to establish freshly-created
+        # Herdr project mappings before treating an absent mapping as an
+        # externally deleted workspace.
+        self._last_workspace_reconcile_at = time.monotonic()
         # Herdr owns one durable project workspace and one pane per node. Turn
         # only opens short-lived control streams into those panes, so Herdr's
         # UI remains the place where project terminals are managed.
@@ -302,7 +305,10 @@ class Runner:
         root = await self.store.get_node(project_id)
         if root is None:
             return None
-        return root.repo_path
+        if root.repo_path:
+            return root.repo_path
+        project_path = self.store.project_path(project_id)
+        return str(project_path) if project_path is not None else None
 
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         # Compatibility shim for older in-process callers. Scheduling
@@ -418,10 +424,13 @@ class Runner:
                         return
                     if kind == "plan":
                         plan = parse_plan(payload)
-                        validate_plan_skill_files(
-                            plan.model_dump(mode="json"),
+                        catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+                        plan_payload = plan.model_dump(mode="json")
+                        catalog.load_plan_role_capabilities(plan_payload, repo_path)
+                        catalog.validate_plan(
+                            plan_payload,
                             repo_path,
-                            planner_skill_ids=current.agent.skill_ids if current.agent else None,
+                            planner_capabilities=current.agent.capabilities if current.agent else None,
                         )
                         await self._apply_plan_revision(node_id, project_id, plan)
                     elif kind == "verification" or (
@@ -618,10 +627,13 @@ class Runner:
             if forbidden_session_id and plan.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
             if ctx.repo_path:
-                validate_plan_skill_files(
-                    plan.model_dump(mode="json"),
+                catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+                plan_payload = plan.model_dump(mode="json")
+                catalog.load_plan_role_capabilities(plan_payload, ctx.repo_path)
+                catalog.validate_plan(
+                    plan_payload,
                     ctx.repo_path,
-                    planner_skill_ids=node.agent.skill_ids if node.agent else None,
+                    planner_capabilities=node.agent.capabilities if node.agent else None,
                 )
             created = await self.store.apply_plan(node, plan)
             submitted = await self.store.add_artifacts(
@@ -769,6 +781,16 @@ class Runner:
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
+            repo_path = await self._project_repo(project_id)
+            if repo_path:
+                catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+                plan_payload = plan.model_dump(mode="json")
+                catalog.load_plan_role_capabilities(plan_payload, repo_path)
+                catalog.validate_plan(
+                    plan_payload,
+                    repo_path,
+                    planner_capabilities=node.agent.capabilities if node.agent else None,
+                )
             created = await self.store.apply_plan(node, plan)
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.EXPAND,
@@ -1127,14 +1149,29 @@ class Runner:
 
             command = [fake_harness_script(), "--reconnect", session_id]
             return [*command, prompt] if prompt is not None else command
-        runtime = prepare_runtime(cwd, node.id, agent)
+        launch = self._prepare_capabilities(agent, cwd, node.id)
         return self.harness_commands.reconnect_command(
             agent,
             cwd,
             session_id,
             prompt=prompt,
-            mcp_config=runtime.claude_config,
+            mcp_config=launch.claude_config,
+            capability_mcp_overrides=launch.codex_overrides,
+            skill_paths=list(launch.skill_paths),
         )
+
+    def _prepare_capabilities(self, agent, cwd: str, node_id: object) -> CapabilityLaunch:
+        catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+        packages = [catalog.resolve_project(capability_id, cwd) for capability_id in agent.capabilities]
+        adapter = harness_capability_adapter(agent.harness)
+        for package in packages:
+            adapter.install(package, cwd)
+            verification = adapter.verify(package, cwd)
+            if not verification.installed:
+                raise RuntimeError(
+                    f"capability {package.id!r} failed {agent.harness.value} installation verification"
+                )
+        return adapter.prepare_launch(packages, cwd, node_id)
 
     async def reconnect(
         self, node_id: uuid.UUID, *, prompt: str | None = None
@@ -1281,8 +1318,14 @@ class Runner:
         return await self.terminal.close_persistent_session(node_id)
 
     async def _run_reconnect(self, node: Node, command: list[str], cwd: str, stream) -> None:
-        runtime = prepare_runtime(cwd, node.id, node.agent)
-        environment = {"TURN_PROJECT_ID": str(node.project_id), **runtime.environment}
+        launch = self._prepare_capabilities(node.agent, cwd, node.id) if node.agent else CapabilityLaunch()
+        environment = {"TURN_PROJECT_ID": str(node.project_id)}
+        if launch.claude_config or launch.pi_mcp_config:
+            environment["TURN_AGENT_MCP_CONFIG"] = launch.claude_config or launch.pi_mcp_config or ""
+        if launch.opencode_config:
+            environment["OPENCODE_CONFIG_CONTENT"] = launch.opencode_config
+        if launch.codex_overrides:
+            environment["TURN_AGENT_CODEX_MCP_OVERRIDES"] = json.dumps(list(launch.codex_overrides))
         try:
             if self.terminal.supports_inject:
                 # The persistent pane is a plain shell. Attach it; if it did
