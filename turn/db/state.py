@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import uuid
 from typing import Literal
 
-from turn.domain.schemas import Artifact, Edge, Node, Run
+from turn.domain.schemas import Artifact, Edge, Node, Run, Trigger
 
 
 @dataclass
@@ -21,13 +21,14 @@ class ProjectState:
     edges: dict[uuid.UUID, Edge] = field(default_factory=dict)
     runs: dict[uuid.UUID, Run] = field(default_factory=dict)
     artifacts: dict[uuid.UUID, Artifact] = field(default_factory=dict)
+    triggers: dict[uuid.UUID, Trigger] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "ProjectState":
         return cls()
 
     def __getitem__(
-        self, collection: Literal["nodes", "edges", "runs", "artifacts"]
-    ) -> dict[uuid.UUID, Node | Edge | Run | Artifact]:
+        self, collection: Literal["nodes", "edges", "runs", "artifacts", "triggers"]
+    ) -> dict[uuid.UUID, Node | Edge | Run | Artifact | Trigger]:
         """Read-only compatibility for existing diagnostic callers."""
         return getattr(self, collection)

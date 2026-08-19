@@ -9,6 +9,7 @@ import type {
   Project,
   Reasoning,
   RunPolicy,
+  Trigger,
   UsageResponse,
 } from "./domain";
 import {
@@ -21,6 +22,7 @@ import {
 } from "./domain";
 import { ApiError } from "./api";
 import {
+  closeProjectTerminals,
   createProject,
   deleteProject as deleteProjectRequest,
   getProjectGraph,
@@ -33,6 +35,7 @@ import {
 } from "./api/projects";
 import { chooseDirectory, getCapabilities, getSettings, saveSettings } from "./api/workspace";
 import { runNodeAction } from "./api/nodes";
+import { TriggerInspector } from "./components/TriggerInspector";
 
 // Project deletion is serialized by the typed API module as json("DELETE", ...).
 import { Graph as GraphCanvas } from "./components/Graph";
@@ -194,6 +197,7 @@ export default function App() {
   const [projectId, setProjectId] = useState<string | null>(null);
   const [graph, setGraph] = useState<Graph | null>(null);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
+  const [graphRevision, setGraphRevision] = useState(0);
   const graphLoadVersion = useRef(0);
   const [capabilities, setCapabilities] = useState<Capabilities>({
     harnesses: [],
@@ -201,6 +205,7 @@ export default function App() {
   const [workspaceSettings, setWorkspaceSettings] = useState<Record<string, unknown> | null>(null);
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"graph" | "document">("graph");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -218,6 +223,21 @@ export default function App() {
     // to developers without interrupting the workgraph with transient toasts.
     console.error(`[Turn] ${text}`);
   }, []);
+  const selectNode = useCallback((id: string) => {
+    setSelected(id);
+    setSelectedTrigger(null);
+  }, []);
+  const selectTrigger = useCallback((trigger: Trigger) => {
+    setSelectedTrigger(trigger.id);
+    setSelected(null);
+  }, []);
+  useEffect(() => {
+    // Selection is intentionally singular. Repair any transient overlap
+    // caused by a graph refresh arriving between pointer events.
+    if (selected !== null && selectedTrigger !== null) {
+      setSelectedTrigger(null);
+    }
+  }, [selected, selectedTrigger]);
   const loadProjects = useCallback(async () => {
     const result = await listProjects();
     setProjects(result.projects);
@@ -232,6 +252,7 @@ export default function App() {
     if (version !== graphLoadVersion.current) return;
     setGraph(next);
     setUsage(nextUsage);
+    setGraphRevision((value) => value + 1);
     await loadProjects();
   }, [projectId, loadProjects]);
   useEffect(() => {
@@ -249,6 +270,7 @@ export default function App() {
   }, [loadProjects, notify]);
   useEffect(() => {
     setSelected(null);
+    setSelectedTrigger(null);
     setViewMode("graph");
     clearDocumentNavigation();
     setPolicyOpen(false);
@@ -258,6 +280,7 @@ export default function App() {
     const clearDeletedProject = () => {
       setProjectId((current) => current === projectId ? null : current);
       setSelected(null);
+      setSelectedTrigger(null);
       setGraph(null);
       setUsage(null);
       setConnected(false);
@@ -340,7 +363,7 @@ export default function App() {
   return (
     <div
       id="app-shell"
-      className={`${sidebar ? "" : "sidebar-collapsed"} ${selected ? "inspector-open" : ""}`}
+      className={`${sidebar ? "" : "sidebar-collapsed"} ${selected || selectedTrigger ? "inspector-open" : ""}`}
       style={
         {
           "--sidebar-w": `${sidebarWidth}px`,
@@ -391,6 +414,7 @@ export default function App() {
             setProjectId(null);
             setGraph(null);
             setSelected(null);
+            setSelectedTrigger(null);
           }
         }}
         notify={notify}
@@ -489,6 +513,7 @@ export default function App() {
                   edges={graph!.edges}
                   artifacts={graph!.artifacts}
                   projectId={projectId}
+                  refreshKey={graphRevision}
                 />
               ) : (
                 <div id="graph" className="graph">
@@ -498,7 +523,10 @@ export default function App() {
                     flowEdges={graph!.flow_edges}
                     usage={usage?.by_node ?? {}}
                     selected={selected}
-                    onSelect={setSelected}
+                    triggers={graph!.triggers}
+                    selectedTrigger={selectedTrigger}
+                    onTriggerSelect={selectTrigger}
+                    onSelect={selectNode}
                     onRun={(node, action) =>
                       void runNodeAction(node.id, action)
                         .then(loadGraph)
@@ -554,6 +582,27 @@ export default function App() {
           />
         </>
       )}
+      {selectedTrigger && graph && (
+        <>
+          <ResizeHandle
+            target="inspector"
+            value={inspectorWidth}
+            onResize={beginResize}
+            onAdjust={adjustResize}
+          />
+          {(() => {
+            const trigger = graph.triggers.find((item) => item.id === selectedTrigger);
+            return trigger ? (
+              <TriggerInspector
+                trigger={trigger}
+                onClose={() => setSelectedTrigger(null)}
+                onChanged={loadGraph}
+                notify={notify}
+              />
+            ) : null;
+          })()}
+        </>
+      )}
       <footer className="statusbar">
         <span>{status}</span>
         <span>
@@ -606,7 +655,7 @@ export default function App() {
           <button
             role="menuitem"
             onClick={() => {
-              setSelected(nodeMenu.node.id);
+              selectNode(nodeMenu.node.id);
               setNodeMenu(null);
             }}
           >
@@ -775,6 +824,27 @@ function Projects({
     setMenu(null);
     setRenaming(false);
   };
+  const closeAllTerminals = async () => {
+    if (!menu) return;
+    const project = menu.node;
+    setMenu(null);
+    setRenaming(false);
+    try {
+      await closeProjectTerminals(project.id);
+      // Closing a project workspace is an explicit user action. Unmount the
+      // active inspector terminal before its websocket sees the server-side
+      // close; otherwise TerminalView treats that intentional close as a
+      // transient disconnect and reconnects, recreating the Herdr workspace
+      // immediately.
+      if (project.id === projectId) {
+        setSelected(null);
+        setSelectedTrigger(null);
+      }
+      notify(`Closed all terminals for ${displayProjectTitle(project)}`);
+    } catch (error) {
+      notify(String(error));
+    }
+  };
   const closeDeleteDialog = () => {
     if (deleteBusy) return;
     setDeleteTarget(null);
@@ -882,6 +952,9 @@ function Projects({
               <Icon name="pencil" /> Rename
             </button>
           )}
+          <button role="menuitem" onClick={() => void closeAllTerminals()}>
+            <Icon name="panel-right-close" /> Close all terminals
+          </button>
           <div className="popover-separator" />
           <button
             role="menuitem"

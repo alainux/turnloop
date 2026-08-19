@@ -34,13 +34,14 @@ from turn.domain.schemas import (
     PlanResult,
     Resource,
     SubgraphRef,
+    TriggerSpec,
     Usage,
     NODE_OBJECTIVE_MAX_LENGTH,
     concise_node_title,
 )
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
 from turn.workers.harnesses import recover_session_id
-from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.workers.harness_catalog import HarnessCommandFactory, codex_project_root_flags
 from turn.workers.interactive import (
     agent_environment,
     opencode_session_ids,
@@ -81,13 +82,19 @@ class HeuristicPlanner(Planner):
         # registry's default only applies when a plan is created without an
         # agent (for example, a headless legacy project).  Freezing the
         # registry default here caused a project visibly configured for Codex
-        # to silently fan out Echo children after workspace preferences had
+        # to silently fan out deterministic children after workspace preferences had
         # changed at runtime.
-        exe = (
-            ctx.node.agent.harness.value
-            if ctx.node.agent is not None
-            else self.default_executor
-        )
+        exe = self.default_executor
+        if ctx.node.agent is not None:
+            # Unit-test projects use the schema-compatible Mock agent while
+            # selecting the in-process deterministic executor. Preserve that
+            # explicit test adapter instead of accidentally launching the
+            # process-backed Mock harness.
+            if not (
+                self.default_executor == "deterministic"
+                and ctx.node.agent.harness is HarnessKind.MOCK
+            ):
+                exe = ctx.node.agent.harness.value
         nodes = [
             NodeSpec(
                 key="core",
@@ -264,24 +271,27 @@ class CodexPlanner(Planner):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *mcp_flags, "--no-alt-screen", "-C", cwd, session_id, prompt,
+                    *codex_project_root_flags(), *mcp_flags,
+                    "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *mcp_flags, "--no-alt-screen", "-C", cwd, prompt,
+                    *codex_project_root_flags(), *mcp_flags,
+                    "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags,
-                *reasoning_flags, *mcp_flags, "-C", cwd, session_id, prompt_arg,
+                *reasoning_flags, *codex_project_root_flags(), *mcp_flags,
+                "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *mcp_flags, "-C", cwd,
+                *codex_project_root_flags(), *mcp_flags, "-C", cwd,
                 prompt_arg,
             ]
         structured = ""
@@ -311,6 +321,8 @@ class CodexPlanner(Planner):
                 initial_input_mode="stdin" if getattr(transport, "supports_inject", False) else "native",
                 environment=environment,
             )
+            if result.returncode != 0:
+                raise RuntimeError(f"planner harness exited {result.returncode}")
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
             submitted = read_result_file(result_path)
@@ -323,8 +335,6 @@ class CodexPlanner(Planner):
             return "", Usage(), None
         finally:
             for temporary_path in (result_path,):
-                if temporary_path is None:
-                    continue
                 try:
                     os.unlink(str(temporary_path))
                 except OSError:
@@ -508,6 +518,8 @@ class AgentPlanner(Planner):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                 )
+            if result.returncode != 0:
+                raise RuntimeError(f"{agent.harness.value} planner harness exited {result.returncode}")
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
             submitted = read_result_file(result_path)
@@ -623,7 +635,7 @@ class AgentPlanner(Planner):
         ]
 
         # 1) Drop redundant "coordinator"/duplicate nodes; reparent their children.
-        # A LONE child whose objective merely echoes the parent is the intended
+    # A LONE child whose objective merely repeats the parent is the intended
         # single step (e.g. when the user asked for exactly one) — never drop it,
         # or we'd regress to zero children. Only drop a duplicate-objective node
         # when siblings exist (there it's redundant scaffolding).
@@ -681,5 +693,6 @@ class AgentPlanner(Planner):
             ),
             artifacts=artifact_specs(data.get("artifacts")),
             edges=[],
+            triggers=[TriggerSpec.model_validate(item) for item in data.get("triggers", [])],
             notes=data.get("notes"),
         )

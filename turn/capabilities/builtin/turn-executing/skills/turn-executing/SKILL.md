@@ -29,14 +29,31 @@ genuine external requirement.
 - Implement a real, usable slice in the existing project structure. Do not
   create a disconnected showcase, placeholder-only surface, or private
   duplicate entry point.
+- Re-read the original user-facing outcome before implementation. Verify
+  external facts, maintained APIs, and repository conventions when they affect
+  the result; do not quietly replace an unknown with a plausible invention.
 - Define and preserve typed inputs, outputs, invariants, and integration seams.
   Keep the canonical state and ownership clear so another worker can compose
   your result without guessing.
+- Stay inside the assigned boundary. Do not rewrite sibling ownership, create
+  graph nodes, or absorb another worker's responsibility. If the boundary is
+  underspecified or conflicts with a prerequisite contract, report the exact
+  gap instead of compensating with an unrelated implementation.
 - For visual or interactive work, connect controls, overlays, assets, and
   feedback to the actual runtime state. A UI element that is not reachable from
   the requested journey is not a completed feature.
 - Add focused tests or deterministic checks for the contract you own, and leave
   concise launch/use notes where downstream workers can find them.
+- Treat trigger activation as an input to the node, not as work the node must
+  recreate. If `TURN_CONTEXT` contains a trigger context, do not emit that
+  context's event name from the node; emitting it would create an accidental
+  self-trigger loop. Use a synthetic trigger context, a direct local entrypoint,
+  or fixture-based tests while developing, and reserve the activating event for
+  a deliberate end-to-end demonstration.
+- Make the work verifiable: identify the command, fixture, observable output,
+  or manual journey that proves the exported contract. “Hard to test” is a
+  signal to add an adapter, fixture, evidence file, or an explicit BLOCK/FAIL,
+  never a reason to claim completion.
 
 ## Pre-handoff quality gate
 

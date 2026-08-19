@@ -160,8 +160,7 @@ class HarnessKind(str, Enum):
     CLAUDE = "claude"
     OPENCODE = "opencode"
     PI = "pi"
-    ECHO = "echo"
-    FAKE = "fake"
+    MOCK = "mock"
     SHELL = "shell"
 
 
@@ -184,6 +183,70 @@ class AgentType(str, Enum):
 class VerificationDecision(str, Enum):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
+
+
+class TriggerKind(str, Enum):
+    """How a trigger is represented in the graph and activated."""
+
+    EVENT = "event"
+    SCHEDULE = "schedule"
+
+
+class EventSource(str, Enum):
+    """Origin of an event delivered to the workspace trigger dispatcher."""
+
+    TRANSITION = "transition"
+    AGENT_ACTION = "agent_action"
+    SCHEDULE = "schedule"
+    CLI = "cli"
+
+
+class TriggerContext(BaseModel):
+    """The exact event envelope that activated a node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    trigger_id: uuid.UUID
+    event_id: uuid.UUID
+    event_name: str = Field(min_length=1)
+    data: dict[str, Any] = Field(default_factory=dict)
+    source: EventSource
+    source_project_id: Optional[uuid.UUID] = None
+    source_node_id: Optional[uuid.UUID] = None
+    occurred_at: datetime = Field(default_factory=_utcnow)
+
+
+class Trigger(BaseModel):
+    """An event or schedule subscription that activates one graph node."""
+
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+    id: uuid.UUID = Field(default_factory=_new_id)
+    project_id: uuid.UUID
+    target_node_id: uuid.UUID
+    event_name: Optional[str] = Field(default=None, max_length=200)
+    kind: TriggerKind = TriggerKind.EVENT
+    schedule: Optional[str] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    last_fired_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> "Trigger":
+        if self.kind is TriggerKind.EVENT and not self.event_name:
+            raise ValueError("event triggers require an event name")
+        if self.kind is TriggerKind.SCHEDULE:
+            if not self.schedule:
+                raise ValueError("schedule triggers require a schedule expression")
+            if len(self.schedule.split()) != 5:
+                raise ValueError("schedule triggers require a five-field cron expression")
+            if self.event_name is not None:
+                raise ValueError("schedule triggers cannot define an event name")
+        if self.kind is TriggerKind.EVENT and self.schedule is not None:
+            raise ValueError("event triggers cannot define a schedule expression")
+        return self
 
 
 class VerificationResult(BaseModel):
@@ -444,6 +507,7 @@ class Node(BaseModel):
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
     agent: Optional[Agent] = None
     verification: Optional[VerificationResult] = None
+    trigger_context: Optional[TriggerContext] = None
     status: NodeStatus = NodeStatus.PENDING
     paused: bool = False
     # Project-level execution mode: True = auto-run ready nodes (default);
@@ -562,6 +626,7 @@ class Graph(BaseModel):
     nodes: list[Node] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
+    triggers: list[Trigger] = Field(default_factory=list)
 
 
 class GraphNodeView(Node):
@@ -582,6 +647,7 @@ class GraphView(BaseModel):
     edges: list[Edge] = Field(default_factory=list)
     flow_edges: list[FlowEdge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
+    triggers: list[Trigger] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -648,6 +714,34 @@ class EdgeSpec(BaseModel):
     dst: str  # key
 
 
+class TriggerSpec(BaseModel):
+    """A trigger declared by a planner for a node in the same plan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_key: str
+    event_name: Optional[str] = Field(default=None, max_length=200)
+    kind: TriggerKind = TriggerKind.EVENT
+    schedule: Optional[str] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> "TriggerSpec":
+        if self.kind is TriggerKind.EVENT and not self.event_name:
+            raise ValueError("event triggers require an event name")
+        if self.kind is TriggerKind.SCHEDULE:
+            if not self.schedule:
+                raise ValueError("schedule triggers require a schedule expression")
+            if len(self.schedule.split()) != 5:
+                raise ValueError("schedule triggers require a five-field cron expression")
+            if self.event_name is not None:
+                raise ValueError("schedule triggers cannot define an event name")
+        if self.kind is TriggerKind.EVENT and self.schedule is not None:
+            raise ValueError("event triggers cannot define a schedule expression")
+        return self
+
+
 class PlanResult(BaseModel):
     """The output of the Plan operation.
 
@@ -668,6 +762,7 @@ class PlanResult(BaseModel):
     )
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
     edges: list[EdgeSpec] = Field(default_factory=list)
+    triggers: list[TriggerSpec] = Field(default_factory=list)
     notes: Optional[str] = None
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
@@ -684,6 +779,9 @@ class PlanResult(BaseModel):
         known = set(keys)
         if len(keys) != len(known):
             raise ValueError("plan node keys must be unique")
+        for trigger in self.triggers:
+            if trigger.target_key not in known:
+                raise ValueError(f"unknown trigger target key: {trigger.target_key}")
 
         containment: dict[str, set[str]] = {key: set() for key in keys}
         sequence: dict[str, set[str]] = {key: set() for key in keys}

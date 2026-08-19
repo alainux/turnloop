@@ -12,7 +12,7 @@ from turn.config import Settings
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, Node, RunPolicy
 from turn.logging import EventLog
-from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
+from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 
 
 def test_cli_exposes_headless_commands_and_policy_flags():
@@ -92,17 +92,17 @@ async def test_headless_run_explicitly_drives_a_manual_project(tmp_path):
     cfg.data_dir = str(tmp_path / "turn")
     cfg.projects_dir = str(tmp_path / "projects")
     cfg.planner = "heuristic"
-    cfg.default_executor = "echo"
+    cfg.default_executor = "deterministic"
     cfg.runner_tick_seconds = 0.001
     async with TurnCore(
         cfg,
         test_mode=True,
-        herdr_adapter=FakeHerdrAdapter(),
-        terminal_transport=FakeTerminalTransport(),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=MockTerminalTransport(),
     ) as core:
         project = await core.create_project(
             "Create a compact deterministic demo",
-            agent=AgentConfig(harness=HarnessKind.ECHO),
+            agent=AgentConfig(harness=HarnessKind.MOCK),
             run_policy=RunPolicy(auto_run=False),
         )
         from turn.tests.capability_fixtures import load_builtin_capabilities
@@ -161,7 +161,7 @@ def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch)
         "project_name": "Revised project",
         "nodes": [
             {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
-            {"key": "write", "objective": "Write chapters", "executor": "echo", "follows": ["chapters"]},
+            {"key": "write", "objective": "Write chapters", "executor": "deterministic", "follows": ["chapters"]},
         ],
     }
 
@@ -392,3 +392,6 @@ async def test_agent_and_capability_cli_actions_are_logged(tmp_path, monkeypatch
     assert records[1]["data"]["query"] == "secret"
     assert records[3]["data"]["operation"] == "load"
     assert records[-1]["data"]["response_status"] == "accepted"
+    assert records[-1]["data"]["argv"] == [
+        "turn", "agent", "submit", "--kind", "result", "--payload"
+    ]

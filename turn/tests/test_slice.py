@@ -29,10 +29,10 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.workers.base import NodeExecutionContext, Planner
 from turn.workers.codex_worker import CodexWorker
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.registry import WorkerRegistry
 from turn.workers.shell_worker import ShellWorker
-from turn.tests.fakes import FakeHerdrAdapter
+from turn.tests.mocks import MockHerdrAdapter
 
 
 # --- deterministic planner ------------------------------------------------
@@ -50,13 +50,13 @@ class ScriptedPlanner(Planner):
                 NodeSpec(
                     key="a",
                     objective="Investigate the objective",
-                    executor="echo",
+                    executor="deterministic",
                     generated_prompt='{"outcome":"COMPLETE","summary":"investigated"}',
                 ),
                 NodeSpec(
                     key="b",
                     objective="Confirm the key decision",
-                    executor="echo",
+                    executor="deterministic",
                     follows=["a"],
                     required_inputs=[
                         InputSpec(
@@ -70,7 +70,7 @@ class ScriptedPlanner(Planner):
                 NodeSpec(
                     key="c",
                     objective="Produce the deliverable",
-                    executor="echo",
+                    executor="deterministic",
                     follows=["b"],
                     generated_prompt='{"outcome":"COMPLETE","summary":"produced"}',
                 ),
@@ -84,7 +84,7 @@ class ScriptedPlanner(Planner):
 
 def build_registry() -> WorkerRegistry:
     reg = WorkerRegistry()
-    reg.register(EchoWorker())
+    reg.register(DeterministicWorker())
     reg.register(ShellWorker())
     reg.register(CodexWorker(settings))
     reg.register_planner(ScriptedPlanner())
@@ -137,7 +137,7 @@ async def main() -> None:
         registry=build_registry(),
         events=events,
         settings=settings,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
 
     # 1) prompt -> root node -> initial planner
@@ -212,7 +212,7 @@ async def test_manual_mode() -> None:
         registry=build_registry(),
         events=events,
         settings=settings,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
 
     root = await store.create_project("Ship a tiny landing page for turnloop.tech (manual)")

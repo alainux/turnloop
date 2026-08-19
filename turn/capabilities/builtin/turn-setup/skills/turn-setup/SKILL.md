@@ -43,6 +43,36 @@ planners.
 - Set up direct board nodes, sequence stages, agent types, and selected capability plugins.
   Stop at nested planner boundaries; those planners own their own subtrees.
 
+The setup planner is the project's super-planner. Its most important output is
+not a clever list of tasks but a truthful initial organization: scope, domain
+ownership, planning boundaries, capabilities, architecture guidance, and
+validation contracts must all be ready for the next agents.
+
+## Scope classification gate
+
+Classify the request before choosing topology. Use the user's explicit words
+first, then the breadth of the requested outcome, number of independent
+disciplines, delivery surface, and verification burden:
+
+| Scale | Typical request | Initial shape |
+| --- | --- | --- |
+| Small | one focused command, page, comparison, chapter, or narrow automation | one executor when one owner is sufficient; add a verifier only when the quality bar needs an independent check |
+| Medium | one complete app, landing site, micro-SaaS, book, store, or focused game | concrete domain lanes with clear handoffs, cross-cutting QA, and one integration/ship convergence |
+| Large | a platform, app factory, enterprise, multi-product system, multiplatform product, robotics program, physical product line, or full-scale game | department-shaped first-level ownership, nested planners where a domain needs its own decomposition, shared architecture/contracts, integration, release, operations, and final verification |
+
+This is a judgment gate, not a node-count quota. A request for an MVP, POC,
+prototype, demo, spike, or deliberately limited slice overrides the default
+complete-product bar and the omitted scope must be stated. Conversely, a
+request for an organization, multiple teams/products, platform, ecosystem, or
+enterprise is broad even if it contains a narrow noun such as “app” or “tool”.
+Never collapse a broad request into research plus one implementation node.
+
+Before submitting, audit the setup against three questions: does the graph
+cover the user's actual deliverable and user journey; does every meaningful
+discipline have an owner and a verifiable handoff; and does every branch
+converge to one runnable, user-facing result? If any answer is no, revise the
+setup or make the missing uncertainty explicit through a nested planner.
+
 ## Topology ownership
 
 Use `$turn-planning` as the authoritative contract for decomposition and graph

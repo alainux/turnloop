@@ -31,10 +31,10 @@ from turn.domain.schemas import (
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.graph.logic import GraphWalker, derive_flow_edges
-from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
+from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 from turn.__main__ import agent_command, parser
 from turn.workers.interactive import format_verification_result
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.registry import WorkerRegistry
 from turn.workers.terminal import TerminalResult
 
@@ -101,9 +101,9 @@ def test_verification_artifact_is_the_submitted_result_not_terminal_transcript()
 
 def test_verifier_target_is_canonical_workflow_sequence():
     plan = PlanResult(nodes=[
-        NodeSpec(key="work", objective="Build product", executor="echo"),
+        NodeSpec(key="work", objective="Build product", executor="deterministic"),
         NodeSpec(
-            key="check", objective="Verify product", executor="echo",
+            key="check", objective="Verify product", executor="deterministic",
             agent_type=AgentType.VERIFIER, follows=["work"],
         ),
     ])
@@ -116,26 +116,26 @@ async def test_rejection_notifies_target_and_replays_entire_sequence_chain(tmp_p
     await store.init()
     root = await store.create_project("Build a verified product", repo_path=str(tmp_path / "repo"))
     plan = PlanResult(nodes=[
-        NodeSpec(key="work", objective="Build product", executor="echo"),
+        NodeSpec(key="work", objective="Build product", executor="deterministic"),
         NodeSpec(
-            key="check-one", objective="Verify product", executor="echo",
+            key="check-one", objective="Verify product", executor="deterministic",
             agent_type=AgentType.VERIFIER, follows=["work"],
         ),
         NodeSpec(
-            key="check-two", objective="Verify release", executor="echo",
+            key="check-two", objective="Verify release", executor="deterministic",
             agent_type=AgentType.VERIFIER, follows=["check-one"],
         ),
     ])
     created = await store.apply_plan(root, plan)
     work, check_one, check_two = created
-    work.agent = AgentConfig(harness=HarnessKind.ECHO, session_id="old-session")
+    work.agent = AgentConfig(harness=HarnessKind.MOCK, session_id="old-session")
     await store._save_node(work)
-    terminal = FakeTerminalTransport()
+    terminal = MockTerminalTransport()
     runner = Runner(
         store, events=EventBus(), settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(), terminal_transport=terminal,
+        herdr_adapter=MockHerdrAdapter(), terminal_transport=terminal,
     )
-    run = await store.create_run(check_one, "echo")
+    run = await store.create_run(check_one, "deterministic")
     await store.set_status(check_one.id, NodeStatus.RUNNING)
     await runner._handle_outcome(
         check_one,
@@ -176,7 +176,7 @@ async def test_rejection_notifies_target_and_replays_entire_sequence_chain(tmp_p
     # A corrected submission from the same parent conversation reopens the
     # verifier as the next ordinary sequence stage.
     await store.set_status(work.id, NodeStatus.RUNNING)
-    resubmission = await store.create_run(work, "echo")
+    resubmission = await store.create_run(work, "deterministic")
     assert resubmission.session_id == "old-session"
     await runner._handle_outcome(
         work,
@@ -199,13 +199,13 @@ async def test_rejection_respects_auto_step_and_manual_progression(tmp_path):
         root = await store.create_project(
             "Build a verified product",
             repo_path=str(tmp_path / f"{name}-repo"),
-            agent=AgentConfig(harness=HarnessKind.ECHO),
+            agent=AgentConfig(harness=HarnessKind.MOCK),
             run_policy=RunPolicy(auto_run=auto_run),
         )
         plan = PlanResult(nodes=[
-            NodeSpec(key="work", objective="Build product", executor="echo"),
+            NodeSpec(key="work", objective="Build product", executor="deterministic"),
             NodeSpec(
-                key="check", objective="Verify product", executor="echo",
+                key="check", objective="Verify product", executor="deterministic",
                 agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ])
@@ -217,15 +217,15 @@ async def test_rejection_respects_auto_step_and_manual_progression(tmp_path):
             registry=WorkerRegistry(),
             events=EventBus(),
             settings=Settings(),
-            herdr_adapter=FakeHerdrAdapter(),
-            terminal_transport=FakeTerminalTransport(),
+            herdr_adapter=MockHerdrAdapter(),
+            terminal_transport=MockTerminalTransport(),
         )
-        runner.registry.register(EchoWorker())
+        runner.registry.register(DeterministicWorker())
         # Simulate the verifier being the active member of a Step stage when
         # it rejects; the rejection must clear this stale barrier.
         if name == "step":
             runner._manual_stages[root.id] = {verifier.id}
-        run = await store.create_run(verifier, "echo")
+        run = await store.create_run(verifier, "deterministic")
         await runner._handle_outcome(
             verifier,
             run,
@@ -280,17 +280,17 @@ async def test_any_node_can_reject_and_route_to_an_arbitrary_node(tmp_path):
     store = Store(tmp_path / "state")
     await store.init()
     root = await store.create_project(
-        "Build an echo project with a cross-branch review",
+        "Build a deterministic project with a cross-branch review",
         repo_path=str(tmp_path / "repo"),
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     plan = PlanResult(nodes=[
-        NodeSpec(key="foundation", objective="Build the foundation", executor="echo"),
-        NodeSpec(key="polish", objective="Polish the integration", executor="echo"),
+        NodeSpec(key="foundation", objective="Build the foundation", executor="deterministic"),
+        NodeSpec(key="polish", objective="Polish the integration", executor="deterministic"),
         NodeSpec(
             key="review",
             objective="Review the integration",
-            executor="echo",
+            executor="deterministic",
             agent_type=AgentType.EXECUTOR,
             follows=["polish"],
         ),
@@ -300,15 +300,15 @@ async def test_any_node_can_reject_and_route_to_an_arbitrary_node(tmp_path):
     await store.set_status(polish.id, NodeStatus.COMPLETE)
     await store.set_status(review.id, NodeStatus.RUNNING)
 
-    terminal = FakeTerminalTransport()
+    terminal = MockTerminalTransport()
     runner = Runner(
         store,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=terminal,
     )
-    run = await store.create_run(review, "echo")
+    run = await store.create_run(review, "deterministic")
     await runner._handle_outcome(
         review,
         run,
@@ -343,23 +343,23 @@ async def test_any_node_can_reject_and_route_to_an_arbitrary_node(tmp_path):
     await store.dispose()
 
 
-async def test_echo_server_rejection_does_not_require_a_provider_session(tmp_path):
+async def test_deterministic_server_rejection_does_not_require_a_provider_session(tmp_path):
     store = Store(tmp_path / "state")
     await store.init()
     root = await store.create_project(
-        "Run an Echo rejection demo",
+        "Run an Deterministic rejection demo",
         repo_path=str(tmp_path / "repo"),
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     work, review = await store.apply_plan(
         root,
         PlanResult(nodes=[
-            NodeSpec(key="work", objective="Start", executor="echo"),
+            NodeSpec(key="work", objective="Start", executor="deterministic"),
             NodeSpec(
                 key="review",
                 objective="Review",
-                executor="echo",
+                executor="deterministic",
                 follows=["work"],
             ),
         ]),
@@ -367,8 +367,8 @@ async def test_echo_server_rejection_does_not_require_a_provider_session(tmp_pat
     runner = Runner(
         store,
         registry=WorkerRegistry(),
-        settings=Settings(default_executor="echo"),
-        herdr_adapter=FakeHerdrAdapter(),
+        settings=Settings(default_executor="deterministic"),
+        herdr_adapter=MockHerdrAdapter(),
     )
 
     await runner._notify_rejection(
@@ -442,9 +442,9 @@ async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path
     await store.init()
     root = await store.create_project("Build a verified product", repo_path=str(tmp_path))
     plan = PlanResult(nodes=[
-        NodeSpec(key="work", objective="Build product", executor="echo"),
+        NodeSpec(key="work", objective="Build product", executor="deterministic"),
         NodeSpec(
-            key="check", objective="Verify product", executor="echo",
+            key="check", objective="Verify product", executor="deterministic",
             agent_type=AgentType.VERIFIER, follows=["work"],
         ),
     ])
@@ -463,7 +463,7 @@ async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path
         store,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=transport,
     )
     await runner._notify_rejection(
@@ -502,15 +502,15 @@ async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_pat
     root = await store.create_project(
         "Reconsider a verification",
         repo_path=str(tmp_path / "repo"),
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     work, verifier = await store.apply_plan(
         root,
         PlanResult(nodes=[
-            NodeSpec(key="work", objective="Build product", executor="echo"),
+            NodeSpec(key="work", objective="Build product", executor="deterministic"),
             NodeSpec(
-                key="verify", objective="Verify product", executor="echo",
+                key="verify", objective="Verify product", executor="deterministic",
                 agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ]),
@@ -523,8 +523,8 @@ async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_pat
     )
     await store._save_node(verifier)
     await store.set_status(verifier.id, NodeStatus.RUNNING)
-    settings = Settings(default_executor="echo")
-    terminal = FakeTerminalTransport()
+    settings = Settings(default_executor="deterministic")
+    terminal = MockTerminalTransport()
     terminal.supports_inject = True
     terminal.backend_name = "herdr"
     runner = Runner(
@@ -532,10 +532,10 @@ async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_pat
         registry=WorkerRegistry(),
         events=EventBus(),
         settings=settings,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=terminal,
     )
-    runner.registry.register(EchoWorker())
+    runner.registry.register(DeterministicWorker())
 
     initial_run = await store.create_run(verifier, "codex")
     await runner._handle_outcome(

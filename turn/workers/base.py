@@ -19,6 +19,7 @@ from turn.domain.schemas import (
     PlanResult,
     Resource,
     WorkerResult,
+    TriggerContext,
 )
 from turn.workers.terminal import SessionCallback, StreamCallback, TerminalTransport
 
@@ -50,6 +51,7 @@ class NodeExecutionContext(BaseModel):
     # One-based durable run number, used by deterministic fixtures to model
     # first-pass/retry behavior without inspecting persistence internals.
     attempt: int = 1
+    trigger_context: TriggerContext | None = None
     interactive_terminal: bool = False
     timeout_seconds: float | None = None
     stall_timeout_seconds: float | None = None
@@ -127,4 +129,5 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         f"model={agent.model or ''}",
         f"reasoning={agent.reasoning.value}",
         f"activate={' '.join(markers)}",
+        f"trigger_context={ctx.trigger_context.model_dump_json() if ctx.trigger_context else ''}",
     ])

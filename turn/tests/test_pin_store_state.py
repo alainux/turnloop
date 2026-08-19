@@ -36,7 +36,7 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
                 NodeSpec(
                     key="build",
                     objective="Build the fixture",
-                    executor="echo",
+                    executor="deterministic",
                     required_inputs=[InputSpec(id="approval", kind=InputKind.APPROVAL, label="Approve")],
                     resource_refs=["README.md"],
                     document_refs=[DocumentRef(ref="DESIGN.md")],
@@ -54,7 +54,7 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
     )
     # The plan above intentionally exercises containment/sequence edges from
     # node declarations; add a durable run and a user artifact as well.
-    run = await store.create_run(created[0], "echo")
+    run = await store.create_run(created[0], "deterministic")
     await store.update_run(run.id, summary="fixture", session_id="session-1")
     await store.add_artifacts(
         created[0].id,

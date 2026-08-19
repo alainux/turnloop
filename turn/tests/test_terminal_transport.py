@@ -5,9 +5,13 @@ import sys
 import uuid
 from types import SimpleNamespace
 
-from turn.tests.fakes import FakeHerdrAdapter
+from turn.tests.mocks import MockHerdrAdapter
 from turn.workers.herdr import HerdrCliAdapter
 from turn.workers.terminal import HerdrPtyTransport, LocalPtyTransport
+
+
+def test_local_pty_advertises_terminal_availability():
+    assert LocalPtyTransport().available
 
 
 async def test_local_pty_forwards_machine_bytes_without_transform(tmp_path):
@@ -228,7 +232,7 @@ async def test_attached_terminal_is_not_reaped_while_quiet(tmp_path):
 
 
 async def test_herdr_replaces_an_externally_closed_workspace_mapping(tmp_path):
-    adapter = FakeHerdrAdapter()
+    adapter = MockHerdrAdapter()
     transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
     created = await adapter.create_workspace(cwd=str(tmp_path), label="stale")
     transport._projects["project-1"] = {
@@ -247,7 +251,7 @@ async def test_herdr_replaces_an_externally_closed_workspace_mapping(tmp_path):
 
 
 async def test_herdr_scroll_targets_the_node_pane_not_the_control_stream(tmp_path):
-    adapter = FakeHerdrAdapter()
+    adapter = MockHerdrAdapter()
     transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
     node_id = uuid.uuid4()
     assert await transport.ensure_persistent_shell(node_id, cwd=str(tmp_path))
@@ -275,7 +279,7 @@ async def test_herdr_scroll_targets_the_node_pane_not_the_control_stream(tmp_pat
 
 
 async def test_herdr_wait_until_ready_uses_pane_output_signal(tmp_path):
-    adapter = FakeHerdrAdapter()
+    adapter = MockHerdrAdapter()
     transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
     node_id = uuid.uuid4()
 

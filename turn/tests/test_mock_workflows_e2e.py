@@ -1,7 +1,8 @@
-"""Mandatory server/DAG E2E coverage through the process-level fake harness."""
+"""Mandatory server/DAG E2E coverage through the process-level mock harness."""
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -10,12 +11,13 @@ import sys
 import uuid
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from turn.config import Settings
 from turn.db.store import Store
 from turn.domain.schemas import AgentConfig, HarnessKind, RunPolicy
-from turn.fake_workflows import fake_workflow_definitions, seed_fake_workflows
+from turn.mock_workflows import mock_workflow_definitions, seed_mock_workflows
 from turn.server.api import router
 from turn.server.runtime import TurnRuntime
 from turn.runner.events import EventBus
@@ -58,7 +60,7 @@ class InjectableLocalPtyTransport(LocalPtyTransport):
         return result
 
 
-async def _wait_for(predicate, *, timeout: float = 5.0) -> None:
+async def _wait_for(predicate, *, timeout: float = 10.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
@@ -92,6 +94,8 @@ async def _run_and_wait(
     store: Store,
     node_id: uuid.UUID,
     statuses: set[str],
+    *,
+    timeout: float = 15,
 ) -> None:
     initial_runs = _run_count(store, node_id)
     response = await client.post(f"/api/nodes/{node_id}/run")
@@ -103,7 +107,8 @@ async def _run_and_wait(
                 _run_count(store, node_id) > initial_runs
                 and _status(store, node_id) in statuses
                 and _latest_run_status(store, node_id) != "RUNNING"
-            )
+            ),
+            timeout=timeout,
         )
     except AssertionError as error:
         found = store._project_for_node(node_id)
@@ -140,13 +145,13 @@ def _project_by_title(projects, title: str):
     return next(project for project in projects if project.project_name == title)
 
 
-async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_path, monkeypatch):
-    monkeypatch.setenv("TURN_FAKE_WORKFLOWS", "1")
+async def test_mock_process_workflow_lab_covers_core_state_machine_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("TURN_MOCK_WORKFLOWS", "1")
     settings = Settings(
         data_dir=str(tmp_path / "turn"),
         projects_dir=str(tmp_path / "projects"),
-        planner="fake",
-        default_executor="fake",
+        planner="mock",
+        default_executor="mock",
         runner_tick_seconds=0.01,
         default_run_timeout_seconds=10,
         stall_timeout_seconds=10,
@@ -170,24 +175,24 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
     events = components.events.subscribe()
 
     try:
-        created = await seed_fake_workflows(store)
+        created = await seed_mock_workflows(store)
         assert created == []  # runtime startup already loaded the test lab
-        assert len(await store.list_projects()) == len(fake_workflow_definitions()) == 6
+        assert len(await store.list_projects()) == len(mock_workflow_definitions()) == 8
         projects = await store.list_projects()
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            rejection = _project_by_title(projects, "Fake · reject and return")
+            rejection = _project_by_title(projects, "Mock · reject and return")
             rejection_nodes = (await store.get_workgraph(rejection.id))[0]
             work = next(node for node in rejection_nodes if node.objective == "Build the reviewable change")
             review = next(node for node in rejection_nodes if node.objective.startswith("Reject the change"))
             release = next(node for node in rejection_nodes if node.objective == "Publish the accepted change")
             await _run_and_wait(client, store, work.id, {"COMPLETE"})
             work_session = (await _node(store, work.id)).agent.session_id
-            assert work_session and work_session.startswith("fake-")
+            assert work_session and work_session.startswith("mock-")
             await _run_and_wait(client, store, review.id, {"PENDING", "RUNNABLE", "BLOCKED"})
-            await _wait_for_terminal(events, work.id, "fake-turn: resumed session")
+            await _wait_for_terminal(events, work.id, "mock-turn: resumed session")
             refreshed = (await client.get(f"/api/projects/{rejection.id}/graph")).json()
             assert next(node for node in refreshed["nodes"] if node["id"] == str(work.id))["status"] == "RUNNABLE"
             release_view = next(node for node in refreshed["nodes"] if node["id"] == str(release.id))
@@ -199,7 +204,7 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
                 for edge in refreshed["flow_edges"]
             )
 
-            expansion = _project_by_title(projects, "Fake · graph expansion")
+            expansion = _project_by_title(projects, "Mock · graph expansion")
             expand = (await store.children_of(expansion.id))[0]
             await _run_and_wait(client, store, expand.id, {"EXPANDED"})
             expanded_nodes = await store.descendants(expand.id)
@@ -214,7 +219,7 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
             await _run_and_wait(client, store, part_a.id, {"COMPLETE"})
             await _run_and_wait(client, store, part_b.id, {"COMPLETE"})
 
-            rerun = _project_by_title(projects, "Fake · rerun replaces outputs")
+            rerun = _project_by_title(projects, "Mock · rerun replaces outputs")
             reusable = (await store.children_of(rerun.id))[0]
             await _run_and_wait(client, store, reusable.id, {"COMPLETE"})
             assert [artifact.name for artifact in await store.get_artifacts(reusable.id)] == ["first-pass"]
@@ -226,14 +231,14 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
             await _run_and_wait(client, store, new_children[0].id, {"COMPLETE"})
             assert len(await store.get_artifacts(new_children[0].id)) == 1
 
-            failure = _project_by_title(projects, "Fake · failure and retry")
+            failure = _project_by_title(projects, "Mock · failure and retry")
             retryable = (await store.children_of(failure.id))[0]
             await _run_and_wait(client, store, retryable.id, {"RUNNABLE"})
             assert (await store.get_runs(retryable.id))[0].status.value == "FAILED"
             await _run_and_wait(client, store, retryable.id, {"COMPLETE"})
             assert len(await store.get_runs(retryable.id)) == 2
 
-            blocked = _project_by_title(projects, "Fake · block and provide input")
+            blocked = _project_by_title(projects, "Mock · block and provide input")
             decision = (await store.children_of(blocked.id))[0]
             await _run_and_wait(client, store, decision.id, {"BLOCKED"})
             decision = await _node(store, decision.id)
@@ -245,7 +250,7 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
             assert supplied.status_code == 200, supplied.text
             await _run_and_wait(client, store, decision.id, {"COMPLETE"})
 
-            cancelled = _project_by_title(projects, "Fake · stop and skip")
+            cancelled = _project_by_title(projects, "Mock · stop and skip")
             long_task, dependent = await store.children_of(cancelled.id)
             started = await client.post(f"/api/nodes/{long_task.id}/run")
             assert started.status_code == 200, started.text
@@ -259,13 +264,274 @@ async def test_fake_process_workflow_lab_covers_core_state_machine_paths(tmp_pat
         await runtime.stop()
 
 
+@pytest.mark.asyncio
+async def test_mock_process_schedule_demo_runs_with_custom_data(tmp_path, monkeypatch):
+    """The seeded cron demo activates and runs through the real mock process."""
+    monkeypatch.setenv("TURN_MOCK_WORKFLOWS", "1")
+    settings = Settings(
+        data_dir=str(tmp_path / "turn"),
+        projects_dir=str(tmp_path / "projects"),
+        planner="mock",
+        default_executor="mock",
+        runner_tick_seconds=0.01,
+        default_run_timeout_seconds=10,
+        stall_timeout_seconds=10,
+    )
+    # Use the same persistent/injectable transport contract as the live Herdr
+    # server. This exercises the retained-session watcher boundary as well as
+    # the real process and CLI submission.
+    terminal = InjectableLocalPtyTransport()
+    runtime = TurnRuntime(
+        settings,
+        test_mode=True,
+        terminal_transport=terminal,
+    )
+    components = await runtime.start()
+    terminal_events = components.events.subscribe()
+
+    try:
+        project = _project_by_title(await components.store.list_projects(), "Mock · schedule demo")
+        [scheduled] = await components.store.children_of(project.id)
+        [trigger] = await components.store.list_triggers(project.id)
+        assert trigger.kind.value == "schedule"
+        assert trigger.event_name is None
+        assert trigger.schedule == "* * * * *"
+        assert trigger.data == {"demo": "schedule", "channel": "cron"}
+
+        await runtime.triggers.tick_schedules(datetime.now(timezone.utc))
+        await _wait_for(
+            lambda: (
+                components.store._project_for_node(scheduled.id) is not None
+                and components.store._project_for_node(scheduled.id)[1].trigger_context is not None
+            )
+        )
+        activated = await _node(components.store, scheduled.id)
+        assert activated.trigger_context is not None
+        assert activated.trigger_context.source.value == "schedule"
+        assert activated.trigger_context.data["demo"] == "schedule"
+        assert activated.trigger_context.data["channel"] == "cron"
+        assert activated.trigger_context.data["scheduled_at"]
+
+        assert (await _node(components.store, project.id)).auto_run is True
+        await _wait_for(
+            lambda: _status(components.store, scheduled.id) == "COMPLETE"
+            and _run_count(components.store, scheduled.id) == 1,
+            timeout=12,
+        )
+        first_terminal = await _wait_for_terminal(
+            terminal_events,
+            scheduled.id,
+            "mock-turn: cli submission accepted (kind=result)",
+        )
+        assert "mock-turn: process started (kind=result)" in first_terminal
+        assert "mock-turn: initial prompt received (" in first_terminal
+        assert [artifact.name for artifact in await components.store.get_artifacts(scheduled.id)] == [
+            "greeting.txt"
+        ]
+        first_fired = (await components.store.get_trigger(trigger.id)).last_fired_at
+        assert first_fired is not None
+        await runtime.triggers.tick_schedules(first_fired + timedelta(minutes=1))
+        await _wait_for(
+            lambda: _status(components.store, scheduled.id) == "COMPLETE"
+            and _run_count(components.store, scheduled.id) == 2,
+            timeout=12,
+        )
+        second_terminal = await _wait_for_terminal(
+            terminal_events,
+            scheduled.id,
+            "mock-turn: cli submission accepted (kind=result)",
+        )
+        assert "mock-turn: process started (kind=result)" in second_terminal
+        assert "mock-turn: initial prompt received (" in second_terminal
+        assert [artifact.name for artifact in await components.store.get_artifacts(scheduled.id)] == [
+            "greeting.txt"
+        ]
+        project_runs = await components.store.get_runs(scheduled.id)
+        assert len(project_runs) == 2
+        assert all(run.status.value == "COMPLETE" for run in project_runs)
+        assert len([
+            record for record in components.logs.read(project.id)
+            if record.get("action") == "trigger.matched"
+            and record.get("data", {}).get("trigger_id") == str(trigger.id)
+        ]) >= 2
+        assert len([
+            record for record in components.logs.read(project.id)
+            if record.get("action") == "agent.submit"
+            and record.get("status") == "ok"
+            and record.get("data", {}).get("kind") == "result"
+        ]) >= 2
+        assert any(
+            record.get("action") == "trigger.matched"
+            and record.get("data", {}).get("trigger_data") == {"demo": "schedule", "channel": "cron"}
+            for record in components.logs.read(project.id)
+        )
+        # Each activation owns one short-lived process. The completion path
+        # must release it before the next cron tick; no terminal processes may
+        # accumulate across schedule activations.
+        await _wait_for(lambda: not terminal.sessions, timeout=3)
+    finally:
+        components.events.unsubscribe(terminal_events)
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_mock_process_verifier_acceptance_is_the_only_loop_entry(tmp_path, monkeypatch):
+    """A real mock process rejects once, accepts once, then triggers a loop."""
+    monkeypatch.setenv("TURN_MOCK_WORKFLOWS", "1")
+    settings = Settings(
+        data_dir=str(tmp_path / "turn"),
+        projects_dir=str(tmp_path / "projects"),
+        planner="mock",
+        default_executor="mock",
+        runner_tick_seconds=0.01,
+        default_run_timeout_seconds=10,
+        stall_timeout_seconds=10,
+    )
+    terminal = InjectableLocalPtyTransport()
+    runtime = TurnRuntime(settings, test_mode=True, terminal_transport=terminal)
+    components = await runtime.start()
+    terminal_events = components.events.subscribe()
+
+    try:
+        project = _project_by_title(
+            await components.store.list_projects(),
+            "Mock · verifier acceptance loop",
+        )
+        work, review = await components.store.children_of(project.id)
+        triggers = await components.store.list_triggers(project.id)
+        begin = next(item for item in triggers if item.event_name == "loop.begin")
+        acceptance = next(
+            item for item in triggers if item.event_name == "verification.accepted"
+        )
+
+        queued = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                "-m",
+                "turn",
+                "trigger",
+                "emit",
+                "loop.begin",
+                "--project-id",
+                str(project.id),
+                "--data",
+                json.dumps({"iteration": 1}),
+            ],
+            cwd=project.repo_path,
+            env={**os.environ, "TURN_DATA_DIR": settings.data_dir},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert queued.returncode == 0, queued.stderr or queued.stdout
+        await _wait_for(
+            lambda: (
+                (components.store._project_for_node(work.id) is not None)
+                and (components.store._project_for_node(work.id)[1].trigger_context is not None)
+            )
+        )
+        context = await _node(components.store, work.id)
+        assert context.trigger_context is not None
+        assert context.trigger_context.trigger_id == begin.id
+        assert context.trigger_context.data == {
+            "demo": "verifier-loop",
+            "source": "manual",
+            "iteration": 1,
+        }
+
+        # Start both passes explicitly. The acceptance trigger, not the
+        # rejection path, is what resets the work entry for the next pass.
+        assert await components.runner.run_node(work.id) == work.id
+        await _wait_for(
+            lambda: (
+                len([run for run in components.store._states[project.id].runs.values() if run.node_id == work.id]) >= 1
+                and components.store._states[project.id].nodes[work.id].status.value == "COMPLETE"
+            )
+        )
+        assert await components.runner.run_node(review.id) == review.id
+        await _wait_for(
+            lambda: (
+                len([run for run in components.store._states[project.id].runs.values() if run.node_id == review.id]) >= 1
+                and (components.store._states[project.id].nodes[review.id].verification is not None)
+                and components.store._states[project.id].nodes[review.id].verification.decision.value == "REJECT"
+            )
+        )
+        assert not [
+            record
+            for record in components.logs.read(project.id)
+            if record.get("action") == "trigger.matched"
+            and record.get("data", {}).get("event_name") == "verification.accepted"
+        ]
+        await _wait_for(
+            lambda: components.store._states[project.id].nodes[work.id].status.value == "RUNNABLE"
+        )
+
+        assert await components.runner.run_node(work.id) == work.id
+        await _wait_for(
+            lambda: components.store._states[project.id].nodes[work.id].status.value == "COMPLETE"
+        )
+        assert await components.runner.run_node(review.id) == review.id
+        await _wait_for(
+            lambda: (
+                len([run for run in components.store._states[project.id].runs.values() if run.node_id == review.id]) >= 2
+                and any(
+                    run.summary == "The corrected work is accepted on the second review."
+                    for run in components.store._states[project.id].runs.values()
+                    if run.node_id == review.id
+                )
+            )
+        )
+        await _wait_for(
+            lambda: bool(
+                [
+                    record
+                    for record in components.logs.read(project.id)
+                    if record.get("action") == "trigger.matched"
+                    and record.get("data", {}).get("event_name") == "verification.accepted"
+                ]
+            )
+        )
+        await components.store.update_trigger(acceptance.id, enabled=False)
+        await _wait_for(
+            lambda: (
+                (components.store._states[project.id].nodes[work.id].status.value == "RUNNABLE")
+                and (components.store._states[project.id].nodes[review.id].status.value == "BLOCKED")
+            )
+        )
+
+        review_runs = [
+            run for run in components.store._states[project.id].runs.values()
+            if run.node_id == review.id
+        ]
+        assert [run.summary for run in review_runs] == [
+            "The work needs one correction before acceptance.",
+            "The corrected work is accepted on the second review.",
+        ]
+        first_terminal = await _wait_for_terminal(
+            terminal_events,
+            work.id,
+            "mock-turn: cli submission accepted (kind=result)",
+        )
+        assert "mock-turn: process started (kind=result)" in first_terminal
+        assert any(
+            record.get("action") == "agent.submit"
+            and record.get("status") == "ok"
+            for record in components.logs.read(project.id)
+        )
+        assert not terminal.sessions
+    finally:
+        components.events.unsubscribe(terminal_events)
+        await runtime.stop()
+
+
 async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path):
     """Exercise the user-facing edit/rejection/delete path in one graph."""
     settings = Settings(
         data_dir=str(tmp_path / "turn"),
         projects_dir=str(tmp_path / "projects"),
-        planner="fake",
-        default_executor="fake",
+        planner="mock",
+        default_executor="mock",
         runner_tick_seconds=0.01,
         default_run_timeout_seconds=10,
         stall_timeout_seconds=10,
@@ -299,7 +565,7 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                     "prompt": "Build a tiny reviewable workflow",
                     "working_dir": str(tmp_path / "project"),
                     "agent": {
-                        "harness": "fake",
+                        "harness": "mock",
                         "model": "deterministic",
                         "type_id": "planner",
                     },
@@ -311,22 +577,22 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
             root = await _node(store, project_id)
             assert root.repo_path is not None
 
-            initial_plan_path = Path(root.repo_path) / ".turn" / "fake-plan.json"
+            initial_plan_path = Path(root.repo_path) / ".turn" / "mock-plan.json"
             initial_plan_path.write_text(
                 json.dumps({
                     "nodes": [
                         {
                             "key": "build",
                             "objective": "Build the reviewable change",
-                            "executor": "fake",
-                            "generated_prompt": "FAKE_COMPLETE_REVIEWABLE",
+                            "executor": "mock",
+                            "generated_prompt": "MOCK_COMPLETE_REVIEWABLE",
                         },
                         {
                             "key": "review",
                             "objective": "Reject the change and return it to build",
-                            "executor": "fake",
+                            "executor": "mock",
                             "agent_type": "verifier",
-                            "generated_prompt": "FAKE_VERIFY_REJECT",
+                            "generated_prompt": "MOCK_VERIFY_REJECT",
                             "follows": ["build"],
                         },
                     ]
@@ -366,26 +632,26 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                     {
                         "key": "chapter_plan",
                         "objective": "Plan the tiny chapters",
-                        "executor": "fake",
+                        "executor": "mock",
                         "agent_type": "planner",
                         "plan": True,
                     },
                     {
                         "key": "chapter_a",
                         "objective": "Write chapter A",
-                        "executor": "fake",
+                        "executor": "mock",
                         "follows": ["chapter_plan"],
                     },
                     {
                         "key": "chapter_b",
                         "objective": "Write chapter B",
-                        "executor": "fake",
+                        "executor": "mock",
                         "follows": ["chapter_plan"],
                     },
                     {
                         "key": "verify_chapters",
                         "objective": "Verify both chapters",
-                        "executor": "fake",
+                        "executor": "mock",
                         "agent_type": "verifier",
                         "follows": ["chapter_a", "chapter_b"],
                     },

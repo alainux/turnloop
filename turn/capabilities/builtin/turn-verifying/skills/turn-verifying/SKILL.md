@@ -24,6 +24,15 @@ point or if its visible behavior contradicts the requested experience. When
 rejecting, name the exact user-visible failure, the evidence observed, and the
 smallest concrete change that would make the predecessor resubmittable.
 
+Review across the full usability spectrum: functional behavior and failure
+paths, typed contracts and persistence, accessibility and keyboard operation,
+visual hierarchy and responsive layout, performance or operational limits,
+security and privacy boundaries, and the actual launch/publish/install path
+when those concerns apply. Inspect edge cases, empty and malformed inputs,
+recovery, and the handoff evidence. If a requirement cannot be observed or
+tested from the delivered boundary, flag it and reject or BLOCK; lack of an
+easy test is itself a quality finding.
+
 Submit exactly one decision through the Turn CLI:
 
 ```sh

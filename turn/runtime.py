@@ -13,10 +13,11 @@ from turn.runner.events import EventBus
 from turn.logging import EventLog
 from turn.runner.prefect_adapter import get_execution_adapter
 from turn.runner.runner import Runner
+from turn.runner.triggers import TriggerDispatcher
 from turn.workers.herdr import HerdrAdapter
 from turn.workers.registry import WorkerRegistry, build_registry
 from turn.workers.harnesses import harness_capabilities
-from turn.fake_workflows import fake_workflows_enabled, seed_fake_workflows
+from turn.mock_workflows import mock_workflows_enabled, seed_mock_workflows
 
 
 @dataclass(frozen=True)
@@ -68,63 +69,79 @@ class TurnRuntime:
         self.runner: Runner | None = None
         self.capabilities: list[dict[str, Any]] = []
         self._started = False
+        self.triggers = TriggerDispatcher(
+            self.store,
+            self.events,
+            self.logs,
+            settings.data_dir,
+        )
+        self.store.set_event_sink(self.triggers.emit)
 
     async def start(self) -> RuntimeComponents:
         if self._started:
             return self.components
-        await self.store.init()
-        await self._restore_settings()
-        self.logs.set_max_records(self.settings.log_max_records)
-        if not self.test_mode:
-            validate_server_settings(self.settings)
-        # Discover provider capabilities once during daemon startup. The UI
-        # reads this server-owned snapshot instead of repeatedly launching
-        # provider discovery subprocesses on every page load.
-        self.capabilities = await asyncio.to_thread(
-            harness_capabilities,
-            {"codex": self.settings.codex_model or ""},
-            {"codex": self.settings.codex_binary},
-        )
-        if self.test_mode:
-            self.capabilities.append({
-                "id": "echo", "label": "Echo · offline", "binary": "internal",
-                "reasoning": ["default"],
-                "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "internal"}],
-                "supports_sessions": False, "supports_tools": False,
-                "accepts_custom_models": False, "reasoning_profiles": [],
-                "available": True,
-            })
-            from turn.workers.fake_harness import fake_harness_script
+        try:
+            await self.store.init()
+            await self._restore_settings()
+            self.logs.set_max_records(self.settings.log_max_records)
+            if not self.test_mode:
+                validate_server_settings(self.settings)
+            # Discover provider capabilities once during daemon startup. The UI
+            # reads this server-owned snapshot instead of repeatedly launching
+            # provider discovery subprocesses on every page load.
+            self.capabilities = await asyncio.to_thread(
+                harness_capabilities,
+                {"codex": self.settings.codex_model or ""},
+                {"codex": self.settings.codex_binary},
+            )
+            if self.test_mode:
+                from turn.workers.mock_harness import mock_harness_script
 
-            self.capabilities.append({
-                "id": "fake", "label": "Fake · process harness", "binary": fake_harness_script(),
-                "reasoning": ["default"],
-                "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "test"}],
-                "supports_sessions": True, "supports_tools": False,
-                "accepts_custom_models": False, "reasoning_profiles": [],
-                "available": True,
-            })
-        registry = self._registry or build_registry(self.settings, test_mode=self.test_mode)
-        adapter = self._execution_adapter or get_execution_adapter(self.settings)
-        self.runner = Runner(
-            self.store,
-            registry,
-            self.events,
-            self.settings,
-            adapter,
-            herdr_adapter=self._herdr_adapter,
-            terminal_transport=self._terminal_transport,
-        )
-        await self.runner.start()
-        if self.test_mode and fake_workflows_enabled():
-            created = await seed_fake_workflows(self.store)
-            for project_id in created:
-                await self.runner.ensure_node_terminal(uuid.UUID(project_id))
-            self.runner.wake()
-        self._started = True
-        return self.components
+                self.capabilities.append({
+                    "id": "mock", "label": "Mock harness", "binary": mock_harness_script(),
+                    "reasoning": ["default"],
+                    "models": [{"id": "deterministic", "label": "Deterministic", "reasoning": ["default"], "source": "test"}],
+                    "supports_sessions": True, "supports_tools": False,
+                    "accepts_custom_models": False, "reasoning_profiles": [],
+                    "available": True,
+                })
+            registry = self._registry or build_registry(self.settings, test_mode=self.test_mode)
+            adapter = self._execution_adapter or get_execution_adapter(self.settings)
+            self.runner = Runner(
+                self.store,
+                registry,
+                self.events,
+                self.settings,
+                adapter,
+                herdr_adapter=self._herdr_adapter,
+                terminal_transport=self._terminal_transport,
+                trigger_dispatcher=self.triggers,
+            )
+            self.triggers.set_wake(self.runner.wake)
+            await self.runner.start()
+            await self.triggers.start()
+            if self.test_mode and mock_workflows_enabled():
+                created = await seed_mock_workflows(self.store)
+                for project_id in created:
+                    await self.runner.ensure_node_terminal(uuid.UUID(project_id))
+                self.runner.wake()
+            self._started = True
+            return self.components
+        except BaseException:
+            await self._cleanup_failed_start()
+            raise
+
+    async def _cleanup_failed_start(self) -> None:
+        """Release partially started services when lifespan startup fails."""
+        await self.triggers.stop()
+        if self.runner is not None:
+            await self.runner.stop(close_workspaces=self.test_mode)
+        await self.store.dispose()
+        self.runner = None
+        self._started = False
 
     async def stop(self) -> None:
+        await self.triggers.stop()
         if self.runner is not None:
             await self.runner.stop(close_workspaces=self.test_mode)
         if self._started:

@@ -233,6 +233,29 @@ def opencode_session_ids(binary: str = "opencode") -> list[str]:
     return list(dict.fromkeys(re.findall(r"ses_[A-Za-z0-9]+", completed.stdout)))
 
 
+def _injected_command_with_markers(
+    command: list[str], process_start_path: Path, process_exit_path: Path
+) -> str:
+    """Wrap a shell command with an attempt-scoped process lifecycle marker.
+
+    Herdr keeps the shell pane alive after a command exits, so its control
+    stream is not a process-exit signal. The wrapper records the child status
+    while leaving the durable shell available for inspection and later runs.
+    ``set +e`` is scoped to the subshell so a user's shell ``errexit`` setting
+    cannot skip the exit marker after a failed harness launch.
+    """
+    quoted_command = " ".join(shlex.quote(part) for part in command)
+    start = shlex.quote(str(process_start_path))
+    exit_path = shlex.quote(str(process_exit_path))
+    return (
+        "( set +e; "
+        f"printf '%s\\n' \"$$\" > {start}; "
+        f"{quoted_command}; "
+        "__turn_exit=$?; "
+        f"printf '%s\\n' \"$__turn_exit\" > {exit_path} )"
+    )
+
+
 async def run_until_result(
     transport: Any,
     node_id: uuid.UUID,
@@ -252,18 +275,37 @@ async def run_until_result(
     initial_input: str | None = None,
     initial_input_mode: str = "native",
     environment: dict[str, str] | None = None,
+    process_start_path: Path | None = None,
+    process_exit_path: Path | None = None,
+    keep_attached: bool = True,
 ):
-    """Keep a native TUI alive until it submits its result file.
+    """Keep a native TUI alive until its Turn handoff file is available.
 
     The process remains a normal interactive PTY while the agent works. The
-    file is only a completion signal; all terminal bytes continue flowing to
-    the browser and browser input continues flowing back to the PTY. Native
-    sessions have no whole-run timeout. A detached, quiet process is reaped
-    only after the shared terminal idle grace period so forgotten processes do
-    not accumulate.
+    handoff JSON is the file-backed Turn payload; all terminal bytes continue
+    flowing to the browser and browser input continues flowing back to the PTY.
+    Native sessions have no
+    whole-run timeout. A detached, quiet process is reaped only after the
+    shared terminal idle grace period so forgotten processes do not accumulate.
     """
     owns_attachment = True
     task: asyncio.Task | None = None
+    # A persistent shell is intentionally longer-lived than the provider
+    # command it runs. When an injected attempt has no explicit exit marker,
+    # create the missing marker and make the command publish its actual child
+    # exit code. Without this boundary a failed provider returns to the shell
+    # while ``ensure_session`` remains alive, leaving the scheduler's task (and
+    # the node's RUNNING projection) stuck forever.
+    injected_markers = (
+        getattr(transport, "supports_inject", False)
+        and process_exit_path is None
+    )
+    if injected_markers:
+        if process_start_path is None:
+            process_start_path = result_path.with_suffix(".started")
+            process_start_path.unlink(missing_ok=True)
+        process_exit_path = result_path.with_suffix(".exit")
+        process_exit_path.unlink(missing_ok=True)
 
     async def abort_owned_attachment() -> None:
         if not owns_attachment:
@@ -359,6 +401,35 @@ async def run_until_result(
                 )
             await asyncio.sleep(0.05)
 
+    async def wait_for_process_start() -> None:
+        """Wait until an injected process has actually begun executing.
+
+        Some terminal providers acknowledge a pane command as soon as it is
+        queued. That acknowledgement is not process execution: a worker can
+        otherwise clean up an attempt-scoped launcher before the pane's shell
+        has opened it. The launcher writes this marker as its first operation,
+        giving the lifecycle code a provider-neutral start boundary.
+        """
+        if process_start_path is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while not process_start_path.exists():
+            if task is not None and task.done():
+                try:
+                    result = await task
+                except Exception as error:
+                    raise RuntimeError(
+                        "harness terminal closed before the process started"
+                    ) from error
+                raise RuntimeError(
+                    f"harness terminal exited with code {result.returncode} before the process started"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "harness launch was accepted but the process did not start"
+                )
+            await asyncio.sleep(0.05)
+
     async def wait_for_local_process() -> None:
         """Wait for a local PTY process to produce its first terminal frame."""
         snapshot_reader = getattr(transport, "snapshot", None)
@@ -408,6 +479,9 @@ async def run_until_result(
             await transport.stop(node_id)
 
     started_at = time.time()
+    process_completion_deadline: float | None = None
+    post_submit_observation_deadline: float | None = None
+    handoff_stop_requested = False
     try:
         if getattr(transport, "supports_inject", False):
             # A provider-native command carries its initial prompt. Reset any
@@ -425,13 +499,21 @@ async def run_until_result(
                 )
             )
             await wait_for_attachment()
+            injected_command = " ".join(shlex.quote(part) for part in command)
+            if injected_markers:
+                assert process_start_path is not None
+                assert process_exit_path is not None
+                injected_command = _injected_command_with_markers(
+                    command, process_start_path, process_exit_path
+                )
             injected = await transport.inject_command(
                 node_id,
-                " ".join(shlex.quote(part) for part in command),
+                injected_command,
                 environment=environment,
             )
             if not injected:
                 raise RuntimeError("Turn could not inject the harness command into Herdr")
+            await wait_for_process_start()
         else:
             task = asyncio.create_task(
                 transport.run(
@@ -450,6 +532,9 @@ async def run_until_result(
                     idle_reap=idle_reap,
                 )
             )
+            await wait_for_process_start()
+        if process_start_path is not None and timeout is not None:
+            process_completion_deadline = time.monotonic() + timeout
         if initial_input:
             # Machine transports receive their prompt through stdin after the
             # command starts. Native provider commands carry their prompt in
@@ -496,8 +581,32 @@ async def run_until_result(
         raise
     discovered_session: str | None = None
     last_probe = 0.0
+
+    def process_exit_code() -> int | None:
+        if process_exit_path is None:
+            return None
+        try:
+            value = process_exit_path.read_text(encoding="utf-8").strip()
+            return int(value) if value else None
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
     try:
-        while task is None or not task.done():
+        while (
+            task is None
+            or not task.done()
+            # A process-backed launch must enter the marker-handling branch at
+            # least once after its control task ends. Otherwise a provider
+            # that closes its control stream early can skip the detach/return
+            # code even though the child has only just submitted its result.
+            or process_start_path is not None
+        ):
+            if (
+                process_completion_deadline is not None
+                and time.monotonic() >= process_completion_deadline
+            ):
+                await abort_owned_attachment()
+                raise asyncio.TimeoutError
             if session_callback is not None and discovered_session is None:
                 discovered_session = _new_codex_session_id(
                     cwd,
@@ -519,7 +628,38 @@ async def run_until_result(
                         discovered_session = candidate
                         if session_callback is not None:
                             await session_callback(candidate)
-            if read_result_file(result_path) is not None:
+            submitted = read_result_file(result_path)
+            exit_code = process_exit_code()
+            # A process-backed provider can crash after writing its start
+            # marker but before publishing the optional exit marker. Once the
+            # control task has ended there is no future event that can make
+            # this attempt complete, so return its real status immediately.
+            if task is not None and task.done() and process_start_path is not None:
+                result = await task
+                # A queued provider command can legitimately have a successful
+                # control task while its child is still running; keep waiting
+                # for its exit marker in that case. Any nonzero control result
+                # is a terminal failure and must never be hidden by a missing
+                # marker.
+                if process_exit_path is None or result.returncode != 0:
+                    if getattr(transport, "supports_inject", False):
+                        await transport.detach(node_id)
+                    return result
+            # A process harness may publish its CLI handoff just before its
+            # shell process exits. Persistent native harnesses intentionally
+            # remain open after a successful handoff, so observe them only for
+            # a short crash window before preserving the attached process.
+            if submitted is not None and process_exit_path is not None and exit_code is None:
+                if keep_attached:
+                    if post_submit_observation_deadline is None:
+                        post_submit_observation_deadline = time.monotonic() + 0.5
+                    if time.monotonic() < post_submit_observation_deadline:
+                        await asyncio.sleep(0.05)
+                        continue
+                else:
+                    await asyncio.sleep(0.05)
+                    continue
+            if submitted is not None:
                 # A provider may finish its first turn before the session
                 # marker is visible in the rollout file. At the completion
                 # boundary the newest session for this cwd is the only new
@@ -536,20 +676,70 @@ async def run_until_result(
                         discovered_session = candidate
                         await session_callback(candidate)
                 if getattr(transport, "supports_inject", False):
-                    # The Herdr pane remains attached and inspectable after
-                    # a handoff. Only an explicit cancel/close may stop it.
-                    snapshot = transport.snapshot(node_id)
+                    if keep_attached:
+                        # The Herdr pane remains attached and inspectable after
+                        # a handoff. Only an explicit cancel/close may stop it.
+                        snapshot = transport.snapshot(node_id)
+                        return TerminalResult(
+                            returncode=exit_code if exit_code is not None else 0,
+                            output=str(snapshot.get("output", "")).encode(),
+                        )
+                    # Short-lived process harnesses have completed once the
+                    # CLI submission and process exit are both observed.
+                    # Release only Turn's control client; the durable Herdr
+                    # shell pane and its scrollback remain available.
+                    await transport.detach(node_id)
+                    result = await task
                     return TerminalResult(
-                        returncode=0,
-                        output=str(snapshot.get("output", "")).encode(),
+                        returncode=exit_code if exit_code is not None else result.returncode,
+                        output=result.output,
+                        display_output=result.display_output,
+                        stalled=result.stalled,
+                        idle_reaped=result.idle_reaped,
                     )
                 # Non-persistent transports retain their original lifecycle:
                 # finish the child PTY once the handoff file is valid.
+                handoff_stop_requested = task is not None and not task.done()
+                await transport.stop(node_id)
+                break
+            if exit_code is not None:
+                # A process exited without publishing the CLI handoff. Return
+                # its real status so the worker can report a failed launch
+                # instead of waiting forever on an artifact that will never
+                # arrive.
+                if getattr(transport, "supports_inject", False):
+                    await transport.detach(node_id)
+                    result = await task
+                    return TerminalResult(
+                        returncode=exit_code,
+                        output=result.output,
+                        display_output=result.display_output,
+                        stalled=result.stalled,
+                        idle_reaped=result.idle_reaped,
+                    )
                 await transport.stop(node_id)
                 break
             await asyncio.sleep(0.1)
         if owns_attachment:
-            return await task
+            result = await task
+            exit_code = process_exit_code()
+            if exit_code is not None:
+                return TerminalResult(
+                    returncode=exit_code,
+                    output=result.output,
+                    display_output=result.display_output,
+                    stalled=result.stalled,
+                    idle_reaped=result.idle_reaped,
+                )
+            if handoff_stop_requested:
+                return TerminalResult(
+                    returncode=0,
+                    output=result.output,
+                    display_output=result.display_output,
+                    stalled=result.stalled,
+                    idle_reaped=result.idle_reaped,
+                )
+            return result
         snapshot = transport.snapshot(node_id)
         return TerminalResult(returncode=0, output=str(snapshot.get("output", "")).encode())
     except asyncio.CancelledError:

@@ -12,8 +12,8 @@ from pathlib import Path
 
 
 REAL_HARNESSES = frozenset({"codex", "claude", "opencode", "pi"})
-TEST_ONLY_PLANNERS = frozenset({"heuristic", "echo", "fake"})
-TEST_ONLY_EXECUTORS = frozenset({"echo", "fake"})
+TEST_ONLY_PLANNERS = frozenset({"heuristic", "deterministic", "mock"})
+TEST_ONLY_EXECUTORS = frozenset({"deterministic", "mock"})
 
 
 def test_modes_enabled() -> bool:
@@ -46,7 +46,7 @@ def validate_server_settings(config: "Settings") -> None:
         )
     if config.default_executor in TEST_ONLY_EXECUTORS:
         raise RuntimeError(
-            "deterministic Echo execution is test-only; the served app requires a real harness"
+            "deterministic mock execution is test-only; the served app requires a real harness"
         )
     if config.default_executor not in REAL_HARNESSES:
         raise RuntimeError(
@@ -169,8 +169,8 @@ class Settings:
     # Where NEW projects are created by default. Each project becomes its own
     # assigned directory under this directory (e.g. ./projects/<id>/). The
     # default is deliberately repo-local so a local Turn server never creates
-    # project files in a temporary system directory. Version control is
-    # managed by the end user outside Turn.
+    # project files in a temporary system directory. Each assigned directory
+    # is initialized as its own Git project by the filesystem boundary.
     projects_dir: str = field(
         default_factory=lambda: os.getenv("TURN_PROJECTS_DIR", str(Path.cwd() / "projects"))
     )

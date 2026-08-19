@@ -89,7 +89,7 @@ class HerdrAdapter(Protocol):
         pane_id: str,
         *,
         source: str = "recent",
-        lines: int = 2000,
+        lines: int | None = None,
     ) -> str: ...
 
     def terminal_control_command(
@@ -329,22 +329,16 @@ class HerdrCliAdapter:
         pane_id: str,
         *,
         source: str = "recent",
-        lines: int = 2000,
+        lines: int | None = None,
     ) -> str:
         if not self.available:
             raise HerdrAdapterError("Herdr is required for pane reads")
+        command = [*self.command("pane", "read", pane_id, "--source", source)]
+        if lines is not None:
+            command.extend(("--lines", str(max(1, lines))))
+        command.extend(("--format", "ansi"))
         process = await asyncio.create_subprocess_exec(
-            *self.command(
-                "pane",
-                "read",
-                pane_id,
-                "--source",
-                source,
-                "--lines",
-                str(max(1, lines)),
-                "--format",
-                "ansi",
-            ),
+            *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

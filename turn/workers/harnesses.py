@@ -609,7 +609,6 @@ class CLIHarnessWorker(Worker):
         except asyncio.TimeoutError:
             return WorkerResult(outcome=Outcome.FAIL, summary=f"{self.name} exceeded the run timeout", error="execution timeout")
         raw_out = terminal.output.decode(errors="replace")
-        raw_err = ""
         if terminal.idle_reaped:
             return WorkerResult(
                 outcome=Outcome.FAIL,
@@ -624,6 +623,14 @@ class CLIHarnessWorker(Worker):
                 summary=f"{self.name} stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                 error="stalled terminal output",
                 retry_recommended=False,
+            )
+        if terminal.returncode != 0:
+            return WorkerResult(
+                outcome=Outcome.FAIL,
+                summary=f"{self.name} exited {terminal.returncode}",
+                error=raw_out[-2000:],
+                retry_recommended=False,
+                session_id=observed_session or agent.session_id,
             )
         submitted = read_result_file(result_path)
         session = observed_session or agent.session_id
@@ -675,20 +682,11 @@ class CLIHarnessWorker(Worker):
         text = json.dumps(submitted) if submitted is not None else ""
         usage = Usage()
         data = parsing.first_result_json(text) or {}
-        if terminal.returncode != 0 and not data:
-            return WorkerResult(
-                outcome=Outcome.FAIL,
-                summary=f"{self.name} exited {terminal.returncode}",
-                error=raw_err or text,
-                retry_recommended=False,
-                session_id=session or agent.session_id,
-                usage=usage,
-            )
         if not data:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} stopped without a structured result",
-                error=text[-2000:] or raw_err,
+                error=text[-2000:],
                 retry_recommended=False,
                 session_id=session or agent.session_id,
                 usage=usage,

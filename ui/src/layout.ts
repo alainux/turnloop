@@ -1,4 +1,4 @@
-import type { Edge, GraphNode } from "./domain";
+import type { Edge, GraphNode, Trigger } from "./domain";
 
 export interface Position {
   x: number;
@@ -9,6 +9,8 @@ export interface Layout {
   positions: Map<string, Position>;
   /** Routed paths are in the same padded coordinate space as the SVG. */
   edgePaths: Map<string, string>;
+  /** Synthetic edges from first-class trigger nodes into their targets. */
+  triggerEdges: Edge[];
   /** Left edge of each rendered rank, also in the unpadded layout space. */
   stageXs: number[];
   width: number;
@@ -19,7 +21,13 @@ export const NODE_WIDTH = 224,
   NODE_HEIGHT = 64,
   NODE_VERTICAL_GAP = 14,
   STAGE_HORIZONTAL_GAP = 54,
-  GRAPH_PADDING = 48;
+  GRAPH_PADDING = 48,
+  TRIGGER_NODE_SIZE = 32,
+  TRIGGER_SOURCE_WIDTH = (NODE_WIDTH + TRIGGER_NODE_SIZE) / 2;
+
+export function triggerLayoutId(trigger: Trigger): string {
+  return `trigger:${trigger.id}`;
+}
 
 function containmentEdges(nodes: GraphNode[], edges: Edge[]): Edge[] {
   const ids = new Set(nodes.map((node) => node.id));
@@ -174,25 +182,23 @@ function parentMap(nodes: GraphNode[], edges: Edge[]): Map<string, string> {
 }
 
 function stableTopologicalOrder(
-  nodes: GraphNode[],
+  ids: string[],
   edges: Edge[],
 ): { order: string[]; outgoing: Map<string, string[]> } {
-  const ids = new Set(nodes.map((node) => node.id));
-  const orderIndex = new Map(nodes.map((node, index) => [node.id, index]));
+  const knownIds = new Set(ids);
+  const orderIndex = new Map(ids.map((id, index) => [id, index]));
   const outgoing = new Map<string, string[]>();
-  const indegree = new Map(nodes.map((node) => [node.id, 0]));
+  const indegree = new Map(ids.map((id) => [id, 0]));
   const pairs = new Set<string>();
   for (const edge of edges) {
-    if (!ids.has(edge.src) || !ids.has(edge.dst)) continue;
+    if (!knownIds.has(edge.src) || !knownIds.has(edge.dst)) continue;
     const pair = `${edge.src}:${edge.dst}`;
     if (pairs.has(pair)) continue;
     pairs.add(pair);
     outgoing.set(edge.src, [...(outgoing.get(edge.src) ?? []), edge.dst]);
     indegree.set(edge.dst, (indegree.get(edge.dst) ?? 0) + 1);
   }
-  const queue = nodes
-    .filter((node) => indegree.get(node.id) === 0)
-    .map((node) => node.id);
+  const queue = ids.filter((id) => indegree.get(id) === 0);
   const order: string[] = [];
   while (queue.length) {
     queue.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0));
@@ -207,9 +213,9 @@ function stableTopologicalOrder(
   // The server validates the graph as acyclic. Keep the UI deterministic if
   // it receives a stale event during a replacement rather than allowing a
   // partial layout to scramble the stage order.
-  if (order.length !== nodes.length) {
-    for (const node of nodes) {
-      if (!order.includes(node.id)) order.push(node.id);
+  if (order.length !== ids.length) {
+    for (const id of ids) {
+      if (!order.includes(id)) order.push(id);
     }
   }
   return { order, outgoing };
@@ -233,8 +239,9 @@ function workflowBranch(
 function routeWorkflowEdge(
   source: Position,
   target: Position,
+  sourceWidth = NODE_WIDTH,
 ): string {
-  const x1 = source.x + GRAPH_PADDING + NODE_WIDTH;
+  const x1 = source.x + GRAPH_PADDING + sourceWidth;
   const y1 = source.y + GRAPH_PADDING + NODE_HEIGHT / 2;
   const x2 = target.x + GRAPH_PADDING;
   const y2 = target.y + GRAPH_PADDING + NODE_HEIGHT / 2;
@@ -260,12 +267,25 @@ function routeWorkflowEdge(
 export async function layoutDendrogram(
   nodes: GraphNode[],
   edges: Edge[] = [],
+  triggers: Trigger[] = [],
 ): Promise<Layout> {
   const visibleEdges = displayEdges(nodes, edges);
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const visibleTriggers = triggers.filter((trigger) => byId.has(trigger.target_node_id));
+  const triggerEdges = visibleTriggers.filter((trigger) => trigger.enabled).map((trigger): Edge => ({
+    id: `trigger-edge:${trigger.id}`,
+    src: triggerLayoutId(trigger),
+    dst: trigger.target_node_id,
+    type: "FOLLOWS",
+    created_at: trigger.created_at,
+  }));
+  const triggerIds = new Set(visibleTriggers.map(triggerLayoutId));
+  const layoutIds = [...nodes.map((node) => node.id), ...triggerIds];
   if (!nodes.length) {
     return {
       positions: new Map(),
       edgePaths: new Map(),
+      triggerEdges: [],
       stageXs: [0],
       width: NODE_WIDTH,
       height: NODE_HEIGHT,
@@ -274,8 +294,7 @@ export async function layoutDendrogram(
   }
 
   const sequenceTargets = new Set(sequenceProjection(nodes, edges).map((edge) => edge.dst));
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const layoutEdges = [...visibleEdges];
+  const layoutEdges = [...visibleEdges, ...triggerEdges];
   const layoutPairs = new Set(layoutEdges.map((edge) => `${edge.src}:${edge.dst}`));
   // Parent metadata may arrive one event before its explicit CONTAINS edge.
   // Use it for rank constraints, but only render the canonical visible edge.
@@ -293,8 +312,10 @@ export async function layoutDendrogram(
     });
   }
 
-  const { order, outgoing } = stableTopologicalOrder(nodes, layoutEdges);
-  const rank = new Map(nodes.map((node) => [node.id, 0]));
+  const { order, outgoing } = stableTopologicalOrder(layoutIds, layoutEdges);
+  const rank = new Map(
+    layoutIds.map((id) => [id, 0]),
+  );
   for (const id of order) {
     const currentRank = rank.get(id) ?? 0;
     for (const next of outgoing.get(id) ?? []) {
@@ -307,13 +328,13 @@ export async function layoutDendrogram(
   }
 
   const parents = parentMap(nodes, edges);
-  const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]));
-  const branchIds = [...new Set(nodes.map((node) => workflowBranch(node.id, parents)))];
+  const nodeOrder = new Map(layoutIds.map((id, index) => [id, index]));
+  const branchIds = [...new Set(layoutIds.map((id) => workflowBranch(id, parents)))];
   const branchOrder = new Map(branchIds.map((id, index) => [id, index]));
   const rankNodes = new Map<number, string[]>();
-  for (const node of nodes) {
-    const depth = rank.get(node.id) ?? 0;
-    rankNodes.set(depth, [...(rankNodes.get(depth) ?? []), node.id]);
+  for (const id of layoutIds) {
+    const depth = rank.get(id) ?? 0;
+    rankNodes.set(depth, [...(rankNodes.get(depth) ?? []), id]);
   }
   for (const ids of rankNodes.values()) {
     ids.sort((a, b) => {
@@ -355,10 +376,15 @@ export async function layoutDendrogram(
   }
 
   const edgePaths = new Map<string, string>();
-  for (const edge of visibleEdges) {
+  for (const edge of [...visibleEdges, ...triggerEdges]) {
     const source = positions.get(edge.src);
     const target = positions.get(edge.dst);
-    if (source && target) edgePaths.set(edge.id, routeWorkflowEdge(source, target));
+    if (source && target) {
+      edgePaths.set(
+        edge.id,
+        routeWorkflowEdge(source, target, triggerIds.has(edge.src) ? TRIGGER_SOURCE_WIDTH : NODE_WIDTH),
+      );
+    }
   }
 
   const width = Math.max(NODE_WIDTH, maxRank * (NODE_WIDTH + STAGE_HORIZONTAL_GAP) + NODE_WIDTH);
@@ -369,6 +395,7 @@ export async function layoutDendrogram(
   return {
     positions,
     edgePaths,
+    triggerEdges,
     stageXs: Array.from({ length: maxRank + 1 }, (_, depth) =>
       depth * (NODE_WIDTH + STAGE_HORIZONTAL_GAP),
     ),

@@ -28,8 +28,8 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server.api import router
 from turn.server.runtime import TurnRuntime
-from turn.tests.fakes import DeterministicExecutionAdapter, FakeHerdrAdapter
-from turn.workers.echo_worker import EchoWorker
+from turn.tests.mocks import DeterministicExecutionAdapter, MockHerdrAdapter
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
 from turn.workers.base import NodeExecutionContext, render_context_block
@@ -60,14 +60,14 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
     settings = Settings(
         data_dir=str(tmp_path / "turn-state"),
         projects_dir=str(tmp_path / "projects"),
-        default_executor="echo",
+        default_executor="deterministic",
         planner="heuristic",
     )
-    herdr = FakeHerdrAdapter()
+    herdr = MockHerdrAdapter()
     execution = DeterministicExecutionAdapter()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
-    registry.register_planner(HeuristicPlanner("echo"))
+    registry.register(DeterministicWorker())
+    registry.register_planner(HeuristicPlanner("deterministic"))
     runtime = TurnRuntime(
         settings,
         registry=registry,
@@ -92,7 +92,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
                 json={
                     "name": "Deterministic boundary project",
                     "prompt": "Build a deterministic integration fixture",
-                    "agent": {"harness": "echo", "type_id": "executor"},
+                    "agent": {"harness": "mock", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                 },
             )
@@ -130,7 +130,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
                     if node.id != project_id
                 )
             )
-            assert execution.workers == ["echo", "echo", "echo"]
+            assert execution.workers == ["deterministic", "deterministic", "deterministic"]
 
             deleted = await client.delete(f"/api/projects/{project_id}")
             assert deleted.status_code == 200, deleted.text
@@ -141,7 +141,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
                 "/api/projects",
                 json={
                     "prompt": "Verify the reverse lifecycle",
-                    "agent": {"harness": "echo", "type_id": "executor"},
+                    "agent": {"harness": "mock", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                 },
             )
@@ -150,7 +150,14 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
             assert external_workspace is not None
             assert await herdr.close_workspace(external_workspace)
             await runner._reconcile_project_workspaces(await components.store.list_projects())
-            assert await components.store.get_node(external_id) is None
+            # A provider workspace is an execution resource, not project
+            # state. If Herdr removes it externally, reconciliation recreates
+            # the workspace and preserves the durable project graph.
+            assert await components.store.get_node(external_id) is not None
+            recreated_workspace = runner.terminal.project_workspace_id(str(external_id))
+            assert recreated_workspace is not None
+            assert recreated_workspace != external_workspace
+            assert recreated_workspace in herdr.workspaces
     finally:
         await runtime.stop()
 
@@ -158,7 +165,7 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
 def test_dag_contract_codecs_reject_invalid_graphs_and_parse_deterministically():
     plan = parse_plan({
         "nodes": [{"key": "build", "objective": "Build", "generated_prompt": None,
-                   "executor": "echo", "required_inputs": [], "resource_refs": [],
+                   "executor": "deterministic", "required_inputs": [], "resource_refs": [],
                    "parent_key": None, "follows": [], "plan": False}],
         "edges": [],
     })
@@ -207,7 +214,7 @@ async def test_project_documents_are_persisted_as_dynamic_references_and_visible
         root,
         PlanResult(
             document_refs=[DocumentRef(ref="ARCHITECTURE.md", title="Architecture")],
-            nodes=[NodeSpec(key="worker", objective="Build the system", executor="echo")],
+            nodes=[NodeSpec(key="worker", objective="Build the system", executor="deterministic")],
         ),
     )
 
@@ -222,13 +229,13 @@ async def test_project_documents_are_persisted_as_dynamic_references_and_visible
     assert persisted_root["document_refs"][0]["ref"] == "ARCHITECTURE.md"
 
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
+    registry.register(DeterministicWorker())
     runner = Runner(
         store,
         registry=registry,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     context = await runner._build_context(root)
     rendered = render_context_block(context)

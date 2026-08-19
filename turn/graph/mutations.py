@@ -141,7 +141,7 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             node_agent = inherited_agent
         elif inherited_agent and executor == inherited_agent.harness.value:
             node_agent = inherited_agent
-        elif executor in {"codex", "claude", "opencode", "pi", "echo", "shell"}:
+        elif executor in {"codex", "claude", "opencode", "pi", "shell"}:
             node_agent = AgentConfig(harness=executor)
         else:
             node_agent = inherited_agent or AgentConfig()

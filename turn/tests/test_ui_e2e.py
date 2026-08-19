@@ -46,7 +46,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
         "TURN_DATA_DIR": f"/private/tmp/turn-ui-{port}",
         "TURN_PROJECTS_DIR": str(tmp_path / "projects"),
         "TURN_PLANNER": "heuristic",
-        "TURN_DEFAULT_EXECUTOR": "fake",
+        "TURN_DEFAULT_EXECUTOR": "mock",
         "TURN_TEST_MODE": "1",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
@@ -118,7 +118,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             objective = "Build a compact offline incident-response CLI with parser, policy, renderer, and integration checks."
             page.get_by_role("textbox", name="Project objective").fill(objective)
             page.get_by_label("Harness").click()
-            page.get_by_role("option", name="Fake · process harness").click()
+            page.get_by_role("option", name="Mock harness").click()
             assert page.get_by_label("Model").input_value() == "Deterministic"
             attachment = tmp_path / "brief.txt"
             attachment.write_text("All commands must be deterministic and offline.")
@@ -138,7 +138,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             selector = page.get_by_label("Harness")
             selector_width = selector.evaluate("node => node.getBoundingClientRect().width")
             selector.click()
-            page.get_by_role("option", name="Fake · process harness").wait_for()
+            page.get_by_role("option", name="Mock harness").wait_for()
             assert abs(selector.evaluate("node => node.getBoundingClientRect().width") - selector_width) < 1
             page.keyboard.press("Escape")
             composer = page.locator("form.composer")
@@ -192,7 +192,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
 
             graph = page.evaluate("async () => { const p = await (await fetch('/api/projects')).json(); return (await (await fetch(`/api/projects/${p.projects[0].id}/graph`)).json()); }")
             children = [node for node in graph["nodes"] if node["parent_id"]]
-            assert children and all(node["agent"]["harness"] == "fake" for node in children)
+            assert children and all(node["agent"]["harness"] == "mock" for node in children)
             runnable = next(node for node in children if "run" in node["allowed_actions"])
             page.get_by_role("button", name=f"Run {runnable['objective']}").click()
             page.wait_for_function(
@@ -271,12 +271,13 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
                     reject(new Error('terminal viewport or socket is unavailable'));
                     return;
                 }
+                const localScrollTop = viewport.scrollTop;
                 const onMessage = event => {
                     try {
                         const message = JSON.parse(event.data);
                         if (message.type === 'snapshot') {
                             socket.removeEventListener('message', onMessage);
-                            resolve(message);
+                            resolve({ message, localScrollTop, afterScrollTop: viewport.scrollTop });
                         }
                     } catch {}
                 };
@@ -289,7 +290,9 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
                 window.setTimeout(() => reject(new Error('wheel scroll snapshot timeout')), 10000);
                 })"""
             )
-            assert wheel_snapshot["type"] == "snapshot"
+            assert wheel_snapshot["message"]["type"] == "snapshot"
+            assert wheel_snapshot["localScrollTop"] == 0
+            assert wheel_snapshot["afterScrollTop"] == 0
             sent_messages = [
                 frame for frame in websocket_frames
                 if isinstance(frame, str) and '"type":"scroll"' in frame

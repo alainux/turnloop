@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { nodeAgentIcon, nodeRunIcon, nodeRunLabel } from "./Graph";
+import { nodeAgentIcon, nodeRunIcon, nodeRunLabel, triggerIcon } from "./Graph";
 import { primaryNodeAction } from "../domain";
-import type { GraphNode } from "../domain";
+import type { GraphNode, Trigger } from "../domain";
 
 const node = (overrides: Partial<GraphNode> = {}): GraphNode =>
   ({
@@ -67,5 +67,12 @@ describe("graph node controls", () => {
         }),
       ),
     ).toBeNull();
+  });
+});
+
+describe("graph triggers", () => {
+  it("uses distinct glyphs for event and schedule subscriptions", () => {
+    expect(triggerIcon({ kind: "event" } as Trigger)).toBe("activity");
+    expect(triggerIcon({ kind: "schedule" } as Trigger)).toBe("calendar");
   });
 });

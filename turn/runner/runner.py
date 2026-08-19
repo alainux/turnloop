@@ -26,6 +26,7 @@ from turn.domain.schemas import (
     ArtifactKind,
     ArtifactSpec,
     EdgeType,
+    EventSource,
     HarnessKind,
     Node,
     NodeStatus,
@@ -53,7 +54,7 @@ from turn.workers.capabilities import CapabilityLaunch, harness_capability_adapt
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
 
-from turn.config import Settings, settings as default_settings
+from turn.config import REAL_HARNESSES, Settings, settings as default_settings
 from turn.contracts.dag import (
     parse_plan,
     parse_result,
@@ -106,6 +107,7 @@ def _plan_submission_artifact(plan: PlanResult) -> ArtifactSpec:
         "composition_edge_count": len(composition_edges),
         "document_ref_count": len(plan.document_refs),
         "artifact_count": len(plan.artifacts),
+        "trigger_count": len(plan.triggers),
     }
     if plan.session_id:
         receipt["session_id"] = plan.session_id
@@ -127,11 +129,13 @@ class Runner:
         execution_adapter=None,
         herdr_adapter: HerdrAdapter | None = None,
         terminal_transport: TerminalTransport | None = None,
+        trigger_dispatcher=None,
     ):
         settings = settings or Settings()
         self.store = store
         self.registry = registry or build_registry(settings)
         self.events = events or EventBus()
+        self.trigger_dispatcher = trigger_dispatcher
         self.s = settings
         self.harness_commands = HarnessCommandFactory(
             codex_binary=settings.codex_binary,
@@ -178,7 +182,10 @@ class Runner:
             emit=self._emit,
             wake=self.wake,
             ensure_terminal=self.ensure_node_terminal,
+            has_persistent_session=self.terminal.has_persistent_session,
+            close_persistent_session=self.terminal.close_persistent_session,
             detach_shell=self.detach_shell,
+            stop_handoff_watcher=self._stop_handoff_watcher,
             agent_status_path=self._agent_status_path,
             watch_agent_status=self._watch_agent_status,
             plan_node=self._plan_node,
@@ -326,25 +333,41 @@ class Runner:
         await self.scheduler.wait_for_idle(project_id)
 
     async def _reconcile_project_workspaces(self, projects: list[Node]) -> None:
-        """Reflect externally deleted Turn-owned Herdr spaces in project state."""
+        """Reattach projects whose provider workspace disappeared externally.
+
+        Project state is durable on disk and a provider workspace is only an
+        execution resource. Losing the latter must never delete the former;
+        recreate the workspace and its root pane instead.
+        """
         projects = [project for project in projects if project.id not in self._deleting_projects]
         await self.terminal.close_orphaned_project_workspaces(
             {str(project.id) for project in projects}
         )
         for project in projects:
+            # Reconciliation runs from the same heartbeat as scheduling. A
+            # provider can briefly report a stale/missing workspace while a
+            # run is opening its control stream; never close that workspace
+            # underneath an active node.
+            nodes, _, _ = await self.store.get_workgraph(project.id)
+            if any(self.generation_active(node.id) for node in nodes):
+                continue
             state = await self.terminal.project_workspace_state(str(project.id))
             if state != "missing":
                 continue
             await self.cancel_project_runs(project.id)
             # The Herdr space has already disappeared externally. Forget the
-            # mapping as well so the next Turn process cannot retain a stale
-            # workspace reference.
+            # stale mapping, then recreate the provider workspace from the
+            # durable project repository without touching graph state.
             await self.terminal.close_project_workspace(str(project.id))
-            await self.store.delete_project(project.id)
+            recreated = await self.ensure_node_terminal(project.id)
             await self._emit(
-                "project.deleted",
+                "project.workspace.recreated",
                 project.id,
-                {"source": "herdr", "reason": "workspace_deleted"},
+                {
+                    "source": "herdr",
+                    "reason": "workspace_missing",
+                    "recreated": recreated,
+                },
             )
 
     async def close_project_workspace(self, project_id: uuid.UUID) -> bool:
@@ -362,9 +385,9 @@ class Runner:
         if root is None:
             return None
         if root.repo_path:
-            return root.repo_path
+            return str(Path(root.repo_path).expanduser().resolve())
         project_path = self.store.project_path(project_id)
-        return str(project_path) if project_path is not None else None
+        return str(project_path.expanduser().resolve()) if project_path is not None else None
 
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         # Compatibility shim for older in-process callers. Scheduling
@@ -491,6 +514,12 @@ class Runner:
                         )
                         validate_subgraph_sources(plan, repo_path)
                         await self._apply_plan_revision(node_id, project_id, plan, force=force)
+                        await self._emit_trigger_event(
+                            "agent.plan.submitted",
+                            project_id=project_id,
+                            node_id=node_id,
+                            data={"node_id": str(node_id), "kind": kind},
+                        )
                     elif kind == "verification" or (
                         kind == "result"
                         and "decision" in payload
@@ -499,9 +528,21 @@ class Runner:
                         await self._apply_verification_revision(
                             node_id, project_id, parse_verification(payload)
                         )
+                        await self._emit_trigger_event(
+                            "agent.verification.submitted",
+                            project_id=project_id,
+                            node_id=node_id,
+                            data={"node_id": str(node_id), "kind": "verification"},
+                        )
                     elif kind == "result":
                         await self._apply_result_revision(
                             node_id, project_id, parse_result(payload)
+                        )
+                        await self._emit_trigger_event(
+                            "agent.result.submitted",
+                            project_id=project_id,
+                            node_id=node_id,
+                            data={"node_id": str(node_id), "kind": kind},
                         )
                 except Exception as error:
                     logger.exception("agent %s revision failed for node %s", kind, node_id)
@@ -547,8 +588,12 @@ class Runner:
                 *(reference for item in plan.nodes for reference in item.subgraph_refs),
             ]
         }
+        # A submitted plan is an agent-owned replacement of this planner's
+        # boundary. Its exact node/source set is authoritative, including an
+        # intentional deletion. The force guard remains for direct destructive
+        # regeneration APIs, not for the planner's own graph revision.
         removed = await self._remove_descendants_before_replan(
-            node_id, force=force, preserved_refs=incoming_refs
+            node_id, force=True, preserved_refs=incoming_refs
         )
         node = await self.store.get_node(node_id)
         if node is None:
@@ -559,9 +604,9 @@ class Runner:
         # message left by an earlier failed submission.
         node.agent_state = None
         node.agent_message = None
-        # A replacement owns the exact source links in the submitted plan.
-        # The guard above has already required user-authored links to be
-        # preserved or explicitly forced away.
+        # A replacement owns the exact source links in the submitted plan;
+        # links omitted by the planner are intentionally removed with the
+        # descendants above.
         node.subgraph_refs = []
         created = await self.store.apply_plan(node, plan)
         artifacts = await self.store.add_artifacts(
@@ -717,6 +762,22 @@ class Runner:
         run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
+
+        # Stop can arrive immediately after the run record makes the node
+        # visible as RUNNING, before this coroutine reaches the harness call.
+        # Do not launch a process for a run that has already been cancelled.
+        current = await self.store.get_node(node.id)
+        if current is None or current.status is NodeStatus.CANCELLED:
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="run cancelled",
+                error="run cancelled before harness launch",
+            )
+            await self._finish_provider_terminal(node.id, project_id)
+            return []
+
         await self._emit("harness.launch", project_id, {
             "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
             "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
@@ -740,11 +801,17 @@ class Runner:
 
         ctx.session_callback = remember_live_session
         try:
-            planner = self.registry.planner
+            planner = self._planner_for(node)
             if planner is None:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
             await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
+            await self._emit_trigger_event(
+                "agent.plan.submitted",
+                project_id=project_id,
+                node_id=node.id,
+                data={"node_id": str(node.id), "kind": "plan", "created": len(plan.nodes)},
+            )
             if forbidden_session_id and plan.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
             if ctx.repo_path:
@@ -808,6 +875,23 @@ class Runner:
             await self._finish_provider_terminal(node.id, project_id)
             self.wake()
 
+    def _planner_for(self, node: Node):
+        """Resolve planning from the node's explicit harness contract.
+
+        Test mode can intentionally serve mock projects alongside real-data
+        projects. The workspace default selects the fallback planner only; it
+        must never turn a node explicitly configured for a real harness into a
+        mock plan.
+        """
+        agent = node.agent
+        if agent is not None:
+            harness = agent.harness.value
+            if harness == HarnessKind.MOCK.value:
+                return self.registry.get_planner("mock") or self.registry.planner
+            if harness in REAL_HARNESSES:
+                return self.registry.get_planner("real") or self.registry.planner
+        return self.registry.planner
+
     async def _run_worker(
         self,
         node: Node,
@@ -817,10 +901,19 @@ class Runner:
     ) -> None:
         ctx = await self._build_context(node)
         ctx.forbidden_session_id = forbidden_session_id
-        worker_key = node.agent.harness.value if node.agent and node.executor != PLANNER_EXECUTOR else node.executor
+        # Deterministic is an in-process unit-test adapter. It deliberately
+        # does not overload the Mock process harness even when the test node
+        # carries a Mock agent configuration for schema compatibility.
+        worker_key = (
+            "deterministic"
+            if node.executor == "deterministic"
+            else node.agent.harness.value
+            if node.agent and node.executor != PLANNER_EXECUTOR
+            else node.executor
+        )
         # A node's agent selection is an execution contract. Never substitute
         # the workspace default when that harness is missing: OpenCode must
-        # launch OpenCode, not silently become Codex (or Echo).
+        # launch OpenCode, not silently become Codex (or a test adapter).
         worker = self.registry.get(worker_key)
         if worker is None:
             await self._mark_failed(node, f"no worker registered for executor '{node.executor}'")
@@ -830,6 +923,22 @@ class Runner:
         ctx.attempt = run.attempt
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
+
+        # Stop can arrive immediately after the run record makes the node
+        # visible as RUNNING, before this coroutine reaches the harness call.
+        # Do not launch a process for a run that has already been cancelled.
+        current = await self.store.get_node(node.id)
+        if current is None or current.status is NodeStatus.CANCELLED:
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="run cancelled",
+                error="run cancelled before harness launch",
+            )
+            await self._finish_provider_terminal(node.id, project_id)
+            return
+
         await self._emit("harness.launch", project_id, {
             "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
             "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
@@ -863,6 +972,17 @@ class Runner:
             await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": result.outcome.value, "session_id": result.session_id, "summary": result.summary, "error": result.error, "usage": _dump(result.usage)})
             if forbidden_session_id and result.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
+            await self._emit_trigger_event(
+                "agent.submitted",
+                project_id=project_id,
+                node_id=node.id,
+                data={
+                    "node_id": str(node.id),
+                    "outcome": result.outcome.value,
+                    "summary": result.summary,
+                    "kind": "verification" if result.verification is not None else "result",
+                },
+            )
         except asyncio.TimeoutError:
             await self._handle_outcome(
                 node, run, project_id,
@@ -1047,7 +1167,39 @@ class Runner:
             current.id,
             decision,
             session_id=result.session_id,
+            status=(
+                NodeStatus.COMPLETE
+                if decision.decision is VerificationDecision.APPROVE
+                # Keep a rejected verifier active while the runner delivers
+                # the correction and resets the affected sequence. Exposing
+                # PENDING before the target is RUNNABLE lets the scheduler or
+                # an API client observe a half-applied rejection and can race
+                # the reset (especially with process-backed mock reconnects).
+                else NodeStatus.RUNNING
+            ),
         ) or current
+        # Verification completion is useful as a general agent-action event,
+        # while acceptance/rejection are the precise workflow events needed
+        # for routing. A loop can therefore subscribe to acceptance without
+        # also restarting on the rejected first pass.
+        await self._emit_trigger_event(
+            "verification.accepted"
+            if decision.decision is VerificationDecision.APPROVE
+            else "verification.rejected",
+            project_id=project_id,
+            node_id=current.id,
+            data={
+                "node_id": str(current.id),
+                "decision": decision.decision.value,
+                "summary": decision.summary,
+                "target_node_id": (
+                    str(decision.target_node_id)
+                    if decision.target_node_id
+                    else None
+                ),
+            },
+            source=EventSource.AGENT_ACTION,
+        )
 
         if decision.decision is VerificationDecision.REJECT:
             nodes, edges, _ = await self.store.get_workgraph(project_id)
@@ -1104,16 +1256,6 @@ class Runner:
         repo = await self._project_repo(target.project_id)
         if not repo:
             return
-        # Echo is a deterministic, non-conversational test worker. A served
-        # Echo demo still needs to exercise routing, but it has no provider
-        # session that Herdr can resume or receive pasted feedback in.
-        if (
-            target.agent is not None
-            and target.agent.harness is HarnessKind.ECHO
-            and self.terminal.backend_name == "herdr"
-            and self.s.default_executor == "echo"
-        ):
-            return
         lines = [
             "TURN VERIFICATION REJECTED",
             f"Reviewer: {reviewer.objective}",
@@ -1124,28 +1266,40 @@ class Runner:
             "Continue the responsible node through Turn after addressing these findings; the project execution mode controls when the refinement runs.",
         ]
         message = "\n".join(lines)
-        # The process-level fake has no durable shell pane when tests inject
+        # The process-level mock has no durable shell pane when tests inject
         # a LocalPtyTransport, but its provider session is still meaningful:
-        # launch a fresh fake process with the retained session id so the
+        # launch a fresh mock process with the retained session id so the
         # rejection path exercises the same command boundary as native
         # harnesses.
-        if target.agent is not None and target.agent.harness is HarnessKind.FAKE:
+        backend_name = getattr(self.terminal, "backend_name", "local")
+        process_mock = (
+            target.executor == "mock"
+            and target.agent is not None
+            and target.agent.harness is HarnessKind.MOCK
+            and backend_name != "mock"
+        )
+        native_provider = (
+            target.agent is not None
+            and target.agent.harness is not HarnessKind.MOCK
+        )
+        if process_mock or (native_provider and self.terminal.supports_inject):
             if not await self.reconnect(target.id, prompt=message):
                 raise RuntimeError(
-                    f"could not launch fake rejection follow-up for node {target.id}"
+                    f"could not launch rejection follow-up for node {target.id}"
                 )
             return
-        if self.terminal.supports_inject:
-            if not await self.reconnect(target.id, prompt=message):
-                raise RuntimeError(
-                    f"could not launch rejection follow-up for node {target.id}'s "
-                    "persisted harness session"
-                )
-            return
-
+        # Deterministic is an in-memory provider and has no persisted
+        # conversation to reopen. Preserve the byte-level fallback used by
+        # its tests even when the replacement terminal advertises injection.
         # Deterministic non-Herdr transports used by tests do not expose a
         # process table. Preserve their byte-level assertion surface; served
         # runs always use the branch above.
+        if not hasattr(self.terminal, "ensure_session"):
+            # A one-shot local PTY has already exited with its handoff. There
+            # is no durable conversation to inject into; the rejection is
+            # still persisted in the graph and the next run receives the
+            # normal Turn context.
+            return
         payload = "\x03\r" + message + "\r"
         if not self.terminal.snapshot(target.id).get("active"):
             task = asyncio.create_task(
@@ -1177,6 +1331,13 @@ class Runner:
             await self.store.set_status(root.id, NodeStatus.COMPLETE)
             await self._emit(
                 "node.updated", root.project_id, _dump(await self.store.get_node(root.id))
+            )
+            await self._emit_trigger_event(
+                "project.completed",
+                project_id=root.project_id,
+                node_id=root.id,
+                data={"project_id": str(root.project_id), "node_id": str(root.id)},
+                source=EventSource.TRANSITION,
             )
 
     # -- user actions ----------------------------------------------------
@@ -1303,14 +1464,14 @@ class Runner:
         agent = node.agent
         if agent is None:
             return None
-        if agent.harness is HarnessKind.FAKE:
-            # The process-level fake is test-only and intentionally does not
+        if agent.harness is HarnessKind.MOCK:
+            # The process-level mock is test-only and intentionally does not
             # belong in the real provider command catalog. It still needs an
             # explicit reconnect command so rejection flows exercise the same
             # retained-session lifecycle as native harnesses.
-            from turn.workers.fake_harness import fake_harness_script
+            from turn.workers.mock_harness import mock_harness_script
 
-            command = [fake_harness_script(), "--reconnect", session_id]
+            command = [mock_harness_script(), "--reconnect", session_id]
             return [*command, prompt] if prompt is not None else command
         launch = self._prepare_capabilities(agent, cwd, node.id)
         return self.harness_commands.reconnect_command(
@@ -1736,6 +1897,7 @@ class Runner:
             node=node,
             ancestry=ancestry,
             resources=resources,
+            trigger_context=node.trigger_context,
             repo_path=project_repo,
             stream=_stream,
             terminal=self.terminal,
@@ -1825,6 +1987,24 @@ class Runner:
         await self.events.publish(
             {"type": etype, "project_id": str(project_id), "data": data}
         )
+
+    async def _emit_trigger_event(
+        self,
+        name: str,
+        *,
+        project_id: uuid.UUID | None,
+        node_id: uuid.UUID | None = None,
+        data: dict | None = None,
+        source: EventSource = EventSource.AGENT_ACTION,
+    ) -> None:
+        if self.trigger_dispatcher is not None:
+            await self.trigger_dispatcher.emit(
+                name,
+                source=source,
+                project_id=project_id,
+                node_id=node_id,
+                data=data or {},
+            )
 
     @staticmethod
     def _launch_flags(node: Node, *, resume: bool) -> list[str]:

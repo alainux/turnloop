@@ -67,6 +67,13 @@ export async function deleteProject(
   );
 }
 
+export async function closeProjectTerminals(projectId: string): Promise<void> {
+  await api(
+    `/api/projects/${encodeURIComponent(projectId)}/workspace/close`,
+    { method: "POST" },
+  );
+}
+
 export async function stepProject(projectId: string): Promise<void> {
   await api(`/api/projects/${encodeURIComponent(projectId)}/step`, {
     method: "POST",

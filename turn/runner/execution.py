@@ -40,7 +40,10 @@ class NodeExecutor:
         emit: Callable[[str, uuid.UUID, object], Awaitable[None]],
         wake: Callable[[], None],
         ensure_terminal: Callable[[uuid.UUID], Awaitable[bool]],
+        has_persistent_session: Callable[[uuid.UUID], Awaitable[bool]],
+        close_persistent_session: Callable[[uuid.UUID], Awaitable[bool]],
         detach_shell: Callable[[uuid.UUID], Awaitable[bool]],
+        stop_handoff_watcher: Callable[[uuid.UUID], Awaitable[None]],
         agent_status_path: Callable[[Node], Awaitable[Path | None]],
         watch_agent_status: Callable[[uuid.UUID, uuid.UUID, Path], Awaitable[None]],
         plan_node: Callable[..., Awaitable[list[Node]]],
@@ -56,7 +59,10 @@ class NodeExecutor:
         self.emit = emit
         self.wake = wake
         self.ensure_terminal = ensure_terminal
+        self.has_persistent_session = has_persistent_session
+        self.close_persistent_session = close_persistent_session
         self.detach_shell = detach_shell
+        self.stop_handoff_watcher = stop_handoff_watcher
         self.agent_status_path = agent_status_path
         self.watch_agent_status = watch_agent_status
         self.plan_node = plan_node
@@ -67,6 +73,11 @@ class NodeExecutor:
     async def execute(self, node: Node, project_id: uuid.UUID) -> None:
         watcher: asyncio.Task | None = None
         try:
+            # A retained provider session has a background watcher for later
+            # human/agent corrections.  An active run owns its handoff file;
+            # stop that watcher before launching so it cannot consume the
+            # current run's CLI submission first.
+            await self.stop_handoff_watcher(node.id)
             fresh = await self.store.get_node(node.id)
             if fresh is None:
                 return
@@ -78,7 +89,16 @@ class NodeExecutor:
                     self.watch_agent_status(node.id, project_id, status_path)
                 )
                 self.status_watchers[node.id] = watcher
-            await self.ensure_terminal(node.id)
+            # Every new launch owns a fresh harness process. The provider
+            # session id remains on the node, so this closes only the old
+            # process/pane and still allows a continuation to resume the same
+            # conversation. A completed harness is intentionally left open
+            # until this boundary or an explicit close/stop action.
+            if await self.has_persistent_session(node.id):
+                await self.close_persistent_session(node.id)
+            terminal_ready = await self.ensure_terminal(node.id)
+            if terminal_ready is False:
+                raise RuntimeError("runner could not prepare the harness terminal")
             await self.detach_shell(node.id)
             forbidden_session_id = self.forbidden_sessions.pop(node.id, None)
             if node.executor == PLANNER_EXECUTOR and node.status != NodeStatus.EXPANDED:

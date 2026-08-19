@@ -7,7 +7,10 @@ import {
   DocumentLinks,
   DocumentView,
   GraphSourceDocument,
+  liveGraphSource,
   SubgraphLinks,
+  SubmissionSummary,
+  WorkflowSourceLinks,
   orderDocumentNodes,
   orderGraphSourceNodes,
   parseGraphSource,
@@ -71,7 +74,7 @@ describe("document specification ordering", () => {
     expect(rendered).toContain("/api/projects/root/documents/future.md");
   });
 
-  it("exposes composed graph sources as navigable work-breakdown links", () => {
+  it("exposes workflow sources as navigable work-breakdown links", () => {
     const reference: SubgraphRef = {
       ref: ".turn/graphs/branch.json",
       title: "Branch graph",
@@ -82,7 +85,7 @@ describe("document specification ordering", () => {
       createElement(SubgraphLinks, { refs: [reference], projectId: "root" }),
     );
 
-    expect(rendered).toContain("Composed subgraphs");
+    expect(rendered).toContain("Workflow source");
     expect(rendered).toContain("Branch graph");
     expect(rendered).toContain("/api/projects/root/documents/.turn/graphs/branch.json");
   });
@@ -140,9 +143,10 @@ describe("document specification ordering", () => {
     ]);
   });
 
-  it("keeps composed work behind its source link in the default document", () => {
+  it("keeps the live composed work visible beside its source link", () => {
     const root = node("root", null);
     root.project_name = "Composed project";
+    root.generated_prompt = "Stale planner receipt";
     root.subgraph_refs = [{
       ref: ".turn/graphs/root.json",
       title: "Root graph",
@@ -161,8 +165,10 @@ describe("document specification ordering", () => {
     );
 
     expect(rendered).toContain("Root graph");
-    expect(rendered).not.toContain("nested implementation");
-    expect(rendered).not.toContain("work-specification");
+    expect(rendered).toContain("nested implementation");
+    expect(rendered).toContain("Project goal");
+    expect(rendered).toContain("Stale planner receipt");
+    expect(rendered).toContain("work-specification");
   });
 
   it("keeps inline work breakdowns for graphs without a composed source", () => {
@@ -184,6 +190,47 @@ describe("document specification ordering", () => {
     expect(rendered).not.toContain("<details open");
   });
 
+  it("presents a step as instructions, result, then generated files", () => {
+    const root = node("root", null);
+    root.project_name = "Readable project";
+    const child = node("Write the result", "root");
+    child.generated_prompt = "Write the final project summary.";
+    child.artifact_refs = ["submission", "output"];
+    const rendered = renderToStaticMarkup(
+      createElement(DocumentView, {
+        nodes: [root, child],
+        edges: [],
+        artifacts: [
+          {
+            id: "submission",
+            node_id: "child",
+            kind: "json",
+            name: "result-submission",
+            content: { outcome: "COMPLETE", summary: "Finished the summary." },
+            ref: null,
+            created_at: "",
+          },
+          {
+            id: "output",
+            node_id: "child",
+            kind: "file",
+            name: "summary.md",
+            content: null,
+            ref: "docs/summary.md",
+            created_at: "",
+          },
+        ],
+        projectId: "root",
+      }),
+    );
+
+    expect(rendered.indexOf("Instructions")).toBeLessThan(rendered.indexOf("Result"));
+    expect(rendered.indexOf("Result")).toBeLessThan(rendered.indexOf("Generated files"));
+    expect(rendered).toContain("Finished the summary.");
+    expect(rendered).toContain("summary.md");
+    expect(rendered).not.toContain("result-submission");
+  });
+
   it("parses and orders recursively composed graph sources", () => {
     const source = parseGraphSource({
       project_name: "Root graph",
@@ -203,6 +250,23 @@ describe("document specification ordering", () => {
       "author",
       "verify",
     ]);
+  });
+
+  it("projects the live node objective into the workflow graph document", () => {
+    const root = node("root", null);
+    root.project_name = "Live project";
+    root.generated_prompt = "Old planner receipt";
+    const child = node("current objective", "root");
+    child.generated_prompt = "Only write the current artifact.";
+
+    const source = liveGraphSource([root, child], [edge("root", "current objective")], []);
+
+    expect(source.project_name).toBe("Live project");
+    expect(source.nodes.find((item) => item.key === "root")?.generated_prompt).toBeNull();
+    expect(source.nodes.find((item) => item.key === "current objective")?.objective).toBe("current objective");
+    expect(source.nodes.find((item) => item.key === "current objective")?.generated_prompt).toBe(
+      "Only write the current artifact.",
+    );
   });
 
   it("renders graph work breakdowns with artifacts and recursive graph links", () => {
@@ -257,16 +321,15 @@ describe("document specification ordering", () => {
       }),
     );
 
-    expect(rendered).toContain("Artifacts");
+    expect(rendered).toContain("Generated files");
     expect(rendered).toContain("document-artifact-links");
     expect(rendered).toContain("/api/projects/root/documents/ARCHITECTURE.md");
     expect(rendered).toContain('target="_blank"');
   });
 
-  it("makes submission responses expandable in the document", () => {
+  it("turns submission receipts into a useful result summary", () => {
     const rendered = renderToStaticMarkup(
-      createElement(ArtifactLinks, {
-        projectId: "root",
+      createElement(SubmissionSummary, {
         artifacts: [{
           kind: "json",
           name: "result-submission",
@@ -276,38 +339,97 @@ describe("document specification ordering", () => {
       }),
     );
 
-    expect(rendered).toContain("View response");
-    expect(rendered).toContain("COMPLETE");
+    expect(rendered).toContain("Result");
+    expect(rendered).toContain("complete");
     expect(rendered).toContain("finished");
-    expect(rendered).not.toContain("<details open");
+    expect(rendered).not.toContain("result-submission");
+    expect(rendered).not.toContain("View response");
   });
 
-  it("associates a submission response with its editable graph source", () => {
+  it("keeps duplicate basenames distinguishable by their full artifact paths", () => {
     const rendered = renderToStaticMarkup(
       createElement(ArtifactLinks, {
         projectId: "root",
-        sourceRefs: [{
+        artifacts: [{
+          kind: "file",
+          name: "idea.json",
+          ref: "cycles/first/idea.json",
+        }, {
+          kind: "file",
+          name: "idea.json",
+          ref: "cycles/second/idea.json",
+        }],
+      }),
+    );
+
+    expect(rendered.match(/data-artifact-ref=/g)).toHaveLength(2);
+    expect(rendered).toContain("cycles/first/idea.json");
+    expect(rendered).toContain("cycles/second/idea.json");
+  });
+
+  it("keeps workflow exploration available without making it the main document", () => {
+    const rendered = renderToStaticMarkup(
+      createElement(WorkflowSourceLinks, {
+        refs: [{
           ref: ".turn/graphs/planner.json",
           title: "planner.json",
           media_type: "application/json",
           managed: false,
         }],
-        artifacts: [{
-          kind: "json",
-          name: "plan-submission",
-          ref: null,
-          content: { nodes: [{ key: "work" }] },
-        }],
+        projectId: "root",
         onOpenDocument: () => undefined,
       }),
     );
 
-    expect(rendered).toContain("plan-submission");
-    expect(rendered).toContain("Submitted graph source");
-    expect(rendered).toContain("/api/projects/root/documents/.turn/graphs/planner.json");
-    expect(rendered).toContain("View response");
-    expect(rendered).toContain("&quot;node_count&quot;: 1");
-    expect(rendered).not.toContain("&quot;key&quot;: &quot;work&quot;");
-    expect(rendered).not.toContain("target=\"_blank\"");
+    expect(rendered).toContain("Explore workflow source");
+    expect(rendered).toContain("planner.json");
+    expect(rendered).not.toContain("Composed subgraphs");
+    expect(rendered).not.toContain("<details open");
+  });
+
+  it("renders generated image references inside the document reader", () => {
+    const root = node("root", null);
+    root.artifact_refs = ["image-artifact"];
+    const rendered = renderToStaticMarkup(
+      createElement(DocumentView, {
+        nodes: [root],
+        edges: [],
+        artifacts: [{
+          id: "image-artifact",
+          node_id: "root",
+          kind: "file",
+          name: "architecture.png",
+          ref: "docs/architecture.png",
+          content: null,
+          created_at: "",
+        }],
+        projectId: "root",
+      }),
+    );
+
+    expect(rendered).toContain("architecture.png");
+    expect(rendered).toContain("/api/projects/root/documents/docs/architecture.png");
+    expect(rendered).toContain("document-image-preview");
+  });
+
+  it("opens an image artifact in the simple document reader", () => {
+    const root = node("root", null);
+    const previousHash = window.location.hash;
+    window.history.replaceState(null, "", "#document=docs%2Farchitecture.png");
+    try {
+      const rendered = renderToStaticMarkup(
+        createElement(DocumentView, {
+          nodes: [root],
+          edges: [],
+          artifacts: [],
+          projectId: "root",
+        }),
+      );
+      expect(rendered).toContain("document-reader-image");
+      expect(rendered).toContain("/api/projects/root/documents/docs/architecture.png");
+      expect(rendered).not.toContain("Loading document");
+    } finally {
+      window.history.replaceState(null, "", previousHash || "/");
+    }
   });
 });

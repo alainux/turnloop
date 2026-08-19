@@ -201,23 +201,43 @@ def test_initial_prompt_is_only_node_data_and_activations():
     assert "turn project info" not in prompt
     assert "GRAPH EXPLORATION TOOL" not in prompt
     assert "REQUIRED DISCOVERY GATE" not in prompt
+    assert prompt.count("TURN_CONTEXT") == 1
+    assert "production_trigger_policy" not in prompt
     assert len(prompt) < 600
 
 
 def test_basics_and_planning_guidance_live_in_capabilities():
     root = Path.cwd() / "turn" / "capabilities" / "builtin"
     basics = (root / "turn-basics" / "skills" / "turn-basics" / "SKILL.md").read_text()
+    setup = (root / "turn-setup" / "skills" / "turn-setup" / "SKILL.md").read_text()
     planning = (root / "turn-planning" / "skills" / "turn-planning" / "SKILL.md").read_text()
+    executing = (root / "turn-executing" / "skills" / "turn-executing" / "SKILL.md").read_text()
+    integrating = (root / "turn-integrating" / "skills" / "turn-integrating" / "SKILL.md").read_text()
+    verifying = (root / "turn-verifying" / "skills" / "turn-verifying" / "SKILL.md").read_text()
 
     assert "turn project info" in basics
     assert "turn graph <project-id>" in basics
     assert "turn agent submit --kind result" in basics
+    assert "The CLI is the only control-plane" in basics
+    assert "Project files are ordinary workspace files" in basics
+    assert "adaptive workflow planner" in basics
+    assert "super-planner" in setup
+    assert "Scope classification gate" in setup
+    assert "department-shaped" in setup
     assert "native" in planning
     assert "turn capabilities search" in planning
     assert "generated_prompt" in planning
     assert "Harness/model selection" in planning
     assert "project's current harness/model catalog" in planning
     assert "provider-specific spelling" in planning
+    assert "Submit the result and its small artifact list through the Turn CLI" in executing
+    assert "Small work" in planning and "Medium work" in planning and "Large work" in planning
+    assert "self-trigger loop" in basics
+    assert "self-trigger loop" in planning
+    assert "self-trigger loop" in executing
+    assert "exported contract" in executing
+    assert "convergence gate" in integrating
+    assert "full usability spectrum" in verifying
 
 
 def test_plan_parser_uses_only_capability_plugin_ids():

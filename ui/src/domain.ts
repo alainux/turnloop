@@ -15,6 +15,9 @@ import type {
   Run,
   RunPolicy,
   SubgraphRef,
+  Trigger,
+  TriggerContext,
+  TriggerKind,
   Usage,
 } from "./generated/domain";
 
@@ -39,15 +42,20 @@ export type {
   RunPolicy,
   SubgraphRef,
   Usage,
+  Trigger,
+  TriggerContext,
+  TriggerKind,
 } from "./generated/domain";
 
 /** UI aliases are generated contract types, kept short at call sites. */
-export type GraphNode = Omit<GraphNodeView, "subgraph_refs"> & {
+export type GraphNode = Omit<GraphNodeView, "subgraph_refs" | "trigger_context"> & {
   subgraph_refs?: SubgraphRef[];
+  trigger_context?: TriggerContext | null;
 };
 export type Graph = GraphView;
-export type Project = Omit<Node, "subgraph_refs"> & {
+export type Project = Omit<Node, "subgraph_refs" | "trigger_context"> & {
   subgraph_refs?: SubgraphRef[];
+  trigger_context?: TriggerContext | null;
 };
 export type HarnessId = HarnessKind;
 export type Reasoning = ReasoningLevel;

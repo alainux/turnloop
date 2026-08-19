@@ -45,7 +45,7 @@ export function TerminalView({ node }: Props) {
     style.textContent = `${xtermCss}
 .mount{display:block;width:100%;height:100%;min-width:0;min-height:0;padding:8px 12px 8px 8px;box-sizing:border-box;overflow:hidden;background:#090b0e}
 .mount .xterm{display:block;width:100%;height:100%;min-width:0;min-height:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace!important;font-size:11px!important;line-height:1!important}
-.mount .xterm-viewport{width:100%!important;height:100%!important;overflow-y:auto!important}`;
+.mount .xterm-viewport{width:100%!important;height:100%!important;overflow:hidden!important}`;
     const mount = document.createElement("div");
     mount.className = "mount";
     mountHost.append(style, mount);
@@ -60,10 +60,9 @@ export function TerminalView({ node }: Props) {
       fontFamily: "ui-monospace,SFMono-Regular,Menlo,monospace",
       fontSize: 11,
       lineHeight: 1,
-      // Herdr is the canonical terminal history. Keep a bounded local render
-      // buffer for smooth browser scrolling, but refresh it from Herdr on
-      // every attach instead of accumulating divergent redraws.
-      scrollback: 5000,
+      // Herdr owns the scrollback. xterm is only a renderer for the snapshot
+      // Herdr returns, so it must not create a second browser-local history.
+      scrollback: 0,
       theme: {
         background: "#090b0e",
         black: "#090b0e",
@@ -98,7 +97,6 @@ export function TerminalView({ node }: Props) {
     let disposed = false;
     let sessionActive = false;
     let replaying = false;
-    let suppressScroll = false;
     let socket: WebSocket | null = null;
     let terminalWriteQueue = Promise.resolve();
     const queueTerminalWrite = (data: string) => {
@@ -108,12 +106,12 @@ export function TerminalView({ node }: Props) {
       // and make a perfectly live PTY appear blank. xterm.write itself keeps
       // the bytes in order, so the queue only needs to serialize calls.
       const write = terminalWriteQueue.then(() => {
-        suppressScroll = true;
         try {
           terminal.write(data);
           terminal.refresh(0, Math.max(0, terminal.rows - 1));
-        } finally {
-          suppressScroll = false;
+        } catch {
+          // The terminal may be disposed while a queued Herdr snapshot is
+          // still resolving.
         }
       });
       terminalWriteQueue = write.catch(() => undefined);
@@ -220,9 +218,6 @@ export function TerminalView({ node }: Props) {
               terminal.resize(fitted.cols, fitted.rows);
             }
             replaying = false;
-            suppressScroll = true;
-            terminal.scrollToBottom();
-            suppressScroll = false;
           }
         } else if (message.type === "output") {
           if (!sessionActive) activate(true);
@@ -295,7 +290,7 @@ export function TerminalView({ node }: Props) {
     // Herdr owns terminal history and viewport position. Do not let xterm's
     // local scrollback become a second history: forward the wheel gesture to
     // the persistent Herdr pane, then redraw the returned snapshot.
-    const viewport = mount.querySelector<HTMLElement>(".xterm-viewport");
+    const wheelTarget = mount;
     const forwardWheel = (event: WheelEvent) => {
       if (!sessionActive || socket?.readyState !== WebSocket.OPEN) return;
       const delta = event.deltaY || event.deltaX;
@@ -311,7 +306,7 @@ export function TerminalView({ node }: Props) {
     // Capture before xterm's own viewport handler. Herdr owns scrollback, so
     // xterm must not first move an independent local viewport and then pass
     // the same wheel event through as a second scroll operation.
-    viewport?.addEventListener("wheel", forwardWheel, { passive: false, capture: true });
+    wheelTarget.addEventListener("wheel", forwardWheel, { passive: false, capture: true });
     const observer = new ResizeObserver(() => refitAfterLayout());
     observer.observe(mountHost);
     refitAfterLayout();
@@ -326,7 +321,7 @@ export function TerminalView({ node }: Props) {
       disposed = true;
       refitTimers.forEach((timer) => window.clearTimeout(timer));
       observer.disconnect();
-      viewport?.removeEventListener("wheel", forwardWheel, true);
+      wheelTarget.removeEventListener("wheel", forwardWheel, true);
       socket?.close();
       terminal.dispose();
     };

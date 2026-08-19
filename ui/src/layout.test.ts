@@ -5,10 +5,11 @@ import {
   layoutDendrogram,
   NODE_HEIGHT,
   NODE_WIDTH,
+  TRIGGER_SOURCE_WIDTH,
   returnPathBetween,
   workflowLeafIds,
 } from "./layout";
-import type { Edge, GraphNode } from "./domain";
+import type { Edge, GraphNode, Trigger } from "./domain";
 const node = (id: string, parent_id: string | null): GraphNode => ({
   id,
   parent_id,
@@ -39,7 +40,68 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   created_at: "",
   updated_at: "",
 });
+const trigger = (id: string, target_node_id: string): Trigger => ({
+  id,
+  project_id: "root",
+  target_node_id,
+  event_name: `event.${id}`,
+  kind: "event",
+  schedule: null,
+  data: {},
+  enabled: true,
+  last_fired_at: null,
+  created_at: "",
+  updated_at: "",
+});
 describe("dendrogram", () => {
+  it("places triggers in the rank layout and routes a proper edge into the target", async () => {
+    const nodes = [node("root", null), node("target", "root")];
+    const edges: Edge[] = [
+      { id: "root-target", src: "root", dst: "target", type: "CONTAINS", created_at: "" },
+    ];
+    const configured = [trigger("start", "target")];
+    const layout = await layoutDendrogram(nodes, edges, configured);
+    const triggerPosition = layout.positions.get("trigger:start")!;
+    const targetPosition = layout.positions.get("target")!;
+    const triggerEdge = layout.triggerEdges[0];
+    const path = layout.edgePaths.get(triggerEdge.id)!;
+
+    expect(triggerPosition.depth).toBe(0);
+    expect(layout.positions.get("root")!.depth).toBe(0);
+    expect(targetPosition.depth).toBe(1);
+    expect(layout.triggerEdges).toEqual([
+      expect.objectContaining({ src: "trigger:start", dst: "target" }),
+    ]);
+    expect(path.startsWith(
+      `M${triggerPosition.x + GRAPH_PADDING + TRIGGER_SOURCE_WIDTH} ${triggerPosition.y + GRAPH_PADDING + NODE_HEIGHT / 2}H`,
+    )).toBe(true);
+    expect(path.endsWith(`H${targetPosition.x + GRAPH_PADDING}`)).toBe(true);
+  });
+
+  it("keeps a trigger ahead of the graph root when it targets the root", async () => {
+    const layout = await layoutDendrogram(
+      [node("root", null)],
+      [],
+      [trigger("root-start", "root")],
+    );
+
+    expect(layout.positions.get("trigger:root-start")!.depth).toBe(0);
+    expect(layout.positions.get("root")!.depth).toBe(1);
+    expect(layout.stageCount).toBe(2);
+  });
+
+  it("keeps disabled trigger nodes visible without drawing their edges", async () => {
+    const layout = await layoutDendrogram(
+      [node("root", null), node("target", "root")],
+      [{ id: "root-target", src: "root", dst: "target", type: "CONTAINS", created_at: "" }],
+      [{ ...trigger("disabled", "target"), enabled: false }],
+    );
+
+    expect(layout.positions.has("trigger:disabled")).toBe(true);
+    expect(layout.triggerEdges).toEqual([]);
+    expect([...layout.edgePaths.keys()]).not.toContain("trigger-edge:disabled");
+  });
+
   it("shares the one-leaf composition invariant with the graph contract", () => {
     const nodes = [
       node("root", null),

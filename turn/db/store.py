@@ -42,6 +42,9 @@ from turn.domain.schemas import (
     RunPolicy,
     RunStatus,
     SubgraphRef,
+    Trigger,
+    TriggerContext,
+    TriggerKind,
     Usage,
     NODE_OBJECTIVE_MAX_LENGTH,
     concise_node_title,
@@ -96,10 +99,33 @@ class Store:
         self._write_lock = asyncio.Lock()
         self._project_locks: dict[uuid.UUID, asyncio.Lock] = {}
         self.logs = logs
+        self._event_sink = None
+
+    def set_event_sink(self, sink) -> None:
+        """Attach the process-wide trigger dispatcher without coupling storage to it."""
+        self._event_sink = sink
 
     async def _log(self, project_id: uuid.UUID | str | None, **kwargs: Any) -> None:
         if self.logs is not None:
             await self.logs.emit(project_id, **kwargs)
+
+    async def _emit_event(
+        self,
+        event_name: str,
+        *,
+        project_id: uuid.UUID | None = None,
+        node_id: uuid.UUID | None = None,
+        data: dict[str, Any] | None = None,
+        source: str = "transition",
+    ) -> None:
+        if self._event_sink is not None:
+            await self._event_sink(
+                event_name,
+                source=source,
+                project_id=project_id,
+                node_id=node_id,
+                data=data or {},
+            )
 
     @staticmethod
     def _resolve_data_dir(raw: str) -> Path:
@@ -259,6 +285,12 @@ class Store:
                 continue
             artifact_keys.add(key)
             state.artifacts[artifact.id] = artifact
+        for item in raw.get("triggers", []):
+            trigger_payload = dict(item)
+            if trigger_payload.pop("filters", None) is not None:
+                normalized = True
+            trigger = Trigger.model_validate(trigger_payload)
+            state.triggers[trigger.id] = trigger
         for node in state.nodes.values():
             filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state.artifacts]
             if filtered != node.artifact_refs:
@@ -339,7 +371,7 @@ class Store:
 
     def _encode_state(self, project_id: uuid.UUID) -> dict[str, Any]:
         state = self._states[project_id]
-        return {
+        payload = {
             "version": STATE_VERSION,
             "project_id": str(project_id),
             "nodes": [self._model_dump(value) for value in state.nodes.values()],
@@ -347,6 +379,11 @@ class Store:
             "runs": [self._model_dump(value) for value in state.runs.values()],
             "artifacts": [self._model_dump(value) for value in state.artifacts.values()],
         }
+        # Keep the original compact state shape for projects that have never
+        # opted into triggers; readers treat the field as an empty collection.
+        if state.triggers:
+            payload["triggers"] = [self._model_dump(value) for value in state.triggers.values()]
+        return payload
 
     async def _persist_project(self, project_id: uuid.UUID) -> None:
         project_path = self._project_paths[project_id]
@@ -503,6 +540,7 @@ class Store:
             nodes=[node.model_copy(deep=True) for node in state.nodes.values()],
             edges=[edge.model_copy(deep=True) for edge in state.edges.values()],
             artifacts=[artifact.model_copy(deep=True) for artifact in state.artifacts.values()],
+            triggers=[trigger.model_copy(deep=True) for trigger in state.triggers.values()],
         )
 
     async def _load_graph(self, project_id: uuid.UUID):
@@ -558,14 +596,33 @@ class Store:
         return saved.model_copy(deep=True)
 
     async def set_status(self, node_id: uuid.UUID, status: NodeStatus) -> Optional[Node]:
-        node = await self.get_node(node_id)
-        if node is None:
+        found = self._project_for_node(node_id)
+        if found is None:
             return None
-        previous = node.status
-        node.status = status
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            current = self._states[project_id].nodes.get(node_id)
+            if current is None:
+                return None
+            node = current.model_copy(deep=True)
+            previous = node.status
+            node.status = status
+            if previous != status:
+                await self._log(node.project_id, kind="graph.transition", action="node.status", message=f"{previous.value} -> {status.value}", data={"node_id": str(node_id), "from": previous.value, "to": status.value})
+            saved = await self._save_node(node)
         if previous != status:
-            await self._log(node.project_id, kind="graph.transition", action="node.status", message=f"{previous.value} -> {status.value}", data={"node_id": str(node_id), "from": previous.value, "to": status.value})
-        return await self._save_node(node)
+            await self._emit_event(
+                "node.status.changed",
+                project_id=saved.project_id,
+                node_id=saved.id,
+                data={
+                    "node_id": str(saved.id),
+                    "project_id": str(saved.project_id),
+                    "from": previous.value,
+                    "to": status.value,
+                },
+            )
+        return saved
 
     async def set_status_if_current(
         self, node_id: uuid.UUID, status: NodeStatus, expected: tuple[NodeStatus, ...]
@@ -574,15 +631,34 @@ class Store:
         if found is None:
             return None
         project_id, _ = found
+        saved: Node | None = None
+        previous: NodeStatus | None = None
         async with self._project_lock(project_id):
             current = self._states[project_id].nodes.get(node_id)
             if current is None or current.status not in expected:
                 return None
             node = current.model_copy(deep=True)
             node.status = status
+            previous = current.status
             if current.status != status:
                 await self._log(project_id, kind="graph.transition", action="node.status", message=f"{current.status.value} -> {status.value}", data={"node_id": str(node_id), "from": current.status.value, "to": status.value})
-            return await self._save_node(node)
+            saved = await self._save_node(node)
+        if saved is not None and previous != status:
+            # Dispatch after releasing the project lock: a matching trigger
+            # may reset a node in this same project and must be able to enter
+            # activate_trigger without deadlocking the Store.
+            await self._emit_event(
+                "node.status.changed",
+                project_id=saved.project_id,
+                node_id=saved.id,
+                data={
+                    "node_id": str(saved.id),
+                    "project_id": str(saved.project_id),
+                    "from": previous.value if previous else None,
+                    "to": status.value,
+                },
+            )
+        return saved
 
     async def set_agent_status(
         self, node_id: uuid.UUID, *, state: str | None, message: str | None
@@ -682,6 +758,7 @@ class Store:
         decision: VerificationResult,
         *,
         session_id: str | None = None,
+        status: NodeStatus = NodeStatus.COMPLETE,
     ) -> Optional[Node]:
         node = await self.get_node(node_id)
         if node is None:
@@ -689,8 +766,26 @@ class Store:
         node.verification = decision
         if session_id and node.agent is not None:
             node.agent.session_id = session_id
-        node.status = NodeStatus.COMPLETE
-        return await self._save_node(node)
+        # A rejected review must not become a terminal leaf before the runner
+        # routes it back to its correction target. Otherwise the scheduler can
+        # finalize the containing project and cancel the review task in the
+        # small window between persisting the decision and resetting the flow.
+        node.status = status
+        saved = await self._save_node(node)
+        await self._emit_event(
+            "verification.completed",
+            project_id=saved.project_id,
+            node_id=saved.id,
+            data={
+                "node_id": str(saved.id),
+                "project_id": str(saved.project_id),
+                "decision": decision.decision.value,
+                "summary": decision.summary,
+                "target_node_id": str(decision.target_node_id) if decision.target_node_id else None,
+            },
+            source="agent_action",
+        )
+        return saved
 
     async def reset_node_after_rejection(
         self, node_id: uuid.UUID, status: NodeStatus
@@ -844,7 +939,22 @@ class Store:
         for key, artifact in list(state.artifacts.items()):
             if artifact.node_id in ids:
                 del state.artifacts[key]
+        removed_triggers = [
+            trigger_id
+            for trigger_id, trigger in state.triggers.items()
+            if trigger.target_node_id in ids
+        ]
+        for trigger_id in removed_triggers:
+            del state.triggers[trigger_id]
         await self._persist_project(node.project_id)
+        if removed_triggers:
+            await self._log(
+                node.project_id,
+                kind="trigger.changed",
+                action="triggers.removed",
+                message=f"removed {len(removed_triggers)} trigger(s) with replaced nodes",
+                data={"trigger_ids": [str(item) for item in removed_triggers]},
+            )
         return [item.id for item in descendants]
 
     async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
@@ -853,6 +963,21 @@ class Store:
         if plan.nodes and project_root is None:
             raise RuntimeError(f"project directory is not known: {parent.project_id}")
         created = apply_graph_plan(self._state(parent.project_id), parent, plan)
+        by_key = {spec.key: node for spec, node in zip(plan.nodes, created, strict=True)}
+        created_trigger_ids: list[uuid.UUID] = []
+        for spec in plan.triggers:
+            target = by_key[spec.target_key]
+            trigger = Trigger(
+                project_id=parent.project_id,
+                target_node_id=target.id,
+                event_name=spec.event_name,
+                kind=spec.kind,
+                schedule=spec.schedule,
+                data=spec.data,
+                enabled=spec.enabled,
+            )
+            self._state(parent.project_id).triggers[trigger.id] = trigger
+            created_trigger_ids.append(trigger.id)
         # Role capabilities are part of Turn's agent contract.  They are
         # project-scoped packages, so materialize them as nodes are created;
         # user-selected capabilities remain subject to plan validation.
@@ -862,7 +987,150 @@ class Store:
                 catalog.load_into_project(capability_id, project_root)
         await self._persist_project(parent.project_id)
         await self._log(parent.project_id, kind="graph.transition", action="plan.applied", message=f"plan applied; created {len(created)} node(s)", data={"parent_id": str(parent.id), "created_node_ids": [str(item.id) for item in created]})
+        if plan.triggers:
+            await self._log(
+                parent.project_id,
+                kind="trigger.changed",
+                action="triggers.created",
+                message=f"created {len(plan.triggers)} trigger(s)",
+                data={"trigger_ids": [str(item) for item in created_trigger_ids]},
+            )
         return created
+
+    # -- triggers ---------------------------------------------------------
+
+    async def list_triggers(self, project_id: uuid.UUID | None = None) -> list[Trigger]:
+        values = [
+            trigger
+            for pid, state in self._states.items()
+            if project_id is None or pid == project_id
+            for trigger in state.triggers.values()
+        ]
+        return [trigger.model_copy(deep=True) for trigger in values]
+
+    async def get_trigger(self, trigger_id: uuid.UUID) -> Optional[Trigger]:
+        for state in self._states.values():
+            trigger = state.triggers.get(trigger_id)
+            if trigger is not None:
+                return trigger.model_copy(deep=True)
+        return None
+
+    async def create_trigger(
+        self,
+        *,
+        project_id: uuid.UUID,
+        target_node_id: uuid.UUID,
+        event_name: str | None = None,
+        kind: TriggerKind = TriggerKind.EVENT,
+        schedule: str | None = None,
+        data: dict[str, Any] | None = None,
+        enabled: bool = True,
+    ) -> Trigger:
+        target = await self.get_node(target_node_id)
+        if target is None or target.project_id != project_id:
+            raise ValueError("trigger target must belong to the project")
+        trigger = Trigger(
+            project_id=project_id,
+            target_node_id=target_node_id,
+            event_name=event_name,
+            kind=kind,
+            schedule=schedule,
+            data=data or {},
+            enabled=enabled,
+        )
+        self._state(project_id).triggers[trigger.id] = trigger
+        await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="trigger.changed",
+            action="trigger.created",
+            message="trigger created",
+            data={"trigger_id": str(trigger.id), "target_node_id": str(target_node_id), "event_name": event_name, "trigger_data": trigger.data},
+        )
+        return trigger.model_copy(deep=True)
+
+    async def update_trigger(self, trigger_id: uuid.UUID, **changes: Any) -> Optional[Trigger]:
+        current = await self.get_trigger(trigger_id)
+        if current is None:
+            return None
+        if "data" in changes and changes["data"] is None:
+            changes["data"] = {}
+        updated = Trigger.model_validate({
+            **current.model_dump(mode="python"),
+            **changes,
+            "updated_at": datetime.now(timezone.utc),
+        })
+        if updated.target_node_id != current.target_node_id:
+            target = await self.get_node(updated.target_node_id)
+            if target is None or target.project_id != current.project_id:
+                raise ValueError("trigger target must belong to the project")
+        self._state(current.project_id).triggers[trigger_id] = updated
+        await self._persist_project(current.project_id)
+        await self._log(current.project_id, kind="trigger.changed", action="trigger.updated", message="trigger updated", data={"trigger_id": str(trigger_id)})
+        return updated.model_copy(deep=True)
+
+    async def delete_trigger(self, trigger_id: uuid.UUID) -> bool:
+        current = await self.get_trigger(trigger_id)
+        if current is None:
+            return False
+        self._state(current.project_id).triggers.pop(trigger_id, None)
+        await self._persist_project(current.project_id)
+        await self._log(current.project_id, kind="trigger.changed", action="trigger.deleted", message="trigger deleted", data={"trigger_id": str(trigger_id)})
+        return True
+
+    async def mark_trigger_fired(self, trigger_id: uuid.UUID, when: datetime) -> Optional[Trigger]:
+        current = await self.get_trigger(trigger_id)
+        if current is None:
+            return None
+        current.last_fired_at = when
+        self._state(current.project_id).triggers[trigger_id] = current
+        await self._persist_project(current.project_id)
+        return current.model_copy(deep=True)
+
+    async def activate_trigger(self, trigger: Trigger, context: TriggerContext) -> list[Node]:
+        """Reset the target flow and attach the event envelope to its entry node."""
+        target = await self.get_node(trigger.target_node_id)
+        if target is None:
+            return []
+        nodes, edges, _ = await self.get_workgraph(trigger.project_id)
+        walker = GraphWalker(nodes, edges)
+        index = walker.indexes
+        affected: set[uuid.UUID] = {target.id}
+        pending = [target.id]
+        while pending:
+            current = pending.pop()
+            for child in index.children.get(current, []):
+                if child not in affected:
+                    affected.add(child)
+                    pending.append(child)
+            for successor in index.successors.get(current, []):
+                if successor not in affected:
+                    affected.add(successor)
+                    pending.append(successor)
+        state = self._state(trigger.project_id)
+        activated: list[Node] = []
+        async with self._project_lock(trigger.project_id):
+            for node_id in affected:
+                node = state.nodes.get(node_id)
+                if node is None or node.status is NodeStatus.RUNNING:
+                    continue
+                node.trigger_context = context if node_id == target.id else None
+                node.verification = None
+                node.agent_state = None
+                node.agent_message = None
+                node.status = NodeStatus.RUNNABLE if node_id == target.id else NodeStatus.PENDING
+                node.updated_at = datetime.now(timezone.utc)
+                state.nodes[node_id] = node
+                activated.append(node.model_copy(deep=True))
+            await self._persist_project(trigger.project_id)
+        await self._log(
+            trigger.project_id,
+            kind="trigger.activity",
+            action="trigger.activated",
+            message="trigger activated node flow",
+            data={"trigger_id": str(trigger.id), "target_node_id": str(target.id), "event_id": str(context.event_id), "event_name": context.event_name},
+        )
+        return activated
 
     # -- runs -------------------------------------------------------------
 

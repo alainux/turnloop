@@ -144,6 +144,30 @@ the preference for the smallest number of work nodes. “Smallest useful” mean
 the smallest complete topology that preserves the requested outcome; it never
 authorizes collapsing a broad request into a narrow interpretation.
 
+Use this practical organization lens when the request does not name a scale:
+
+- Small work has one clear owner and one concrete acceptance path. It may be a
+  single node; do not add departments, research, or integration ceremony that
+  does not improve the requested result.
+- Medium work is one complete product or deliverable with several real
+  boundaries. Typical lanes are product/domain logic, user experience or
+  content, delivery/runtime, and quality, converging through an integrator or
+  final verifier. Name the lanes from the domain rather than copying a generic
+  checklist.
+- Large work is an organization or product family. Preserve departments such
+  as narrative, engineering, art, audio, QA, operations, marketing, or their
+  domain equivalents at the first level; use nested planners for departments
+  whose internal plan is too broad or uncertain to responsibly author here.
+  “Hundreds of agents” is not a quota: create as many meaningful boundaries as
+  the work requires and let nested planners expand them.
+
+For each scale, run a completeness audit before handoff: (1) name the actual
+deliverable, runtime, host, or publishing path; (2) cover the disciplines and
+cross-cutting concerns needed to make it usable; (3) assign contracts and
+evidence a verifier can inspect; (4) converge every fan-out to one cohesive
+user-facing result; and (5) state the remaining assumptions and risks. A graph
+that is tidy but cannot produce the requested result is not a good graph.
+
 An app factory is organization-scale by definition: it is a repeatable
 organization/system for producing multiple applications, not one app and not
 a research assignment. Treat explicit requests for an organization, platform,
@@ -219,11 +243,23 @@ write the `PlanResult` to a project-relative JSON file and submit it with
 `turn agent submit --kind plan --graph-file <path>`. The source link belongs to
 the planner node that owns the boundary. Nested `subgraph_refs` are validated
 but remain references during exploration; they are not flattened into the
-parent graph. Revisions edit and resubmit the owning source file, preserving
-links unless an explicit `--force` replacement is intended. This is a default
-for graph-changing handoffs, not a requirement that every planner create a
+parent graph. Revisions edit and resubmit the owning source file. The owning
+planner's submitted revision is authoritative for its boundary, so it may
+append, change, or intentionally delete its own descendants without
+`--force`; `--force` is reserved for direct destructive regeneration that
+would discard unmanaged external composition. This is a default for
+graph-changing handoffs, not a requirement that every planner create a
 graph file: a planner may keep its boundary as-is and submit `nodes: []` with
 document references or artifacts only.
+
+Before submitting a graph file, reopen the exact JSON that will be handed off
+and validate it as one local boundary: every `parent_key` and `follows` value
+must name a node in that file, sequence edges must stay within one composition
+boundary, every non-empty boundary must converge to one leaf, and every
+referenced artifact or subgraph source must already exist. If validation
+rejects the handoff, fix the source and resubmit the corrected file; do not
+continue planning from an unaccepted graph or claim that a failed submission
+was applied.
 
 Project documentation is optional for a genuinely atomic request. It is not
 optional merely because the planner wants to avoid doing the architectural
@@ -269,6 +305,31 @@ explorer to inspect the preceding stages' files and run history. If a fan-in
 verifier rejects work, set `target_node_id` to the specific earlier node that
 needs correction. Rejection feedback is sent through the predecessor's active
 Herdr conversation and is not added to the graph.
+
+## Trigger planning
+
+Use `PlanResult.triggers` when a graph should have a durable start condition.
+Each event trigger names a local node with `target_key` and an exact
+`event_name`. A schedule trigger has no event name; it takes a classic
+five-field UTC cron `schedule` (for example, `*/5 * * * *`) and emits its own
+schedule event. Both trigger kinds may declare a JSON-object `data` payload.
+Keep the target at the workflow's normal start node unless the product
+explicitly needs a later entry. Prefer `project.completed` for repeat loops,
+and a custom CLI event for human- or agent-declared starts.
+Do not invent fuzzy names or clever routing chains. Trigger events are
+workspace-wide and their data becomes the target agent's trigger context. For a
+CLI-started workflow, document the exact command shape in the project notes:
+`turn trigger emit EVENT_NAME --project-id PROJECT_ID --data '{"key":"value"}'`.
+The daemon must be running, the event name is case-sensitive, and the payload
+must be a JSON object. Do not add a UI-only trigger action in place of this
+runtime CLI contract.
+
+Treat trigger activation as an input boundary. A node that starts because of
+an event must not emit that same event; otherwise the plan creates an accidental
+self-trigger loop. If a repeat loop is intended, use a distinct completion or
+acceptance event as the trigger boundary and make that boundary explicit in the
+plan. Prefer one trigger into the normal start node, and add a later-node target
+only when the user-facing workflow genuinely requires it.
 
 Before submitting, run `turn capabilities search` and inspect the capability
 catalog for each concrete executor, integrator, and verifier; do not invent a

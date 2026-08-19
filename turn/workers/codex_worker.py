@@ -37,6 +37,7 @@ from turn.workers.interactive import (
 )
 from turn.workers import parsing
 from turn.workers.terminal import LocalPtyTransport
+from turn.workers.harness_catalog import codex_project_root_flags
 
 logger = logging.getLogger("turn.worker.codex")
 
@@ -74,8 +75,6 @@ class CodexWorker(Worker):
         prompt = self._build_prompt(
             ctx,
             cwd=cwd,
-            result_path=result_path,
-            verification=verification,
         )
 
         model = agent.model if agent and agent.model else self.s.codex_model
@@ -103,12 +102,14 @@ class CodexWorker(Worker):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *mcp_flags, "--no-alt-screen", "-C", cwd, session_id, prompt,
+                    *codex_project_root_flags(), *mcp_flags,
+                    "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *mcp_flags, "--no-alt-screen", "-C", cwd, prompt,
+                    *codex_project_root_flags(), *mcp_flags,
+                    "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
             # Continue the same conversation when the runner resumes a node.
@@ -116,13 +117,13 @@ class CodexWorker(Worker):
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
-                *mcp_flags, "-C", cwd, session_id, prompt_arg,
+                *codex_project_root_flags(), *mcp_flags, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
             cmd = [
                 self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
-                *mcp_flags, "-C", cwd, prompt_arg,
+                *codex_project_root_flags(), *mcp_flags, "-C", cwd, prompt_arg,
             ]
 
         structured_text = ""
@@ -194,6 +195,14 @@ class CodexWorker(Worker):
                     error="stalled terminal output",
                     retry_recommended=False,
                 )
+            if terminal.returncode != 0:
+                return WorkerResult(
+                    outcome=Outcome.FAIL,
+                    summary=f"Codex exited {terminal.returncode}",
+                    error=f"Codex exited with code {terminal.returncode}",
+                    retry_recommended=False,
+                    session_id=discovered_session or session_id,
+                )
             submitted = read_result_file(result_path)
             if submitted is not None:
                 structured_text = json.dumps(submitted)
@@ -216,8 +225,6 @@ class CodexWorker(Worker):
             )
         finally:
             for temporary_path in (result_path,):
-                if temporary_path is None:
-                    continue
                 try:
                     os.unlink(str(temporary_path))
                 except OSError:
@@ -303,9 +310,8 @@ class CodexWorker(Worker):
         self,
         ctx: NodeExecutionContext,
         cwd=None,
-        result_path: Path | None = None,
-        verification: bool = False,
     ) -> str:
+        """Send the assignment envelope; operational rules live in skills."""
         gp = ctx.node.generated_prompt or "Complete the objective above using the available tools."
         # The prompt and worker both point at the same assigned project path.
         repo = ctx.repo_path

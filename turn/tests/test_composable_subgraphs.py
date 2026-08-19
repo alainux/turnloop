@@ -19,7 +19,7 @@ from turn.domain.schemas import (
     RunPolicy,
     SubgraphRef,
 )
-from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
+from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 from turn.core import TurnCore
 from turn.config import Settings
 from turn.db.store import Store
@@ -151,7 +151,7 @@ async def test_apply_plan_materializes_nested_diamond_without_flattening(tmp_pat
     await store.init()
     root = await store.create_project(
         "Materialize a nested workflow",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     plan = PlanResult(nodes=[
@@ -322,19 +322,19 @@ async def test_graph_state_keeps_composition_anchor_links_without_flattening(tmp
     async with TurnCore(
         settings,
         test_mode=True,
-        herdr_adapter=FakeHerdrAdapter(),
-        terminal_transport=FakeTerminalTransport(),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=MockTerminalTransport(),
     ) as core:
         root = await core.create_project(
             "Composable graph",
-            agent=AgentConfig(harness=HarnessKind.ECHO),
+            agent=AgentConfig(harness=HarnessKind.MOCK),
             run_policy=RunPolicy(auto_run=False),
         )
         source = SubgraphRef(ref="graphs/root.json")
         created = await core.store.apply_plan(
             root,
             PlanResult(
-                nodes=[NodeSpec(key="work", objective="Work", executor="echo")],
+                nodes=[NodeSpec(key="work", objective="Work", executor="deterministic")],
                 subgraph_refs=[source],
             ),
         )
@@ -366,19 +366,19 @@ async def test_empty_normal_handoff_preserves_children_but_explicit_empty_replac
     async with TurnCore(
         settings,
         test_mode=True,
-        herdr_adapter=FakeHerdrAdapter(),
-        terminal_transport=FakeTerminalTransport(),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=MockTerminalTransport(),
     ) as core:
         root = await core.create_project(
             "No-op planner handoff",
-            agent=AgentConfig(harness=HarnessKind.ECHO),
+            agent=AgentConfig(harness=HarnessKind.MOCK),
             run_policy=RunPolicy(auto_run=False),
         )
         source = SubgraphRef(ref="graphs/root.json")
         [child] = await core.store.apply_plan(
             root,
             PlanResult(
-                nodes=[NodeSpec(key="work", objective="Work", executor="echo")],
+                nodes=[NodeSpec(key="work", objective="Work", executor="deterministic")],
                 subgraph_refs=[source],
             ),
         )
@@ -407,21 +407,59 @@ async def test_empty_normal_handoff_preserves_children_but_explicit_empty_replac
         assert unchanged.document_refs[0].ref == "docs/notes.md"
         assert [item.id for item in await core.store.children_of(root.id)] == [child.id]
 
-        with pytest.raises(RuntimeError, match="--force"):
-            await core.runner._apply_plan_revision(
-                root.id,
-                root.project_id,
-                PlanResult(nodes=[]),
-            )
-
         await core.runner._apply_plan_revision(
             root.id,
             root.project_id,
             PlanResult(nodes=[]),
-            force=True,
         )
         cleared = await core.store.get_node(root.id)
         assert cleared is not None
         assert cleared.status is NodeStatus.COMPLETE
         assert await core.store.children_of(root.id) == []
         assert cleared.subgraph_refs == []
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_revision_can_delete_and_replace_its_owned_graph_without_force(
+    tmp_path: Path,
+):
+    """A planner owns its boundary and can intentionally submit an empty replacement."""
+    settings = Settings()
+    settings.data_dir = str(tmp_path / "turn-data")
+    settings.projects_dir = str(tmp_path / "projects")
+    settings.runner_tick_seconds = 0.001
+    async with TurnCore(
+        settings,
+        test_mode=True,
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=MockTerminalTransport(),
+    ) as core:
+        root = await core.create_project(
+            "Planner-owned graph",
+            agent=AgentConfig(harness=HarnessKind.MOCK),
+            run_policy=RunPolicy(auto_run=False),
+        )
+        [child] = await core.store.apply_plan(
+            root,
+            PlanResult(
+                nodes=[
+                    NodeSpec(
+                        key="old",
+                        objective="Old branch",
+                        executor="deterministic",
+                        subgraph_refs=[SubgraphRef(ref="graphs/old.json")],
+                    )
+                ],
+            ),
+        )
+        created = await core.runner._apply_plan_revision(
+            root.id,
+            root.project_id,
+            PlanResult(nodes=[NodeSpec(key="new", objective="New branch")]),
+        )
+
+        assert created
+        assert await core.store.get_node(child.id) is None
+        assert [node.objective for node in await core.store.descendants(root.id)] == [
+            "New branch"
+        ]

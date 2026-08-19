@@ -40,8 +40,8 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.tools import graph_explorer
 from turn.workers.base import NodeExecutionContext, Planner, Worker, render_context_block
-from turn.workers.echo_worker import EchoWorker
-from turn.tests.fakes import FakeHerdrAdapter, FakeTerminalTransport
+from turn.workers.deterministic_worker import DeterministicWorker
+from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
 from turn.workers.harness_catalog import HarnessCommandFactory
 import turn.workers.harnesses as harness_module
@@ -151,7 +151,7 @@ class SessionPlanner(Planner):
             self.started.set()
             await asyncio.Event().wait()
         return PlanResult(
-            nodes=[NodeSpec(key="leaf", objective="Fresh branch", executor="echo")],
+            nodes=[NodeSpec(key="leaf", objective="Fresh branch", executor="deterministic")],
             session_id=self.session_id,
         )
 
@@ -162,7 +162,7 @@ async def test_heuristic_planner_keeps_card_titles_short_and_full_intent_in_prom
         id=uuid.uuid4(), project_id=uuid.uuid4(), objective="Constellation generator",
         generated_prompt=intent, executor="planner", status=NodeStatus.RUNNABLE,
     )
-    plan = await HeuristicPlanner("echo").plan(NodeExecutionContext(node=root))
+    plan = await HeuristicPlanner("deterministic").plan(NodeExecutionContext(node=root))
     assert [node.objective for node in plan.nodes] == [
         "Define core structure", "Handle inputs and storage",
         "Create output surface", "Integrate the deliverable",
@@ -179,7 +179,7 @@ async def test_heuristic_planner_inherits_the_project_agent_harness():
         executor="planner",
         agent=AgentConfig(harness=HarnessKind.CODEX, model="gpt-5.6-luna"),
     )
-    plan = await HeuristicPlanner("echo").plan(NodeExecutionContext(node=root))
+    plan = await HeuristicPlanner("deterministic").plan(NodeExecutionContext(node=root))
     assert {node.executor for node in plan.nodes} == {"codex"}
     assert plan.nodes[-1].agent_type.value == "integrator"
 
@@ -192,9 +192,9 @@ async def _runtime(tmp_path, worker: Worker):
     await store.init()
     registry = WorkerRegistry()
     registry.register(worker)
-    if worker.name != "echo":
-        registry.register(EchoWorker())
-    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=FakeHerdrAdapter())
+    if worker.name != "deterministic":
+        registry.register(DeterministicWorker())
+    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=MockHerdrAdapter())
     return cfg, store, runner
 
 
@@ -325,10 +325,10 @@ def test_native_harness_commands_deploy_prompt_and_resume_saved_session(harness)
 async def test_native_executor_persists_provider_session_before_result(
     tmp_path, monkeypatch, harness, session_id
 ):
-    class FakeNativeTransport:
+    class MockNativeTransport:
         pass
 
-    async def fake_run_until_result(_transport, _node_id, _command, **kwargs):
+    async def mock_run_until_result(_transport, _node_id, _command, **kwargs):
         (tmp_path / "native-output.txt").write_text("native output")
         kwargs["result_path"].write_text(
             '{"outcome":"COMPLETE","summary":"native executor verified"}'
@@ -336,8 +336,8 @@ async def test_native_executor_persists_provider_session_before_result(
         await kwargs["session_callback"](session_id)
         return TerminalResult(returncode=0, output=b"\x1b[32mnative PTY\x1b[0m")
 
-    monkeypatch.setattr(harness_module, "LocalPtyTransport", FakeNativeTransport)
-    monkeypatch.setattr(harness_module, "run_until_result", fake_run_until_result)
+    monkeypatch.setattr(harness_module, "LocalPtyTransport", MockNativeTransport)
+    monkeypatch.setattr(harness_module, "run_until_result", mock_run_until_result)
     monkeypatch.setattr(harness_module, "opencode_session_ids", lambda: [])
     seen: list[str] = []
 
@@ -372,7 +372,7 @@ def test_reconnect_commands_use_native_provider_sessions(tmp_path):
         WorkerRegistry(),
         EventBus(),
         Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     project_id = uuid.uuid4()
     node = Node(
@@ -386,6 +386,7 @@ def test_reconnect_commands_use_native_provider_sessions(tmp_path):
     assert codex is not None
     assert codex[1] == "resume"
     assert "exec" not in codex and "--json" not in codex
+    assert "project_root_markers=[]" in codex
     assert "--thinking" not in codex
     assert "model_reasoning_effort=\"default\"" not in codex
 
@@ -418,7 +419,7 @@ async def test_user_shell_is_independent_from_node_activity(tmp_path):
         WorkerRegistry(),
         EventBus(),
         Settings(data_dir=str(tmp_path / "turn-shell-state")),
-        terminal_transport=FakeTerminalTransport(),
+        terminal_transport=MockTerminalTransport(),
     )
     initial_status = (await store.get_node(root.id)).status
     assert runner.shell is runner.terminal
@@ -497,12 +498,12 @@ async def test_reconnect_requires_the_node_session_not_run_history(tmp_path):
     )
     run = await store.create_run(root, "codex")
     await store.update_run(run.id, session_id="history-only-session")
-    transport = FakeTerminalTransport()
+    transport = MockTerminalTransport()
     runner = Runner(
         store,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=transport,
     )
 
@@ -524,12 +525,12 @@ async def test_manual_stop_of_retained_follow_up_requires_a_fresh_run(tmp_path):
     )
     root.agent.session_id = "retained-session"
     await store._save_node(root)
-    transport = FakeTerminalTransport()
+    transport = MockTerminalTransport()
     runner = Runner(
         store,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=transport,
     )
     assert await runner.reconnect(root.id)
@@ -569,20 +570,20 @@ async def test_agent_planner_uses_the_selected_opencode_harness(monkeypatch):
     )
     observed: list[HarnessKind] = []
 
-    async def fake_call(agent, prompt, ctx):
+    async def mock_call(agent, prompt, ctx):
         observed.append(agent.harness)
         return '''```turn-plan
 {"nodes":[{"key":"room","objective":"Build room","executor":"codex"}],"edges":[]}
 ```'''
 
-    monkeypatch.setattr(planner, "_call_harness", fake_call)
+    monkeypatch.setattr(planner, "_call_harness", mock_call)
     plan = await planner.plan(NodeExecutionContext(node=node))
     assert observed == [HarnessKind.OPENCODE]
     assert plan.nodes and plan.nodes[0].objective == "Build room"
 
 
 async def test_agent_config_inherits_and_cascades(tmp_path):
-    cfg, store, runner = await _runtime(tmp_path, EchoWorker())
+    cfg, store, runner = await _runtime(tmp_path, DeterministicWorker())
     runner.registry.register_planner(FixedPlanner())
     chosen = AgentConfig(
         harness=HarnessKind.CODEX,
@@ -615,7 +616,7 @@ async def test_agent_config_inherits_and_cascades(tmp_path):
 
 
 async def test_regeneration_has_no_fork_or_revision_branch(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     runner.registry.register_planner(FixedPlanner())
     root = await store.create_project("visible root fork", run_policy=RunPolicy(auto_run=False))
 
@@ -630,7 +631,7 @@ async def test_regeneration_has_no_fork_or_revision_branch(tmp_path):
 
 async def test_cli_plan_revision_replaces_an_expanded_subtree(tmp_path, monkeypatch):
     """A follow-up plan submitted in the retained planner session is applied."""
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     runner.registry.register_planner(FixedPlanner())
     root = await store.create_project(
         "revise the lantern",
@@ -657,7 +658,7 @@ async def test_cli_plan_revision_replaces_an_expanded_subtree(tmp_path, monkeypa
         json.dumps({
             "nodes": [
                 {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
-                {"key": "write", "objective": "Write chapters", "executor": "echo", "follows": ["chapters"]},
+                {"key": "write", "objective": "Write chapters", "executor": "deterministic", "follows": ["chapters"]},
             ],
         }),
     ])
@@ -689,13 +690,13 @@ async def test_runner_restores_retained_handoff_watchers_after_restart(tmp_path)
     )
     root.agent.session_id = "retained-planner-session"
     await store._save_node(root)
-    terminal = FakeTerminalTransport()
+    terminal = MockTerminalTransport()
     terminal.supports_inject = True
     runner = Runner(
         store,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
         terminal_transport=terminal,
     )
 
@@ -713,7 +714,7 @@ async def test_runner_restores_retained_handoff_watchers_after_restart(tmp_path)
 
 async def test_cli_result_revision_updates_a_completed_executor_session(tmp_path, monkeypatch):
     """Every retained executor conversation can publish a corrected result."""
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project(
         "revise executor work",
         repo_path=str(tmp_path / "project"),
@@ -721,7 +722,7 @@ async def test_cli_result_revision_updates_a_completed_executor_session(tmp_path
     )
     [work] = await store.apply_plan(
         root,
-        PlanResult(nodes=[NodeSpec(key="work", objective="Implement the feature", executor="echo")]),
+        PlanResult(nodes=[NodeSpec(key="work", objective="Implement the feature", executor="deterministic")]),
     )
     work.agent = AgentConfig(harness=HarnessKind.CODEX, session_id="executor-session")
     await store._save_node(work)
@@ -769,7 +770,7 @@ async def test_cli_result_revision_updates_a_completed_executor_session(tmp_path
 
 
 async def test_regeneration_closes_removed_herdr_panes_and_projects_agent_status(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     runner.registry.register_planner(FixedPlanner())
     repo = tmp_path / "project"
     root = await store.create_project(
@@ -814,7 +815,7 @@ async def test_regeneration_closes_removed_herdr_panes_and_projects_agent_status
 
 
 async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     planner = SessionPlanner("new-session")
     runner.registry.register_planner(planner)
     root = await store.create_project(
@@ -829,7 +830,7 @@ async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
         root.id,
         [ArtifactSpec(kind=ArtifactKind.TEXT, name="old-artifact", content="old")],
     )
-    terminal = FakeTerminalTransport()
+    terminal = MockTerminalTransport()
     runner.terminal = terminal
     runner.shell = terminal
     await terminal.ensure_persistent_shell(root.id, cwd=str(tmp_path))
@@ -862,14 +863,14 @@ async def test_run_again_resets_provider_session_and_forbids_reuse(tmp_path):
 
 
 async def test_stop_cancels_an_inflight_regeneration(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     started = asyncio.Event()
     planner = SessionPlanner("never-reached", started)
     runner.registry.register_planner(planner)
-    runner.terminal = FakeTerminalTransport()
+    runner.terminal = MockTerminalTransport()
     root = await store.create_project(
         "cancel planner run",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     root.agent.session_id = "old-session"
@@ -907,7 +908,7 @@ async def test_store_preserves_explicit_planner_agent_type(tmp_path):
 
 
 async def test_new_plan_children_inherit_config_but_not_parent_session(tmp_path):
-    _, store, _ = await _runtime(tmp_path, EchoWorker())
+    _, store, _ = await _runtime(tmp_path, DeterministicWorker())
     parent = await store.create_project(
         "session boundary",
         agent=AgentConfig(
@@ -932,11 +933,11 @@ async def test_new_plan_children_inherit_config_but_not_parent_session(tmp_path)
 
 
 async def test_plan_can_assign_integrator_specialization_without_new_harness_config(tmp_path):
-    _, store, _ = await _runtime(tmp_path, EchoWorker())
+    _, store, _ = await _runtime(tmp_path, DeterministicWorker())
     parent = await store.create_project(
         "assemble product",
         agent=AgentConfig(
-            harness=HarnessKind.ECHO,
+            harness=HarnessKind.MOCK,
             model="deterministic",
             session_id="planner-thread",
         ),
@@ -949,7 +950,7 @@ async def test_plan_can_assign_integrator_specialization_without_new_harness_con
                 NodeSpec(
                     key="integrate",
                     objective="Integrate product",
-                    executor="echo",
+                    executor="deterministic",
                     agent_type=AgentType.INTEGRATOR,
                 )
             ]
@@ -957,18 +958,18 @@ async def test_plan_can_assign_integrator_specialization_without_new_harness_con
     )
 
     assert created[0].agent.type_id is AgentType.INTEGRATOR
-    assert created[0].agent.harness is HarnessKind.ECHO
+    assert created[0].agent.harness is HarnessKind.MOCK
     assert created[0].agent.model == "deterministic"
     assert created[0].agent.session_id is None
     await store.dispose()
 
 
 async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
-    _, store, _ = await _runtime(tmp_path, EchoWorker())
+    _, store, _ = await _runtime(tmp_path, DeterministicWorker())
     parent = await store.create_project(
         "explicit adapter",
         agent=AgentConfig(
-            harness=HarnessKind.ECHO,
+            harness=HarnessKind.MOCK,
             model="deterministic",
             reasoning=ReasoningLevel.DEFAULT,
             session_id="planner-thread",
@@ -977,16 +978,16 @@ async def test_explicit_same_harness_keeps_dynamic_model_assignment(tmp_path):
     )
     created = await store.apply_plan(
         parent,
-        PlanResult(nodes=[NodeSpec(key="child", objective="Implement leaf", executor="echo")]),
+        PlanResult(nodes=[NodeSpec(key="child", objective="Implement leaf", executor="deterministic")]),
     )
-    assert created[0].agent.harness == HarnessKind.ECHO
+    assert created[0].agent.harness == HarnessKind.MOCK
     assert created[0].agent.model == "deterministic"
     assert created[0].agent.session_id is None
     await store.dispose()
 
 
 async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     cancelled_parent = await store.create_node(
         project_id=root.id,
@@ -994,15 +995,15 @@ async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_pat
         objective="Cancelled parent",
         executor="planner",
         status=NodeStatus.CANCELLED,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     late_child = await store.create_node(
         project_id=root.id,
         parent_id=cancelled_parent.id,
         objective="Late verifier replacement",
-        executor="echo",
+        executor="deterministic",
         status=NodeStatus.RUNNING,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     worker = asyncio.create_task(asyncio.Event().wait())
     runner._running[late_child.id] = worker
@@ -1016,21 +1017,21 @@ async def test_scheduler_cancels_child_created_after_parent_cancellation(tmp_pat
 
 
 async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     await store.set_status(root.id, NodeStatus.EXPANDED)
     orphan = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="Interrupted work",
         status=NodeStatus.RUNNING,
-        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="stale-session"),
+        agent=AgentConfig(harness=HarnessKind.MOCK, session_id="stale-session"),
     )
     live = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="Owned work",
-        status=NodeStatus.RUNNING, agent=AgentConfig(harness=HarnessKind.ECHO),
+        status=NodeStatus.RUNNING, agent=AgentConfig(harness=HarnessKind.MOCK),
     )
-    orphan_run = await store.create_run(orphan, "echo")
+    orphan_run = await store.create_run(orphan, "deterministic")
     await runner.terminal.ensure_persistent_shell(orphan.id, cwd=str(tmp_path))
-    live_run = await store.create_run(live, "echo")
+    live_run = await store.create_run(live, "deterministic")
     live_task = asyncio.create_task(asyncio.Event().wait())
     runner._running[live.id] = live_task
 
@@ -1049,15 +1050,15 @@ async def test_scheduler_terminalizes_persisted_running_rows_without_live_tasks(
 
 
 async def test_retry_prepares_a_fresh_provider_call(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
-    runner.terminal = FakeTerminalTransport()
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
+    runner.terminal = MockTerminalTransport()
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     node = await store.create_node(
         project_id=root.id,
         parent_id=root.id,
         objective="Retryable work",
         status=NodeStatus.FAILED,
-        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="stale-session"),
+        agent=AgentConfig(harness=HarnessKind.MOCK, session_id="stale-session"),
     )
     await runner.terminal.ensure_persistent_shell(node.id, cwd=str(tmp_path))
 
@@ -1072,14 +1073,14 @@ async def test_retry_prepares_a_fresh_provider_call(tmp_path):
 
 
 async def test_late_failure_retries_a_running_node(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     node = await store.create_node(
         project_id=root.id, parent_id=root.id, objective="Node while running",
-        executor="echo", status=NodeStatus.RUNNING,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        executor="deterministic", status=NodeStatus.RUNNING,
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
-    run = await store.create_run(node, "echo", 1)
+    run = await store.create_run(node, "deterministic", 1)
 
     await runner._handle_outcome(
         node, run, root.id,
@@ -1112,13 +1113,13 @@ async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
         async def wait(self):
             return 0
 
-    async def fake_subprocess(*args, **kwargs):
+    async def mock_subprocess(*args, **kwargs):
         captured["args"] = args
         captured["cwd"] = kwargs.get("cwd")
         return Process()
 
     monkeypatch.setattr(planner_module.shutil, "which", lambda _binary: "/usr/bin/codex")
-    monkeypatch.setattr(planner_module.asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(planner_module.asyncio, "create_subprocess_exec", mock_subprocess)
     cfg = Settings()
     planner = CodexPlanner(settings=cfg)
     agent = AgentConfig(harness=HarnessKind.CODEX, session_id="planner-session")
@@ -1127,6 +1128,7 @@ async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
 
     args = captured["args"]
     assert args[:3] == (cfg.codex_binary, "exec", "resume")
+    assert "project_root_markers=[]" in args
     assert "--ephemeral" not in args
     assert "planner-session" in args
     assert captured["cwd"] == str(tmp_path)
@@ -1185,9 +1187,9 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
         parent_id=root.id,
         objective="Build the domain",
         generated_prompt="Implement the domain contract from the original intention.",
-        executor="echo",
+        executor="deterministic",
         agent=AgentConfig(
-            harness=HarnessKind.ECHO,
+            harness=HarnessKind.MOCK,
             model="deterministic",
             session_id="worker-session",
         ),
@@ -1198,8 +1200,8 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
         parent_id=root.id,
         objective="Integrate the product",
         generated_prompt="Read the domain output and assemble the product.",
-        executor="echo",
-        agent=AgentConfig(harness=HarnessKind.ECHO, model="deterministic"),
+        executor="deterministic",
+        agent=AgentConfig(harness=HarnessKind.MOCK, model="deterministic"),
         status=NodeStatus.BLOCKED,
     )
     state = store._states[root.id]
@@ -1207,7 +1209,7 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
     state["edges"][dependency.id] = dependency
     await store._persist_project(root.id)
     await store.set_agent_status(worker.id, state="working", message="writing the domain")
-    run = await store.create_run(worker, "echo")
+    run = await store.create_run(worker, "deterministic")
     await store.update_run(run.id, summary="Started domain work", session_id="worker-session")
     await store.add_artifacts(worker.id, [ArtifactSpec(kind=ArtifactKind.FILE, name="domain.py")])
 
@@ -1224,7 +1226,7 @@ async def test_graph_explorer_exposes_full_coordination_state(tmp_path):
     assert root_view["instructions"] == "Original user intention"
     assert worker_view["instructions"] == "Implement the domain contract from the original intention."
     assert dependent_view["instructions"] == "Read the domain output and assemble the product."
-    assert worker_view["agent"]["harness"] == "echo"
+    assert worker_view["agent"]["harness"] == "mock"
     assert worker_view["agent"]["model"] == "deterministic"
     assert worker_view["session_id"] == "worker-session"
     assert worker_view["agent_state"] == "working"
@@ -1433,6 +1435,28 @@ def test_worker_context_delivers_assignment_and_live_graph_access():
     assert "turn graph" not in prompt
 
 
+def test_codex_worker_keeps_handoff_protocol_in_turn_basics_skill(tmp_path):
+    from turn.workers.codex_worker import CodexWorker
+
+    load_builtin_capabilities(tmp_path, ["turn-basics"])
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Create an artifact",
+        generated_prompt="Create the requested artifact.",
+        agent=AgentConfig(type_id=AgentType.EXECUTOR, harness=HarnessKind.CODEX),
+    )
+    prompt = CodexWorker()._build_prompt(
+        NodeExecutionContext(node=node, repo_path=str(tmp_path))
+    )
+
+    assert "$turn-basics" in prompt
+    assert "TURN HANDOFF GATE" not in prompt
+    assert "turn agent submit" not in prompt
+    assert "turn agent verify" not in prompt
+    assert "never write Turn protocol files directly" not in prompt
+    assert len(prompt) < 700
+
+
 def test_codex_choked_output_is_not_a_false_success():
     from turn.workers.codex_worker import CodexWorker
 
@@ -1626,7 +1650,7 @@ async def test_scheduler_snapshot_cannot_regress_a_fresh_complete_node(tmp_path)
         return stale_graph
 
     store.get_workgraph = old_snapshot
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=MockHerdrAdapter())
     await runner._schedule_project(root.id)
     assert (await store.get_node(child.id)).status == NodeStatus.COMPLETE
     assert child.id not in runner._running
@@ -1643,7 +1667,7 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
         parent_id=root.id,
         objective="slow work",
         executor="slow",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     # Worker lookup follows agent harness. Keep the custom adapter assignment
     # explicit without adding it to the persistent HarnessKind catalog.
@@ -1662,9 +1686,44 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
     await store.dispose()
 
 
+async def test_terminal_launch_failure_cannot_leave_node_running(tmp_path):
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
+    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+    child = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="provider launch failure",
+        executor="deterministic",
+        status=NodeStatus.RUNNABLE,
+        agent=AgentConfig(harness=HarnessKind.MOCK),
+    )
+
+    async def unavailable(_node_id):
+        return False
+
+    # Simulate the terminal adapter reporting that its pane could not be
+    # allocated. The scheduler must settle the node instead of allowing the
+    # worker to run and leaving the UI's RUNNING projection behind.
+    runner.node_executor.ensure_terminal = unavailable
+    await runner.run_node(child.id)
+    for _ in range(100):
+        current = await store.get_node(child.id)
+        if current is not None and current.status == NodeStatus.FAILED and not runner.generation_active(child.id):
+            break
+        await asyncio.sleep(0.01)
+
+    failed = await store.get_node(child.id)
+    assert failed is not None
+    assert failed.status == NodeStatus.FAILED
+    assert not runner.generation_active(child.id)
+    assert child.id not in runner.active_node_ids()
+    await store.dispose()
+
+
 async def test_run_after_manual_stop_starts_a_fresh_provider_session(tmp_path):
     class SessionWorker(Worker):
-        name = "echo"
+        name = "deterministic"
 
         def __init__(self):
             self.seen_sessions: list[str | None] = []
@@ -1684,16 +1743,16 @@ async def test_run_after_manual_stop_starts_a_fresh_provider_session(tmp_path):
 
     worker = SessionWorker()
     _, store, runner = await _runtime(tmp_path, worker)
-    runner.terminal = FakeTerminalTransport()
+    runner.terminal = MockTerminalTransport()
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     await store.set_status(root.id, NodeStatus.EXPANDED)
     node = await store.create_node(
         project_id=root.id,
         parent_id=root.id,
         objective="manual rerun",
-        executor="echo",
+        executor="deterministic",
         status=NodeStatus.RUNNABLE,
-        agent=AgentConfig(harness=HarnessKind.ECHO, session_id="old-session"),
+        agent=AgentConfig(harness=HarnessKind.MOCK, session_id="old-session"),
     )
 
     await runner.run_node(node.id)
@@ -1721,7 +1780,7 @@ async def test_disconnected_terminal_output_is_not_persisted_after_release(tmp_p
     store = Store(tmp_path / "terminal-output")
     await store.init()
     root = await store.create_project("root", repo_path=str(tmp_path / "project"))
-    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=FakeHerdrAdapter())
+    runner = Runner(store, WorkerRegistry(), EventBus(), Settings(), herdr_adapter=MockHerdrAdapter())
     # The live terminal may contain output while it is attached, but that
     # output belongs to Herdr's session log, not Turn's graph state.
     runner.terminal = LocalPtyTransport()
@@ -1744,15 +1803,15 @@ async def test_disconnected_terminal_output_is_not_persisted_after_release(tmp_p
 
 
 async def test_resume_respects_step_and_auto_modes(tmp_path):
-    _, store, runner = await _runtime(tmp_path, EchoWorker())
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     await store.set_status(root.id, NodeStatus.EXPANDED)
     child = await store.create_node(
         project_id=root.id,
         parent_id=root.id,
         objective="resumable",
-        executor="echo",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        executor="deterministic",
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     await runner.pause(child.id)
     await runner.resume(child.id)

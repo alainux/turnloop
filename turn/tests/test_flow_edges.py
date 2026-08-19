@@ -30,14 +30,14 @@ def _scenario(
         project_id=project_id,
         objective="Repair the implementation",
         status=target_status,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     verifier = Node(
         id=uuid.uuid4(),
         project_id=project_id,
         objective="Verify the implementation",
         status=NodeStatus.PENDING,
-        agent=AgentConfig(harness=HarnessKind.ECHO, type_id=verifier_type),
+        agent=AgentConfig(harness=HarnessKind.MOCK, type_id=verifier_type),
         verification=VerificationResult(
             decision=decision,
             summary="The implementation needs another pass",
@@ -51,7 +51,7 @@ def _scenario(
             project_id=project_id,
             objective="Another prerequisite",
             status=NodeStatus.RUNNABLE,
-            agent=AgentConfig(harness=HarnessKind.ECHO),
+            agent=AgentConfig(harness=HarnessKind.MOCK),
         )
         nodes.append(other)
         edges.append(Edge(src=other.id, dst=verifier.id, type=EdgeType.FOLLOWS))
@@ -105,7 +105,7 @@ def test_any_node_can_return_to_an_explicit_arbitrary_target():
         project_id=dependency.project_id,
         objective="Repair the earlier foundation",
         status=NodeStatus.RUNNABLE,
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
     )
     nodes.append(arbitrary)
     reviewer.verification = VerificationResult(

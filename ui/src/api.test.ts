@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  closeProjectTerminals,
   deleteProject,
   getProjectGraph,
   renameProject,
@@ -33,6 +34,7 @@ describe("typed API modules", () => {
     await renameProject("project/one", "Renamed");
     await setProjectMode("project/one", true);
     await stepProject("project/one");
+    await closeProjectTerminals("project/one");
     await deleteProject("project/one", {
       delete_files: true,
       delete_conversations: false,
@@ -43,6 +45,7 @@ describe("typed API modules", () => {
       ["/api/projects/project%2Fone", "PATCH", JSON.stringify({ name: "Renamed" })],
       ["/api/projects/project%2Fone/mode", "POST", JSON.stringify({ auto_run: true })],
       ["/api/projects/project%2Fone/step", "POST", undefined],
+      ["/api/projects/project%2Fone/workspace/close", "POST", undefined],
       [
         "/api/projects/project%2Fone",
         "DELETE",

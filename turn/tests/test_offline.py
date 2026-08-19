@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import tempfile
 import uuid
+from pathlib import Path
 
 from turn.config import Settings, settings
 from turn.db.store import Store
@@ -25,11 +27,11 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.workers.base import NodeExecutionContext, Planner
 from turn.workers.codex_worker import CodexWorker
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.filesystem import init_project_directory
 from turn.workers.registry import WorkerRegistry
 from turn.workers.planner import HeuristicPlanner
-from turn.tests.fakes import FakeHerdrAdapter
+from turn.tests.mocks import MockHerdrAdapter
 from turn.tests.capability_fixtures import load_builtin_capabilities
 
 
@@ -38,10 +40,31 @@ def seed_project_capabilities(store: Store, project_id: uuid.UUID) -> None:
     load_builtin_capabilities(project_root)
 
 
-def test_project_directory_does_not_initialize_git(tmp_path) -> None:
+def test_project_directory_initializes_an_independent_git_root(tmp_path) -> None:
     project = init_project_directory(uuid.uuid4(), working_dir=str(tmp_path / "demo"))
     assert project == str((tmp_path / "demo").resolve())
-    assert not (tmp_path / "demo" / ".git").exists()
+    assert (tmp_path / "demo" / ".git").exists()
+    git_root = subprocess.run(
+        ["git", "-C", project, "rev-parse", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert Path(git_root).resolve() == Path(project).resolve()
+    assert (tmp_path / "demo" / "AGENTS.md").read_text() == (
+        "# Turn project\n\nThis is a Turn project.\n"
+    )
+
+
+def test_project_directory_preserves_existing_agents_file(tmp_path) -> None:
+    project = tmp_path / "existing"
+    project.mkdir()
+    agents = project / "AGENTS.md"
+    agents.write_text("# Existing project instructions\n")
+
+    init_project_directory(uuid.uuid4(), working_dir=str(project))
+
+    assert agents.read_text() == "# Existing project instructions\n"
 
 
 async def test_codex_worker_refuses_missing_directory() -> None:
@@ -63,19 +86,19 @@ async def test_pause_respected() -> None:
         name = "p"
 
         async def plan(self, ctx):
-            return PlanResult(nodes=[NodeSpec(key="a", objective="do a", executor="echo")])
+            return PlanResult(nodes=[NodeSpec(key="a", objective="do a", executor="deterministic")])
 
     store = Store(tempfile.mkdtemp())
     await store.init()
     reg = WorkerRegistry()
-    reg.register(EchoWorker())
+    reg.register(DeterministicWorker())
     reg.register_planner(P())
     runner = Runner(
         store,
         registry=reg,
         events=EventBus(),
         settings=settings,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     root = await store.create_project("x")
     seed_project_capabilities(store, root.id)
@@ -97,8 +120,8 @@ async def test_direct_files_are_available_to_downstream_nodes(tmp_path) -> None:
         async def plan(self, ctx):
             return PlanResult(
                 nodes=[
-                    NodeSpec(key="write", objective="write a source file", executor="echo"),
-                    NodeSpec(key="read", objective="assemble the source file", executor="echo", follows=["write"]),
+                    NodeSpec(key="write", objective="write a source file", executor="deterministic"),
+                    NodeSpec(key="read", objective="assemble the source file", executor="deterministic", follows=["write"]),
                 ]
             )
 
@@ -107,14 +130,14 @@ async def test_direct_files_are_available_to_downstream_nodes(tmp_path) -> None:
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     reg = WorkerRegistry()
-    reg.register(EchoWorker())
+    reg.register(DeterministicWorker())
     reg.register_planner(P())
     runner = Runner(
         store,
         registry=reg,
         events=EventBus(),
         settings=settings,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     root = await store.create_project("demo", repo_path=str(project_dir))
     seed_project_capabilities(store, root.id)
@@ -134,7 +157,7 @@ async def test_architectural_decomposition_has_parallel_lanes_and_integrator(tmp
     await store.init()
     root = await store.create_project("Build a modular reading log")
     seed_project_capabilities(store, root.id)
-    plan = await HeuristicPlanner("echo").plan(
+    plan = await HeuristicPlanner("deterministic").plan(
         NodeExecutionContext(node=root.model_copy(update={"generated_prompt": root.objective}))
     )
     assert [node.objective for node in plan.nodes] == [
@@ -191,7 +214,7 @@ async def test_auto_runner_dispatches_all_independent_lanes_together(tmp_path) -
         registry=registry,
         events=EventBus(),
         settings=cfg,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     root = await store.create_project("parallel demo", run_policy=RunPolicy(auto_run=True))
     seed_project_capabilities(store, root.id)
@@ -217,26 +240,26 @@ async def test_manual_step_uses_sequence_order_not_uuid_order(tmp_path) -> None:
     store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
+    registry.register(DeterministicWorker())
     runner = Runner(
         store,
         registry=registry,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     root = await store.create_project(
         "ordered manual demo",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     seed_project_capabilities(store, root.id)
     created = await store.apply_plan(
         root,
         PlanResult(nodes=[
-            NodeSpec(key="finish", objective="finish", executor="echo", follows=["middle"]),
-            NodeSpec(key="middle", objective="middle", executor="echo", follows=["first"]),
-            NodeSpec(key="first", objective="first", executor="echo"),
+            NodeSpec(key="finish", objective="finish", executor="deterministic", follows=["middle"]),
+            NodeSpec(key="middle", objective="middle", executor="deterministic", follows=["first"]),
+            NodeSpec(key="first", objective="first", executor="deterministic"),
         ]),
     )
 
@@ -251,17 +274,17 @@ async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> Non
     store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
+    registry.register(DeterministicWorker())
     runner = Runner(
         store,
         registry=registry,
         events=EventBus(),
         settings=Settings(),
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     root = await store.create_project(
         "parallel manual demo",
-        agent=AgentConfig(harness=HarnessKind.ECHO),
+        agent=AgentConfig(harness=HarnessKind.MOCK),
         run_policy=RunPolicy(auto_run=False),
     )
     seed_project_capabilities(store, root.id)
@@ -269,12 +292,12 @@ async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> Non
         root,
         PlanResult(
             nodes=[
-                NodeSpec(key="world", objective="world", executor="echo"),
-                NodeSpec(key="systems", objective="systems", executor="echo"),
+                NodeSpec(key="world", objective="world", executor="deterministic"),
+                NodeSpec(key="systems", objective="systems", executor="deterministic"),
                 NodeSpec(
                     key="integrate",
                     objective="integrate",
-                    executor="echo",
+                    executor="deterministic",
                     follows=["world", "systems"],
                 ),
             ]

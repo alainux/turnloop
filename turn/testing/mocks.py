@@ -1,4 +1,4 @@
-"""Small deterministic provider fakes for offline runtime composition."""
+"""Small deterministic provider mocks for offline runtime composition."""
 from __future__ import annotations
 
 from turn.workers.herdr import (
@@ -9,7 +9,7 @@ from turn.workers.herdr import (
 )
 
 
-class FakeHerdrAdapter:
+class MockHerdrAdapter:
     """In-memory Herdr port; no CLI, daemon, or external process is used."""
 
     def __init__(self):
@@ -34,8 +34,8 @@ class FakeHerdrAdapter:
     async def create_workspace(self, *, cwd: str, label: str, focus: bool = False):
         self._workspace_number += 1
         self._pane_number += 1
-        workspace_id = f"fake-w{self._workspace_number}"
-        pane_id = f"fake-p{self._pane_number}"
+        workspace_id = f"mock-w{self._workspace_number}"
+        pane_id = f"mock-p{self._pane_number}"
         self.workspaces[workspace_id] = HerdrWorkspace(workspace_id, label, 1, 1)
         self.panes[pane_id] = (workspace_id, HerdrPane(pane_id))
         self.created.append(workspace_id)
@@ -66,7 +66,7 @@ class FakeHerdrAdapter:
     async def create_tab(self, *, workspace_id: str, cwd: str, label: str, focus: bool = False):
         await self.get_workspace(workspace_id)
         self._pane_number += 1
-        pane_id = f"fake-p{self._pane_number}"
+        pane_id = f"mock-p{self._pane_number}"
         pane = HerdrPane(pane_id)
         self.panes[pane_id] = (workspace_id, pane)
         return pane

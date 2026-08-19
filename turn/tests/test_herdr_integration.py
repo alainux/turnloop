@@ -17,7 +17,7 @@ from turn.db.store import Store
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server.api import router
-from turn.workers.fake_harness import FakeHarnessWorker
+from turn.workers.mock_harness import MockHarnessWorker
 from turn.workers.herdr import HerdrResourceNotFound
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
@@ -47,7 +47,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
 
     # The live Herdr daemon is permissioned to the repository's project root;
     # the test intentionally exercises that real boundary rather than using a
-    # fake path the daemon cannot open.
+    # mock path the daemon cannot open.
     project_root = Path(__file__).resolve().parents[2] / "projects"
     # Herdr is permissioned to this repository-owned root, so keep the real
     # daemon boundary while isolating every project path to this test run.
@@ -58,14 +58,14 @@ async def test_herdr_project_space_contract(tmp_path: Path):
     settings = Settings(
         data_dir=str(tmp_path / "turn-state"),
         projects_dir=str(project_root),
-        default_executor="fake",
+        default_executor="mock",
         planner="heuristic",
     )
     store = Store(settings.data_dir)
     await store.init()
     registry = WorkerRegistry()
-    registry.register(FakeHarnessWorker(settings))
-    registry.register_planner(HeuristicPlanner("fake"))
+    registry.register(MockHarnessWorker(settings))
+    registry.register_planner(HeuristicPlanner("mock"))
     runner = Runner(store, registry, EventBus(), settings)
     app = FastAPI()
     app.include_router(router)
@@ -83,7 +83,7 @@ async def test_herdr_project_space_contract(tmp_path: Path):
                 json={
                     "name": "Herdr contract project",
                     "prompt": "Exercise the Herdr project-space contract",
-                    "agent": {"harness": "fake", "type_id": "executor"},
+                    "agent": {"harness": "mock", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                     "working_dir": str(project_paths[0]),
                 },
@@ -129,14 +129,15 @@ async def test_herdr_project_space_contract(tmp_path: Path):
             )
             assert str(project_id) not in metadata
 
-            # An external Herdr deletion is reflected back into Turn on the
-            # server reconciliation path, including cleanup of its mapping.
+            # An external Herdr deletion is repaired by Turn's reconciliation
+            # path. The provider workspace is disposable; project state is
+            # not, so the graph remains available with a fresh workspace.
             created_again = await client.post(
                 "/api/projects",
                 json={
                     "name": "Externally deleted Herdr project",
                     "prompt": "Verify reverse lifecycle reconciliation",
-                    "agent": {"harness": "fake", "type_id": "executor"},
+                    "agent": {"harness": "mock", "type_id": "executor"},
                     "run_policy": {"auto_run": False},
                     "working_dir": str(project_paths[1]),
                 },
@@ -148,12 +149,15 @@ async def test_herdr_project_space_contract(tmp_path: Path):
             assert await runner.terminal.adapter.close_workspace(external_workspace_id)
 
             await runner._reconcile_project_workspaces(await store.list_projects())
-            assert await store.get_node(external_id) is None
-            assert (await client.get("/api/projects")).json()["projects"] == []
+            assert await store.get_node(external_id) is not None
+            assert len((await client.get("/api/projects")).json()["projects"]) == 1
+            recreated_workspace_id = runner.terminal.project_workspace_id(str(external_id))
+            assert recreated_workspace_id is not None
+            assert recreated_workspace_id != external_workspace_id
             metadata = json.loads(
                 (Path(settings.data_dir) / "herdr-workspaces.json").read_text()
             )
-            assert str(external_id) not in metadata
+            assert str(external_id) in metadata
     finally:
         try:
             for project in await store.list_projects():

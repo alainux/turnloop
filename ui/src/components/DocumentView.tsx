@@ -27,6 +27,7 @@ interface Props {
   edges: Edge[];
   artifacts: Artifact[];
   projectId?: string;
+  refreshKey?: string | number;
 }
 
 export type DocumentTarget = DocumentRef & {
@@ -70,6 +71,7 @@ type ArtifactLike = {
   name: string;
   ref: string | null;
   content?: unknown | null;
+  created_at?: string;
 };
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
@@ -389,8 +391,8 @@ export function DocumentLinks({
     );
   };
   return (
-    <section className="document-links">
-      <h3>Document references</h3>
+    <section className="document-links" aria-label="Project documents">
+      <h3>Project documents</h3>
       <ul>{refs.map((reference) => render(reference))}</ul>
     </section>
   );
@@ -407,8 +409,8 @@ export function SubgraphLinks({
 }) {
   if (!refs.length || !projectId) return null;
   return (
-    <section className="document-links document-subgraph-links" aria-label="Composed subgraphs">
-      <h3>Composed subgraphs</h3>
+    <section className="document-links document-subgraph-links" aria-label="Workflow source">
+      <h3>Workflow source</h3>
       <ul>
         {refs.map((reference) => {
           const href = subgraphReferenceHref(reference, projectId);
@@ -445,23 +447,47 @@ export function SubgraphLinks({
   );
 }
 
+export function WorkflowSourceLinks({
+  refs,
+  projectId,
+  onOpenDocument,
+}: {
+  refs: SubgraphRef[];
+  projectId?: string;
+  onOpenDocument?: (reference: DocumentTarget) => void;
+}) {
+  if (!refs.length || !projectId) return null;
+  return (
+    <details className="document-advanced document-source-panel">
+      <summary>
+        <Icon name="workflow" className="document-reference-icon" />
+        <span>Explore workflow source</span>
+        <small>{refs.length} {refs.length === 1 ? "source" : "sources"}</small>
+      </summary>
+      <SubgraphLinks refs={refs} projectId={projectId} onOpenDocument={onOpenDocument} />
+    </details>
+  );
+}
+
 export function ArtifactLinks({
   artifacts,
   projectId,
   onOpenDocument,
-  sourceRefs = [],
 }: {
   artifacts: ArtifactLike[];
   projectId?: string;
   onOpenDocument?: (reference: DocumentTarget) => void;
-  sourceRefs?: SubgraphRef[];
 }) {
-  if (!artifacts.length || !projectId) return null;
+  const visibleArtifacts = artifacts.filter((artifact) => !isSubmissionArtifact(artifact));
+  if (!visibleArtifacts.length || !projectId) return null;
   return (
-    <section className="document-links document-artifact-links" aria-label="Artifacts">
-      <h3>Artifacts</h3>
-      <ul>
-        {artifacts.map((artifact, index) => {
+    <section className="document-links document-artifact-links" aria-label="Generated files">
+      <div className="document-section-heading">
+        <h3>Generated files</h3>
+        <small>{visibleArtifacts.length} {visibleArtifacts.length === 1 ? "file" : "files"}</small>
+      </div>
+      <ul className="document-artifact-grid">
+        {visibleArtifacts.map((artifact, index) => {
           const reference = artifact.ref ? {
             ref: artifact.ref,
             title: artifact.name,
@@ -474,41 +500,53 @@ export function ArtifactLinks({
           const label = artifact.name || artifact.ref || `artifact-${index + 1}`;
           const graphSource = Boolean(artifact.ref && isGraphSourceReference(artifact.ref));
           const documentArtifact = Boolean(artifact.ref && isDocumentArtifact(artifact.ref));
-          const submission = artifact.name.toLowerCase().includes("submission");
-          const submittedSource = submission
-            ? uniqueReferences(sourceRefs).find((item) => isGraphSourceReference(item.ref))
-            : undefined;
-          const sourceReference = reference ?? (submittedSource ? {
-            ref: submittedSource.ref,
-            title: subgraphReferenceLabel(submittedSource),
-            media_type: submittedSource.media_type,
-            imports: [],
-            kind: "graph" as const,
-          } satisfies DocumentTarget : null);
-          const inReader = graphSource || documentArtifact || Boolean(submittedSource);
+          const imageArtifact = Boolean(artifact.ref && isImageReference(artifact.ref));
+          const inReader = graphSource || documentArtifact || imageArtifact;
           const external = reference ? isExternalDocumentReference(reference) : false;
-          const hasContent = submission && artifact.content !== null && artifact.content !== undefined;
-          const content = hasContent
-            ? formatSubmissionContent(artifact.content, sourceRefs)
-            : null;
+          const pathLabel = artifact.ref ? artifactPathLabel(artifact.ref) : null;
           const iconName = graphSource
             ? "workflow"
-            : artifact.kind === "file"
+            : imageArtifact
+              ? "image"
+              : artifact.kind === "file"
               ? "file"
               : "braces";
           return (
-            <li className="document-reference-row document-artifact-row" key={`${artifact.name}:${artifact.ref ?? index}`}>
-              <Icon name={iconName} className="document-reference-icon" />
-              <span className="document-reference-copy">
-                <span className="document-reference-main">
-                  {sourceReference ? (
+            <li
+              className="document-artifact-card"
+              data-artifact-ref={artifact.ref ?? undefined}
+              key={`${artifact.name}:${artifact.ref ?? index}`}
+            >
+              {imageArtifact && reference ? (
+                <details className="document-image-preview">
+                  <summary aria-label={`Preview ${label}`} title={`Preview ${label}`}>
+                    <img
+                      className="document-artifact-thumbnail"
+                      src={documentReferenceContentHref(reference, projectId)}
+                      alt=""
+                    />
+                  </summary>
+                  <img
+                    className="document-artifact-image"
+                    src={documentReferenceContentHref(reference, projectId)}
+                    alt={label}
+                  />
+                </details>
+              ) : (
+                <div className="document-artifact-icon" aria-hidden="true">
+                  <Icon name={iconName} className="document-reference-icon" />
+                </div>
+              )}
+              <span className="document-artifact-card-copy">
+                <span className="document-artifact-card-title">
+                  {reference ? (
                     <a
-                      href={documentReferenceHref(sourceReference, projectId)}
+                      href={documentReferenceHref(reference, projectId)}
                       target={external || !inReader ? "_blank" : undefined}
                       rel={external || !inReader ? "noreferrer" : undefined}
                       onClick={external || !inReader || !onOpenDocument ? undefined : (event) => {
                         event.preventDefault();
-                        onOpenDocument(sourceReference);
+                        onOpenDocument(reference);
                       }}
                     >
                       {label}
@@ -516,17 +554,9 @@ export function ArtifactLinks({
                   ) : (
                     <span>{label}</span>
                   )}
-                  <small className="document-reference-kind">{artifact.kind}</small>
-                  {submittedSource && (
-                    <small className="document-reference-hint">Submitted graph source</small>
-                  )}
+                  <small className="document-reference-kind">{artifactKindLabel(artifact, imageArtifact)}</small>
                 </span>
-                {content !== null && (
-                  <details className="document-artifact-content">
-                    <summary>{artifact.name.toLowerCase().includes("submission") ? "View response" : "View content"}</summary>
-                    <pre>{content}</pre>
-                  </details>
-                )}
+                {pathLabel && <small className="document-artifact-path" title={pathLabel}>{pathLabel}</small>}
               </span>
             </li>
           );
@@ -536,45 +566,98 @@ export function ArtifactLinks({
   );
 }
 
-function formatArtifactContent(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2) ?? String(value);
-  } catch {
-    return String(value);
-  }
+function isSubmissionArtifact(artifact: ArtifactLike): boolean {
+  return artifact.name.trim().toLowerCase().includes("submission");
 }
 
-function formatSubmissionContent(value: unknown, sourceRefs: SubgraphRef[]): string {
-  const record = objectRecord(value);
-  const nodes = record?.nodes;
-  // Older plan receipts stored the complete PlanResult. The source file is
-  // now the canonical graph document, so keep the receipt useful without
-  // duplicating the entire graph inside the artifact disclosure.
-  if (!record || !Array.isArray(nodes) || record.outcome !== undefined) {
-    return formatArtifactContent(value);
+function artifactKindLabel(artifact: ArtifactLike, image: boolean): string {
+  if (image) return "image";
+  if (artifact.kind === "json") return "JSON";
+  if (artifact.kind === "file") return "file";
+  return artifact.kind;
+}
+
+function artifactPathLabel(reference: string): string {
+  const path = splitDocumentReference(reference).path;
+  const parts = path.split("/").filter(Boolean);
+  return parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : path;
+}
+
+function submissionOutcomeLabel(artifact: ArtifactLike): string {
+  const record = objectRecord(artifact.content);
+  const outcome = stringValue(record?.outcome);
+  if (outcome) return outcome.toLowerCase();
+  if (artifact.name.toLowerCase().includes("plan")) return "ready";
+  return "complete";
+}
+
+function submissionSummary(artifact: ArtifactLike): string {
+  const record = objectRecord(artifact.content);
+  const summary = stringValue(record?.summary);
+  if (summary) return summary;
+  const nodeCount = typeof record?.node_count === "number" ? record.node_count : null;
+  if (nodeCount !== null) {
+    return `Created a workflow with ${nodeCount} ${nodeCount === 1 ? "work item" : "work items"}.`;
   }
-  const refs = uniqueReferences([
-    ...parseSubgraphReferences(record.subgraph_refs),
-    ...sourceRefs,
-  ]);
-  const receipt: Record<string, unknown> = {
-    subgraph_refs: refs.map((reference) => ({
-      ref: reference.ref,
-      title: reference.title,
-      media_type: reference.media_type,
-      managed: reference.managed,
-    })),
-    project_name: stringValue(record.project_name),
-    node_count: nodes.length,
-    edge_count: Array.isArray(record.edges) ? record.edges.length : 0,
-    document_ref_count: Array.isArray(record.document_refs) ? record.document_refs.length : 0,
-    artifact_count: Array.isArray(record.artifacts) ? record.artifacts.length : 0,
-  };
-  if (typeof record.session_id === "string" && record.session_id.trim()) {
-    receipt.session_id = record.session_id;
-  }
-  return formatArtifactContent(receipt);
+  return "This step completed successfully.";
+}
+
+function submissionDetails(artifact: ArtifactLike): string | null {
+  const record = objectRecord(artifact.content);
+  const details: string[] = [];
+  const nodeCount = typeof record?.node_count === "number" ? record.node_count : null;
+  const edgeCount = typeof record?.edge_count === "number" ? record.edge_count : null;
+  const outputs = Array.isArray(record?.artifacts)
+    ? record.artifacts.filter((item): item is string => typeof item === "string")
+    : [];
+  const missing = Array.isArray(record?.missing_inputs) ? record.missing_inputs.length : 0;
+  if (nodeCount !== null) details.push(`${nodeCount} work items`);
+  if (edgeCount !== null) details.push(`${edgeCount} workflow links`);
+  if (outputs.length) details.push(`${outputs.length} output ${outputs.length === 1 ? "file" : "files"}`);
+  if (missing) details.push(`${missing} missing input${missing === 1 ? "" : "s"}`);
+  return details.length ? details.join(" · ") : null;
+}
+
+function submissionOutputPaths(artifact: ArtifactLike): string[] {
+  const record = objectRecord(artifact.content);
+  if (!Array.isArray(record?.artifacts)) return [];
+  return record.artifacts
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .map(artifactPathLabel);
+}
+
+export function SubmissionSummary({ artifacts }: { artifacts: ArtifactLike[] }) {
+  const submissions = artifacts.filter(isSubmissionArtifact);
+  if (!submissions.length) return null;
+  return (
+    <section className="document-submission-summary" aria-label="Step result">
+      <div className="document-section-heading">
+        <h3>Result</h3>
+        <small>{submissions.length === 1 ? "Latest handoff" : `${submissions.length} handoffs`}</small>
+      </div>
+      <ul className="document-submission-list">
+        {submissions.map((artifact, index) => {
+          const outcome = submissionOutcomeLabel(artifact);
+          const detail = submissionDetails(artifact);
+          const outputs = submissionOutputPaths(artifact);
+          return (
+            <li className="document-submission-card" key={`${artifact.name}:${artifact.created_at ?? index}`}>
+              <div className="document-submission-heading">
+                <span className={`document-result-badge result-${outcome}`}>{outcome}</span>
+                <strong>{submissionSummary(artifact)}</strong>
+              </div>
+              {detail && <small>{detail}</small>}
+              {outputs.length > 0 && (
+                <div className="document-submission-outputs">
+                  {outputs.map((output) => <span key={output}>{output}</span>)}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
 }
 
 function markdownText(value: ReactNode): string {
@@ -603,6 +686,11 @@ function isGraphSourceReference(value: string): boolean {
 function isDocumentArtifact(value: string): boolean {
   const { path } = splitDocumentReference(value);
   return /\.(?:md|markdown|mdown|txt|rst)$/i.test(path);
+}
+
+function isImageReference(value: string): boolean {
+  const { path } = splitDocumentReference(value);
+  return /\.(?:png|jpe?g|gif|webp|avif|svg|bmp)$/i.test(path);
 }
 
 function resolveDocumentPath(value: string, baseReference: string): string {
@@ -718,14 +806,20 @@ function MarkdownContent({
   );
 }
 
-function useProjectDocument(projectId: string, reference: DocumentRef) {
+function useProjectDocument(
+  projectId: string,
+  reference: DocumentRef,
+  refreshKey?: string | number,
+) {
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     setContent(null);
     setError(null);
-    if (!reference.ref) return () => { cancelled = true; };
+    if (!reference.ref || isImageReference(reference.ref)) {
+      return () => { cancelled = true; };
+    }
     void fetch(documentReferenceContentHref(reference, projectId))
       .then(async (response) => {
         if (!response.ok) throw new Error(`Unable to read ${reference.ref}`);
@@ -734,7 +828,7 @@ function useProjectDocument(projectId: string, reference: DocumentRef) {
       .then((value) => { if (!cancelled) setContent(value); })
       .catch((reason: unknown) => { if (!cancelled) setError(String(reason)); });
     return () => { cancelled = true; };
-  }, [projectId, reference.ref]);
+  }, [projectId, reference.ref, refreshKey]);
   return { content, error };
 }
 
@@ -755,6 +849,51 @@ function uniqueArtifacts(artifacts: ArtifactLike[]): ArtifactLike[] {
     seen.add(key);
     return true;
   });
+}
+
+/** Build the graph document from the live graph response, not a stale receipt. */
+export function liveGraphSource(
+  nodes: GraphNode[],
+  edges: Edge[],
+  artifacts: Artifact[],
+): GraphSource {
+  const root = nodes.find((node) => node.parent_id === null);
+  const sourceEdges = edges
+    .filter((edge) => edge.type === "FOLLOWS")
+    .map((edge) => ({ type: edge.type, src: edge.src, dst: edge.dst }));
+  const sourceArtifacts = (node: GraphNode): GraphSourceArtifact[] =>
+    artifacts
+      .filter((artifact) => node.artifact_refs.includes(artifact.id))
+      .map((artifact) => ({
+        kind: artifact.kind,
+        name: artifact.name,
+        ref: artifact.ref,
+        content: artifact.content,
+      }));
+  return {
+    project_name: root?.project_name ?? root?.objective ?? null,
+    notes: null,
+    nodes: nodes.map((node) => ({
+      key: node.id,
+      objective: node.objective,
+      // The composed root is a graph boundary; its old planner receipt should
+      // not shadow the live child instructions shown below.
+      generated_prompt: node.parent_id === null ? null : node.generated_prompt,
+      executor: node.executor,
+      agent_type: node.agent?.type_id ?? null,
+      capabilities: (node.capability_status ?? []).map((item) => item.capability_id),
+      document_refs: node.document_refs,
+      subgraph_refs: node.subgraph_refs ?? [],
+      artifacts: sourceArtifacts(node),
+      parent_key: node.parent_id,
+      follows: sourceEdges.filter((edge) => edge.dst === node.id).map((edge) => edge.src),
+      plan: node.agent?.type_id === "planner",
+    })),
+    document_refs: root?.document_refs ?? [],
+    subgraph_refs: root?.subgraph_refs ?? [],
+    artifacts: root ? sourceArtifacts(root) : [],
+    edges: sourceEdges,
+  };
 }
 
 function sourceNodePredecessors(
@@ -847,7 +986,6 @@ function GraphSourceNodeView({
         <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
         <ArtifactLinks
           artifacts={artifacts}
-          sourceRefs={subgraphRefs}
           projectId={projectId}
           onOpenDocument={onOpenDocument}
         />
@@ -930,7 +1068,6 @@ export function GraphSourceDocument({
       <SubgraphLinks refs={subgraphRefs} projectId={projectId} onOpenDocument={onOpenDocument} />
       <ArtifactLinks
         artifacts={artifacts}
-        sourceRefs={contextRoot?.subgraph_refs ?? []}
         projectId={projectId}
         onOpenDocument={onOpenDocument}
       />
@@ -964,6 +1101,7 @@ function GraphSourceReader({
   stateArtifacts,
   onBack,
   onOpenDocument,
+  refreshKey,
 }: {
   projectId: string;
   reference: DocumentTarget;
@@ -971,8 +1109,9 @@ function GraphSourceReader({
   stateArtifacts: Artifact[];
   onBack: () => void;
   onOpenDocument: (reference: DocumentTarget) => void;
+  refreshKey?: string | number;
 }) {
-  const { content, error } = useProjectDocument(projectId, reference);
+  const { content, error } = useProjectDocument(projectId, reference, refreshKey);
   let source: GraphSource | null = null;
   let sourceError = error;
   if (!sourceError && content !== null) {
@@ -1006,15 +1145,18 @@ function DocumentReader({
   reference,
   onBack,
   onOpenDocument,
+  refreshKey,
 }: {
   projectId: string;
   reference: DocumentTarget;
   onBack: () => void;
   onOpenDocument?: (reference: DocumentTarget) => void;
+  refreshKey?: string | number;
 }) {
-  const { content, error } = useProjectDocument(projectId, reference);
+  const { content, error } = useProjectDocument(projectId, reference, refreshKey);
 
   const markdown = /\.(?:md|markdown|mdown)$/i.test(reference.ref.split(/[?#]/, 1)[0]);
+  const image = isImageReference(reference.ref);
   return (
     <article className="document-reader">
       <button className="document-reader-back" type="button" onClick={onBack}>← Back to specification</button>
@@ -1022,8 +1164,15 @@ function DocumentReader({
       <h1>{documentReferenceLabel(reference)}</h1>
       <p className="document-reader-path">{reference.ref}</p>
       {error && <p className="document-reader-error">{error}</p>}
-      {!error && content === null && <p className="document-reader-loading">Loading document…</p>}
-      {!error && content !== null && (markdown ? (
+      {!error && !image && content === null && <p className="document-reader-loading">Loading document…</p>}
+      {!error && image && (
+        <img
+          className="document-reader-image"
+          src={documentReferenceContentHref(reference, projectId)}
+          alt={documentReferenceLabel(reference)}
+        />
+      )}
+      {!error && content !== null && !image && (markdown ? (
         <div className="document-markdown document-reader-content">
           <MarkdownContent
             content={content}
@@ -1057,15 +1206,19 @@ function DocumentNode({
   onOpenDocument?: (reference: DocumentTarget) => void;
 }) {
   const [open, setOpen] = useState(false);
-  // The graph view intentionally expands imported nodes. The document view
-  // starts at the source boundary instead, so a composed subtree is reached
-  // through its explicit graph link and is not duplicated in this document.
-  const children = node.subgraph_refs?.length
-    ? []
-    : orderDocumentNodes(nodes, edges, node.id);
+  // Nested work remains in the readable specification even when a node also
+  // links to a source graph. The source link is an alternate workflow view,
+  // not a reason to hide live graph state.
+  const children = orderDocumentNodes(nodes, edges, node.id);
   const predecessors = sequenceLabels(node, nodes, edges);
   const prompt = node.generated_prompt?.trim();
   const nodeArtifacts = artifacts.filter((artifact) => node.artifact_refs.includes(artifact.id));
+  const hasAdvancedDetails = Boolean(
+    predecessors.length ||
+      node.capability_status?.length ||
+      node.document_refs.length ||
+      node.subgraph_refs?.length,
+  );
   return (
     <details
       className={`document-node depth-${Math.min(Math.max(path.length - 1, 0), 4)}`}
@@ -1088,24 +1241,34 @@ function DocumentNode({
         </span>
       </summary>
       <div className="document-node-body">
-        {predecessors.length > 0 && (
-          <p className="document-sequence-predecessors">
-            <span>Follows</span> {predecessors.join(" · ")}
-          </p>
+        {prompt && (
+          <section className="document-node-intent">
+            <div className="document-section-heading">
+              <h3>Instructions</h3>
+            </div>
+            <div className="document-markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{prompt}</ReactMarkdown>
+            </div>
+          </section>
         )}
-        <DocumentCapabilities node={node} />
-        <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
-        <SubgraphLinks refs={node.subgraph_refs ?? []} projectId={projectId} onOpenDocument={onOpenDocument} />
+        <SubmissionSummary artifacts={nodeArtifacts} />
         <ArtifactLinks
           artifacts={nodeArtifacts}
-          sourceRefs={node.subgraph_refs ?? []}
           projectId={projectId}
           onOpenDocument={onOpenDocument}
         />
-        {prompt && (
-          <div className="document-markdown">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{prompt}</ReactMarkdown>
-          </div>
+        {hasAdvancedDetails && (
+          <details className="document-advanced document-node-details">
+            <summary>Step details</summary>
+            {predecessors.length > 0 && (
+              <p className="document-sequence-predecessors">
+                <span>Follows</span> {predecessors.join(" · ")}
+              </p>
+            )}
+            <DocumentCapabilities node={node} />
+            <DocumentLinks refs={node.document_refs} projectId={projectId} onOpenDocument={onOpenDocument} />
+            <WorkflowSourceLinks refs={node.subgraph_refs ?? []} projectId={projectId} onOpenDocument={onOpenDocument} />
+          </details>
         )}
         {children.length > 0 && (
           <div className="document-children">
@@ -1156,7 +1319,7 @@ function documentTargetFromLocation(): DocumentTarget | null {
   };
 }
 
-export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
+export function DocumentView({ nodes, edges, artifacts, projectId, refreshKey }: Props) {
   const [documentReference, setDocumentReference] = useState<DocumentTarget | null>(() =>
     documentTargetFromHistory(typeof window === "undefined" ? null : window.history.state)
       ?? documentTargetFromLocation(),
@@ -1180,6 +1343,22 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
   if (documentReference) {
     const onBack = () => window.history.back();
     if (documentReference.kind === "graph") {
+      const liveSource = splitDocumentReference(documentReference.ref).path === "workflow.graph.json"
+        ? liveGraphSource(nodes, edges, artifacts)
+        : null;
+      if (liveSource) {
+        return (
+          <GraphSourceDocument
+            source={liveSource}
+            reference={documentReference}
+            projectId={projectId ?? root.project_id}
+            contextNodes={nodes}
+            stateArtifacts={artifacts}
+            onOpenDocument={openDocument}
+            onBack={onBack}
+          />
+        );
+      }
       return (
         <GraphSourceReader
           projectId={projectId ?? root.project_id}
@@ -1188,6 +1367,7 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
           stateArtifacts={artifacts}
           onOpenDocument={openDocument}
           onBack={onBack}
+          refreshKey={refreshKey}
         />
       );
     }
@@ -1198,25 +1378,28 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
           reference={documentReference}
           onOpenDocument={openDocument}
           onBack={onBack}
+          refreshKey={refreshKey}
         />
       </div>
     );
   }
-  const rootHasComposedSource = (root.subgraph_refs?.length ?? 0) > 0;
-  const visibleChildren = rootHasComposedSource ? [] : children;
+  const visibleChildren = children;
   const rootArtifacts = artifacts.filter((artifact) => root.artifact_refs.includes(artifact.id));
   return (
     <div className="document-view" aria-label="Read-only specification">
       <article className="document-spec">
-        <div className="document-kicker">Read-only graph specification</div>
+        <div className="document-kicker">Project overview</div>
         <h1>{stripMarkdown(root.project_name ?? root.objective)}</h1>
         <div className="document-meta">
           <span className={`badge ${root.ui_state}`}>{statusLabel(root)}</span>
-          <span>{nodes.length} work items</span>
-          <span>Sequence is explicit</span>
+          <span>{Math.max(nodes.length - 1, 0)} work items</span>
+          <span>Ordered workflow</span>
         </div>
         {root.generated_prompt?.trim() && (
           <div className="document-intent document-markdown">
+            <div className="document-section-heading">
+              <h3>Project goal</h3>
+            </div>
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
               {root.generated_prompt.trim()}
             </ReactMarkdown>
@@ -1227,22 +1410,22 @@ export function DocumentView({ nodes, edges, artifacts, projectId }: Props) {
           projectId={projectId ?? root.project_id}
           onOpenDocument={openDocument}
         />
-        <SubgraphLinks
-          refs={root.subgraph_refs ?? []}
+        <SubmissionSummary artifacts={rootArtifacts} />
+        <ArtifactLinks
+          artifacts={rootArtifacts}
           projectId={projectId ?? root.project_id}
           onOpenDocument={openDocument}
         />
-        <ArtifactLinks
-          artifacts={rootArtifacts}
-          sourceRefs={root.subgraph_refs ?? []}
+        <WorkflowSourceLinks
+          refs={root.subgraph_refs ?? []}
           projectId={projectId ?? root.project_id}
           onOpenDocument={openDocument}
         />
         {visibleChildren.length > 0 && (
           <div id="work-specification" className="document-flow">
             <div className="document-flow-heading">
-              <span>Work specification</span>
-              <small>Nested sections are collapsible. Composed work is reached through its graph link.</small>
+              <span>Work plan</span>
+              <small>Open a step to read its instructions, result, and generated files.</small>
             </div>
             {visibleChildren.map((child, index) => (
               <DocumentNode

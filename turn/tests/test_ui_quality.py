@@ -111,6 +111,9 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "Connection interrupted; reconnecting" in terminal
     assert 'addEventListener("wheel"' in terminal
     assert 'removeEventListener("wheel"' in terminal
+    assert "scrollback: 0" in terminal
+    assert "overflow:hidden!important" in terminal
+    assert "terminal.scrollToBottom()" not in terminal
     assert "terminal.onScroll" not in terminal
     assert ":host{" not in terminal
     assert "convertEol: true" in terminal

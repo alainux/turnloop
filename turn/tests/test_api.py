@@ -24,22 +24,22 @@ from turn.domain.schemas import (
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server.api import router
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
-from turn.tests.fakes import FakeHerdrAdapter
+from turn.tests.mocks import MockHerdrAdapter
 
 
 async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path):
     cfg = Settings()
     cfg.projects_dir = str(tmp_path / "projects")
-    cfg.default_executor = "echo"
+    cfg.default_executor = "deterministic"
     store = Store(tmp_path / "turn")
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
-    registry.register_planner(HeuristicPlanner("echo"))
-    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=FakeHerdrAdapter())
+    registry.register(DeterministicWorker())
+    registry.register_planner(HeuristicPlanner("deterministic"))
+    runner = Runner(store, registry, EventBus(), cfg, herdr_adapter=MockHerdrAdapter())
     app = FastAPI()
     app.include_router(router)
     app.state.store = store
@@ -78,7 +78,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         created = await client.post("/api/projects", json={
             "name": "Inspectable demo",
             "prompt": "Build an inspectable demo",
-            "agent": {"harness": "echo", "type_id": "executor"},
+            "agent": {"harness": "mock", "type_id": "executor"},
             "run_policy": {"auto_run": False, "delay_between_jobs_ms": 25},
             "attachments": [
                 {"name": "brief.txt", "mime": "text/plain", "content_base64": base64.b64encode(b"immutable project context").decode()},
@@ -94,7 +94,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert root["generated_prompt"] == "Build an inspectable demo"
         assert root["ui_state"] == "ready"
         assert "run" in root["allowed_actions"]
-        assert root["agent"]["harness"] == "echo"
+        assert root["agent"]["harness"] == "mock"
         assert root["agent"]["type_id"] == "planner"
         assert graph["flow_edges"] == []
         assert len(root["resource_refs"]) == 2
@@ -116,7 +116,7 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         assert derived.objective == "Build a **scoped** project"
         await store.delete_project(derived.id)
         root_node = await store.get_node(uuid.UUID(pid))
-        run = await store.create_run(root_node, "echo")
+        run = await store.create_run(root_node, "deterministic")
         await store.update_run(run.id, session_id="live-session")
         live_run = (await store.get_runs(root_node.id))[0]
         assert live_run.session_id == "live-session" and live_run.ended_at is None
@@ -135,10 +135,10 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
             project_id=root_node.project_id,
             parent_id=root_node.id,
             objective="A second measured agent",
-            executor="echo",
+            executor="deterministic",
             agent=root_node.agent,
         )
-        child_run = await store.create_run(child, "echo")
+        child_run = await store.create_run(child, "deterministic")
         await store.update_run(
             child_run.id,
             status=RunStatus.COMPLETE,
@@ -170,7 +170,7 @@ async def test_api_projects_transient_rejection_return_flow(tmp_path):
         store,
         events=EventBus(),
         settings=cfg,
-        herdr_adapter=FakeHerdrAdapter(),
+        herdr_adapter=MockHerdrAdapter(),
     )
     app = FastAPI()
     app.include_router(router)
@@ -184,15 +184,15 @@ async def test_api_projects_transient_rejection_return_flow(tmp_path):
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post("/api/projects", json={
             "prompt": "Build a verified product",
-            "agent": {"harness": "echo"},
+            "agent": {"harness": "mock"},
         })
         assert created.status_code == 200, created.text
         project_id = uuid.UUID(created.json()["project_id"])
         root = await store.get_node(project_id)
         created_nodes = await store.apply_plan(root, PlanResult(nodes=[
-            NodeSpec(key="work", objective="Build product", executor="echo"),
+            NodeSpec(key="work", objective="Build product", executor="deterministic"),
             NodeSpec(
-                key="check", objective="Verify product", executor="echo",
+                key="check", objective="Verify product", executor="deterministic",
                 agent_type=AgentType.VERIFIER, follows=["work"],
             ),
         ]))

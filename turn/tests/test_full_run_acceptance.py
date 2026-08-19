@@ -69,7 +69,7 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
         "TURN_DATA_DIR": str(data_dir),
         "TURN_PROJECTS_DIR": str(tmp_path / "projects"),
         "TURN_PLANNER": "heuristic",
-        "TURN_DEFAULT_EXECUTOR": "fake",
+        "TURN_DEFAULT_EXECUTOR": "mock",
         "TURN_TEST_MODE": "1",
         "TURN_RUNNER_TICK_SECONDS": "0.02",
     })
@@ -97,7 +97,7 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                 for index, objective in enumerate(OBJECTIVES):
                     page.get_by_role("textbox", name="Project objective").fill(objective)
                     page.get_by_label("Harness").click()
-                    page.get_by_role("option", name="Fake · process harness").click()
+                    page.get_by_role("option", name="Mock harness").click()
                     # Step is the product default. This acceptance flow
                     # intentionally verifies the separate Auto behavior.
                     page.get_by_role("button", name="Project and run configuration").click()
@@ -120,7 +120,7 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                     assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 0
                     assert sum(edge["type"] == "FOLLOWS" for edge in graph["edges"]) == 3
                     assert all(
-                        node["agent"]["harness"] == "fake" and node["agent"]["model"] == "deterministic"
+                        node["agent"]["harness"] == "mock" and node["agent"]["model"] == "deterministic"
                         for node in graph["nodes"] if node["parent_id"]
                     )
 

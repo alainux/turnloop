@@ -35,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--name")
     create.add_argument(
         "--dir",
-        help="use this existing project directory; defaults to the current directory",
+        help="use this project directory; defaults to a new directory under the configured projects root",
     )
     create.add_argument("--open", action="store_true")
     create.add_argument("--harness", choices=[x.value for x in HarnessKind], default=settings.default_executor)
@@ -75,6 +75,13 @@ def parser() -> argparse.ArgumentParser:
     logs.add_argument("--follow", action="store_true", help="continue polling for new records")
     logs.add_argument("--format", choices=["jsonl", "text"], default="jsonl")
     logs.add_argument("--poll", type=float, default=0.25)
+    trigger = sub.add_parser("trigger", aliases=["event"], help="inspect and emit workspace trigger events")
+    trigger_sub = trigger.add_subparsers(dest="trigger_command", required=True)
+    emit = trigger_sub.add_parser("emit", help="emit a named event for the running workflow daemon")
+    emit.add_argument("event_name")
+    emit.add_argument("--data", default="{}", help="JSON object containing event data")
+    emit.add_argument("--project-id", type=uuid.UUID)
+    emit.add_argument("--node-id", type=uuid.UUID)
     agent = sub.add_parser("agent", help="small local protocol used by a running agent")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     status = agent_sub.add_parser("status", help="publish the agent's current state")
@@ -194,7 +201,11 @@ def _cli_project_id(args: argparse.Namespace | None = None) -> str | None:
 
     repo = os.getenv("TURN_REPO")
     if not repo:
-        return None
+        try:
+            state_path = discover_project_state()
+        except SystemExit:
+            return None
+        repo = str(state_path.parent.parent)
     state_path = Path(repo).expanduser() / ".turn" / "state.json"
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
@@ -278,11 +289,72 @@ def _cli_invocation_data(args: argparse.Namespace) -> dict[str, object]:
         "node_id": os.getenv("TURN_NODE_ID"),
         "command": _cli_action(args),
     }
-    for name in ("kind", "state", "query", "capability", "format", "project_id", "graph_file", "force"):
+    for name in ("kind", "state", "query", "capability", "format", "project_id", "graph_file", "force", "event_name", "node_id"):
         value = getattr(args, name, None)
         if value is not None:
             data[name] = value
+    argv = ["turn", str(args.command)]
+    for name in ("agent_command", "capabilities_command", "project_command"):
+        value = getattr(args, name, None)
+        if value:
+            argv.append(str(value))
+    if getattr(args, "agent_command", None) in {"submit", "verify"}:
+        if getattr(args, "kind", None):
+            argv.extend(["--kind", str(args.kind)])
+        if getattr(args, "stdin", False):
+            argv.append("--stdin")
+        elif getattr(args, "graph_file", None):
+            argv.extend(["--graph-file", str(args.graph_file)])
+        else:
+            argv.append("--payload")
+        if getattr(args, "force", False):
+            argv.append("--force")
+    elif getattr(args, "agent_command", None) == "status":
+        argv.extend(["--state", str(args.state)])
+        if getattr(args, "message", ""):
+            argv.extend(["--message", "<redacted>"])
+    data["argv"] = argv
     return data
+
+
+def trigger_command(args) -> int:
+    """Append a durable CLI event for the global daemon to consume."""
+    project_id = str(args.project_id) if args.project_id else _cli_project_id(args)
+    action = "trigger.emit"
+    try:
+        data = json.loads(args.data)
+        if not isinstance(data, dict):
+            raise ValueError("--data must be a JSON object")
+        from turn.runner.triggers import EventInbox
+
+        record = EventInbox(os.getenv("TURN_DATA_DIR", settings.data_dir)).append(
+            name=args.event_name,
+            data=data,
+            project_id=project_id,
+            node_id=str(args.node_id) if args.node_id else os.getenv("TURN_NODE_ID"),
+        )
+        _emit_cli_event(
+            project_id,
+            action=action,
+            status="ok",
+            message="trigger event queued",
+            data={
+                "event_id": record["event_id"],
+                "event_name": args.event_name,
+                "response_status": "accepted",
+            },
+        )
+        print(json.dumps({"queued": True, "event": record}, indent=2))
+        return 0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        _emit_cli_event(
+            project_id,
+            action=action,
+            status="error",
+            message=str(error),
+            data={"event_name": args.event_name, "response_status": "error"},
+        )
+        raise SystemExit(f"invalid trigger event: {error}") from error
 
 
 def _write_agent_json(path: Path, value: dict) -> None:
@@ -385,7 +457,7 @@ def agent_command(args) -> int:
             "state": "complete" if kind in {"result", "verification"} else "working",
             "message": "submission received",
         })
-    logger.emit_sync(project_id, kind="agent.action", action=action, status="ok", source="cli", message="agent submission published", data={"node_id": os.getenv("TURN_NODE_ID"), "kind": kind, "response_status": "accepted"})
+    logger.emit_sync(project_id, kind="agent.action", action=action, status="ok", source="cli", message="agent submission published", data={**_cli_invocation_data(args), "kind": kind, "response_status": "accepted"})
     return 0
 
 
@@ -658,6 +730,8 @@ async def async_main(args) -> int:
         return agent_command(args)
     if args.command == "logs":
         return logs_command(args)
+    if args.command in {"trigger", "event"}:
+        return trigger_command(args)
     if args.command == "graph":
         return await local_graph_command(args)
     if args.command == "project":
@@ -685,7 +759,7 @@ async def async_main(args) -> int:
             project = await core.create_project(
                 args.objective,
                 name=args.name,
-                working_dir=args.dir or str(Path.cwd()),
+                working_dir=args.dir,
                 open_existing=args.open,
                 agent=AgentConfig(harness=args.harness, model=args.model, reasoning=args.reasoning),
                 run_policy=RunPolicy(auto_run=not args.manual),
@@ -711,7 +785,7 @@ def main() -> None:
             port=getattr(args, "port", 8000),
         )
         return
-    if args.command in {"agent", "capabilities", "logs"}:
+    if args.command in {"agent", "capabilities", "logs", "trigger", "event"}:
         raise SystemExit(asyncio.run(async_main(args)))
     raise SystemExit(_run_logged_cli(args))
 

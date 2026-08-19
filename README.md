@@ -51,13 +51,15 @@ the path matters as much as the final artifact.
 | Evidence | Document view, logs, artifacts, diffs, token/cost usage, and server-projected UI state |
 | Harnesses | Codex, Claude Code, OpenCode, and Pi adapters with local availability detection |
 
-The process-level Fake harness and heuristic planning are test-only fixtures.
+The process-level Mock harness and heuristic planning are test-only fixtures.
 For a repeatable local workflow laboratory, set `TURN_TEST_MODE=1`, choose
-`TURN_PLANNER=fake` and `TURN_DEFAULT_EXECUTOR=fake`, and add
-`TURN_FAKE_WORKFLOWS=1`; the server then seeds the rejection, expansion, rerun,
+`TURN_PLANNER=mock` and `TURN_DEFAULT_EXECUTOR=mock`, and add
+`TURN_MOCK_WORKFLOWS=1`; the server then seeds the rejection, expansion, rerun,
 failure, input, and cancellation projects once in the configured data
-directory. The Fake provider is not advertised or accepted by production
-runtime configuration.
+directory. The Mock provider is not advertised or accepted by production
+runtime configuration. The seeded lab includes the rejection, expansion, rerun,
+failure, input, cancellation, and schedule scenarios; the trigger loop
+E2E also exercises a manually started loop with configured event data.
 
 ### Current scope
 
@@ -115,7 +117,10 @@ planner ──▶ PlanResult ──▶ workgraph ──▶ runner ──▶ harn
 
 For broad requests, a plan can carry an executive summary, approach, typed
 sections, decisions, risks, acceptance criteria, and optional diagrams. The
-document view renders that metadata alongside the workflow graph, and worker
+document view renders that metadata as a live project document: nested work is
+collapsible, workflow source graphs remain explorable through links, and
+generated Markdown, text, and image artifacts open from the same reader. It
+refreshes from the current graph as agents append or replace work, and worker
 nodes receive the same graph-owned context.
 
 The main boundaries are deliberately small:
@@ -170,11 +175,31 @@ turn logs PROJECT_UUID                 # stitched JSONL event history
 turn logs PROJECT_UUID --search error  # free-text search
 turn logs PROJECT_UUID --follow         # JSONL live feed; pipe to jq or another reader
 turn serve --port 8000
+turn trigger emit EVENT_NAME --project-id PROJECT_UUID --data '{"key":"value"}'
 ```
 
 When run from a project directory, `turn create` uses that current directory as
 the project directory. The UI/server uses `TURN_PROJECTS_DIR` for its default
 project root.
+
+To activate an event trigger, keep the Turn server running and emit its exact
+event name with an optional JSON object. From a project directory,
+`--project-id` may be omitted; otherwise provide the target project UUID. The
+matching node receives the complete object in its trigger context:
+
+```bash
+turn trigger emit goal.plan.requested \
+  --project-id PROJECT_UUID \
+  --data '{"goal":"Plan a small product launch"}'
+```
+
+Use `turn logs PROJECT_UUID --search trigger` to inspect event and activation
+records after emission.
+
+Schedule triggers use classic five-field UTC cron only, for example
+`*/5 * * * *`; interval forms such as `@every 5m` are not supported. Schedules
+do not use a manually configured event name; their configured JSON data is
+merged with the schedule event's runtime data.
 
 Workspace configuration is stored in `./.turn/config.json`. Project state and
 operational history are stored inside each project at
@@ -196,8 +221,8 @@ npm run build
 python -m pytest -q
 ```
 
-The process-level Fake workflow laboratory is covered by the mandatory
-`turn/tests/test_fake_workflows_e2e.py` end-to-end test, which launches the
+The process-level Mock workflow laboratory is covered by the mandatory
+`turn/tests/test_mock_workflows_e2e.py` end-to-end test, which launches the
 repository-owned harness process and drives those scenarios through the API,
 terminal transport, retained sessions, persisted graph, runs, and artifacts.
 
@@ -249,10 +274,12 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Architecture / Hygiene & Cleanups
 - [x] Skills / MCP via Capabilities / Agent Plugins 1.0
 - [x] Live Logs / State & Graph Transitions
-- [ ] Composable graph
-- [ ] Triggers
+- [x] Composable graph
+- [x] Triggers
+- [ ] Evals / Run dashboard
+- [ ] Multi-graphs
 - [ ] Decision-based Routing
-- [ ] Skipped / Locked nodes for Repeatable organizations
+- [ ] Repeatable organizations - Skipped / Locked nodes for 
 - [ ] Tickets / Units of work / Spec-driven execution
 - [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management
 - [ ] Loops / Goals / Hill-climbing
@@ -261,7 +288,7 @@ is the product, architecture, scope, operation, and verification guide.
 - [ ] Architecture / Hygiene & Cleanups
 - [ ] Native app
 - [ ] Terminal UI
-- [ ] Better Styling / Document view
+- [x] Better Styling / Document view
 - [ ] In-host multiplexer
 - [ ] Tmux
 - [ ] Ghostty Web

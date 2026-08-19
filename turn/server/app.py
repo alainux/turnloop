@@ -24,17 +24,34 @@ XTERM_FIT_DIR = ROOT_DIR / "node_modules" / "@xterm" / "addon-fit"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     herdr_adapter = None
-    if test_modes_enabled() and os.getenv("TURN_TEST_HERDR_ADAPTER") == "fake":
-        from turn.testing.fakes import FakeHerdrAdapter
+    terminal_transport = None
+    if test_modes_enabled() and os.getenv("TURN_TEST_HERDR_ADAPTER") == "mock":
+        from turn.testing.mocks import MockHerdrAdapter
 
-        herdr_adapter = FakeHerdrAdapter()
-    runtime = TurnRuntime(settings, herdr_adapter=herdr_adapter)
+        herdr_adapter = MockHerdrAdapter()
+    if test_modes_enabled() and os.getenv("TURN_TEST_TERMINAL") == "local":
+        # A served Turn instance must never silently fall back to a process
+        # local PTY.  Local transports are valid for isolated tests that
+        # inject one into TurnRuntime, but they are not project workspaces:
+        # closing the browser/server connection would otherwise leave the
+        # user with a terminal that Herdr does not own.  Fail loudly so an
+        # outdated launch command cannot create an orphan-prone server.
+        raise RuntimeError(
+            "TURN_TEST_TERMINAL=local is not supported by the served app; "
+            "start Turn with Herdr or inject LocalPtyTransport in a test"
+        )
+    runtime = TurnRuntime(
+        settings,
+        herdr_adapter=herdr_adapter,
+        terminal_transport=terminal_transport,
+    )
     components = await runtime.start()
     app.state.runtime = runtime
     app.state.store = components.store
     app.state.events = components.events
     app.state.logs = components.logs
     app.state.runner = components.runner
+    app.state.triggers = runtime.triggers
     app.state.capabilities = components.capabilities
     app.state.test_mode = components.test_mode
     try:

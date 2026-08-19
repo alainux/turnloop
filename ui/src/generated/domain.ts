@@ -63,6 +63,8 @@ export interface EdgeSpec {
 
 export type EdgeType = "CONTAINS" | "FOLLOWS";
 
+export type EventSource = "transition" | "agent_action" | "schedule" | "cli";
+
 export interface Executor {
   id: string;
   type_id: AgentType;
@@ -88,6 +90,7 @@ export interface Graph {
   nodes: Array<Node>;
   edges: Array<Edge>;
   artifacts: Array<Artifact>;
+  triggers: Array<Trigger>;
 }
 
 export interface GraphNodeView {
@@ -101,6 +104,7 @@ export interface GraphNodeView {
   executor: string | null;
   agent: Agent | null;
   verification: VerificationResult | null;
+  trigger_context: TriggerContext | null;
   status: NodeStatus;
   paused: boolean;
   auto_run: boolean;
@@ -128,9 +132,10 @@ export interface GraphView {
   edges: Array<Edge>;
   flow_edges: Array<FlowEdge>;
   artifacts: Array<Artifact>;
+  triggers: Array<Trigger>;
 }
 
-export type HarnessKind = "codex" | "claude" | "opencode" | "pi" | "echo" | "fake" | "shell";
+export type HarnessKind = "codex" | "claude" | "opencode" | "pi" | "mock" | "shell";
 
 export type InputKind = "text" | "file" | "decision" | "credential" | "account" | "approval";
 
@@ -164,6 +169,7 @@ export interface Node {
   executor: string | null;
   agent: Agent | null;
   verification: VerificationResult | null;
+  trigger_context: TriggerContext | null;
   status: NodeStatus;
   paused: boolean;
   auto_run: boolean;
@@ -213,6 +219,7 @@ export interface PlanResult {
   subgraph_refs: Array<SubgraphRef>;
   artifacts: Array<ArtifactSpec>;
   edges: Array<EdgeSpec>;
+  triggers: Array<TriggerSpec>;
   notes: string | null;
   usage: Usage;
   session_id: string | null;
@@ -266,6 +273,42 @@ export interface SubgraphRef {
   title: string | null;
   media_type: string | null;
   managed: boolean;
+}
+
+export interface Trigger {
+  id: string;
+  project_id: string;
+  target_node_id: string;
+  event_name: string | null;
+  kind: TriggerKind;
+  schedule: string | null;
+  data: Record<string, unknown>;
+  enabled: boolean;
+  last_fired_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TriggerContext {
+  trigger_id: string;
+  event_id: string;
+  event_name: string;
+  data: Record<string, unknown>;
+  source: EventSource;
+  source_project_id: string | null;
+  source_node_id: string | null;
+  occurred_at: string;
+}
+
+export type TriggerKind = "event" | "schedule";
+
+export interface TriggerSpec {
+  target_key: string;
+  event_name: string | null;
+  kind: TriggerKind;
+  schedule: string | null;
+  data: Record<string, unknown>;
+  enabled: boolean;
 }
 
 export interface Usage {

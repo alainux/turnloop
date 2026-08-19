@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Usage } from "../domain";
+import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Trigger, Usage } from "../domain";
 import {
   displayNodeTitle,
   primaryNodeAction,
@@ -12,6 +12,8 @@ import {
   NODE_HEIGHT,
   NODE_WIDTH,
   GRAPH_PADDING,
+  TRIGGER_NODE_SIZE,
+  triggerLayoutId,
   returnPathBetween,
   displayEdges,
 } from "../layout";
@@ -26,6 +28,9 @@ interface Props {
   onSelect: (id: string) => void;
   onRun: (node: GraphNode, action: PrimaryNodeAction) => void;
   onContextMenu: (node: GraphNode, x: number, y: number) => void;
+  triggers: Trigger[];
+  selectedTrigger: string | null;
+  onTriggerSelect: (trigger: Trigger) => void;
 }
 export const nodeStatusLabel = (node: GraphNode) => {
   const machineState =
@@ -46,6 +51,9 @@ export const nodeAgentIcon = (node: GraphNode): string =>
     : node.agent?.type_id === "verifier"
       ? "check"
       : "bot";
+
+export const triggerIcon = (trigger: Trigger): string =>
+  trigger.kind === "schedule" ? "calendar" : "activity";
 
 export const nodeRunIcon = (
   active: boolean,
@@ -72,6 +80,9 @@ export function Graph({
   onSelect,
   onRun,
   onContextMenu,
+  triggers,
+  selectedTrigger,
+  onTriggerSelect,
 }: Props) {
   const visibleEdges = useMemo(() => displayEdges(nodes, edges), [nodes, edges]);
   // `displayEdges` is the single workflow projection: it keeps composition
@@ -80,7 +91,7 @@ export function Graph({
   const [layout, setLayout] = useState<Awaited<ReturnType<typeof layoutDendrogram>> | null>(null);
   useEffect(() => {
     let cancelled = false;
-    void layoutDendrogram(nodes, edges)
+    void layoutDendrogram(nodes, edges, triggers)
       .then((nextLayout) => {
         if (!cancelled) setLayout(nextLayout);
       })
@@ -90,14 +101,21 @@ export function Graph({
     return () => {
       cancelled = true;
     };
-  }, [nodes, edges]);
+  }, [nodes, edges, triggers]);
   if (!layout) {
     return <div className="graph-canvas graph-layout-pending" aria-label="Arranging workgraph" />;
   }
   const finalDepth = layout.stageCount - 1;
-  const finalStageNodeCount = [...layout.positions.values()].filter(
-    (position) => position.depth === finalDepth,
+  const finalStageNodeCount = nodes.filter(
+    (node) => layout.positions.get(node.id)?.depth === finalDepth,
   ).length;
+  const startDepth = Math.min(
+    ...nodes.map((node) => layout.positions.get(node.id)?.depth ?? finalDepth),
+  );
+  const stageHasNodes = (depth: number) =>
+    nodes.some((node) => layout.positions.get(node.id)?.depth === depth);
+  const stageHasTriggers = (depth: number) =>
+    triggers.some((trigger) => layout.positions.get(triggerLayoutId(trigger))?.depth === depth);
   return (
     <div
       className="graph-canvas"
@@ -115,13 +133,15 @@ export function Graph({
               left: (layout.stageXs[depth] ?? depth * (NODE_WIDTH + 54)) + GRAPH_PADDING,
             }}
           >
-            {depth === 0
+            {stageHasTriggers(depth) && !stageHasNodes(depth)
+              ? "Triggers"
+              : depth === startDepth
               ? "Start"
               : depth === finalDepth && finalStageNodeCount === 1
                 ? "Final integration"
                 : depth === finalDepth
                   ? "Final stage"
-                  : `Stage ${depth + 1}`}
+                  : `Stage ${depth - startDepth + 2}`}
           </span>
         ))}
       </div>
@@ -170,6 +190,18 @@ export function Graph({
             />
           ) : null;
         })}
+        {layout.triggerEdges.map((edge) => {
+          const path = layout.edgePaths.get(edge.id);
+          return path ? (
+            <path
+              key={edge.id}
+              className="edge-trigger"
+              d={path}
+              markerEnd="url(#workflow-arrow)"
+              data-trigger-edge="true"
+            />
+          ) : null;
+        })}
         {flowEdges.map((edge) => {
           const a = layout.positions.get(edge.src),
             b = layout.positions.get(edge.dst);
@@ -185,6 +217,26 @@ export function Graph({
           ) : null;
         })}
       </svg>
+      {triggers.map((trigger) => {
+        const position = layout.positions.get(triggerLayoutId(trigger));
+        if (!position) return null;
+        return (
+          <button
+            key={trigger.id}
+            className={`graph-trigger-node ${selectedTrigger === trigger.id ? "selected" : ""} ${trigger.enabled ? "" : "disabled"}`}
+            style={{
+              transform: `translate(${position.x + GRAPH_PADDING + (NODE_WIDTH - TRIGGER_NODE_SIZE) / 2}px,${position.y + GRAPH_PADDING + (NODE_HEIGHT - TRIGGER_NODE_SIZE) / 2}px)`,
+            }}
+            onClick={() => onTriggerSelect(trigger)}
+            aria-label={`Trigger ${trigger.kind === "schedule" ? "schedule" : trigger.event_name ?? "event"}`}
+            aria-pressed={selectedTrigger === trigger.id}
+            aria-disabled={!trigger.enabled}
+            title={trigger.kind === "schedule" ? "Schedule trigger" : `Event: ${trigger.event_name ?? ""}`}
+          >
+            <Icon name={triggerIcon(trigger)} />
+          </button>
+        );
+      })}
       {nodes.map((node) => {
         const p = layout.positions.get(node.id);
         if (!p) return null;
@@ -205,12 +257,11 @@ export function Graph({
         const capabilityTitle = capabilities.length
           ? capabilityTooltip(capabilities)
           : capabilityIds.join("\n");
-        const finalNode = p.depth === finalDepth && finalStageNodeCount === 1;
         return (
           <article
             key={node.id}
             data-node-id={node.id}
-            className={`gnode ${node.ui_state} ${actionable ? "node-actionable" : ""} ${finalNode ? "graph-final-node" : ""} ${selected === node.id ? "selected" : ""}`}
+            className={`gnode ${node.ui_state} ${actionable ? "node-actionable" : ""} ${selected === node.id ? "selected" : ""}`}
             onContextMenu={(event) => {
               event.preventDefault();
               onSelect(node.id);

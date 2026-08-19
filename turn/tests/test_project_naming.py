@@ -15,7 +15,7 @@ async def test_setup_plan_name_becomes_the_persisted_root_objective(tmp_path):
         root,
         PlanResult(
             project_name="First App Factory",
-            nodes=[NodeSpec(key="research", objective="Research the first app", executor="echo")],
+            nodes=[NodeSpec(key="research", objective="Research the first app", executor="deterministic")],
         ),
     )
 

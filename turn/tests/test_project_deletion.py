@@ -16,7 +16,7 @@ from turn.runner.events import EventBus
 from turn.runner.runner import Runner
 from turn.server import api as server_api
 from turn.server.api import router
-from turn.tests.fakes import FakeHerdrAdapter
+from turn.tests.mocks import MockHerdrAdapter
 from turn.workers.conversations import (
     ConversationCleanup,
     ConversationProgress,
@@ -25,7 +25,7 @@ from turn.workers.conversations import (
     cleanup_conversations,
     conversation_refs,
 )
-from turn.workers.echo_worker import EchoWorker
+from turn.workers.deterministic_worker import DeterministicWorker
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.workers.planner import HeuristicPlanner
 from turn.workers.registry import WorkerRegistry
@@ -36,15 +36,15 @@ async def _app(tmp_path: Path) -> tuple[FastAPI, Store, Runner]:
     settings = Settings(
         data_dir=str(tmp_path / "turn"),
         projects_dir=str(tmp_path / "projects"),
-        default_executor="echo",
+        default_executor="deterministic",
         planner="heuristic",
     )
     store = Store(settings.data_dir, projects_dir=settings.projects_dir)
     await store.init()
     registry = WorkerRegistry()
-    registry.register(EchoWorker())
-    registry.register_planner(HeuristicPlanner("echo"))
-    runner = Runner(store, registry, EventBus(), settings, herdr_adapter=FakeHerdrAdapter())
+    registry.register(DeterministicWorker())
+    registry.register_planner(HeuristicPlanner("deterministic"))
+    runner = Runner(store, registry, EventBus(), settings, herdr_adapter=MockHerdrAdapter())
     app = FastAPI()
     app.include_router(router)
     app.state.store = store
@@ -58,12 +58,12 @@ async def test_runner_stop_closes_all_owned_herdr_workspaces(tmp_path):
     settings = Settings(
         data_dir=str(tmp_path / "turn"),
         projects_dir=str(tmp_path / "projects"),
-        default_executor="echo",
+        default_executor="deterministic",
         planner="heuristic",
     )
     store = Store(settings.data_dir, projects_dir=settings.projects_dir)
     await store.init()
-    adapter = FakeHerdrAdapter()
+    adapter = MockHerdrAdapter()
     runner = Runner(
         store,
         WorkerRegistry(),
@@ -97,7 +97,7 @@ async def test_close_project_workspace_closes_node_processes_before_workspace(tm
     )
     [child] = await store.apply_plan(
         project,
-        PlanResult(nodes=[NodeSpec(key="child", objective="Child work", executor="echo")]),
+        PlanResult(nodes=[NodeSpec(key="child", objective="Child work", executor="deterministic")]),
     )
     order: list[tuple[str, uuid.UUID | str]] = []
 
@@ -119,6 +119,83 @@ async def test_close_project_workspace_closes_node_processes_before_workspace(tm
             ("workspace", str(project.id)),
         ]
     finally:
+        await runner.stop()
+        await store.dispose()
+
+
+async def test_close_all_terminals_endpoint_keeps_project_runnable(tmp_path, monkeypatch):
+    app, store, runner = await _app(tmp_path)
+    project = await store.create_project(
+        "close terminals without deleting",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    closed: list[uuid.UUID] = []
+
+    async def close_project(project_id: uuid.UUID) -> bool:
+        closed.append(project_id)
+        return True
+
+    monkeypatch.setattr(runner, "close_project_workspace", close_project)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(f"/api/projects/{project.id}/workspace/close")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "closed": True}
+        assert closed == [project.id]
+        assert await store.get_node(project.id) is not None
+    finally:
+        await runner.stop()
+        await store.dispose()
+
+
+async def test_close_all_terminals_is_scoped_and_reopens_in_the_same_project(tmp_path):
+    app, store, runner = await _app(tmp_path)
+    first = await store.create_project(
+        "first isolated workspace",
+        repo_path=str(tmp_path / "first"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    second = await store.create_project(
+        "second isolated workspace",
+        repo_path=str(tmp_path / "second"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    transport = runner.terminal
+    assert isinstance(transport, HerdrPtyTransport)
+    adapter = transport.adapter
+    try:
+        assert await runner.ensure_node_terminal(first.id)
+        assert await runner.ensure_node_terminal(second.id)
+        first_workspace = transport.project_workspace_id(str(first.id))
+        second_workspace = transport.project_workspace_id(str(second.id))
+        assert first_workspace and second_workspace and first_workspace != second_workspace
+        assert set(adapter.workspaces) == {first_workspace, second_workspace}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(f"/api/projects/{first.id}/workspace/close")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "closed": True}
+        assert first_workspace not in adapter.workspaces
+        assert second_workspace in adapter.workspaces
+        assert transport.project_workspace_id(str(first.id)) is None
+        assert transport.project_workspace_id(str(second.id)) == second_workspace
+
+        # Closing the project workspace is reversible: the next allocation
+        # recreates only that project's Herdr workspace and pane.
+        assert await runner.ensure_node_terminal(first.id)
+        recreated = transport.project_workspace_id(str(first.id))
+        assert recreated and recreated != first_workspace
+        assert set(adapter.workspaces) == {recreated, second_workspace}
+    finally:
+        for workspace in await adapter.list_workspaces():
+            await adapter.close_workspace(workspace.workspace_id)
         await runner.stop()
         await store.dispose()
 
@@ -149,13 +226,13 @@ async def test_project_delete_recovers_a_lost_herdr_workspace_mapping(tmp_path, 
         # mapping is gone, so the old deletion path cannot identify it.
         transport._projects.pop(str(project.id), None)  # type: ignore[attr-defined]
 
-        async def fake_cleanup(refs, *, cwd, commands, on_progress):
+        async def mock_cleanup(refs, *, cwd, commands, on_progress):
             del cwd, commands, on_progress
             assert [ref.session_id for ref in refs] == ["c-1"]
             assert await adapter.list_workspaces() == ()
             return ConversationCleanup(1, 1, 0, 0, 0, ())
 
-        monkeypatch.setattr(server_api, "cleanup_conversations", fake_cleanup)
+        monkeypatch.setattr(server_api, "cleanup_conversations", mock_cleanup)
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -365,13 +442,13 @@ async def test_project_delete_captures_session_ids_before_cancelling_runs(tmp_pa
 
             monkeypatch.setattr(runner, "cancel_project_runs", clear_session_before_cleanup)
 
-            async def fake_cleanup(refs, *, cwd, commands, on_progress):
+            async def mock_cleanup(refs, *, cwd, commands, on_progress):
                 del cwd, commands
                 observed.extend((ref.harness, ref.session_id) for ref in refs)
                 await on_progress(ConversationProgress(1, len(refs), "codex", "codex-session-1", "deleted", "done"))
                 return ConversationCleanup(len(refs), len(refs), 0, 0, 0, ())
 
-            monkeypatch.setattr(server_api, "cleanup_conversations", fake_cleanup)
+            monkeypatch.setattr(server_api, "cleanup_conversations", mock_cleanup)
             response = await client.request(
                 "DELETE",
                 f"/api/projects/{project_id}",
@@ -476,7 +553,7 @@ async def test_project_delete_keeps_files_when_disk_deletion_is_not_opted_in(tmp
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             created = await client.post("/api/projects", json={
                 "prompt": "Keep this project directory",
-                "agent": {"harness": "echo", "type_id": "planner"},
+                "agent": {"harness": "mock", "type_id": "planner"},
                 "working_dir": str(tmp_path / "keep-me"),
                 "run_policy": {"auto_run": False},
             })
@@ -504,7 +581,7 @@ async def test_project_delete_files_removes_the_entire_project_directory(tmp_pat
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             created = await client.post("/api/projects", json={
                 "prompt": "Remove this project directory",
-                "agent": {"harness": "echo", "type_id": "planner"},
+                "agent": {"harness": "mock", "type_id": "planner"},
                 "working_dir": str(tmp_path / "remove-me"),
                 "run_policy": {"auto_run": False},
             })
@@ -534,7 +611,7 @@ async def test_project_delete_files_refuses_protected_store_directories(tmp_path
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             created = await client.post("/api/projects", json={
                 "prompt": "Do not remove the projects store",
-                "agent": {"harness": "echo", "type_id": "planner"},
+                "agent": {"harness": "mock", "type_id": "planner"},
                 "working_dir": str(protected),
                 "run_policy": {"auto_run": False},
             })
@@ -574,12 +651,12 @@ async def test_failed_conversation_cleanup_reports_progress_and_preserves_projec
             project_id = created.json()["project_id"]
             repo = Path(created.json()["repo_path"])
 
-            async def fake_cleanup(refs, *, cwd, commands, on_progress):
+            async def mock_cleanup(refs, *, cwd, commands, on_progress):
                 del cwd, commands
                 await on_progress(ConversationProgress(1, len(refs), "codex", "codex-session-1", "failed", "denied"))
                 return ConversationCleanup(1, 0, 0, 1, 0, ("denied",))
 
-            monkeypatch.setattr(server_api, "cleanup_conversations", fake_cleanup)
+            monkeypatch.setattr(server_api, "cleanup_conversations", mock_cleanup)
             response = await client.request(
                 "DELETE",
                 f"/api/projects/{project_id}",

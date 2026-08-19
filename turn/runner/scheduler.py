@@ -127,6 +127,15 @@ class Scheduler:
         walker = GraphWalker(nodes, edges)
         evaluation = walker.evaluate()
         node_by_id = walker.indexes.node_by_id
+        # A trigger target is intentionally dormant until its trigger supplies
+        # a context. Without this gate an auto-run project can launch a target
+        # in the small window between graph creation and the first scheduled
+        # or external event, consuming the trigger before it can activate.
+        trigger_targets = {
+            trigger.target_node_id
+            for trigger in await self.store.list_triggers(project_id)
+            if trigger.enabled
+        }
 
         for node in nodes:
             effective = evaluation.status.get(node.id)
@@ -172,6 +181,10 @@ class Scheduler:
             candidate.id
             for candidate in walker.topological()
             if candidate.id in evaluation.runnable
+            and (
+                candidate.id not in trigger_targets
+                or candidate.trigger_context is not None
+            )
         ]
         for node_id in runnable_order:
             if project_id in self.deleting_projects:
@@ -217,10 +230,19 @@ class Scheduler:
 
         walker = GraphWalker(nodes, edges)
         evaluation = walker.evaluate()
+        trigger_targets = {
+            trigger.target_node_id
+            for trigger in await self.store.list_triggers(project_id)
+            if trigger.enabled
+        }
         stage_nodes = [
             node
             for node in walker.topological()
             if node.id in evaluation.runnable and node.id not in self.running
+            and (
+                node.id not in trigger_targets
+                or node.trigger_context is not None
+            )
         ]
         if not stage_nodes:
             return []

@@ -29,6 +29,8 @@ def _literal(value: Any) -> str:
 
 
 def _type_for(schema: dict[str, Any]) -> str:
+    if isinstance(schema, bool):
+        return "unknown" if schema else "never"
     reference = _ref_name(schema)
     if reference:
         return reference

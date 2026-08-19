@@ -166,10 +166,19 @@ class LocalPtyTransport:
     # therefore cannot inject a command into an already-running shell.
     supports_inject = False
 
+    @property
+    def backend_name(self) -> str:
+        return "local"
+
     def __init__(self, backlog_limit: int = 2_000_000, completed_session_limit: int = 32):
         self.sessions: dict[uuid.UUID, _Session] = {}
         self.backlog_limit = backlog_limit
         self.completed_session_limit = completed_session_limit
+
+    @property
+    def available(self) -> bool:
+        """Local PTY support is available whenever this transport is constructed."""
+        return True
 
     @staticmethod
     def _window(fd: int, cols: int, rows: int) -> None:
@@ -934,7 +943,7 @@ class HerdrPtyTransport(LocalPtyTransport):
         output = await self.adapter.read_pane(
             pane_id,
             source=source,
-            lines=max(2000, session.rows * 40),
+            lines=None,
         )
         if output or source == "visible":
             session.output = bytearray(output.encode())

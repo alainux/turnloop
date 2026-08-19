@@ -15,7 +15,7 @@ from turn.workers.herdr import (
 from turn.workers.terminal import TerminalResult
 
 
-class FakeHerdrAdapter:
+class MockHerdrAdapter:
     """In-memory Herdr port; no CLI, daemon, or filesystem process is used."""
 
     def __init__(self):
@@ -28,7 +28,7 @@ class FakeHerdrAdapter:
         self.sent_keys: list[tuple[str, tuple[str, ...]]] = []
         self.run_commands: list[tuple[str, str]] = []
         self.wait_outputs: list[tuple[str, str, str, int | None]] = []
-        self.read_requests: list[tuple[str, str, int]] = []
+        self.read_requests: list[tuple[str, str, int | None]] = []
 
     @property
     def available(self) -> bool:
@@ -40,8 +40,8 @@ class FakeHerdrAdapter:
     async def create_workspace(self, *, cwd: str, label: str, focus: bool = False):
         self._workspace_number += 1
         self._pane_number += 1
-        workspace_id = f"fake-w{self._workspace_number}"
-        pane_id = f"fake-p{self._pane_number}"
+        workspace_id = f"mock-w{self._workspace_number}"
+        pane_id = f"mock-p{self._pane_number}"
         self.workspaces[workspace_id] = HerdrWorkspace(workspace_id, label, 1, 1)
         self.panes[pane_id] = (workspace_id, HerdrPane(pane_id))
         self.created.append(workspace_id)
@@ -72,7 +72,7 @@ class FakeHerdrAdapter:
     async def create_tab(self, *, workspace_id: str, cwd: str, label: str, focus: bool = False):
         await self.get_workspace(workspace_id)
         self._pane_number += 1
-        pane_id = f"fake-p{self._pane_number}"
+        pane_id = f"mock-p{self._pane_number}"
         pane = HerdrPane(pane_id)
         self.panes[pane_id] = (workspace_id, pane)
         return pane
@@ -102,7 +102,7 @@ class FakeHerdrAdapter:
         self.wait_outputs.append((pane_id, regex, source, lines))
         return True
 
-    async def read_pane(self, pane_id: str, *, source: str = "recent", lines: int = 2000) -> str:
+    async def read_pane(self, pane_id: str, *, source: str = "recent", lines: int | None = None) -> str:
         await self.get_pane(pane_id)
         self.read_requests.append((pane_id, source, lines))
         return ""
@@ -111,11 +111,11 @@ class FakeHerdrAdapter:
         raise AssertionError("deterministic Herdr integration does not open a control process")
 
 
-class FakeTerminalTransport:
+class MockTerminalTransport:
     """Deterministic terminal port for runner shell lifecycle tests."""
 
     supports_inject = False
-    backend_name = "fake"
+    backend_name = "mock"
 
     def __init__(self):
         self._state: dict[uuid.UUID, dict[str, object]] = {}
@@ -130,14 +130,14 @@ class FakeTerminalTransport:
     def _node(self, node_id: uuid.UUID) -> dict[str, object]:
         return self._state.setdefault(
             node_id,
-            {"active": False, "output": "", "persistent": False, "pane": f"fake-pane-{node_id}"},
+            {"active": False, "output": "", "persistent": False, "pane": f"mock-pane-{node_id}"},
         )
 
     async def run(self, node_id: uuid.UUID, command: list[str], **kwargs) -> TerminalResult:
         state = self._node(node_id)
         state["active"] = True
         state["persistent"] = True
-        state["output"] = "fake shell\n"
+        state["output"] = "mock shell\n"
         stop = self._stops.get(node_id)
         if stop is None or stop.is_set():
             stop = asyncio.Event()

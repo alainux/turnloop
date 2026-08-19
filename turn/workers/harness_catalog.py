@@ -165,6 +165,11 @@ MODEL_DISCOVERY_COMMANDS = {
     "pi": ["pi", "--offline", "--list-models"],
 }
 
+
+def codex_project_root_flags() -> list[str]:
+    """Keep Codex project discovery anchored to Turn's assigned directory."""
+    return ["-c", "project_root_markers=[]"]
+
 class HarnessCommandFactory:
     """Build provider commands for workers, planners, and reconnects."""
 
@@ -289,7 +294,8 @@ class HarnessCommandFactory:
             thinking = (["-c", f'model_reasoning_effort="{agent.reasoning.value}"']
                         if agent.reasoning.value != "default" else [])
             mcp_flags = [item for override in capability_mcp_overrides for item in ("-c", override)]
-            command = [self.codex_binary, "resume", *model, *thinking, *mcp_flags,
+            command = [self.codex_binary, "resume", *model, *thinking,
+                       *codex_project_root_flags(), *mcp_flags,
                        "--no-alt-screen", "-C", cwd, session_id]
             return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.PI:

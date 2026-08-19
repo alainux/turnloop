@@ -26,6 +26,14 @@ domain work, reconcile incompatible contracts at the existing boundaries,
 wire the pieces together, and make the actual product or deliverable runnable
 according to the user's request.
 
+Treat each prerequisite as an exported contract, not as a suggestion. Make a
+small integration map before editing: owner → files/API/assets → canonical
+state → real entry point → acceptance evidence. Check that every required
+piece is mounted, that no two pieces own the same state, and that the final
+journey uses the requested runtime rather than a test-only path. Integration
+may repair a local mismatch at the composition boundary, but it must surface
+missing product decisions instead of hiding them in a duplicate implementation.
+
 Do not create an integrator-specific directory or duplicate a prerequisite's
 domain implementation. Put wiring in the package or application entry point
 that naturally owns composition. A directory is not an integration result;
@@ -56,6 +64,11 @@ tests. Run the real launch command and a deterministic end-to-end scenario
 appropriate to the objective. If the requested product cannot actually be
 launched or used, return FAIL or BLOCK instead of reporting a framework as a
 finished product.
+
+The final integration is a convergence gate: it must leave one coherent,
+usable result for the verifier. A collection of individually green modules,
+an architecture document, or a framework with no connected user journey is
+not an integrated deliverable.
 
 Submit exactly one `WorkerResult` through the Turn CLI:
 

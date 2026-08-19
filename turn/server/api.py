@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import uuid
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -29,6 +29,7 @@ from turn.domain.schemas import (
     Node,
     NodeStatus,
     RunPolicy,
+    TriggerKind,
 )
 from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
@@ -178,6 +179,30 @@ class DeleteProjectOptions(BaseModel):
     delete_conversations: bool = False
 
 
+class CreateTrigger(BaseModel):
+    target_node_id: uuid.UUID
+    event_name: Optional[str] = Field(default=None, max_length=200)
+    kind: TriggerKind = TriggerKind.EVENT
+    schedule: Optional[str] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class UpdateTrigger(BaseModel):
+    event_name: Optional[str] = Field(default=None, max_length=200)
+    kind: Optional[TriggerKind] = None
+    schedule: Optional[str] = None
+    data: Optional[dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
+
+class EmitEvent(BaseModel):
+    event_name: str = Field(min_length=1, max_length=200)
+    data: dict[str, Any] = Field(default_factory=dict)
+    project_id: Optional[uuid.UUID] = None
+    node_id: Optional[uuid.UUID] = None
+
+
 def _validate_served_agent(agent: AgentConfig, request: Request) -> None:
     if (
         agent.harness.value not in REAL_HARNESSES
@@ -204,6 +229,7 @@ def _dump(n: Node):
 
 async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner | None = None) -> dict:
     nodes, edges, artifacts = await store.get_workgraph(project_id)
+    triggers = await store.list_triggers(project_id)
     walker = GraphWalker(nodes, edges)
     ev = walker.evaluate()
     for n in nodes:
@@ -270,6 +296,7 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
             for edge in derive_flow_edges(nodes, edges, ev.status)
         ],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
+        "triggers": [trigger.model_dump(mode="json") for trigger in triggers],
     }).model_dump(mode="json")
 
 
@@ -305,8 +332,7 @@ async def create_project(body: CreateProject, request: Request):
             raise HTTPException(413, f"attachment {attachment.name} exceeds 10 MB")
         decoded_attachments.append((candidate, payload))
 
-    # Each project gets its own assigned directory. Turn never initializes or
-    # manages version control in that directory.
+    # Each project gets its own assigned directory and independent Git root.
     root_id = uuid.uuid4()
     try:
         repo_path = init_project_directory(
@@ -399,6 +425,7 @@ async def get_settings(request: Request):
         "delay_between_jobs_ms": app_settings.delay_between_jobs_ms,
         "retry_choked_models": app_settings.retry_choked_models,
         "log_max_records": int(await store.get_setting("log_max_records", str(app_settings.log_max_records))),
+        "data_dir": str(Path(app_settings.data_dir).resolve()),
         "projects_dir": str(Path(app_settings.projects_dir).resolve()),
     }
 
@@ -612,6 +639,23 @@ async def delete_project(
         return await _delete_project(pid, project_id, request, body)
     finally:
         runner.end_project_deletion(pid)
+
+
+@router.post("/api/projects/{project_id}/workspace/close")
+async def close_project_terminals(project_id: str, request: Request):
+    """Close all project terminals through the configured terminal adapter.
+
+    This only releases execution UI resources. Durable graph state and
+    provider session ids remain intact, so the next run can recreate the
+    terminals and continue normally.
+    """
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    root = await store.get_node(pid)
+    if root is None or root.parent_id is not None:
+        raise HTTPException(404, "project not found")
+    return {"ok": True, "closed": await runner.close_project_workspace(pid)}
 
 
 async def _delete_project(
@@ -832,6 +876,69 @@ async def get_graph(project_id: str, request: Request):
     store: Store = request.app.state.store
     pid = uuid.UUID(project_id)
     return await _serialize_graph(store, pid, request.app.state.runner)
+
+
+@router.get("/api/projects/{project_id}/triggers")
+async def list_triggers(project_id: str, request: Request):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    return {"triggers": [item.model_dump(mode="json") for item in await store.list_triggers(pid)]}
+
+
+@router.post("/api/projects/{project_id}/triggers")
+async def create_trigger(project_id: str, body: CreateTrigger, request: Request):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    try:
+        trigger = await store.create_trigger(
+            project_id=pid,
+            target_node_id=body.target_node_id,
+            event_name=body.event_name,
+            kind=body.kind,
+            schedule=body.schedule,
+            data=body.data,
+            enabled=body.enabled,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    return {"trigger": trigger.model_dump(mode="json")}
+
+
+@router.patch("/api/triggers/{trigger_id}")
+async def update_trigger(trigger_id: str, body: UpdateTrigger, request: Request):
+    store: Store = request.app.state.store
+    changes = body.model_dump(exclude_unset=True, mode="python")
+    try:
+        trigger = await store.update_trigger(uuid.UUID(trigger_id), **changes)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    if trigger is None:
+        raise HTTPException(404, "trigger not found")
+    return {"trigger": trigger.model_dump(mode="json")}
+
+
+@router.delete("/api/triggers/{trigger_id}")
+async def delete_trigger(trigger_id: str, request: Request):
+    if not await request.app.state.store.delete_trigger(uuid.UUID(trigger_id)):
+        raise HTTPException(404, "trigger not found")
+    return {"ok": True}
+
+
+@router.post("/api/events")
+async def emit_event(body: EmitEvent, request: Request):
+    dispatcher = getattr(request.app.state, "triggers", None)
+    if dispatcher is None:
+        raise HTTPException(503, "trigger dispatcher is not initialized")
+    event = await dispatcher.emit(
+        body.event_name,
+        data=body.data,
+        source="cli",
+        project_id=body.project_id,
+        node_id=body.node_id,
+    )
+    return {"event": event}
 
 
 @router.get("/api/projects/{project_id}/concept-images/{image_path:path}")
@@ -1139,9 +1246,17 @@ async def regenerate(node_id: str, request: Request, force: bool = False):
 @router.post("/api/nodes/{node_id}/retry")
 async def retry(node_id: str, request: Request):
     runner = await _runner(request)
-    await runner.retry(uuid.UUID(node_id))
-    nid = await runner.run_node(uuid.UUID(node_id))
-    return {"ok": nid is not None, "ran": str(nid) if nid else None}
+    nid = uuid.UUID(node_id)
+    await runner.retry(nid)
+    # retry() wakes the scheduler. In auto-run mode it owns the next launch;
+    # starting one here as well races that wake-up and can launch the same
+    # process twice. Manual projects still need an explicit launch.
+    node = await request.app.state.store.get_node(nid)
+    root = await request.app.state.store.get_node(node.project_id) if node else None
+    if root is not None and root.auto_run:
+        return {"ok": True, "ran": None}
+    ran = await runner.run_node(nid)
+    return {"ok": ran is not None, "ran": str(ran) if ran else None}
 
 
 @router.post("/api/nodes/{node_id}/reconnect")
