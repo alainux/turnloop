@@ -1,7 +1,0 @@
-[sandbox_workspace_write]
-network_access = true
-
-
-[features.network_proxy]
-enabled = true
-allow_local_binding = true
