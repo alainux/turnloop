@@ -34,6 +34,7 @@ class Scheduler:
         emit: Callable[[str, uuid.UUID, object], Awaitable[None]],
         finalize: Callable[[Node], Awaitable[None]],
         wake: Callable[[], None],
+        is_externally_busy: Callable[[uuid.UUID], bool] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -41,6 +42,11 @@ class Scheduler:
         self._emit = emit
         self._finalize = finalize
         self._wake = wake
+        # A retained provider reconnect is a real active agent turn, even
+        # though it is not a scheduler-owned execution task.  The scheduler
+        # must not launch a second command for the same node while that
+        # continuation is receiving verifier feedback.
+        self._is_externally_busy = is_externally_busy or (lambda _node_id: False)
         self.running: dict[uuid.UUID, asyncio.Task] = {}
         self.running_projects: dict[uuid.UUID, uuid.UUID] = {}
         self.retries: dict[uuid.UUID, int] = {}
@@ -196,6 +202,8 @@ class Scheduler:
         for node_id in runnable_order:
             if project_id in self.deleting_projects:
                 return
+            if self._is_externally_busy(node_id):
+                continue
             if node_id in self.running:
                 continue
             node = await self.store.get_node(node_id)

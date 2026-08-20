@@ -23,6 +23,13 @@ genuine external requirement.
    guidance is working context, not text to paste into the result.
 3. Restate the original user-facing outcome in your working notes and identify
    the concrete contract your node exports to downstream workers.
+4. Check whether the assignment is still **leaf-fit** before editing. A leaf is
+   one cohesive contract with one primary craft or implementation boundary,
+   bounded ownership, and one concrete acceptance path. If the assignment
+   actually contains several independently ownable contracts, multiple crafts,
+   a substantial internal backlog, or its own integration/QA problem, do not
+   silently turn one executor into an entire team. Escalate it to a nested
+   planning boundary as described below.
 
 ## Implementation contract
 
@@ -35,10 +42,14 @@ genuine external requirement.
 - Define and preserve typed inputs, outputs, invariants, and integration seams.
   Keep the canonical state and ownership clear so another worker can compose
   your result without guessing.
-- Stay inside the assigned boundary. Do not rewrite sibling ownership, create
-  graph nodes, or absorb another worker's responsibility. If the boundary is
-  underspecified or conflicts with a prerequisite contract, report the exact
-  gap instead of compensating with an unrelated implementation.
+- Stay inside the assigned boundary. Do not rewrite sibling ownership or absorb
+  another worker's responsibility. Executors do not author arbitrary graph
+  topology. The one exception is **scope escalation**: when the current node is
+  demonstrably not leaf-fit, return `EXPAND` with exactly one child planner so
+  that a planning boundary—not the executor—owns the actual decomposition. If
+  the boundary is merely underspecified or conflicts with a prerequisite
+  contract, report the exact gap instead of compensating with an unrelated
+  implementation.
 - For visual or interactive work, connect controls, overlays, assets, and
   feedback to the actual runtime state. A UI element that is not reachable from
   the requested journey is not a completed feature.
@@ -54,6 +65,32 @@ genuine external requirement.
   or manual journey that proves the exported contract. “Hard to test” is a
   signal to add an adapter, fixture, evidence file, or an explicit BLOCK/FAIL,
   never a reason to claim completion.
+
+## Adaptive scope escalation
+
+Turn is allowed to discover organizational structure during execution. If a
+node looked leaf-sized to its parent planner but, after reading the repository
+and prerequisite contracts, it clearly requires a team, **do not compress the
+team into one heroic executor**. Return `EXPAND` and delegate the whole current
+contract to exactly one nested planner child.
+
+That child is a department/program boundary. Give it the inherited mission,
+constraints, exported contract, relevant document/resource references, and the
+evidence that revealed the larger scope. Do not pre-author its descendants;
+the child planner will use `$turn-planning` to choose the organization. Declare
+it unambiguously with `agent_type: "planner"` and `plan: true`.
+
+Example handoff:
+
+```sh
+turn agent submit --kind result --stdin <<'TURN_PAYLOAD'
+{"outcome":"EXPAND","summary":"The assigned subsystem contains multiple independently verifiable contracts and needs departmental decomposition.","missing_inputs":[],"artifacts":[],"children":{"nodes":[{"key":"department","objective":"Plan and deliver the subsystem","agent_type":"planner","plan":true,"generated_prompt":"Own the full inherited subsystem mission. Decompose it into leaf-fit work, integrate the descendants, and independently verify the exported contract before returning it to the parent. Preserve the existing repository and prerequisite contracts."}]}}
+TURN_PAYLOAD
+```
+
+Use this only for real scope discovery. A cohesive leaf should execute rather
+than bouncing through another planner. `EXPAND` is not a way to avoid difficult
+work; it is the escape valve that prevents accidental under-decomposition.
 
 ## Pre-handoff quality gate
 

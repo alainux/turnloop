@@ -697,6 +697,58 @@ class GatedReadyHerdrHarness(AttachedHerdrHarness):
         await self.ready.wait()
 
 
+class TransientControlHerdrHarness(AttachedHerdrHarness):
+    """A durable pane survives one controller disconnect before injection."""
+
+    def __init__(self):
+        super().__init__()
+        self.attachments = 0
+
+    async def has_persistent_session(self, _node_id):
+        return True
+
+    async def ensure_session(self, node_id, **kwargs):
+        self.attachments += 1
+        if self.attachments == 1:
+            return TerminalResult(returncode=0, output=b"control handoff")
+        return await super().ensure_session(node_id, **kwargs)
+
+    async def wait_until_ready(self, _node_id):
+        if self.attachments == 1:
+            await asyncio.Event().wait()
+
+
+async def test_native_launch_recovers_one_pre_injection_control_disconnect(tmp_path):
+    """A fresh UI run must not fail when Herdr reconnects to a live pane."""
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    transport = TransientControlHerdrHarness()
+    task = asyncio.create_task(
+        run_until_result(
+            transport,
+            node_id,
+            ["codex", "initial prompt"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+            harness_name="codex",
+        )
+    )
+
+    for _ in range(100):
+        if transport.injected:
+            break
+        await asyncio.sleep(0.01)
+    assert transport.attachments == 2
+    assert len(transport.injected) == 1
+
+    result_path.write_text('{"outcome":"COMPLETE","summary":"done"}')
+    assert transport.process_exit_path is not None
+    transport.process_exit_path.write_text("0")
+    await task
+    transport.released.set()
+    await transport.session_done.wait()
+
+
 async def test_native_launch_waits_for_provider_readiness_before_injection(tmp_path):
     node_id = uuid.uuid4()
     result_path = prepare_result_file(str(tmp_path), node_id, "result")
@@ -954,6 +1006,42 @@ async def test_native_codex_session_id_is_observed_before_completion(tmp_path, m
     result_path.write_text('{"outcome":"COMPLETE"}')
     await task
     assert seen == [session_id]
+
+
+async def test_native_resume_keeps_its_known_session_when_another_rollout_appears(tmp_path, monkeypatch):
+    """Concurrent workers in one repo must not steal each other's session id."""
+    codex_home = tmp_path / "codex-home"
+    session_dir = codex_home / "sessions" / "2026" / "08" / "14"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    (session_dir / "rollout-other.jsonl").write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {"session_id": "other-worker-session", "cwd": str(tmp_path)},
+    }) + "\n")
+    transport = WaitingTransport()
+    seen: list[str] = []
+
+    async def record(session: str) -> None:
+        seen.append(session)
+
+    task = asyncio.create_task(
+        run_until_result(
+            transport,
+            node_id,
+            ["codex", "resume"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+            session_callback=record,
+            known_session_id="saved-verifier-session",
+        )
+    )
+    await asyncio.sleep(0.1)
+    result_path.write_text('{"outcome":"COMPLETE"}')
+    await task
+
+    assert seen == []
 
 
 async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp_path):

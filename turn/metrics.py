@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from enum import Enum
@@ -104,6 +105,7 @@ class BehaviorMetrics(BaseModel):
     files_read: int = 0
     files_written: int = 0
     docs_accessed: int = 0
+    skills_loaded: int = 0
     skills_accessed: int = 0
     mcp_calls: int = 0
     web_searches: int = 0
@@ -145,7 +147,7 @@ class ProjectBehaviorMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = 6
+    version: int = 12
     project: BehaviorMetrics
     by_node: dict[str, BehaviorMetrics] = Field(default_factory=dict)
     by_run: dict[str, BehaviorRunMetrics] = Field(default_factory=dict)
@@ -157,6 +159,29 @@ def _counter(metrics: BehaviorMetrics, key: str, amount: int = 1) -> None:
 
 def _role_counter(metrics: BehaviorMetrics, key: str, amount: int = 1) -> None:
     metrics.role_metrics[key] = metrics.role_metrics.get(key, 0) + amount
+
+
+def _loaded_skills(data: dict[str, Any]) -> tuple[str, ...]:
+    """Return the actual launch skills, including historical role defaults.
+
+    Before metrics version 10, Codex launches recorded no paths because Codex
+    discovers project-installed skills natively. Those launches still had the
+    mandatory role capabilities installed, so reconstruct their exact built-in
+    set from the role rather than misreporting zero loaded skills.
+    """
+    recorded = data.get("capability_skills")
+    if isinstance(recorded, list) and recorded:
+        return tuple(
+            dict.fromkeys(skill for skill in recorded if isinstance(skill, str) and skill)
+        )
+    # ``turn.domain.schemas`` imports BehaviorExpectations from this module,
+    # so keep the contract import lazy to preserve the one-way import boundary.
+    from turn.domain.capability_contracts import ROLE_CAPABILITY_IDS, SETUP_CAPABILITY_ID
+
+    role = _string(data.get("role"))
+    if role == "setup":
+        return (*ROLE_CAPABILITY_IDS["planner"], SETUP_CAPABILITY_ID)
+    return ROLE_CAPABILITY_IDS.get(role or "", ())
 
 
 def _number(value: Any) -> float:
@@ -181,11 +206,120 @@ def _is_doc(value: str | None) -> bool:
     return bool(value and value.lower().rsplit("?", 1)[0].endswith((".md", ".mdx", ".txt", ".rst")))
 
 
+def _mark_material_action(metrics: BehaviorMetrics) -> None:
+    """Record a graph-changing action for the documentation ordering check.
+
+    Discovery commands and tool wrappers are preparation, not the work whose
+    quality this metric evaluates. The check therefore asks whether relevant
+    documentation was read before a file change, plan application, or
+    verification decision.
+    """
+    state = metrics.reducer_state
+    if not state.get("run_saw_docs"):
+        state["run_actions_before_docs"] = True
+    state["run_saw_material_action"] = True
+
+
+def _record_document_access(metrics: BehaviorMetrics, path: str) -> None:
+    metrics.files_read += 1
+    _counter(metrics, "resource:file_read")
+    if _is_doc(path):
+        metrics.docs_accessed += 1
+        metrics.reducer_state["run_saw_docs"] = True
+
+
+def _record_file_write(metrics: BehaviorMetrics, path: str = "file") -> None:
+    metrics.files_written += 1
+    _mark_material_action(metrics)
+    state = metrics.reducer_state
+    if state.get("run_saw_verification"):
+        state["run_changed_after_verification"] = True
+    state["run_saw_change"] = True
+    _counter(metrics, "resource:file_write")
+
+
+_DELIVERY_ROLES = frozenset({"executor", "integrator"})
+
+
+def _run_requires_delivery_verification(metrics: BehaviorMetrics) -> bool:
+    """Only product-changing workers belong in the post-change test rate.
+
+    Setup and planners change graph or documentation state by contract; their
+    work has its own CLI/plan validation and is not a shipped product edit.
+    Counting those runs would report a failed product test where none is
+    required, while still preserving missing test evidence for executors and
+    integrators.
+    """
+    role = metrics.reducer_state.get("run_role") or metrics.role
+    return role in _DELIVERY_ROLES
+
+
+def _refresh_finalized_observations(metrics: BehaviorMetrics) -> None:
+    """Update a completed run when native telemetry arrives after handoff."""
+    state = metrics.reducer_state
+    if not state.get("run_observations_finalized"):
+        return
+    if state.get("run_saw_material_action") and not state.get("docs_before_action_counted"):
+        metrics.docs_before_action_runs += 1
+        state["docs_before_action_counted"] = True
+    docs_success = bool(state.get("run_saw_docs") and not state.get("run_actions_before_docs"))
+    previous_docs_success = bool(state.get("docs_before_action_success"))
+    if state.get("docs_before_action_counted") and docs_success != previous_docs_success:
+        metrics.docs_before_action_successes += 1 if docs_success else -1
+        state["docs_before_action_success"] = docs_success
+
+    if (
+        _run_requires_delivery_verification(metrics)
+        and state.get("run_saw_change")
+        and not state.get("verification_after_change_counted")
+    ):
+        metrics.verification_after_change_runs += 1
+        state["verification_after_change_counted"] = True
+    verification_success = bool(
+        state.get("run_verification_after_change")
+        and not state.get("run_changed_after_verification")
+    )
+    previous_verification_success = bool(state.get("verification_after_change_success"))
+    if state.get("verification_after_change_counted") and verification_success != previous_verification_success:
+        metrics.verification_after_change_successes += 1 if verification_success else -1
+        state["verification_after_change_success"] = verification_success
+
+
+_VERIFICATION_COMMAND = re.compile(
+    r"""(?imx)(?:^|&&|\|\||;|\n)\s*
+    (?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*
+    (?:
+        (?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|build|typecheck|check)\b
+        |(?:python(?:3)?\s+-m\s+)?pytest\b
+        |npx\s+(?:vitest|jest|tsc)\b
+        |(?:cargo|go|dotnet)\s+test\b
+        |(?:mvn|gradle|./gradlew)\s+(?:test|check)\b
+    )
+    """
+)
+
+
 def _is_verification_command(value: str | None) -> bool:
-    if not value:
-        return False
-    lower = value.lower()
-    return any(token in lower for token in ("test", "pytest", "vitest", "jest", "typecheck", "tsc", "lint", "build", "verify", "check"))
+    """Recognize an executed check, never incidental words in an agent payload."""
+    return bool(value and _VERIFICATION_COMMAND.search(value))
+
+
+def _record_verification_command(metrics: BehaviorMetrics, *, failed: bool = False) -> None:
+    metrics.verification_commands += 1
+    state = metrics.reducer_state
+    state["run_saw_verification"] = True
+    if not state.get("run_saw_change"):
+        return
+    if failed:
+        # A completed failing check cannot certify the latest edit.
+        state["run_verification_after_change"] = False
+        state["run_changed_after_verification"] = True
+        return
+    # An agent often tests, adjusts one more file, then tests again. The most
+    # recent post-change check is authoritative; do not leave a stale earlier
+    # edit permanently poisoning the result.
+    state["run_verification_after_change"] = True
+    state["run_changed_after_verification"] = False
 
 
 def _usage_values(value: dict[str, Any]) -> dict[str, float]:
@@ -228,31 +362,24 @@ def _apply_harness_event(metrics: BehaviorMetrics, event: HarnessEvent) -> None:
                 HarnessEventKind.COMMAND_START, HarnessEventKind.WEB_SEARCH, HarnessEventKind.MCP_CALL,
                 HarnessEventKind.SKILL_ACCESS, HarnessEventKind.CONTEXT_ACCESS}:
         metrics.actions += 1
-        if not state.get("run_saw_action") and not state.get("run_saw_docs") and not document_access:
-            state["run_actions_before_docs"] = True
         state["run_saw_action"] = True
     if kind is HarnessEventKind.TOOL_CALL:
         _counter(metrics, f"tool:{name}")
     elif kind is HarnessEventKind.FILE_READ:
-        metrics.files_read += 1
-        _counter(metrics, "resource:file_read")
         path = str(event.data.get("path") or name)
-        if _is_doc(path):
-            metrics.docs_accessed += 1
-            state["run_saw_docs"] = True
+        _record_document_access(metrics, path)
     elif kind is HarnessEventKind.FILE_WRITE:
-        metrics.files_written += 1
-        if state.get("run_saw_verification"):
-            state["run_changed_after_verification"] = True
-        state["run_saw_change"] = True
-        _counter(metrics, "resource:file_write")
+        _record_file_write(metrics, str(event.data.get("path") or name))
     elif kind is HarnessEventKind.COMMAND_START:
         _counter(metrics, f"command:{name}")
-        if _is_verification_command(str(event.data.get("command") or name)):
-            metrics.verification_commands += 1
-            state["run_saw_verification"] = True
-            if state.get("run_saw_change"):
-                state["run_verification_after_change"] = True
+        command = str(event.data.get("command") or _command_from_arguments(event.data.get("arguments")) or name)
+        if _nested_apply_patch(event.data) and not event.data.get("file_writes_emitted"):
+            _record_file_write(metrics, "apply_patch")
+        if command and not event.data.get("document_reads_emitted"):
+            for path in _document_paths(command):
+                _record_document_access(metrics, path)
+        if _is_verification_command(command):
+            _record_verification_command(metrics)
     elif kind is HarnessEventKind.COMMAND_END:
         exit_code = event.data.get("exit_code")
         failed = failed or (exit_code is not None and _number(exit_code) != 0)
@@ -264,11 +391,14 @@ def _apply_harness_event(metrics: BehaviorMetrics, event: HarnessEvent) -> None:
             failures[signature] = before + 1
             if before:
                 metrics.repeated_failed_actions += 1
-        if _is_verification_command(str(event.data.get("command") or name)):
-            metrics.verification_commands += 1
-            state["run_saw_verification"] = True
-            if state.get("run_saw_change"):
-                state["run_verification_after_change"] = True
+        command = str(event.data.get("command") or _command_from_arguments(event.data.get("arguments")) or name)
+        if _nested_apply_patch(event.data) and not event.data.get("file_writes_emitted"):
+            _record_file_write(metrics, "apply_patch")
+        if command and not event.data.get("document_reads_emitted"):
+            for path in _document_paths(command):
+                _record_document_access(metrics, path)
+        if _is_verification_command(command):
+            _record_verification_command(metrics, failed=failed)
     elif kind is HarnessEventKind.WEB_SEARCH:
         metrics.web_searches += 1
         _counter(metrics, "resource:web_search")
@@ -307,6 +437,7 @@ def _apply_harness_event(metrics: BehaviorMetrics, event: HarnessEvent) -> None:
         _counter(metrics, f"status:{event.status or name}")
     if failed and kind is not HarnessEventKind.COMMAND_END:
         metrics.errors += 1
+    _refresh_finalized_observations(metrics)
 
 
 def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
@@ -331,11 +462,15 @@ def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
         metrics.reducer_state = {
             "active_run_id": _string(data.get("run_id")),
             "last_run_id": _string(data.get("run_id")),
+            "run_role": _string(data.get("role")),
         }
         if isinstance(metrics, BehaviorRunMetrics):
             metrics.attempt = _integer(data.get("attempt")) or metrics.attempt
             metrics.status = "RUNNING"
             metrics.started_at = metrics.started_at or when
+        for skill in _loaded_skills(data):
+            metrics.skills_loaded += 1
+            _counter(metrics, f"skill_loaded:{skill}")
     elif kind == "harness.return":
         if metrics.active_run_started_at is not None:
             metrics.duration_seconds += max(0.0, (when - metrics.active_run_started_at).total_seconds())
@@ -367,18 +502,9 @@ def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
             metrics.outcome = _string(data.get("outcome")) or metrics.outcome
             metrics.ended_at = metrics.ended_at or when
         state = metrics.reducer_state
-        # The runner publishes an immediate return observation, followed by
-        # Store's durable ``run.updated`` log carrying final usage. Count the
-        # run-level expectations once, while still accepting the later usage.
-        if state.get("run_saw_action") and not state.get("run_observations_finalized"):
-            metrics.docs_before_action_runs += 1
-            if state.get("run_saw_docs") and not state.get("run_actions_before_docs"):
-                metrics.docs_before_action_successes += 1
-            if state.get("run_saw_change"):
-                metrics.verification_after_change_runs += 1
-                if state.get("run_verification_after_change") and not state.get("run_changed_after_verification"):
-                    metrics.verification_after_change_successes += 1
-            state["run_observations_finalized"] = True
+        # Native sidecars can flush structured events after the result handoff.
+        # Finalize once, then keep this projection responsive to those late facts.
+        state["run_observations_finalized"] = True
     elif kind == "harness.run" and action == "run.updated" and str(data.get("status")) == "FAILED":
         metrics.harness_failures += 1
     elif kind == "application.error":
@@ -393,6 +519,7 @@ def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
     elif kind == "graph.transition":
         metrics.graph_changes += 1
         if action == "plan.applied":
+            _mark_material_action(metrics)
             _role_counter(metrics, "valid_graph_submissions")
             _role_counter(metrics, "children_created", len(data.get("created_node_ids") or []))
             _role_counter(metrics, "dependencies_created", int(data.get("edge_count") or 0))
@@ -413,6 +540,7 @@ def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
         if data.get("kind") == "verification":
             _role_counter(metrics, "verification_submissions")
     elif kind == "verification.completed":
+        _mark_material_action(metrics)
         decision = str(data.get("decision") or "")
         if decision == "APPROVE":
             _role_counter(metrics, "accepts")
@@ -431,6 +559,7 @@ def _apply_log_record(metrics: BehaviorMetrics, record: dict[str, Any]) -> None:
         # A new runnable state after an attempted run is an objective retry signal.
         if metrics.active_run_started_at is None:
             metrics.retries += 1
+    _refresh_finalized_observations(metrics)
 
 
 def _string(value: Any) -> str | None:
@@ -596,6 +725,52 @@ def _tool_events(
     return events
 
 
+_DOUBLE_QUOTED_COMMAND = re.compile(r'''(?:\b(?:cmd|command)\b|["'](?:cmd|command)["'])\s*:\s*"((?:\\.|[^"\\])*)"''')
+_SINGLE_QUOTED_COMMAND = re.compile(r"""(?:\b(?:cmd|command)\b|[\"'](?:cmd|command)[\"'])\s*:\s*'((?:\\.|[^'\\])*)'""")
+_DOCUMENT_PATH = re.compile(r"(?<![A-Za-z0-9_./-])((?:\.?\.?/)?[A-Za-z0-9_./-]+\.(?:md|mdx|txt|rst))\b", re.IGNORECASE)
+
+
+def _command_from_arguments(arguments: Any) -> str | None:
+    """Extract a shell command from Codex's structured ``exec`` input."""
+    if isinstance(arguments, dict):
+        value = arguments.get("cmd") or arguments.get("command")
+        return value if isinstance(value, str) and value else None
+    if not isinstance(arguments, str):
+        return None
+    match = _DOUBLE_QUOTED_COMMAND.search(arguments)
+    if match:
+        try:
+            return json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            return match.group(1)
+    match = _SINGLE_QUOTED_COMMAND.search(arguments)
+    if match:
+        return match.group(1).replace("\\'", "'").replace("\\\\", "\\")
+    return None
+
+
+def _nested_apply_patch(data: dict[str, Any]) -> bool:
+    return "tools.apply_patch(" in str(data.get("arguments") or "")
+
+
+def _document_paths(command: str) -> list[str]:
+    return list(dict.fromkeys(match.group(1) for match in _DOCUMENT_PATH.finditer(command)))
+
+
+def _document_read_events(*, harness: str, command: str, status: str | None) -> list[HarnessEvent]:
+    paths = _document_paths(command)
+    return [
+        HarnessEvent(
+            kind=HarnessEventKind.FILE_READ,
+            harness=harness,
+            name=path,
+            status=status,
+            data={"path": path, "command": command},
+        )
+        for path in paths
+    ]
+
+
 def normalize_codex_event(raw: dict[str, Any]) -> list[HarnessEvent]:
     """Translate Codex JSONL and notify-exported rollout items into facts."""
     event_type = str(raw.get("type") or "")
@@ -617,6 +792,11 @@ def normalize_codex_event(raw: dict[str, Any]) -> list[HarnessEvent]:
     if event_type in {"item.started", "item.completed"}:
         if detail_type in {"command_execution", "command"}:
             payload = {"command": details.get("command"), "exit_code": details.get("exit_code")}
+            command = str(details.get("command") or "")
+            document_events = _document_read_events(harness="codex", command=command, status=status)
+            if document_events:
+                payload["document_reads_emitted"] = True
+            events.extend(document_events)
             events.append(HarnessEvent(
                 kind=HarnessEventKind.COMMAND_START if event_type == "item.started" else HarnessEventKind.COMMAND_END,
                 harness="codex", name=str(details.get("command") or "command"), status=status, data=payload,
@@ -674,8 +854,26 @@ def _normalize_codex_rollout(record: dict[str, Any]) -> list[HarnessEvent]:
     item_type = str(item.get("type") or record_type)
     if item_type in {"function_call", "custom_tool_call"}:
         name = _string(item.get("name")) or _string(item.get("tool_name")) or "tool"
-        data = {"arguments": item.get("arguments") or item.get("input"), "call_id": item.get("call_id")}
-        events = _tool_events(harness="codex", name=name, status="started", data=data)
+        arguments = item.get("arguments") or item.get("input")
+        data = {"arguments": arguments, "call_id": item.get("call_id")}
+        command = _command_from_arguments(arguments)
+        if command:
+            data["command"] = command
+        # Document reads happen within the command, before its surrounding
+        # tool wrapper becomes a material action in the reducer.
+        events = _document_read_events(harness="codex", command=command, status="started") if command else []
+        if events:
+            data["document_reads_emitted"] = True
+        if _nested_apply_patch(data):
+            data["file_writes_emitted"] = True
+            events.append(HarnessEvent(
+                kind=HarnessEventKind.FILE_WRITE,
+                harness="codex",
+                name="apply_patch",
+                status="started",
+                data={"path": "apply_patch"},
+            ))
+        events.extend(_tool_events(harness="codex", name=name, status="started", data=data))
         if "mcp" in name.lower():
             events.append(HarnessEvent(kind=HarnessEventKind.MCP_CALL, harness="codex", name=name, status="started", data=data))
         return events

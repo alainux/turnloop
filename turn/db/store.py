@@ -798,14 +798,19 @@ class Store:
         return saved
 
     async def reset_node_after_rejection(
-        self, node_id: uuid.UUID, status: NodeStatus
+        self,
+        node_id: uuid.UUID,
+        status: NodeStatus,
+        *,
+        agent_state: str | None = None,
+        agent_message: str | None = None,
     ) -> Optional[Node]:
         node = await self.get_node(node_id)
         if node is None:
             return None
         node.status = status
-        node.agent_state = None
-        node.agent_message = None
+        node.agent_state = agent_state
+        node.agent_message = agent_message
         return await self._save_node(node)
 
     # -- settings ---------------------------------------------------------

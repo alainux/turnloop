@@ -181,6 +181,7 @@ class CodexWorker(Worker):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=session_id,
                     session_marker=str(ctx.node.id),
                     excluded_session_ids={ctx.forbidden_session_id}
                     if ctx.forbidden_session_id
@@ -208,6 +209,7 @@ class CodexWorker(Worker):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=session_id,
                     session_marker=str(ctx.node.id),
                     excluded_session_ids={ctx.forbidden_session_id}
                     if ctx.forbidden_session_id
@@ -395,10 +397,16 @@ class CodexWorker(Worker):
         repo = ctx.repo_path
         if cwd and repo and repo != cwd:
             gp = gp.replace(repo, cwd)
+        correction = (
+            ctx.node.agent_message
+            if ctx.node.agent_state == "correction_requested"
+            else None
+        )
         return "\n".join([
             render_context_block(ctx),
             f"objective={ctx.node.objective}",
             f"instructions={gp}",
+            *([f"correction={correction}"] if correction else []),
         ])
 
     # -- parsing ---------------------------------------------------------

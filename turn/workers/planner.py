@@ -199,7 +199,17 @@ class CodexPlanner(Planner):
 
     @staticmethod
     def _validate_setup_scope(ctx: NodeExecutionContext, plan: PlanResult) -> None:
-        """Reject a narrow root plan that contradicts explicit broad scope."""
+        """Reject root plans whose organization contradicts explicit broad scope.
+
+        Prompt guidance alone is too easy for a model to satisfy cosmetically:
+        a plan can name five "departments" while still assigning each department
+        to one heroic executor. Broad root intent therefore has one structural
+        invariant at the runtime boundary: the first level must actually expose
+        recursive ownership, convergence, and independent quality control.
+
+        This is intentionally limited to explicit organization/release-scale
+        intent. Ordinary requests remain free to use a small flat graph.
+        """
         node = ctx.node
         if node.parent_id is not None:
             return
@@ -217,21 +227,132 @@ class CodexPlanner(Planner):
             "enterprise",
             "platform",
             "ecosystem",
+            "large-scale",
+            "large scale",
+            "full-scale",
+            "full scale",
+            "production-ready",
+            "production ready",
+            "production-quality",
+            "production quality",
+            "not a demo",
+            "not a poc",
+            "multi-level game",
+            "multi level game",
+            "complete game",
+            "full game",
+            "build a game",
+            "create a game",
+            "make a game",
+            "develop a game",
+            "ship a game",
+            "playable game",
         )
         if not any(marker in intent for marker in broad_markers):
             return
-        if len(plan.nodes) != 1:
-            return
-        only_node = plan.nodes[0]
-        is_nested_planner = (
-            only_node.plan
-            or only_node.executor == "planner"
-            or only_node.agent_type is AgentType.PLANNER
-        )
-        if not is_nested_planner:
+
+        direct = [spec for spec in plan.nodes if spec.parent_key is None]
+        if not direct:
             raise RuntimeError(
-                "root planner collapsed an explicitly organization-scale request "
-                "to one leaf; return a broad first-level graph or a nested planner"
+                "root planner returned no first-level organization for an explicitly "
+                "organization-scale request"
+            )
+
+        def role(spec: NodeSpec) -> AgentType | None:
+            if spec.agent_type is not None:
+                return spec.agent_type
+            if spec.agent is not None:
+                return spec.agent.type_id
+            return AgentType.PLANNER if spec.plan or spec.executor == "planner" else None
+
+        # A single child with required inputs is a legitimate clarification
+        # gate. Once scope is executable, however, handing the whole broad
+        # request to one child merely moves the same under-decomposition down a
+        # level and adds ceremony rather than organization.
+        if (
+            len(direct) == 1
+            and direct[0].required_inputs
+            and role(direct[0]) is AgentType.PLANNER
+        ):
+            return
+
+        planners = [spec for spec in direct if role(spec) is AgentType.PLANNER]
+        if not planners:
+            raise RuntimeError(
+                "root planner produced a flat graph for an explicitly organization-scale "
+                "request; make at least one broad first-level responsibility a nested "
+                "planner boundary instead of a department-named executor"
+            )
+
+        integrators = [spec for spec in direct if role(spec) is AgentType.INTEGRATOR]
+        if not integrators:
+            raise RuntimeError(
+                "organization-scale root plan has no first-level integrator; add an "
+                "explicit convergence owner that consumes the department outputs"
+            )
+
+        verifiers = [spec for spec in direct if role(spec) is AgentType.VERIFIER]
+        if not verifiers:
+            raise RuntimeError(
+                "organization-scale root plan has no independent first-level verifier; "
+                "add a release/acceptance gate after integration"
+            )
+
+        production_owners = [
+            spec for spec in direct
+            if role(spec) not in {AgentType.INTEGRATOR, AgentType.VERIFIER}
+        ]
+        if len(production_owners) < 2:
+            raise RuntimeError(
+                "organization-scale root plan still has only one production ownership "
+                "branch; expose at least two independently accountable first-level "
+                "responsibilities before convergence"
+            )
+
+        direct_keys = {spec.key for spec in direct}
+        sequence: dict[str, set[str]] = {key: set() for key in direct_keys}
+        for spec in direct:
+            for predecessor in spec.follows:
+                if predecessor in direct_keys:
+                    sequence[predecessor].add(spec.key)
+        for edge in plan.edges:
+            if (
+                edge.type is EdgeType.FOLLOWS
+                and edge.src in direct_keys
+                and edge.dst in direct_keys
+            ):
+                sequence[edge.src].add(edge.dst)
+
+        def reaches(src: str, dst: str) -> bool:
+            frontier = [src]
+            seen: set[str] = set()
+            while frontier:
+                current = frontier.pop()
+                if current == dst:
+                    return True
+                if current in seen:
+                    continue
+                seen.add(current)
+                frontier.extend(sequence[current] - seen)
+            return False
+
+        convergence = next(
+            (
+                integrator
+                for integrator in integrators
+                if all(reaches(owner.key, integrator.key) for owner in production_owners)
+            ),
+            None,
+        )
+        if convergence is None:
+            raise RuntimeError(
+                "organization-scale root integrator is not downstream of every first-level "
+                "production branch; sequence the organization so its outputs actually converge"
+            )
+        if not any(reaches(convergence.key, verifier.key) for verifier in verifiers):
+            raise RuntimeError(
+                "organization-scale root verifier is not downstream of the convergence owner; "
+                "make independent acceptance a real post-integration release gate"
             )
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
@@ -346,6 +467,7 @@ class CodexPlanner(Planner):
                 idle_warning=self.s.terminal_idle_warning_seconds,
                 idle_reap=self.s.terminal_idle_reap_seconds,
                 session_callback=remember_session,
+                known_session_id=session_id,
                 session_marker=str(node_id),
                 excluded_session_ids={forbidden_session_id}
                 if forbidden_session_id
@@ -585,6 +707,7 @@ class AgentPlanner(Planner):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=agent.session_id,
                     session_probe=probe_session if agent.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
                     harness_name=agent.harness.value,
@@ -604,6 +727,7 @@ class AgentPlanner(Planner):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=agent.session_id,
                     session_marker=str(ctx.node.id),
                     harness_name=agent.harness.value,
                     initial_input=native_prompt,

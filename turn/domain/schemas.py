@@ -683,7 +683,14 @@ class NodeSpec(BaseModel):
     # A plan can request a built-in agent specialization while inheriting the
     # parent's harness/model configuration. An explicit ``agent`` remains the
     # escape hatch for a fully configured agent.
-    agent_type: Optional[AgentType] = None
+    agent_type: Optional[AgentType] = Field(
+        default=None,
+        description=(
+            "Turn role for this node. A planner role is a planning boundary, not "
+            "a leaf worker: Turn normalizes agent_type=planner to plan=true and "
+            "runs the planner operation for that node."
+        ),
+    )
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
@@ -701,11 +708,50 @@ class NodeSpec(BaseModel):
     # follow one node (fan-out), and one node may follow multiple nodes
     # (fan-in), but sequence never crosses a composition boundary.
     follows: list[str] = Field(default_factory=list)  # prior sequence keys
-    # When True (or executor == "planner") the created node is itself a
-    # sub-planner: the runner will decompose it again on its next turn instead
-    # of executing it as a leaf. This is intentionally available for very
-    # large or uncertain scopes, but should be rare for one user request.
-    plan: bool = False
+    # A planner node is a recursive organization boundary. ``agent_type`` is
+    # the semantic source of truth; ``plan`` remains as a concise wire-level
+    # declaration and for compatibility with existing graph files.
+    plan: bool = Field(
+        default=False,
+        description=(
+            "Create a recursive planning boundary. plan=true, executor=planner, "
+            "or agent_type=planner are equivalent planner declarations."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def normalize_planning_boundary(self) -> "NodeSpec":
+        """Make planner role and planner execution semantics impossible to split.
+
+        Historically a plan could declare ``agent_type=planner`` while leaving
+        ``plan`` false. The created node then *looked* like a planner and carried
+        planner capabilities, but the runner executed it as an ordinary worker
+        because persistence uses the special ``executor=planner`` operation
+        sentinel. That is especially destructive for recursive organizations:
+        a department planner silently becomes one generalist leaf.
+
+        Normalize every planner-shaped declaration at the contract boundary so
+        the role shown in the graph always matches the operation the runner will
+        execute. Contradictory explicit roles fail instead of producing a hybrid
+        node whose behavior depends on mutation-order details.
+        """
+        explicit_agent_type = self.agent.type_id if self.agent is not None else None
+        planning_requested = (
+            self.plan
+            or self.executor == "planner"
+            or self.agent_type is AgentType.PLANNER
+            or explicit_agent_type is AgentType.PLANNER
+        )
+        if not planning_requested:
+            return self
+        if self.agent_type is not None and self.agent_type is not AgentType.PLANNER:
+            raise ValueError("planning boundaries must use agent_type=planner")
+        if explicit_agent_type is not None and explicit_agent_type is not AgentType.PLANNER:
+            raise ValueError("planning boundaries must use a planner Agent")
+        self.plan = True
+        if self.agent is None:
+            self.agent_type = AgentType.PLANNER
+        return self
 
 
 class EdgeSpec(BaseModel):

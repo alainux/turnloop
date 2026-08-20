@@ -53,6 +53,21 @@ def _wait_persisted_complete(state_file, seconds: float = 30) -> None:
     raise AssertionError(f"project {project_id} did not complete: {statuses}")
 
 
+def _wait_for_graph(page, project_id: str, predicate, seconds: float = 30):
+    """Poll the API response itself, rather than treating a Promise as truthy."""
+    deadline = time.time() + seconds
+    graph = None
+    while time.time() < deadline:
+        graph = page.evaluate(
+            "async id => (await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json())",
+            project_id,
+        )
+        if predicate(graph):
+            return graph
+        page.wait_for_timeout(100)
+    raise AssertionError(f"project {project_id} never reached the expected graph state: {graph}")
+
+
 def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_path):
     if shutil.which("herdr") is None:
         pytest.skip("Herdr is required for process-harness acceptance runs")
@@ -109,12 +124,9 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                         objective,
                     )
                     project_ids.append(project_id)
-                    page.wait_for_function(
-                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json(); return g.nodes.length === 5; }",
-                        arg=project_id,
-                        timeout=30000,
+                    graph = _wait_for_graph(
+                        page, project_id, lambda value: len(value["nodes"]) == 5,
                     )
-                    graph = page.evaluate("async id => (await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json())", project_id)
                     state_files.append(Path(graph["nodes"][0]["repo_path"]) / ".turn" / "state.json")
                     assert len(graph["nodes"]) == 5
                     assert sum(node["ui_state"] == "waiting_input" for node in graph["nodes"]) == 0
@@ -124,10 +136,10 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                         for node in graph["nodes"] if node["parent_id"]
                     )
 
-                    page.wait_for_function(
-                        "async id => { const g = await (await fetch(`/api/projects/${id}/graph?fresh=${Date.now()}`, {cache: 'no-store'})).json(); return g.nodes.every(n => n.status === 'COMPLETE'); }",
-                        arg=project_id,
-                        timeout=30000,
+                    _wait_for_graph(
+                        page,
+                        project_id,
+                        lambda value: all(node["status"] == "COMPLETE" for node in value["nodes"]),
                     )
                     _wait_persisted_complete(state_files[-1])
                     page.locator(f'[data-node-id="{project_id}"] .node-main').click()

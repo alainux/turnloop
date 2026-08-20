@@ -487,11 +487,77 @@ async def test_rejection_relaunches_with_retained_session_and_artifacts(tmp_path
         assert refreshed.agent.session_id == "node-owned-session"
         artifacts = await store.get_artifacts(work.id)
         assert [artifact.name for artifact in artifacts] == ["existing-result"]
+
+        # A retained correction is an active provider turn.  Auto must leave
+        # the scheduler-owned frontier alone until that conversation submits
+        # its handoff, otherwise it launches a second `codex resume` into the
+        # same durable pane.
+        await store.set_status(work.id, NodeStatus.RUNNABLE)
+        await runner._schedule_project(root.id)
+        assert work.id not in runner._running
     finally:
         await runner.terminal.stop(work.id)
         reconnect = runner._reconnect_tasks.get(work.id)
         if reconnect is not None:
             await asyncio.gather(reconnect, return_exceptions=True)
+    await store.dispose()
+
+
+async def test_corrected_handoff_releases_reconnect_for_later_rejections(tmp_path):
+    """A retained follow-up must not block the next verifier rejection."""
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project("Build a verified product", repo_path=str(tmp_path))
+    work, verifier = await store.apply_plan(
+        root,
+        PlanResult(nodes=[
+            NodeSpec(key="work", objective="Build product", executor="deterministic"),
+            NodeSpec(
+                key="check", objective="Verify product", executor="deterministic",
+                agent_type=AgentType.VERIFIER, follows=["work"],
+            ),
+        ]),
+    )
+    work.agent = AgentConfig(harness=HarnessKind.CODEX, session_id="retained-session")
+    await store._save_node(work)
+    transport = ActiveHerdrConversation()
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=transport,
+    )
+    rejection = VerificationResult(
+        decision=VerificationDecision.REJECT,
+        summary="Fix the entry point",
+        required_changes=["Repair the launch path"],
+    )
+
+    await runner._notify_rejection(work, verifier, rejection)
+    await asyncio.wait_for(transport.injected.wait(), timeout=1)
+    first_follow_up = runner._reconnect_tasks[work.id]
+
+    await runner._apply_result_revision(
+        work.id,
+        root.id,
+        WorkerResult(outcome=Outcome.COMPLETE, summary="corrected submission"),
+    )
+
+    assert first_follow_up.done()
+    assert work.id not in runner._reconnect_tasks
+    # The persistent pane is retained even though the control task is gone.
+    assert transport.snapshot(work.id)["active"] is True
+
+    transport.injected.clear()
+    await runner._notify_rejection(work, verifier, rejection)
+    await asyncio.wait_for(transport.injected.wait(), timeout=1)
+    assert len(transport.commands) == 2
+
+    await runner.terminal.stop(work.id)
+    reconnect = runner._reconnect_tasks.get(work.id)
+    if reconnect is not None:
+        await asyncio.gather(reconnect, return_exceptions=True)
     await store.dispose()
 
 

@@ -22,6 +22,10 @@ from turn.workers.capabilities import harness_capability_adapter
 from turn.workers.terminal import TerminalResult
 
 
+class _TerminalAttachmentClosedBeforeInjection(RuntimeError):
+    """The transient controller ended while its durable pane still existed."""
+
+
 def format_verification_result(result: VerificationResult) -> str:
     """Render the exact submitted verification payload for human inspection.
 
@@ -276,6 +280,7 @@ async def run_until_result(
     idle_warning: float | None = None,
     idle_reap: float | None = None,
     session_callback=None,
+    known_session_id: str | None = None,
     session_probe: Callable[[], Awaitable[str | None]] | None = None,
     session_marker: str | None = None,
     excluded_session_ids: set[str] | None = None,
@@ -386,10 +391,10 @@ async def run_until_result(
                 try:
                     await task
                 except Exception as error:
-                    raise RuntimeError(
+                    raise _TerminalAttachmentClosedBeforeInjection(
                         "harness terminal closed before Turn could inject its command"
                     ) from error
-                raise RuntimeError(
+                raise _TerminalAttachmentClosedBeforeInjection(
                     "harness terminal closed before Turn could inject its command"
                 )
             try:
@@ -531,16 +536,19 @@ async def run_until_result(
         if snapshot_reader is not None and snapshot_reader(node_id).get("active"):
             await transport.stop(node_id)
 
-    started_at = time.time()
-    process_completion_deadline: float | None = None
-    post_submit_observation_deadline: float | None = None
-    handoff_stop_requested = False
-    try:
-        if getattr(transport, "supports_inject", False):
-            # A provider-native command carries its initial prompt. Reset any
-            # durable Herdr pane first so shell setup can never be interpreted
-            # by an old foreground harness as a new user message.
-            await reset_injected_session()
+    async def open_injected_attachment() -> None:
+        """Attach to a durable pane before injecting exactly one command.
+
+        Herdr's control client is deliberately disposable: its process can
+        exit during a workspace/takeover handoff even though the pane and its
+        shell remain live.  Retrying one *pre-injection* attachment is safe --
+        no provider command has reached the pane yet -- and prevents that
+        transient control disconnect from turning a fresh UI run into a false
+        harness failure.  A missing pane, a second disconnect, or any later
+        failure still remains visible to the scheduler.
+        """
+        nonlocal task
+        for attempt in range(2):
             task = asyncio.create_task(
                 transport.ensure_session(
                     node_id,
@@ -553,10 +561,38 @@ async def run_until_result(
             )
             try:
                 await asyncio.wait_for(wait_for_attachment(), timeout=10.0)
+                return
             except asyncio.TimeoutError as error:
                 raise RuntimeError(
                     "harness pane did not become ready before Turn launched the command"
                 ) from error
+            except _TerminalAttachmentClosedBeforeInjection:
+                persistent = getattr(transport, "has_persistent_session", None)
+                pane_is_live = False
+                if persistent is not None:
+                    try:
+                        pane_is_live = bool(await persistent(node_id))
+                    except Exception:
+                        pane_is_live = False
+                if attempt or not pane_is_live:
+                    raise
+                await asyncio.gather(task, return_exceptions=True)
+                task = None
+                # Let Herdr finish releasing its just-ended control client
+                # before asking it to take over the same durable pane again.
+                await asyncio.sleep(0.05)
+
+    started_at = time.time()
+    process_completion_deadline: float | None = None
+    post_submit_observation_deadline: float | None = None
+    handoff_stop_requested = False
+    try:
+        if getattr(transport, "supports_inject", False):
+            # A provider-native command carries its initial prompt. Reset any
+            # durable Herdr pane first so shell setup can never be interpreted
+            # by an old foreground harness as a new user message.
+            await reset_injected_session()
+            await open_injected_attachment()
             injected_command = " ".join(shlex.quote(part) for part in command)
             if injected_markers:
                 assert process_start_path is not None
@@ -680,7 +716,12 @@ async def run_until_result(
     except BaseException:
         await abort_owned_attachment()
         raise
-    discovered_session: str | None = None
+    # A resume command already has the provider's canonical conversation id.
+    # Do not rediscover it from a shared cwd: concurrently active native
+    # workers can touch each other's Codex rollout files, and a mistaken
+    # replacement makes the next automatic continuation resume the wrong
+    # conversation. Discovery remains only for a genuinely fresh launch.
+    discovered_session: str | None = known_session_id
     last_probe = 0.0
 
     def process_exit_code() -> int | None:

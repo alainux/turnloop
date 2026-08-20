@@ -173,6 +173,10 @@ class Runner:
             emit=self._emit,
             finalize=self._maybe_finalize,
             wake=self.wake,
+            is_externally_busy=lambda node_id: bool(
+                (task := self._reconnect_tasks.get(node_id))
+                and not task.done()
+            ),
         )
         self.node_executor = NodeExecutor(
             store=self.store,
@@ -643,6 +647,7 @@ class Runner:
     async def _apply_result_revision(
         self, node_id: uuid.UUID, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
+        await self._settle_reconnect_after_handoff(node_id)
         node = await self.store.get_node(node_id)
         if node is None:
             return
@@ -658,6 +663,7 @@ class Runner:
     async def _apply_verification_revision(
         self, node_id: uuid.UUID, project_id: uuid.UUID, decision: VerificationResult
     ) -> None:
+        await self._settle_reconnect_after_handoff(node_id)
         node = await self.store.get_node(node_id)
         if node is None:
             return
@@ -674,6 +680,25 @@ class Runner:
             project_id,
             WorkerResult(outcome=Outcome.COMPLETE, verification=decision),
         )
+
+    async def _settle_reconnect_after_handoff(self, node_id: uuid.UUID) -> None:
+        """Release a completed rejection follow-up before accepting its handoff.
+
+        A native rejection follow-up deliberately retains its Herdr pane so a
+        later correction can resume the provider session.  Its reconnect task
+        waits on that durable pane, though, and therefore stays alive after the
+        agent has written a result or verification handoff.  Leaving it in the
+        task map suppresses the next rejection prompt and makes the UI show a
+        node as preparing without an actual new harness launch.
+
+        Cancelling the control task only detaches Turn's awaiter; the durable
+        provider pane and its session remain available for the next reconnect.
+        """
+        task = self._reconnect_tasks.get(node_id)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _remove_descendants_before_replan(
         self,
@@ -779,6 +804,12 @@ class Runner:
             await self._finish_provider_terminal(node.id, project_id)
             return []
 
+        capability_launch = (
+            self._prepare_capabilities(node.agent, ctx.repo_path, node.id)
+            if node.agent and node.agent.harness in REAL_HARNESSES
+            else CapabilityLaunch()
+        )
+
         await self._emit("harness.launch", project_id, {
             "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
             "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
@@ -786,6 +817,7 @@ class Runner:
             "timeout_seconds": ctx.timeout_seconds, "purpose": "plan", "repo_path": ctx.repo_path,
             "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
             "role": "setup" if node.id == project_id else (node.agent.type_id.value if node.agent else None),
+            "capability_skills": list(capability_launch.skill_names),
         })
 
         async def remember_live_session(session_id: str) -> None:
@@ -807,6 +839,17 @@ class Runner:
             if planner is None:
                 raise RuntimeError("no planner registered")
             plan: PlanResult = await planner.plan(ctx)
+            current = await self.store.get_node(node.id)
+            if current is not None and current.status is NodeStatus.CANCELLED:
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    outcome=Outcome.FAIL,
+                    summary="run cancelled",
+                    error="run cancelled by user",
+                    retry_recommended=False,
+                )
+                return []
             await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
             await self._emit_trigger_event(
                 "agent.plan.submitted",
@@ -862,6 +905,17 @@ class Runner:
             )
             raise
         except Exception as error:
+            current = await self.store.get_node(node.id)
+            if current is not None and current.status is NodeStatus.CANCELLED:
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    outcome=Outcome.FAIL,
+                    summary="run cancelled",
+                    error="run cancelled by user",
+                    retry_recommended=False,
+                )
+                return []
             await self._emit("application.error", project_id, {"run_id": str(run.id), "node_id": str(node.id), "phase": "planner", "error": str(error)})
             await self.store.update_run(
                 run.id,
@@ -941,6 +995,12 @@ class Runner:
             await self._finish_provider_terminal(node.id, project_id)
             return
 
+        capability_launch = (
+            self._prepare_capabilities(node.agent, ctx.repo_path, node.id)
+            if node.agent and node.agent.harness in REAL_HARNESSES
+            else CapabilityLaunch()
+        )
+
         await self._emit("harness.launch", project_id, {
             "run_id": str(run.id), "node_id": str(node.id), "harness": node.agent.harness.value if node.agent else node.executor,
             "model": node.agent.model if node.agent else None, "reasoning": node.agent.reasoning.value if node.agent else None,
@@ -948,6 +1008,7 @@ class Runner:
             "timeout_seconds": ctx.timeout_seconds, "purpose": "execute", "repo_path": ctx.repo_path,
             "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
             "role": "setup" if node.id == project_id else (node.agent.type_id.value if node.agent else None),
+            "capability_skills": list(capability_launch.skill_names),
         })
 
         async def remember_live_session(session_id: str) -> None:
@@ -1000,6 +1061,18 @@ class Runner:
             await self._finish_provider_terminal(node.id, project_id)
             raise
         except Exception as e:
+            current = await self.store.get_node(node.id)
+            if current is not None and current.status is NodeStatus.CANCELLED:
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    outcome=Outcome.FAIL,
+                    summary="run cancelled",
+                    error="run cancelled by user",
+                    retry_recommended=False,
+                )
+                await self._finish_provider_terminal(node.id, project_id)
+                return
             logger.exception("worker failed for node %s", node.id)
             await self._emit("application.error", project_id, {"run_id": str(run.id), "node_id": str(node.id), "phase": "worker", "error": str(e)})
             await self.store.update_run(
@@ -1019,6 +1092,21 @@ class Runner:
     async def _handle_outcome(
         self, node: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
+        current = await self.store.get_node(node.id)
+        if current is not None and current.status is NodeStatus.CANCELLED:
+            # Stop is a terminal user decision. A provider can return a result
+            # while its terminal is shutting down, but it must not mutate the
+            # graph, artifacts, or final run outcome after that decision.
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="run cancelled",
+                error="run cancelled by user",
+                retry_recommended=False,
+            )
+            await self._emit("node.updated", project_id, _dump(current))
+            return
         await self._persist_result_materials(node.id, project_id, result)
         if result.verification is not None:
             await self._handle_verification(node, run, project_id, result)
@@ -1231,7 +1319,8 @@ class Runner:
                 "reviewer_node_id": str(current.id),
                 "decision": decision.decision.value,
             })
-            await self._notify_rejection(target, reviewer, decision)
+            correction = self._rejection_message(reviewer, decision)
+            await self._notify_rejection(target, reviewer, decision, message=correction)
             # A reviewer may be the active member of a manual Step barrier.
             # Rejection moves that reviewer back behind the corrected target,
             # so the old barrier can never settle. The next Step must be
@@ -1257,13 +1346,16 @@ class Runner:
             for item in invalidated:
                 if item.id == target.id or item.id == reviewer.id or item.status != NodeStatus.RUNNING:
                     item.status = NodeStatus.RUNNABLE if item.id == target.id else NodeStatus.PENDING
-                    item.agent_state = None
-                    item.agent_message = None
                     # Keep the target's provider session. The rejection was
                     # injected into that active conversation, so the next
                     # attempt must continue with the same context rather than
                     # starting a new conversation from zero.
-                    updated = await self.store.reset_node_after_rejection(item.id, item.status)
+                    updated = await self.store.reset_node_after_rejection(
+                        item.id,
+                        item.status,
+                        agent_state="correction_requested" if item.id == target.id else None,
+                        agent_message=correction if item.id == target.id else None,
+                    )
                     await self._emit("node.updated", project_id, _dump(updated or item))
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(reviewer.id)))
         await self._ensure_handoff_watcher(
@@ -1273,12 +1365,10 @@ class Runner:
         )
         self.wake()
 
-    async def _notify_rejection(self, target: Node, reviewer: Node, decision) -> None:
-        """Deliver feedback to the selected node's scoped conversation."""
-        repo = await self._project_repo(target.project_id)
-        if not repo:
-            return
-        lines = [
+    @staticmethod
+    def _rejection_message(reviewer: Node, decision) -> str:
+        """Render a correction envelope for retained and fresh resumes."""
+        return "\n".join([
             "TURN VERIFICATION REJECTED",
             f"Reviewer: {reviewer.objective}",
             f"Summary: {decision.summary}",
@@ -1286,8 +1376,21 @@ class Runner:
             "Required changes:",
             *[f"- {item}" for item in decision.required_changes],
             "Continue the responsible node through Turn after addressing these findings; the project execution mode controls when the refinement runs.",
-        ]
-        message = "\n".join(lines)
+        ])
+
+    async def _notify_rejection(
+        self,
+        target: Node,
+        reviewer: Node,
+        decision,
+        *,
+        message: str | None = None,
+    ) -> None:
+        """Deliver feedback to the selected node's scoped conversation."""
+        repo = await self._project_repo(target.project_id)
+        if not repo:
+            return
+        message = message or self._rejection_message(reviewer, decision)
         # The process-level mock has no durable shell pane when tests inject
         # a LocalPtyTransport, but its provider session is still meaningful:
         # launch a fresh mock process with the retained session id so the
@@ -1751,11 +1854,10 @@ class Runner:
             # A follow-up runs in a separate reconnect task, but Stop has the
             # same lifecycle meaning as it does for a normal worker: terminate
             # the provider and make the next user action an explicit fresh run.
+            await self._mark_cancelled(node)
             await self.terminal.stop(node_id)
             reconnect.cancel()
             await asyncio.gather(reconnect, return_exceptions=True)
-            await self.store.set_status(node_id, NodeStatus.CANCELLED)
-            await self._emit("node.updated", node.project_id, _dump(await self.store.get_node(node_id)))
             self.wake()
             return
         task = self._running.get(node_id)
@@ -1763,11 +1865,8 @@ class Runner:
             # Stop the provider before cancelling Turn's awaiter. This makes
             # Stop effective even when the task is inside a native harness
             # call rather than inside the runner's Python bookkeeping.
+            await self._mark_cancelled(node)
             await self.terminal.stop(node_id)
-            await self.store.set_status(node_id, NodeStatus.CANCELLED)
-            await self._emit(
-                "node.updated", node.project_id, _dump(await self.store.get_node(node_id))
-            )
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             current = await self.store.get_node(node_id)
@@ -1778,8 +1877,7 @@ class Runner:
                 )
         else:
             await self.terminal.stop(node_id)
-            await self.store.set_status(node_id, NodeStatus.CANCELLED)
-            await self._emit("node.updated", node.project_id, _dump(node))
+            await self._mark_cancelled(node)
         self.wake()
 
     async def branch_action(self, node_id: uuid.UUID, action: str) -> None:
@@ -2018,7 +2116,13 @@ class Runner:
         return await self.store.get_node(node_id)
 
     async def _mark_failed(self, node: Node, error: str) -> None:
-        await self.store.set_status(node.id, NodeStatus.FAILED)
+        changed = await self.store.set_status_if_current(
+            node.id,
+            NodeStatus.FAILED,
+            tuple(status for status in NodeStatus if status is not NodeStatus.CANCELLED),
+        )
+        if changed is None:
+            return
         n = await self.store.get_node(node.id)
         if n is not None:
             await self._emit("node.updated", n.project_id, _dump(n))

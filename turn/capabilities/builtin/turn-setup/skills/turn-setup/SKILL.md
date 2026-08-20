@@ -1,6 +1,6 @@
 ---
 name: turn-setup
-description: Interpret a user request and set up the smallest complete Turn workgraph that preserves its scope.
+description: Interpret a user request and set up a right-sized complete Turn organization that preserves its scope.
 metadata:
   opencode/slash: "true"
 ---
@@ -8,12 +8,12 @@ metadata:
 # Turn setup skill
 
 Use this skill only for the initial planner at the project root. Set up the
-board by interpreting the user's actual request and choosing the minimum
-  complete set of agents, capability plugins, sequence stages, and ownership boundaries that
-preserves the requested outcome and scale. Do not invent a venture, software
-product, or organization when the request does not state one. Explicit scope
-and scale words are binding. This skill must not be inherited by nested
-planners.
+board by interpreting the user's actual request and choosing the right-sized
+complete set of planning boundaries, agents, capability plugins, sequence
+stages, and ownership boundaries that preserves the requested outcome and
+scale. Optimize for truthful ownership and finished delivery before optimizing
+for node count. Explicit scope and scale words are binding. This skill must not
+be inherited by nested planners.
 
 ## Interpret before structuring
 
@@ -21,6 +21,48 @@ planners.
   delivery form, quality bar, and explicit scope and scale words before
   structuring work. Explicit scope outranks the default preference for a
   smaller plan.
+- A request to build a software product, experience, or system in ordinary
+  language is a request for a complete usable result unless the user explicitly
+  limits it to an MVP, demo, prototype, experiment, or similar slice. Do not
+  use the absence of a detailed screen list, architecture, or team chart as a
+  reason to produce a single-page POC or hand every discipline to one executor.
+- Infer the release promise and organize the material disciplines needed to
+  deliver it. Different craft, source boundary, acceptance evidence, or
+  independently executable work is a real ownership boundary. Product/design,
+  domain/platform engineering, content/data, presentation, integration, QA,
+  release, and operations are examples—not a mandatory checklist. Use the
+  product's actual disciplines and converge them into one usable result.
+- Use recursive organization when a direct child is itself too broad for one
+  accountable worker. A department is not "one task" merely because the root
+  planner can name it in one sentence. If a boundary contains multiple
+  independently verifiable contracts, multiple crafts, or a substantial
+  production backlog, make that boundary a planner node and stop there. Its
+  planner will create the department's own executors, integrators, and QA. The
+  root should therefore look like an executive organization for large work,
+  not a flat checklist of oversized executor assignments.
+- For medium and larger products, establish a right-sized release lifecycle
+  before choosing individual work nodes: discovery and product definition,
+  material technical-risk reduction, a vertical-slice review, independent
+  feature-production lanes, recurring integration, QA/polish, and release
+  readiness when each is justified. This is how the root planner builds an
+  organization instead of jumping from a vague request to one implementation
+  node. It is not a fixed ceremony: record why any normally material stage is
+  omitted or combined, and never use that omission to deliver a POC in place
+  of the requested release.
+- If an omitted decision would materially change the audience, platform,
+  interaction model, visual direction, delivery target, business/safety
+  constraints, or success measure, create a short planner clarification
+  boundary with one to three precise `required_inputs`; do not disguise the
+  question as an implementation task. It must say what decision is needed,
+  give useful options or a recommended default, and name the downstream
+  boundaries it unlocks. Continue with documented, reversible defaults for
+  non-consequential details.
+- Interpret local-only/offline/self-contained as a runtime and infrastructure
+  boundary, not a ban on normal packages, build tooling, maintained libraries,
+  or bundled local assets. Unless the user says otherwise, exclude accounts,
+  hosted databases, third-party runtime services, remote APIs, and required
+  runtime network access; use conventional local dependencies rather than
+  rebuilding commodity subsystems from scratch.
 - Choose the shape that fits: one focused worker, a lean MVP or demo, a
   book-writing workflow, a routine automation, a broad product or system, or
   another domain-specific workflow.
@@ -31,7 +73,9 @@ planners.
   broad even when the request also uses a narrow word such as "app" or "tool".
   Do not collapse that scope into a single research, design, or implementation
   worker. Use broad first-level ownership and nested planners for domains that
-  need their own evolving subtree; research is only a supporting domain.
+  need their own evolving subtree; research is only a supporting domain. A
+  flat graph of department-named executors is still under-decomposed if those
+  departments contain multiple material contracts.
 - A broad product or system may need research, design, engineering,
   verification, integration, launch or adoption, and operations stages, but
   add only stages the request actually justifies. When organization-scale
@@ -57,8 +101,8 @@ disciplines, delivery surface, and verification burden:
 | Scale | Typical request | Initial shape |
 | --- | --- | --- |
 | Small | one focused command, page, comparison, chapter, or narrow automation | one executor when one owner is sufficient; add a verifier only when the quality bar needs an independent check |
-| Medium | one complete app, landing site, micro-SaaS, book, store, or focused game | concrete domain lanes with clear handoffs, cross-cutting QA, and one integration/ship convergence |
-| Large | a platform, app factory, enterprise, multi-product system, multiplatform product, robotics program, physical product line, or full-scale game | department-shaped first-level ownership, nested planners where a domain needs its own decomposition, shared architecture/contracts, integration, release, operations, and final verification |
+| Medium | one complete app, landing site, micro-SaaS, book, store, or focused game | a delivery organization with real domain lanes; use a nested planner for any lane that itself contains multiple contracts, then converge through integration and independent QA |
+| Large | a platform, app factory, enterprise, multi-product system, multiplatform product, robotics program, physical product line, or full-scale game | department-shaped first-level planner ownership, nested organizations where departments need further decomposition, shared architecture/contracts, integration, release, operations, and final verification |
 
 This is a judgment gate, not a node-count quota. A request for an MVP, POC,
 prototype, demo, spike, or deliberately limited slice overrides the default
@@ -67,11 +111,12 @@ request for an organization, multiple teams/products, platform, ecosystem, or
 enterprise is broad even if it contains a narrow noun such as “app” or “tool”.
 Never collapse a broad request into research plus one implementation node.
 
-Before submitting, audit the setup against three questions: does the graph
+Before submitting, audit the setup against four questions: does the graph
 cover the user's actual deliverable and user journey; does every meaningful
-discipline have an owner and a verifiable handoff; and does every branch
-converge to one runnable, user-facing result? If any answer is no, revise the
-setup or make the missing uncertainty explicit through a nested planner.
+discipline have an owner and a verifiable handoff; is every direct executor
+actually leaf-sized rather than a department disguised as one task; and does
+every branch converge to one runnable, user-facing result? If any answer is no,
+revise the setup or make the broad boundary a nested planner.
 
 ## Topology ownership
 

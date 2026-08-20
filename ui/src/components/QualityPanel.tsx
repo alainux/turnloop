@@ -110,8 +110,8 @@ export function QualityPanel({
       <div className="quality-content">
       {!metrics ? <div className="logs-empty">No behavior evidence has been recorded yet.</div> : <>
         <div className="quality-trends">
-          <Trend label="Docs before action" value={count(metrics, "docs_before_action_successes", "docs_before_action_runs")} />
-          <Trend label="Skills" value={compact(metrics.skills_accessed)} />
+          <Trend label="Docs before material action" value={count(metrics, "docs_before_action_successes", "docs_before_action_runs")} />
+          <Trend label="Skills loaded / observed" value={`${compact(metrics.skills_loaded)} / ${compact(metrics.skills_accessed)}`} />
           <Trend label="Tool / MCP / web" value={`${compact(toolCalls(metrics))} / ${compact(metrics.mcp_calls)} / ${compact(metrics.web_searches)}`} />
           <Trend label="Verify after change" value={count(metrics, "verification_after_change_successes", "verification_after_change_runs")} />
           <Trend label="Errors / retries / recovery" value={`${compact(metrics.errors)} / ${compact(metrics.retries)} / ${compact(metrics.recovery_actions)}`} />

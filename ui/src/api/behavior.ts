@@ -20,6 +20,7 @@ export interface BehaviorMetrics {
   files_read: number;
   files_written: number;
   docs_accessed: number;
+  skills_loaded: number;
   skills_accessed: number;
   mcp_calls: number;
   web_searches: number;

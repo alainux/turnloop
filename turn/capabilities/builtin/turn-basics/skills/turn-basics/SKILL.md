@@ -73,7 +73,11 @@ TURN_PAYLOAD
 ```
 
 Use `EXPAND` only when the node genuinely needs a child plan, `BLOCK` only for
-an external human gate, and `FAIL` for an unrecoverable execution failure.
+an external human gate, and `FAIL` for an unrecoverable execution failure. For
+an executor that discovers it is not leaf-fit, the safe adaptive form is one
+nested planner child (`agent_type: "planner"`, `plan: true`); that planner then
+authors the real descendant topology. Do not use `EXPAND` to smuggle a
+hand-authored executor subgraph around the planning boundary.
 Artifacts are small repo-relative files or directories created by the node;
 do not list every changed file.
 
@@ -96,7 +100,10 @@ objective is the graph/card label; put detailed instructions in
 Graph construction is a planner concern. Planners must use `$turn-planning` for
 topology, ownership, and source-file handoffs; executors, integrators, and
 verifiers inspect the graph but do not author or revise it unless they are
-explicitly assigned a planning boundary.
+explicitly assigned a planning boundary. The sole adaptive exception is the
+one-child planner escalation above: it promotes an oversized leaf into a new
+planning boundary without letting the executor decide that boundary's internal
+organization.
 
 ## Triggers and events
 

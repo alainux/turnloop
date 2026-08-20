@@ -40,6 +40,7 @@ def _expanded_config(component: MCPComponent, package: CapabilityPlugin, data_ro
 
 @dataclass(frozen=True)
 class CapabilityLaunch:
+    skill_names: tuple[str, ...] = ()
     skill_paths: tuple[str, ...] = ()
     codex_overrides: tuple[str, ...] = ()
     claude_config: str | None = None
@@ -154,6 +155,7 @@ class CapabilityHarnessAdapter:
         root = Path(project_root).expanduser().resolve()
         data_root = root / ".turn" / "capability-data"
         skills = tuple(str(skill.path) for package in packages for skill in package.skills)
+        skill_names = tuple(skill.name for package in packages for skill in package.skills)
         configs = [
             (package, component.name, _expanded_config(component, package, data_root))
             for package in packages
@@ -163,23 +165,38 @@ class CapabilityHarnessAdapter:
         if len(names) != len(set(names)):
             raise ValueError("capability MCP server names must be unique for one launch")
         if self.harness is HarnessKind.CODEX:
-            return CapabilityLaunch(codex_overrides=tuple(self._codex_overrides(configs)))
+            return CapabilityLaunch(
+                skill_names=skill_names,
+                codex_overrides=tuple(self._codex_overrides(configs)),
+            )
         if self.harness is HarnessKind.CLAUDE:
             path = root / ".turn" / "interactive" / f"{node_id}.capabilities.mcp.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"mcpServers": {
                 name: self._claude_server(config) for _, name, config in configs
             }}, indent=2) + "\n", encoding="utf-8")
-            return CapabilityLaunch(claude_config=str(path)) if configs else CapabilityLaunch()
+            return (
+                CapabilityLaunch(skill_names=skill_names, claude_config=str(path))
+                if configs
+                else CapabilityLaunch(skill_names=skill_names)
+            )
         if self.harness is HarnessKind.OPENCODE:
             payload = {"mcp": {
                 name: self._opencode_server(config) for _, name, config in configs
             }}
-            return CapabilityLaunch(opencode_config=json.dumps(payload)) if configs else CapabilityLaunch()
+            return (
+                CapabilityLaunch(skill_names=skill_names, opencode_config=json.dumps(payload))
+                if configs
+                else CapabilityLaunch(skill_names=skill_names)
+            )
         if self.harness is HarnessKind.PI:
             path = root / ".pi" / "mcp.json"
-            return CapabilityLaunch(skill_paths=skills, pi_mcp_config=str(path) if configs else None)
-        return CapabilityLaunch(skill_paths=skills)
+            return CapabilityLaunch(
+                skill_names=skill_names,
+                skill_paths=skills,
+                pi_mcp_config=str(path) if configs else None,
+            )
+        return CapabilityLaunch(skill_names=skill_names, skill_paths=skills)
 
     def verify(self, package: CapabilityPlugin, project_root: str | Path) -> CapabilityVerification:
         root = Path(project_root).expanduser().resolve()

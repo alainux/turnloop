@@ -136,6 +136,138 @@ def test_harness_adapters_normalize_structured_events_without_provider_names_in_
     assert HarnessEventKind.FILE_READ in {event.kind for event in opencode}
 
 
+def test_codex_native_exec_telemetry_preserves_commands_and_document_reads():
+    events = normalize_codex_event({
+        "type": "turn.codex.rollout",
+        "payload": {
+            "type": "function_call",
+            "name": "exec",
+            "arguments": 'const r = await tools.exec_command({cmd:"sed -n \\"1,80p\\" README.md && npm test"});',
+        },
+    })
+    assert any(event.kind is HarnessEventKind.FILE_READ and event.data.get("path") == "README.md" for event in events)
+    command = next(event for event in events if event.kind is HarnessEventKind.COMMAND_START)
+    assert command.data["command"] == 'sed -n "1,80p" README.md && npm test'
+
+
+def test_metrics_keep_late_native_document_and_verification_evidence(tmp_path):
+    project_id = "project-late-native-evidence"
+    node_id = "executor"
+    run_id = "run-late-native-evidence"
+    _record(tmp_path, project_id, "harness.launch", node_id=node_id, seconds=0, data={
+        "run_id": run_id, "attempt": 1, "role": "executor", "harness": "codex",
+        "capability_skills": ["turn-basics", "turn-executing"],
+    })
+    _record(tmp_path, project_id, "harness.return", node_id=node_id, action="run.updated", seconds=1, data={
+        "run_id": run_id, "status": "COMPLETE", "outcome": "COMPLETE", "usage": {},
+    })
+    for event in [
+        HarnessEvent(kind=HarnessEventKind.FILE_READ, node_id=node_id, run_id=run_id, name="README.md", data={"path": "README.md"}),
+        HarnessEvent(kind=HarnessEventKind.FILE_WRITE, node_id=node_id, run_id=run_id, name="app.js", data={"path": "app.js"}),
+        HarnessEvent(kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="npm test", data={"command": "npm test"}),
+    ]:
+        _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=2, data=event.model_dump(mode="json"))
+
+    metrics = BehaviorMetricsStore.read(tmp_path, project_id)
+    run = metrics.by_run[run_id]
+    assert run.skills_loaded == 2
+    assert run.docs_accessed == 1
+    assert run.docs_before_action_runs == run.docs_before_action_successes == 1
+    assert run.verification_after_change_runs == run.verification_after_change_successes == 1
+
+
+def test_latest_post_change_verification_supersedes_an_earlier_edit(tmp_path):
+    project_id = "project-final-check"
+    node_id = "executor"
+    run_id = "run-final-check"
+    _record(tmp_path, project_id, "harness.launch", node_id=node_id, seconds=0, data={
+        "run_id": run_id, "attempt": 1, "role": "executor", "harness": "codex",
+    })
+    _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=1, data=HarnessEvent(
+        kind=HarnessEventKind.FILE_WRITE, node_id=node_id, run_id=run_id, name="app.js", data={"path": "app.js"},
+    ).model_dump(mode="json"))
+    _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=2, data=HarnessEvent(
+        kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="npm test", data={"command": "npm test"},
+    ).model_dump(mode="json"))
+    _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=3, data=HarnessEvent(
+        kind=HarnessEventKind.FILE_WRITE, node_id=node_id, run_id=run_id, name="README.md", data={"path": "README.md"},
+    ).model_dump(mode="json"))
+    _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=4, data=HarnessEvent(
+        kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="npm test", data={"command": "npm test"},
+    ).model_dump(mode="json"))
+    _record(tmp_path, project_id, "harness.return", node_id=node_id, action="run.updated", seconds=5, data={
+        "run_id": run_id, "status": "COMPLETE", "outcome": "COMPLETE", "usage": {},
+    })
+
+    run = BehaviorMetricsStore.read(tmp_path, project_id).by_run[run_id]
+    assert run.verification_after_change_runs == run.verification_after_change_successes == 1
+
+
+def test_setup_graph_or_document_changes_do_not_dilute_delivery_verification(tmp_path):
+    project_id = "project-setup-verification-scope"
+    node_id = "setup"
+    run_id = "run-setup-verification-scope"
+    _record(tmp_path, project_id, "harness.launch", node_id=node_id, seconds=0, data={
+        "run_id": run_id, "attempt": 1, "role": "setup", "harness": "codex",
+    })
+    _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=1, data=HarnessEvent(
+        kind=HarnessEventKind.FILE_WRITE, node_id=node_id, run_id=run_id, name="PROJECT.md",
+        data={"path": "PROJECT.md"},
+    ).model_dump(mode="json"))
+    _record(tmp_path, project_id, "graph.transition", node_id=node_id, action="plan.applied", seconds=2)
+    _record(tmp_path, project_id, "harness.return", node_id=node_id, action="run.updated", seconds=3, data={
+        "run_id": run_id, "status": "COMPLETE", "outcome": "COMPLETE", "usage": {},
+    })
+
+    metrics = BehaviorMetricsStore.read(tmp_path, project_id)
+    assert metrics.project.verification_after_change_runs == 0
+    assert metrics.by_run[run_id].verification_after_change_runs == 0
+
+
+def test_verification_command_detection_ignores_agent_payload_words():
+    from turn.metrics import _is_verification_command
+
+    assert _is_verification_command("curl -sI http://localhost:4173 && npm test")
+    assert not _is_verification_command('turn agent submit --payload "all tests pass"')
+    assert not _is_verification_command('const patch = "*** Begin Patch\\n+test(\\\"not a shell command\\\")"')
+
+
+def test_metrics_migration_enriches_retained_codex_exec_events(tmp_path):
+    project_id = "project-retained-codex-events"
+    node_id = "executor"
+    run_id = "run-retained-codex-events"
+    _record(tmp_path, project_id, "harness.launch", node_id=node_id, seconds=0, data={
+        "run_id": run_id, "attempt": 1, "role": "executor", "harness": "codex",
+    })
+    for event in [
+        HarnessEvent(
+            kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="exec",
+            data={"arguments": 'const r = await tools.exec_command({cmd:"sed -n \\"1,80p\\" README.md"});'},
+        ),
+        HarnessEvent(
+            kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="exec",
+            data={"arguments": 'const patch = "*** Begin Patch"; await tools.apply_patch(patch);'},
+        ),
+        HarnessEvent(
+            kind=HarnessEventKind.COMMAND_START, node_id=node_id, run_id=run_id, name="exec",
+            data={"arguments": 'const r = await tools.exec_command({cmd:"npm test"});'},
+        ),
+    ]:
+        _record(tmp_path, project_id, "harness.event", node_id=node_id, seconds=1, data=event.model_dump(mode="json"))
+    _record(tmp_path, project_id, "harness.return", node_id=node_id, action="run.updated", seconds=2, data={
+        "run_id": run_id, "status": "COMPLETE", "outcome": "COMPLETE", "usage": {},
+    })
+
+    run = BehaviorMetricsStore.read(tmp_path, project_id).by_run[run_id]
+    assert run.skills_loaded == 2
+    assert run.dynamic_usage["skill_loaded:turn-basics"] == 1
+    assert run.dynamic_usage["skill_loaded:turn-executing"] == 1
+    assert run.files_written == 1
+    assert run.docs_accessed == 1
+    assert run.docs_before_action_runs == run.docs_before_action_successes == 1
+    assert run.verification_after_change_runs == run.verification_after_change_successes == 1
+
+
 def test_run_projection_keeps_attempts_separate_and_accepts_future_assessments(tmp_path):
     project_id = "project-runs"
     node_id = "executor"

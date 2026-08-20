@@ -9,6 +9,7 @@ from turn.__main__ import agent_command, parser
 from turn.contracts.dag import parse_plan, validate_subgraph_sources
 from turn.domain.schemas import (
     AgentConfig,
+    AgentType,
     ArtifactKind,
     ArtifactSpec,
     DocumentRef,
@@ -205,6 +206,40 @@ async def test_apply_plan_materializes_nested_diamond_without_flattening(tmp_pat
         for edge in edges
         if edge.type.value == "FOLLOWS"
     )
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_type_planner_materializes_as_a_real_planning_boundary(tmp_path: Path):
+    store = Store(tmp_path / "turn-data", projects_dir=tmp_path / "projects")
+    await store.init()
+    root = await store.create_project(
+        "Create an organization",
+        agent=AgentConfig(harness=HarnessKind.MOCK),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    plan = PlanResult(nodes=[
+        # Deliberately omit executor="planner" and plan=true. The semantic
+        # planner role must be enough to make this an executable planning
+        # boundary rather than a planner-looking generalist leaf.
+        NodeSpec(
+            key="engineering_org",
+            objective="Run the engineering organization",
+            agent_type="planner",
+        ),
+    ])
+
+    assert plan.nodes[0].plan is True
+    assert plan.nodes[0].agent_type is AgentType.PLANNER
+
+    await store.apply_plan(root, plan)
+    nodes, _, _ = await store.get_workgraph(root.id)
+    department = next(
+        node for node in nodes if node.objective == "Run the engineering organization"
+    )
+    assert department.executor == "planner"
+    assert department.agent is not None
+    assert department.agent.type_id is AgentType.PLANNER
     await store.dispose()
 
 

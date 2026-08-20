@@ -1308,21 +1308,81 @@ def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
         nodes=[NodeSpec(key="research", objective="Research the market", executor="codex")]
     )
 
-    with pytest.raises(RuntimeError, match="organization-scale request"):
+    with pytest.raises(RuntimeError, match="flat graph"):
         CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), narrow_plan)
 
-    nested_plan = PlanResult(
+    ceremonial_nested_plan = PlanResult(
         nodes=[
             NodeSpec(
                 key="factory_setup",
                 objective="Plan the app factory",
-                executor="planner",
                 agent_type="planner",
-                plan=True,
             )
         ]
     )
-    CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), nested_plan)
+    with pytest.raises(RuntimeError, match="no first-level integrator"):
+        CodexPlanner._validate_setup_scope(
+            NodeExecutionContext(node=root), ceremonial_nested_plan
+        )
+
+    organization_plan = PlanResult(
+        nodes=[
+            NodeSpec(
+                key="market",
+                objective="Own market intelligence",
+                agent_type="executor",
+            ),
+            NodeSpec(
+                key="product_org",
+                objective="Run the product organization",
+                agent_type="planner",
+                follows=["market"],
+            ),
+            NodeSpec(
+                key="integrate",
+                objective="Integrate the company output",
+                agent_type="integrator",
+                follows=["product_org"],
+            ),
+            NodeSpec(
+                key="verify",
+                objective="Verify the shipped organization",
+                agent_type="verifier",
+                follows=["integrate"],
+            ),
+        ]
+    )
+    CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), organization_plan)
+
+
+def test_root_planner_rejects_a_flat_complete_game_even_with_many_departments():
+    root = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a game",
+        generated_prompt="Make the requested game playable locally.",
+    )
+    flat_plan = PlanResult(
+        nodes=[
+            NodeSpec(key="design", objective="Design the game", agent_type="executor"),
+            NodeSpec(key="engine", objective="Build the engine", agent_type="executor"),
+            NodeSpec(key="content", objective="Create all content", agent_type="executor"),
+            NodeSpec(
+                key="integrate",
+                objective="Integrate the game",
+                agent_type="integrator",
+                follows=["design", "engine", "content"],
+            ),
+            NodeSpec(
+                key="verify",
+                objective="Verify the game",
+                agent_type="verifier",
+                follows=["integrate"],
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="flat graph"):
+        CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), flat_plan)
 
 
 def test_setup_plan_shape_preserves_stage_handoffs():
@@ -1707,6 +1767,59 @@ async def test_cancelling_a_running_node_cancels_task_and_run(tmp_path):
     runs = await store.get_runs(child.id)
     assert cancelled.status == NodeStatus.CANCELLED
     assert runs[-1].status.value == "CANCELLED"
+    await store.dispose()
+
+
+async def test_stop_remains_cancelled_when_provider_returns_during_shutdown(tmp_path):
+    """A result racing with Stop must not restore a cancelled node to complete."""
+
+    class LateCompletionWorker(Worker):
+        name = "late-completion"
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.returned = asyncio.Event()
+
+        async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
+            self.started.set()
+            await self.release.wait()
+            self.returned.set()
+            return WorkerResult(outcome=Outcome.COMPLETE, summary="finished during stop")
+
+    class CompletionOnStopTerminal(MockTerminalTransport):
+        def __init__(self, worker: LateCompletionWorker):
+            super().__init__()
+            self.worker = worker
+
+        async def stop(self, node_id):
+            self.worker.release.set()
+            await asyncio.wait_for(self.worker.returned.wait(), timeout=1)
+            return True
+
+    worker = LateCompletionWorker()
+    _, store, runner = await _runtime(tmp_path, worker)
+    runner.terminal = CompletionOnStopTerminal(worker)
+    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+    child = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="completion races with stop",
+        executor=worker.name,
+        agent=AgentConfig(harness=HarnessKind.MOCK),
+    )
+    child.agent = None
+    await store._save_node(child)
+
+    await runner.run_node(child.id)
+    await asyncio.wait_for(worker.started.wait(), timeout=1)
+    await runner.cancel(child.id)
+
+    cancelled = await store.get_node(child.id)
+    runs = await store.get_runs(child.id)
+    assert cancelled.status == NodeStatus.CANCELLED
+    assert runs[-1].status == RunStatus.CANCELLED
     await store.dispose()
 
 

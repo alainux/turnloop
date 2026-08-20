@@ -875,7 +875,7 @@ async def project_behavior(project_id: str, request: Request):
         raise HTTPException(404, "project not found")
     metrics_path = BehaviorMetricsStore.path(project_path)
     metrics = BehaviorMetricsStore.read(project_path, project_id)
-    if not metrics_path.exists() or metrics.version < 6:
+    if not metrics_path.exists() or metrics.version < 12:
         records = await asyncio.to_thread(
             request.app.state.logs.read, pid, limit=100_000,
         )
@@ -910,7 +910,7 @@ async def behavior_dashboard(
         if path is None:
             continue
         projection = BehaviorMetricsStore.read(path, str(root.id))
-        if not BehaviorMetricsStore.path(path).exists() or projection.version < 6:
+        if not BehaviorMetricsStore.path(path).exists() or projection.version < 12:
             records = await asyncio.to_thread(
                 request.app.state.logs.read, root.id, limit=100_000,
             )

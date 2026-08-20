@@ -64,3 +64,11 @@ console/runtime errors, and whether controls alter the real state. Reject the
 smallest concrete gap with exact evidence and an actionable required change;
 approve only when the predecessor's actual boundary is usable by the real
 entry point, not merely when isolated tests pass.
+
+Select the available browser deliberately. In Codex, inspect the native skill
+catalog first; prefer `$control-in-app-browser` when it has a controllable
+in-app tab, and invoke `$control-chrome` when that surface is unavailable and
+Chrome control is available. The absence of either individual binding is not a
+rejection finding. Reject for a browser limitation only when no available local
+browser can exercise the delivered entry point; otherwise use the available
+surface for the real user journey at desktop and the relevant narrow viewport.

@@ -618,6 +618,7 @@ class CLIHarnessWorker(Worker):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=agent.session_id,
                     session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
                     excluded_session_ids={ctx.forbidden_session_id}
@@ -640,6 +641,7 @@ class CLIHarnessWorker(Worker):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                     session_callback=remember_session,
+                    known_session_id=agent.session_id,
                     session_probe=probe_session if self.harness == HarnessKind.OPENCODE else None,
                     session_marker=str(ctx.node.id),
                     excluded_session_ids={ctx.forbidden_session_id}
