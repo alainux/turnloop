@@ -51,6 +51,21 @@ from turn.workers.interactive import (
     run_until_result,
 )
 from turn.workers.terminal import GenerationStalled, LocalPtyTransport
+from turn.metrics import emit_jsonl_telemetry
+from turn.workers.pi_telemetry import (
+    prepare_interactive_pi_telemetry,
+    with_interactive_pi_telemetry,
+)
+from turn.workers.native_telemetry import (
+    NativeTelemetrySidecar,
+    codex_notify_flags,
+    emit_telemetry_status,
+    prepare_claude_hook_telemetry,
+    prepare_codex_notify_telemetry,
+    schedule_late_sidecar_collection,
+    with_claude_telemetry,
+)
+from turn.workers.opencode_telemetry import OpenCodeSseTelemetry, reserve_loopback_port
 
 class HeuristicPlanner(Planner):
     """Deterministic test-only decomposition — domain-agnostic scaffolding.
@@ -171,6 +186,7 @@ class CodexPlanner(Planner):
             terminal=ctx.terminal, timeout=ctx.timeout_seconds,
             stall_timeout=ctx.stall_timeout_seconds,
             session_callback=ctx.session_callback,
+            telemetry=ctx.telemetry,
             forbidden_session_id=ctx.forbidden_session_id,
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
@@ -230,7 +246,7 @@ class CodexPlanner(Planner):
     async def _call_codex(
         self, prompt: str, cwd: str, *, agent: AgentConfig | None = None,
         stream=None, node_id=None, terminal=None, timeout=None, stall_timeout=None,
-        session_callback=None, project_id=None,
+        session_callback=None, project_id=None, telemetry=None,
         forbidden_session_id: str | None = None,
     ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
@@ -241,11 +257,15 @@ class CodexPlanner(Planner):
         # switch Codex from its native TUI to JSON/exec output.
         native = isinstance(transport, LocalPtyTransport)
         result_path = prepare_result_file(cwd, node_id, "plan")
+        machine_output_path = result_path.with_suffix(".jsonl") if not native else None
         environment = agent_environment(
             cwd, node_id, "plan", result_path, agent, data_dir=self.s.data_dir
         )
         if project_id is not None:
             environment["TURN_PROJECT_ID"] = str(project_id)
+        sidecar = prepare_codex_notify_telemetry(cwd, node_id) if native else None
+        if sidecar is not None:
+            environment.update(sidecar.environment)
         model = agent.model if agent and agent.model else self.s.codex_model
         model_flags = ["-m", model] if model else []
         reasoning = agent.reasoning.value if agent else "default"
@@ -257,6 +277,7 @@ class CodexPlanner(Planner):
             for override in json.loads(environment.get("TURN_AGENT_CODEX_MCP_OVERRIDES", "[]"))
             for item in ("-c", override)
         ]
+        telemetry_flags = codex_notify_flags(cwd) if sidecar is not None else []
         session_id = agent.session_id if agent else None
         observed_session = session_id
 
@@ -271,31 +292,49 @@ class CodexPlanner(Planner):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags,
+                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags,
+                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
-            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
+            prompt_arg = prompt
             cmd = [
-                self.s.codex_binary, "exec", "resume", *model_flags,
+                self.s.codex_binary, "exec", "--json", "resume", *model_flags,
                 *reasoning_flags, *codex_project_root_flags(), *mcp_flags,
                 "-C", cwd, session_id, prompt_arg,
             ]
         else:
-            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
+            prompt_arg = prompt
             cmd = [
-                self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
+                self.s.codex_binary, "exec", "--json", *model_flags, *reasoning_flags,
                 *codex_project_root_flags(), *mcp_flags, "-C", cwd,
                 prompt_arg,
             ]
+        live_machine_events = bool(
+            machine_output_path is not None
+            and getattr(transport, "supports_inject", False)
+        )
+        telemetry_records = 0
+        late_sidecar_scheduled = False
+
+        async def emit_machine_event(line: str) -> None:
+            nonlocal telemetry_records
+            telemetry_records += 1
+            if telemetry_records == 1 and sidecar is not None:
+                await emit_telemetry_status(telemetry, harness="codex", source=sidecar.source,
+                                            status="connected", detail="Codex notify delivered structured rollout events.")
+            await emit_jsonl_telemetry("codex", line, telemetry)
+
         structured = ""
         try:
+            if sidecar is not None:
+                await emit_telemetry_status(telemetry, harness="codex", source=sidecar.source,
+                                            status="ready", detail=sidecar.detail)
             result = await run_until_result(
                 transport,
                 node_id,
@@ -315,14 +354,37 @@ class CodexPlanner(Planner):
                 # project harness is inherited by its planned leaves and is
                 # not the foreground process we are waiting for here.
                 harness_name=self.s.codex_binary,
-                initial_input=prompt
-                if getattr(transport, "supports_inject", False) and not native
-                else None,
-                initial_input_mode="stdin" if getattr(transport, "supports_inject", False) else "native",
+                initial_input=(
+                    None
+                ),
+                initial_input_mode="stdin",
                 environment=environment,
+                # A machine-readable `codex exec --json` turn is bounded;
+                # collect its process output through exit rather than keeping
+                # the durable interactive attachment alive.
+                keep_attached=native,
+                machine_output_path=sidecar.path if sidecar else machine_output_path,
+                machine_output_handler=emit_machine_event if (sidecar or live_machine_events) else None,
+                capture_machine_output=machine_output_path is not None,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"planner harness exited {result.returncode}")
+            if machine_output_path is not None and not live_machine_events:
+                raw_output = (
+                    machine_output_path.read_text(encoding="utf-8", errors="replace")
+                    if machine_output_path.exists()
+                    else result.output.decode(errors="replace")
+                )
+                await emit_jsonl_telemetry("codex", raw_output, telemetry)
+            if sidecar is not None and telemetry_records == 0:
+                late_sidecar_scheduled = True
+                schedule_late_sidecar_collection(
+                    sidecar,
+                    emit_machine_event,
+                    emit=telemetry,
+                    harness="codex",
+                    unavailable_detail="Codex completed without a notify rollout; lifecycle evidence remains available but tool metrics are unavailable for this run.",
+                )
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
             submitted = read_result_file(result_path)
@@ -334,7 +396,13 @@ class CodexPlanner(Planner):
         except (FileNotFoundError, OSError):
             return "", Usage(), None
         finally:
-            for temporary_path in (result_path,):
+            for temporary_path in (
+                result_path,
+                machine_output_path,
+                sidecar.path if sidecar and not late_sidecar_scheduled else None,
+            ):
+                if temporary_path is None:
+                    continue
                 try:
                     os.unlink(str(temporary_path))
                 except OSError:
@@ -389,8 +457,10 @@ class AgentPlanner(Planner):
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
         skill_paths: list[str] | None = None,
+        telemetry_extension: str | None = None,
+        interactive_server_port: int | None = None,
     ) -> list[str]:
-        return self.commands.planner_command(
+        command = self.commands.planner_command(
             agent,
             prompt,
             cwd=cwd or os.getcwd(),
@@ -399,7 +469,13 @@ class AgentPlanner(Planner):
             prompt_via_stdin=prompt_via_stdin,
             mcp_config=mcp_config,
             skill_paths=skill_paths,
+            interactive_server_port=interactive_server_port,
         )
+        if native and agent.harness is HarnessKind.PI and telemetry_extension:
+            command = with_interactive_pi_telemetry(
+                command, {"TURN_PI_TELEMETRY_EXTENSION": telemetry_extension}
+            )
+        return command
 
     async def _call_harness(
         self, agent: AgentConfig, prompt: str, ctx: NodeExecutionContext
@@ -415,6 +491,7 @@ class AgentPlanner(Planner):
             if agent.harness == HarnessKind.PI:
                 agent.session_id = str(uuid.uuid4())
                 ctx.node.agent = agent
+        opencode_telemetry: OpenCodeSseTelemetry | None = None
         try:
             transport = ctx.terminal or LocalPtyTransport()
             native = isinstance(transport, LocalPtyTransport)
@@ -446,21 +523,61 @@ class AgentPlanner(Planner):
             environment = agent_environment(
                 cwd, ctx.node.id, "plan", result_path, agent, data_dir=self.s.data_dir
             )
+            telemetry_sidecar: NativeTelemetrySidecar | None = None
+            claude_settings = None
+            if native and agent.harness is HarnessKind.PI:
+                environment.update(prepare_interactive_pi_telemetry(cwd, ctx.node.id))
+                telemetry_sidecar = NativeTelemetrySidecar(
+                    path=Path(environment["TURN_METRICS_FILE"]), source="pi.extension",
+                    detail="Pi lifecycle extension will export structured tool and turn events.",
+                )
+            elif native and agent.harness is HarnessKind.CLAUDE:
+                telemetry_sidecar, claude_settings = prepare_claude_hook_telemetry(cwd, ctx.node.id)
+                environment.update(telemetry_sidecar.environment)
             environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
+            opencode_port = reserve_loopback_port() if native and agent.harness is HarnessKind.OPENCODE else None
+            if opencode_port is not None:
+                opencode_telemetry = OpenCodeSseTelemetry(opencode_port, ctx.telemetry)
             native_prompt = prompt
+            def build_command(*, native_command: bool, prompt_via_stdin: bool = False) -> list[str]:
+                command = self._command(
+                    agent,
+                    native_prompt,
+                    cwd=cwd,
+                    native=native_command,
+                    resume=resume,
+                    prompt_via_stdin=prompt_via_stdin,
+                    mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
+                    skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
+                    telemetry_extension=environment.get("TURN_PI_TELEMETRY_EXTENSION"),
+                    interactive_server_port=opencode_telemetry.port if opencode_telemetry else None,
+                )
+                return with_claude_telemetry(command, claude_settings) if native_command and agent.harness is HarnessKind.CLAUDE else command
+
+            telemetry_records = 0
+            async def emit_sidecar_event(line: str) -> None:
+                nonlocal telemetry_records
+                telemetry_records += 1
+                if telemetry_records == 1 and telemetry_sidecar is not None:
+                    await emit_telemetry_status(ctx.telemetry, harness=agent.harness.value, source=telemetry_sidecar.source,
+                                                status="connected", detail=f"{agent.harness.value} delivered structured telemetry.")
+                await emit_jsonl_telemetry(agent.harness.value, line, ctx.telemetry)
+
+            if telemetry_sidecar is not None:
+                await emit_telemetry_status(ctx.telemetry, harness=agent.harness.value, source=telemetry_sidecar.source,
+                                            status="ready", detail=telemetry_sidecar.detail)
+            if opencode_telemetry is not None:
+                await opencode_telemetry.start()
+            elif native and agent.harness is HarnessKind.OPENCODE:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness="opencode", source="opencode.server-sse", status="unavailable",
+                    detail="Turn could not reserve a loopback port for OpenCode's event stream; the interactive run continues with lifecycle evidence only.",
+                )
             if native:
                 result = await run_until_result(
                     transport,
                     ctx.node.id,
-                    self._command(
-                        agent,
-                        native_prompt,
-                        cwd=cwd,
-                        native=True,
-                        resume=resume,
-                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
-                        skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
-                    ),
+                    build_command(native_command=True),
                     cwd=cwd,
                     result_path=result_path,
                     stream=ctx.stream,
@@ -472,21 +589,14 @@ class AgentPlanner(Planner):
                     session_marker=str(ctx.node.id),
                     harness_name=agent.harness.value,
                     environment=environment,
+                    machine_output_path=telemetry_sidecar.path if telemetry_sidecar else None,
+                    machine_output_handler=emit_sidecar_event if telemetry_sidecar else None,
                 )
             elif getattr(transport, "supports_inject", False):
                 result = await run_until_result(
                     transport,
                     ctx.node.id,
-                    self._command(
-                        agent,
-                        native_prompt,
-                        cwd=cwd,
-                        native=False,
-                        resume=resume,
-                        prompt_via_stdin=True,
-                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
-                        skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
-                    ),
+                    build_command(native_command=False, prompt_via_stdin=True),
                     cwd=cwd,
                     result_path=result_path,
                     stream=ctx.stream,
@@ -503,13 +613,7 @@ class AgentPlanner(Planner):
             else:
                 result = await transport.run(
                     ctx.node.id,
-                    self._command(
-                        agent,
-                        native_prompt,
-                        cwd=cwd,
-                        mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
-                        skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
-                    ),
+                    build_command(native_command=False),
                     cwd=cwd,
                     environment=environment,
                     stream=ctx.stream,
@@ -522,6 +626,12 @@ class AgentPlanner(Planner):
                 raise RuntimeError(f"{agent.harness.value} planner harness exited {result.returncode}")
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
+            raw_output = result.output.decode(errors="replace")
+            if not native:
+                await emit_jsonl_telemetry(agent.harness.value, raw_output, ctx.telemetry)
+            if telemetry_sidecar is not None and telemetry_records == 0:
+                await emit_telemetry_status(ctx.telemetry, harness=agent.harness.value, source=telemetry_sidecar.source,
+                                            status="degraded", detail=f"{agent.harness.value} completed without structured hook events; lifecycle evidence remains available but tool metrics are unavailable for this run.")
             submitted = read_result_file(result_path)
             text = json.dumps(submitted) if submitted is not None else ""
             if agent.harness == HarnessKind.OPENCODE and not agent.session_id:
@@ -533,6 +643,9 @@ class AgentPlanner(Planner):
             raise GenerationStalled("planner exceeded the run timeout") from error
         except (FileNotFoundError, OSError):
             return ""
+        finally:
+            if opencode_telemetry is not None:
+                await opencode_telemetry.stop()
 
     COORDINATOR_KEYS = {"coordinator", "oversee", "manage", "coordinate", "co-ordinate"}
 

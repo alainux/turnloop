@@ -16,6 +16,8 @@ import time
 import uuid
 from typing import Any, Iterator
 
+from turn.metrics import BehaviorMetricsStore
+
 
 class EventLog:
     """One process-owned writer and stitched reader for project JSONL logs.
@@ -95,6 +97,14 @@ class EventLog:
                 with target.open("a", encoding="utf-8") as stream:
                     stream.write(line + "\n")
                     stream.flush()
+                # Metrics are a materialized view of the same event stream,
+                # never a prerequisite for recording or running a project.
+                project_root = self._project_roots.get(str(project_id)) if project_id else None
+                if project_root is not None:
+                    try:
+                        BehaviorMetricsStore.record(project_root, record)
+                    except Exception:
+                        pass
         except Exception:
             return
 

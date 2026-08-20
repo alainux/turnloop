@@ -38,6 +38,13 @@ from turn.workers.interactive import (
 from turn.workers import parsing
 from turn.workers.terminal import LocalPtyTransport
 from turn.workers.harness_catalog import codex_project_root_flags
+from turn.metrics import emit_jsonl_telemetry
+from turn.workers.native_telemetry import (
+    codex_notify_flags,
+    emit_telemetry_status,
+    prepare_codex_notify_telemetry,
+    schedule_late_sidecar_collection,
+)
 
 logger = logging.getLogger("turn.worker.codex")
 
@@ -60,18 +67,22 @@ class CodexWorker(Worker):
             )
         cwd = repo
         transport = ctx.terminal or LocalPtyTransport()
-        # HerdrPtyTransport intentionally subclasses LocalPtyTransport: both
-        # expose a real interactive PTY. Injection is only how Turn reaches
-        # that PTY; it must not switch Codex to JSON/exec output.
-        native = isinstance(transport, LocalPtyTransport)
         agent = ctx.node.agent
+        # HerdrPtyTransport intentionally subclasses LocalPtyTransport: both
+        # expose a real interactive PTY. Telemetry is a passive side channel,
+        # never a reason to replace Codex's native terminal UI.
+        native = isinstance(transport, LocalPtyTransport)
         verification = bool(agent and agent.type_id is AgentType.VERIFIER)
         protocol_kind = "verification" if verification else "result"
         result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
+        machine_output_path = result_path.with_suffix(".jsonl") if not native else None
         environment = agent_environment(
             cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
         )
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
+        sidecar = prepare_codex_notify_telemetry(cwd, ctx.node.id) if native else None
+        if sidecar is not None:
+            environment.update(sidecar.environment)
         prompt = self._build_prompt(
             ctx,
             cwd=cwd,
@@ -87,6 +98,7 @@ class CodexWorker(Worker):
             for override in json.loads(environment.get("TURN_AGENT_CODEX_MCP_OVERRIDES", "[]"))
             for item in ("-c", override)
         ]
+        telemetry_flags = codex_notify_flags(cwd) if sidecar is not None else []
         session_id = ctx.node.agent.session_id if ctx.node.agent else None
         discovered_session = session_id
 
@@ -102,32 +114,61 @@ class CodexWorker(Worker):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags,
+                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags,
+                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
             # Continue the same conversation when the runner resumes a node.
             # Resume has a deliberately smaller flag surface than a fresh exec.
-            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
+            # JSON execution is an automatic machine-transport boundary. Supplying
+            # the prompt as an argument means it never depends on PTY input or
+            # an EOF event that a terminal-control stream cannot prove it
+            # delivered to Codex.
+            prompt_arg = prompt
             cmd = [
-                self.s.codex_binary, "exec", "resume", *model_flags, *reasoning_flags,
+                self.s.codex_binary, "exec", "--json", "resume", *model_flags, *reasoning_flags,
                 *codex_project_root_flags(), *mcp_flags, "-C", cwd, session_id, prompt_arg,
             ]
         else:
-            prompt_arg = "-" if getattr(transport, "supports_inject", False) else prompt
+            prompt_arg = prompt
             cmd = [
-                self.s.codex_binary, "exec", *model_flags, *reasoning_flags,
+                self.s.codex_binary, "exec", "--json", *model_flags, *reasoning_flags,
                 *codex_project_root_flags(), *mcp_flags, "-C", cwd, prompt_arg,
             ]
 
+        # Both sources below are documented structured channels, never
+        # terminal output: Codex notify rollouts for native sessions and
+        # ``exec --json`` for headless machine transports.
+        live_machine_events = bool(
+            (sidecar is not None or machine_output_path is not None)
+            and getattr(transport, "supports_inject", False)
+        )
+        telemetry_records = 0
+        late_sidecar_scheduled = False
+
+        async def emit_machine_event(line: str) -> None:
+            nonlocal telemetry_records
+            telemetry_records += 1
+            if telemetry_records == 1 and sidecar is not None:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness="codex", source=sidecar.source,
+                    status="connected", detail="Codex notify delivered structured rollout events.",
+                )
+            await emit_jsonl_telemetry("codex", line, ctx.telemetry)
+
         structured_text = ""
         try:
+            if sidecar is not None:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness="codex", source=sidecar.source,
+                    status="ready", detail=sidecar.detail,
+                )
             if native:
                 terminal = await run_until_result(
                     transport,
@@ -146,8 +187,16 @@ class CodexWorker(Worker):
                     else None,
                     harness_name=self.s.codex_binary,
                     environment=environment,
+                    machine_output_path=sidecar.path if sidecar else None,
+                    machine_output_handler=emit_machine_event if sidecar else None,
                 )
             elif getattr(transport, "supports_inject", False):
+                structured_kwargs = {
+                    "keep_attached": False,
+                    "machine_output_path": machine_output_path,
+                    "machine_output_handler": emit_machine_event if live_machine_events else None,
+                    "capture_machine_output": True,
+                }
                 terminal = await run_until_result(
                     transport,
                     ctx.node.id,
@@ -164,9 +213,12 @@ class CodexWorker(Worker):
                     if ctx.forbidden_session_id
                     else None,
                     harness_name=self.s.codex_binary,
-                    initial_input=prompt,
-                    initial_input_mode="stdin" if not native else "native",
                     environment=environment,
+                    # `codex exec --json` is a bounded process, unlike the
+                    # native TUI.  Wait for its exit marker after the Turn
+                    # handoff so the structured output is complete before it
+                    # is normalized.
+                    **structured_kwargs,
                 )
             else:
                 terminal = await transport.run(
@@ -179,6 +231,26 @@ class CodexWorker(Worker):
                     stall_timeout=ctx.stall_timeout_seconds,
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
+                )
+            if machine_output_path is not None and not live_machine_events:
+                raw_output = (
+                    machine_output_path.read_text(encoding="utf-8", errors="replace")
+                    if machine_output_path.exists()
+                    else terminal.output.decode(errors="replace")
+                )
+                await emit_jsonl_telemetry("codex", raw_output, ctx.telemetry)
+            if sidecar is not None and telemetry_records == 0:
+                # Codex emits its documented ``notify`` callback after the
+                # model turn closes, while an agent handoff occurs inside that
+                # turn. Keep observing the attempt-scoped sidecar in the
+                # background instead of delaying the node's completion.
+                late_sidecar_scheduled = True
+                schedule_late_sidecar_collection(
+                    sidecar,
+                    emit_machine_event,
+                    emit=ctx.telemetry,
+                    harness="codex",
+                    unavailable_detail="Codex completed without a notify rollout; lifecycle evidence remains available but tool metrics are unavailable for this run.",
                 )
             if terminal.idle_reaped:
                 return WorkerResult(
@@ -224,7 +296,13 @@ class CodexWorker(Worker):
                 retry_recommended=False,
             )
         finally:
-            for temporary_path in (result_path,):
+            for temporary_path in (
+                result_path,
+                machine_output_path,
+                sidecar.path if sidecar and not late_sidecar_scheduled else None,
+            ):
+                if temporary_path is None:
+                    continue
                 try:
                     os.unlink(str(temporary_path))
                 except OSError:

@@ -80,6 +80,25 @@ def test_injected_command_publishes_a_failed_child_exit_code(tmp_path):
     assert exit_path.read_text() == "23\n"
 
 
+def test_injected_command_captures_machine_stdout_without_reading_the_pty(tmp_path):
+    start_path = tmp_path / "attempt.started"
+    exit_path = tmp_path / "attempt.exit"
+    machine_output = tmp_path / "attempt.jsonl"
+    command = _injected_command_with_markers(
+        [sys.executable, "-c", "print('{\\\"type\\\": \\\"item.completed\\\"}')"],
+        start_path,
+        exit_path,
+        machine_output,
+    )
+
+    completed = subprocess.run(["sh", "-c", command], check=True, capture_output=True, text=True)
+
+    assert completed.stdout == ""
+    assert machine_output.read_text() == '{"type": "item.completed"}\n'
+    assert start_path.exists()
+    assert exit_path.read_text() == "0\n"
+
+
 def test_worker_environment_rejects_an_unloaded_capability(tmp_path):
     node_id = uuid.uuid4()
     handoff = prepare_result_file(str(tmp_path), node_id, "result")
@@ -763,6 +782,118 @@ async def test_native_launch_fails_when_herdr_rejects_prompt_injection(tmp_path)
     assert transport.stopped
 
 
+async def test_injected_prompt_delivery_timeout_is_a_visible_launch_failure(tmp_path):
+    """A blocked terminal-control write must not leave a node RUNNING."""
+    node_id = uuid.uuid4()
+    result_path = prepare_result_file(str(tmp_path), node_id, "result")
+    started = result_path.with_suffix(".started")
+
+    class HungPromptTransport:
+        supports_inject = True
+
+        def __init__(self):
+            self.control_task: asyncio.Task | None = None
+
+        def snapshot(self, _node_id):
+            return {"active": True, "output": "shell ready"}
+
+        async def ensure_session(self, _node_id, **_kwargs):
+            self.control_task = asyncio.current_task()
+            await asyncio.Event().wait()
+            raise AssertionError("the mocked control session should be cancelled")
+
+        async def wait_until_ready(self, _node_id):
+            return None
+
+        async def inject_command(self, _node_id, _command, **_kwargs):
+            started.write_text("started")
+            return True
+
+        async def foreground_process_names(self, _node_id):
+            return ("mock-harness",)
+
+        async def write(self, _node_id, _data):
+            await asyncio.Event().wait()
+            return True
+
+        async def detach(self, _node_id):
+            if self.control_task is not None:
+                self.control_task.cancel()
+            return True
+
+        async def stop(self, _node_id):
+            if self.control_task is not None:
+                self.control_task.cancel()
+            return True
+
+    transport = HungPromptTransport()
+    with pytest.raises(RuntimeError, match="did not acknowledge Turn prompt delivery"):
+        await run_until_result(
+            transport,
+            node_id,
+            ["mock-harness", "-"],
+            cwd=str(tmp_path),
+            result_path=result_path,
+            initial_input="TURN_CONTEXT",
+            initial_input_mode="stdin",
+            input_delivery_timeout=0.01,
+        )
+
+
+async def test_headless_codex_launch_passes_the_prompt_as_an_argument(tmp_path, monkeypatch):
+    """A machine transport gets JSONL automatically without a user mode."""
+    from turn.config import Settings
+    from turn.domain.schemas import AgentConfig, HarnessKind, Node
+    from turn.workers.base import NodeExecutionContext
+    from turn.workers.codex_worker import CodexWorker
+    import turn.workers.codex_worker as codex_module
+
+    captured: dict = {}
+    telemetry = []
+
+    async def collect(event):
+        telemetry.append(event)
+
+    async def fake_run(_transport, _node_id, command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        kwargs["result_path"].write_text('{"outcome":"COMPLETE","summary":"done"}')
+        line = '{"type":"item.completed","item":{"details":{"type":"command_execution","command":"pytest","exit_code":0}}}\n'
+        kwargs["machine_output_path"].write_text(line)
+        await kwargs["machine_output_handler"](line)
+        return TerminalResult(returncode=0, output=b"")
+
+    monkeypatch.setattr(codex_module, "run_until_result", fake_run)
+
+    class HerdrLikeTransport:
+        supports_inject = True
+
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build the app",
+        repo_path=str(tmp_path),
+        executor="codex",
+        agent=AgentConfig(
+            harness=HarnessKind.CODEX,
+        ),
+    )
+    result = await CodexWorker(Settings(codex_binary="codex")).execute(
+        NodeExecutionContext(
+            node=node,
+            repo_path=str(tmp_path),
+            terminal=HerdrLikeTransport(),
+            telemetry=collect,
+        )
+    )
+
+    assert result.outcome.value == "COMPLETE"
+    assert captured["command"][-1] != "-"
+    assert "TURN_CONTEXT" in captured["command"][-1]
+    assert "initial_input" not in captured["kwargs"]
+    assert callable(captured["kwargs"]["machine_output_handler"])
+    assert {event.kind.value for event in telemetry} == {"command_end"}
+
+
 async def test_native_session_stops_only_after_valid_project_file(tmp_path):
     node_id = uuid.uuid4()
     path = prepare_result_file(str(tmp_path), node_id, "result")
@@ -891,6 +1022,7 @@ async def test_herdr_transport_keeps_codex_in_native_interactive_mode(tmp_path, 
         return TerminalResult(returncode=0, output=b"")
 
     monkeypatch.setattr(codex_module, "run_until_result", mock_run_until_result)
+    monkeypatch.setattr(codex_module, "schedule_late_sidecar_collection", lambda *_args, **_kwargs: None)
     node = Node(
         project_id=uuid.uuid4(),
         objective="Keep the terminal interactive",

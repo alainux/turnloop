@@ -244,6 +244,16 @@ class Store:
         edge_keys: set[tuple[uuid.UUID, uuid.UUID, EdgeType]] = set()
         for item in raw.get("nodes", []):
             node_payload = dict(item)
+            agent_payload = node_payload.get("agent")
+            if isinstance(agent_payload, dict) and "telemetry_mode" in agent_payload:
+                # Telemetry is now an implementation detail of the one normal
+                # interactive run path. Remove the retired user preference
+                # while normalizing persisted project state once.
+                node_payload["agent"] = {
+                    key: value for key, value in agent_payload.items()
+                    if key != "telemetry_mode"
+                }
+                normalized = True
             # Older planners sometimes put the full assignment in the graph
             # label. Preserve that text as the worker prompt and migrate the
             # persisted label to the same concise form used for new nodes.
@@ -947,6 +957,13 @@ class Store:
         for trigger_id in removed_triggers:
             del state.triggers[trigger_id]
         await self._persist_project(node.project_id)
+        await self._log(
+            node.project_id,
+            kind="graph.transition",
+            action="graph.replaced",
+            message=f"replaced {len(descendants)} descendant node(s)",
+            data={"node_id": str(node_id), "removed_node_ids": [str(item.id) for item in descendants]},
+        )
         if removed_triggers:
             await self._log(
                 node.project_id,
@@ -986,7 +1003,8 @@ class Store:
             for capability_id in capability_ids_for_agent_type(node.agent.type_id):
                 catalog.load_into_project(capability_id, project_root)
         await self._persist_project(parent.project_id)
-        await self._log(parent.project_id, kind="graph.transition", action="plan.applied", message=f"plan applied; created {len(created)} node(s)", data={"parent_id": str(parent.id), "created_node_ids": [str(item.id) for item in created]})
+        edge_count = sum(len(spec.follows) + (1 if spec.parent_key else 0) for spec in plan.nodes) + len(plan.edges)
+        await self._log(parent.project_id, kind="graph.transition", action="plan.applied", message=f"plan applied; created {len(created)} node(s)", data={"parent_id": str(parent.id), "node_id": str(parent.id), "created_node_ids": [str(item.id) for item in created], "created_roles": [item.agent.type_id.value if item.agent else None for item in created], "edge_count": edge_count})
         if plan.triggers:
             await self._log(
                 parent.project_id,
@@ -1194,7 +1212,22 @@ class Store:
         if status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED):
             run.ended_at = datetime.now(timezone.utc)
         await self._persist_project(project_id)
-        await self._log(project_id, kind="harness.return", action="run.updated", message=summary or error or f"run {run.status.value}", status="error" if run.status is RunStatus.FAILED else "ok" if run.status is RunStatus.COMPLETE else "info", data={"run_id": str(run.id), "node_id": str(run.node_id), "status": run.status.value, "outcome": _jsonable(run.outcome), "error": run.error, "summary": run.summary, "session_id": run.session_id, "usage": _jsonable(run.usage)})
+        terminal_update = status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED)
+        await self._log(
+            project_id,
+            # Session discovery is a live progress update, not a completed
+            # provider return. Keeping those facts distinct prevents the
+            # Activity view from claiming a RUNNING harness has returned.
+            kind="harness.return" if terminal_update else "harness.run",
+            action="run.updated",
+            message=(
+                summary
+                or error
+                or ("harness session updated" if session_id is not None else f"run {run.status.value} updated")
+            ),
+            status="error" if run.status is RunStatus.FAILED else "ok" if run.status is RunStatus.COMPLETE else "info",
+            data={"run_id": str(run.id), "node_id": str(run.node_id), "status": run.status.value, "outcome": _jsonable(run.outcome), "error": run.error, "summary": run.summary, "session_id": run.session_id, "usage": _jsonable(run.usage)},
+        )
         return run.model_copy(deep=True)
 
     async def get_runs(self, node_id: uuid.UUID) -> list[Run]:

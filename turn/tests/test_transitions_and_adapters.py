@@ -198,6 +198,30 @@ async def _runtime(tmp_path, worker: Worker):
     return cfg, store, runner
 
 
+@pytest.mark.asyncio
+async def test_scheduler_reservation_is_idempotent_when_manual_and_auto_paths_race(tmp_path):
+    """One RUNNABLE observation must produce one provider attempt."""
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
+    started: list[uuid.UUID] = []
+    release = asyncio.Event()
+    node = Node(id=uuid.uuid4(), project_id=uuid.uuid4(), objective="race", executor="deterministic")
+
+    async def execute(candidate, _project_id):
+        started.append(candidate.id)
+        await release.wait()
+
+    runner.scheduler.set_executor(execute)
+    first = runner.scheduler.reserve(node, node.project_id)
+    second = runner.scheduler.reserve(node, node.project_id)
+    await asyncio.sleep(0)
+
+    assert first is second
+    assert started == [node.id]
+    release.set()
+    await first
+    await store.dispose()
+
+
 def test_plan_contract_rejects_missing_references_and_cycles():
     with pytest.raises(ValidationError, match="unknown sequence key"):
         PlanResult(nodes=[NodeSpec(key="a", objective="a", follows=["missing"])])
@@ -1127,7 +1151,7 @@ async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
     _, _, session = await planner._call_codex("revise plan", str(tmp_path), agent=agent, terminal=terminal)
 
     args = captured["args"]
-    assert args[:3] == (cfg.codex_binary, "exec", "resume")
+    assert args[:4] == (cfg.codex_binary, "exec", "--json", "resume")
     assert "project_root_markers=[]" in args
     assert "--ephemeral" not in args
     assert "planner-session" in args

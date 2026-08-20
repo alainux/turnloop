@@ -12,6 +12,7 @@ import {
   primaryNodeActionIcon,
   primaryNodeActionLabel,
   stripMarkdown,
+  tokens,
 } from "./domain";
 import type { Project } from "./domain";
 
@@ -72,6 +73,11 @@ describe("display labels", () => {
   it("renders home paths with a portable prefix", () => {
     expect(displayPath("/Users/alain/Developer/project")).toBe("~/Developer/project");
     expect(displayPath("/workspace/project")).toBe("/workspace/project");
+  });
+
+  it("does not count cached input twice in displayed token totals", () => {
+    expect(tokens({ input_tokens: 100, cached_input_tokens: 80, output_tokens: 20, cost_usd: null }))
+      .toBe(120);
   });
 
   it("labels capability plugins and their deployment state", () => {

@@ -28,6 +28,7 @@ from turn.domain.schemas import (
     RunPolicy,
     WorkerResult,
 )
+from turn.metrics import BehaviorExpectations
 
 
 PUBLIC_DOMAIN_MODELS = {
@@ -45,6 +46,7 @@ PUBLIC_DOMAIN_MODELS = {
     "FlowEdge": FlowEdge,
     "InputSpec": InputSpec,
     "RunPolicy": RunPolicy,
+    "BehaviorExpectations": BehaviorExpectations,
     "Artifact": Artifact,
     "ArtifactSpec": ArtifactSpec,
     "Graph": Graph,

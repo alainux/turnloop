@@ -188,6 +188,7 @@ class HarnessCommandFactory:
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
         skill_paths: list[str] | None = None,
+        interactive_server_port: int | None = None,
     ) -> list[str]:
         model = agent.model
         reasoning = agent.reasoning.value
@@ -214,7 +215,11 @@ class HarnessCommandFactory:
             # The project-root command is OpenCode's interactive TUI. It
             # accepts --prompt but not --variant, so keep variant handling on
             # the one-shot run surface used by noninteractive transports.
-            cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
+            cmd = (
+                ["opencode", "--hostname", "127.0.0.1", "--port", str(interactive_server_port), cwd]
+                if native and interactive_server_port is not None
+                else ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
+            )
             if session:
                 cmd += ["--session", session]
             if model:
@@ -244,9 +249,14 @@ class HarnessCommandFactory:
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
         skill_paths: list[str] | None = None,
+        interactive_server_port: int | None = None,
     ) -> list[str]:
         if agent.harness == HarnessKind.OPENCODE:
-            cmd = ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
+            cmd = (
+                ["opencode", "--hostname", "127.0.0.1", "--port", str(interactive_server_port), cwd]
+                if native and interactive_server_port is not None
+                else ["opencode", cwd] if native else ["opencode", "run", "--format", "json", "--dir", cwd]
+            )
             if agent.session_id:
                 cmd += ["--session", agent.session_id]
             if model := agent.model:

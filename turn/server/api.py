@@ -15,7 +15,7 @@ import shutil
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,7 @@ from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
 from turn.runner.runner import Runner
+from turn.metrics import BehaviorMetricsStore, evaluate_expectations
 from turn.workers.conversations import (
     ConversationProgress,
     cleanup_conversations,
@@ -863,6 +864,84 @@ async def project_usage(project_id: str, request: Request):
     }
 
 
+@router.get("/api/projects/{project_id}/behavior")
+async def project_behavior(project_id: str, request: Request):
+    """Return compact behavior evidence; inspect source records in Logs."""
+    store: Store = request.app.state.store
+    pid = uuid.UUID(project_id)
+    root = await store.get_node(pid)
+    project_path = store.project_path(pid)
+    if root is None or project_path is None:
+        raise HTTPException(404, "project not found")
+    metrics_path = BehaviorMetricsStore.path(project_path)
+    metrics = BehaviorMetricsStore.read(project_path, project_id)
+    if not metrics_path.exists() or metrics.version < 6:
+        records = await asyncio.to_thread(
+            request.app.state.logs.read, pid, limit=100_000,
+        )
+        metrics = await asyncio.to_thread(
+            BehaviorMetricsStore.rebuild, project_path, project_id, records,
+        )
+    return {
+        "project": metrics.project.model_dump(mode="json"),
+        "by_node": {key: value.model_dump(mode="json") for key, value in metrics.by_node.items()},
+        "by_run": {key: value.model_dump(mode="json") for key, value in metrics.by_run.items()},
+        "expectations": evaluate_expectations(
+            metrics.project,
+            root.run_policy.behavior_expectations if root.run_policy else None,
+        ),
+    }
+
+
+@router.get("/api/behavior")
+async def behavior_dashboard(
+    request: Request,
+    role: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+):
+    """Recent-project trends using only behavior dimensions Turn already knows."""
+    store: Store = request.app.state.store
+    rows = []
+    for root in await store.list_projects():
+        path = store.project_path(root.id)
+        if path is None:
+            continue
+        projection = BehaviorMetricsStore.read(path, str(root.id))
+        if not BehaviorMetricsStore.path(path).exists() or projection.version < 6:
+            records = await asyncio.to_thread(
+                request.app.state.logs.read, root.id, limit=100_000,
+            )
+            projection = await asyncio.to_thread(
+                BehaviorMetricsStore.rebuild, path, str(root.id), records,
+            )
+        nodes = []
+        for node_id, metrics in projection.by_node.items():
+            observed = metrics.last_observed_at.isoformat() if metrics.last_observed_at else None
+            if role and metrics.role != role:
+                continue
+            if harness and metrics.harness != harness:
+                continue
+            if model and metrics.model != model:
+                continue
+            if date_from and observed and observed < date_from:
+                continue
+            if date_to and observed and observed > date_to:
+                continue
+            nodes.append({"node_id": node_id, **metrics.model_dump(mode="json")})
+        if (role or harness or model or date_from or date_to) and not nodes:
+            continue
+        rows.append({
+            "project_id": str(root.id),
+            "project_name": root.project_name or root.objective,
+            "metrics": projection.project.model_dump(mode="json"),
+            "nodes": nodes,
+        })
+    return {"projects": rows}
+
+
 @router.post("/api/projects/{project_id}/step")
 async def step_project(project_id: str, request: Request):
     """Manual mode: execute the next runnable DAG stage in parallel."""
@@ -872,7 +951,10 @@ async def step_project(project_id: str, request: Request):
 
 
 @router.get("/api/projects/{project_id}/graph")
-async def get_graph(project_id: str, request: Request):
+async def get_graph(project_id: str, request: Request, response: Response):
+    # The graph changes while agents run. An ordinary browser fetch must not
+    # reuse the initial one-node response after a planner expands it.
+    response.headers["Cache-Control"] = "no-store"
     store: Store = request.app.state.store
     pid = uuid.UUID(project_id)
     return await _serialize_graph(store, pid, request.app.state.runner)

@@ -65,6 +65,13 @@ class Scheduler:
         self.deleting_projects.discard(project_id)
 
     def reserve(self, node: Node, project_id: uuid.UUID) -> asyncio.Task:
+        # A user-triggered Run can race the normal auto-run pass immediately
+        # after a cancelled node becomes runnable. Reservation is the one
+        # boundary both paths share, so it must be idempotent: two callers may
+        # observe RUNNABLE, but only one provider process may be created.
+        existing = self.running.get(node.id)
+        if existing is not None and not existing.done():
+            return existing
         task = asyncio.create_task(self._execute_node(node, project_id))
         self.running[node.id] = task
         self.running_projects[node.id] = project_id

@@ -32,6 +32,12 @@ export interface ArtifactSpec {
   ref: string | null;
 }
 
+export interface BehaviorExpectations {
+  read_docs: boolean | null;
+  use_skills: boolean | null;
+  verify_after_changes: boolean | null;
+}
+
 export interface CapabilityStatus {
   capability_id: string;
   skills: number;
@@ -264,6 +270,7 @@ export interface RunPolicy {
   retry_backoff_ms: number;
   retry_choked_models: boolean;
   compact_on_context_pressure: boolean;
+  behavior_expectations: BehaviorExpectations | null;
 }
 
 export type RunStatus = "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";

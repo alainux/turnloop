@@ -87,7 +87,9 @@ async def test_api_exposes_state_actions_policy_capabilities_and_usage(tmp_path)
         })
         assert created.status_code == 200, created.text
         pid = created.json()["project_id"]
-        graph = (await client.get(f"/api/projects/{pid}/graph")).json()
+        graph_response = await client.get(f"/api/projects/{pid}/graph")
+        assert graph_response.headers["cache-control"] == "no-store"
+        graph = graph_response.json()
         root = graph["nodes"][0]
         assert root["project_name"] == "Inspectable demo"
         assert root["objective"] == "Inspectable demo"

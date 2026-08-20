@@ -240,7 +240,6 @@ export function isGraph(value: unknown): value is Graph {
 export function tokens(usage?: Usage): number {
   return (
     (usage?.input_tokens ?? 0) +
-    (usage?.cached_input_tokens ?? 0) +
     (usage?.output_tokens ?? 0)
   );
 }

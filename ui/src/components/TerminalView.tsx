@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import xtermCss from "@xterm/xterm/css/xterm.css?inline";
 import type { GraphNode, Run } from "../domain";
+import { getProjectLogs, type LogRecord } from "../api/logs";
 import { Icon } from "./Icon";
 
 interface Props {
@@ -15,6 +16,7 @@ export function TerminalView({ node }: Props) {
   const [active, setActive] = useState(false);
   const [idle, setIdle] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
+  const [view, setView] = useState<"terminal" | "activity">("terminal");
   // A project owns one Herdr space. A node gets a durable pane only when an
   // agent runs or a user explicitly opens its terminal; the inspector only
   // attaches to that pane.
@@ -336,6 +338,10 @@ export function TerminalView({ node }: Props) {
         <span className="terminal-title">
           {endpoint === "shell" ? "shell" : node.agent?.harness ?? node.executor} · {node.id.slice(0, 8)}
         </span>
+        <span className="terminal-view-switch" role="tablist" aria-label="Node output views">
+          <button role="tab" aria-selected={view === "terminal"} className={view === "terminal" ? "active" : ""} onClick={() => setView("terminal")}>Terminal</button>
+          <button role="tab" aria-selected={view === "activity"} className={view === "activity" ? "active" : ""} onClick={() => setView("activity")}>Activity</button>
+        </span>
         <span className="terminal-mode">
           {active ? (idle ? "LIVE · waiting" : "LIVE") : connection === "connecting" ? "CONNECTING" : "RECONNECTING"}
         </span>
@@ -351,9 +357,96 @@ export function TerminalView({ node }: Props) {
       )}
       <div
         ref={host}
-        className={`terminal-shadow-host ${!active ? "is-collapsed" : ""}`}
+        className={`terminal-shadow-host ${!active || view !== "terminal" ? "is-collapsed" : ""}`}
         aria-label="Agent terminal"
       />
+      {view === "activity" && <HarnessActivity node={node} />}
     </div>
   );
+}
+
+function HarnessActivity({ node }: { node: GraphNode }) {
+  const [records, setRecords] = useState<LogRecord[]>([]);
+
+  useEffect(() => {
+    let alive = true;
+    const include = (record: LogRecord) => isNodeActivity(record, node.id);
+    const append = (record: LogRecord) => {
+      if (!include(record)) return;
+      setRecords((current) => current.some((item) => item.event_id === record.event_id)
+        ? current
+        : [...current.slice(-79), record]);
+    };
+    void getProjectLogs(node.project_id, node.id)
+      .then(({ records: existing }) => { if (alive) existing.forEach(append); })
+      .catch(() => { /* Existing terminal remains usable if evidence is unavailable. */ });
+    const stream = new EventSource(
+      `/api/projects/${encodeURIComponent(node.project_id)}/logs/stream?search=${encodeURIComponent(node.id)}`,
+    );
+    stream.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as { type?: string; record?: LogRecord };
+        if (alive && message.type === "log" && message.record) append(message.record);
+      } catch {
+        // A future malformed log must not affect the terminal or project run.
+      }
+    };
+    return () => { alive = false; stream.close(); };
+  }, [node.id, node.project_id]);
+
+  const telemetry = [...records].reverse().find(isTelemetryStatus);
+  return <div className="harness-activity" aria-live="polite">
+    {telemetry && <div className={`harness-telemetry telemetry-${telemetryStatus(telemetry)}`}>
+      <strong>Telemetry {telemetryStatus(telemetry)}</strong>
+      <span>{activityDetail(telemetry)}</span>
+    </div>}
+    {!records.length && <p>Waiting for telemetry status. The raw terminal remains available and interactive.</p>}
+    {records.map((record) => <div className="harness-activity-line" key={record.event_id}>
+      <time dateTime={record.timestamp}>{activityTime(record.timestamp)}</time>
+      <span>{activityLabel(record)}</span>
+      <small>{activityDetail(record)}</small>
+    </div>)}
+  </div>;
+}
+
+function isTelemetryStatus(record: LogRecord) {
+  if (record.kind !== "harness.event") return false;
+  const data = record.data && typeof record.data === "object" ? record.data as Record<string, unknown> : {};
+  return data.kind === "status" && data.name === "telemetry";
+}
+
+function telemetryStatus(record: LogRecord) {
+  const data = record.data && typeof record.data === "object" ? record.data as Record<string, unknown> : {};
+  return String(data.status ?? "unknown");
+}
+
+function isNodeActivity(record: LogRecord, nodeId: string) {
+  if (![
+    "harness.launch", "harness.return", "harness.event", "application.error",
+  ].includes(record.kind)) return false;
+  const data = record.data;
+  return Boolean(data && typeof data === "object" && (data as Record<string, unknown>).node_id === nodeId);
+}
+
+function activityLabel(record: LogRecord) {
+  const data = record.data && typeof record.data === "object" ? record.data as Record<string, unknown> : {};
+  if (isTelemetryStatus(record)) return `telemetry ${String(data.status ?? "status")}`;
+  if (record.kind === "harness.event") return String(data.kind ?? "harness event").replaceAll("_", " ");
+  return record.kind.replaceAll(".", " ");
+}
+
+function activityDetail(record: LogRecord) {
+  const data = record.data && typeof record.data === "object" ? record.data as Record<string, unknown> : {};
+  const nested = data.data && typeof data.data === "object" ? data.data as Record<string, unknown> : {};
+  if (isTelemetryStatus(record)) {
+    return [nested.source, nested.detail].filter((value) => typeof value === "string" && value).join(" · ") || "telemetry status";
+  }
+  const name = data.name ?? nested.command ?? nested.path ?? data.outcome ?? data.error ?? record.message;
+  const status = data.status ?? record.status;
+  return [name ? String(name) : "", status ? String(status) : ""].filter(Boolean).join(" · ") || "observed";
+}
+
+function activityTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
 }

@@ -98,6 +98,7 @@ def test_document_reader_keeps_references_generic_and_explicit():
 
 def test_terminal_is_a_raw_dom_pty_view():
     terminal = source("components", "TerminalView.tsx")
+    css = (UI / "style.css").read_text()
     transport = (ROOT / "turn" / "workers" / "terminal.py").read_text()
     worker = (ROOT / "turn" / "workers" / "codex_worker.py").read_text()
     assert "attachShadow" not in terminal and "Terminal(" in terminal
@@ -124,10 +125,28 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "display_output" in transport and "raw stream" in transport
     assert "--output-last-message" not in worker
     assert "--output-schema" not in worker
-    assert "\"--json\"" not in worker
-    # Provider output stays in Herdr's session log; Turn persists only the
-    # structured submission, never a copied terminal transcript.
-    assert "terminal.output" not in worker and "terminal.display_output" not in worker
+    # Normal Codex execution remains a raw interactive terminal with the
+    # documented notify sidecar. A non-interactive transport gets JSONL
+    # automatically; neither source is inferred from a PTY transcript.
+    assert "prepare_codex_notify_telemetry" in worker and '"--json"' in worker
+    # Provider output stays in Herdr's session log during normal use. The
+    # machine-transport branch may consume its documented JSONL channel,
+    # never ``display_output`` or an ANSI transcript.
+    assert "terminal.display_output" not in worker
+    assert "machine_output_path.read_text" in worker
+    assert "await emit_jsonl_telemetry" in worker
+    assert "Telemetry {telemetryStatus(telemetry)}" in terminal
+    assert "telemetry-unavailable" in css
+
+
+def test_quality_panel_reuses_the_logs_panel_shell_and_record_layout():
+    quality = source("components", "QualityPanel.tsx")
+    css = (UI / "style.css").read_text()
+    assert 'className="logs-panel quality-panel"' in quality
+    assert '<div className="quality-content">' in quality
+    assert ".quality-content" in css
+    assert ".quality-agent pre, .quality-run pre" in css
+    assert "border-left: 2px solid var(--border-strong);" in css
 
 
 def test_inspector_prioritizes_markdown_instructions_without_legacy_review_surfaces():

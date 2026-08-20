@@ -31,6 +31,7 @@ from turn.domain.capability_contracts import (
     capability_ids_for_agent_type,
     validate_capability_id,
 )
+from turn.metrics import BehaviorExpectations
 
 
 def _utcnow() -> datetime:
@@ -370,6 +371,7 @@ class RunPolicy(BaseModel):
     retry_backoff_ms: int = Field(default=750, ge=0, le=600_000)
     retry_choked_models: bool = True
     compact_on_context_pressure: bool = True
+    behavior_expectations: BehaviorExpectations | None = None
 
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)

@@ -276,19 +276,19 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Live Logs / State & Graph Transitions
 - [x] Composable graph
 - [x] Triggers
-- [ ] Evals / Run dashboard
-- [ ] Multi-graphs
-- [ ] Decision-based Routing
-- [ ] Repeatable organizations - Skipped / Locked nodes for 
-- [ ] Tickets / Units of work / Spec-driven execution
-- [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management
-- [ ] Loops / Goals / Hill-climbing
-- [ ] Metrics
-- [ ] Capability library
+- [x] Run Quality Dashboard / Metrics
+- [ ] Multi-graph projects
+- [ ] Variables / Handoffs / Data passing between nodes
+- [ ] Repeatable organizations - Skipped / Locked nodes that can be re-run with new data
+- [ ] Tickets board / Units of work / Spec-driven execution
+- [ ] Decision-based Routing for nodes 
+- [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management for Running Processes
+- [ ] Loops / Goals / Hill-climbing with visual feedback and metrics
+- [ ] Capability library with Web UI
 - [ ] Architecture / Hygiene & Cleanups
 - [ ] Native app
 - [ ] Terminal UI
-- [x] Better Styling / Document view
+- [ ] Better Styling / Document view
 - [ ] In-host multiplexer
 - [ ] Tmux
 - [ ] Ghostty Web
@@ -297,3 +297,5 @@ is the product, architecture, scope, operation, and verification guide.
 - [ ] Website / Demos - Capabilities, MCPs, and Skills
 - [ ] Architecture / Hygiene & Cleanups
 - [ ] Plugins / Extensions / Hooks
+- [ ] Evals
+- [ ] Phoenix integration

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
@@ -22,6 +22,7 @@ from turn.domain.schemas import (
     TriggerContext,
 )
 from turn.workers.terminal import SessionCallback, StreamCallback, TerminalTransport
+from turn.metrics import HarnessEvent
 
 
 class NodeExecutionContext(BaseModel):
@@ -55,6 +56,7 @@ class NodeExecutionContext(BaseModel):
     interactive_terminal: bool = False
     timeout_seconds: float | None = None
     stall_timeout_seconds: float | None = None
+    telemetry: Callable[[HarnessEvent], Awaitable[None]] | None = None
 
 
 class Worker(ABC):

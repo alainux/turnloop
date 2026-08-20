@@ -234,7 +234,10 @@ def opencode_session_ids(binary: str = "opencode") -> list[str]:
 
 
 def _injected_command_with_markers(
-    command: list[str], process_start_path: Path, process_exit_path: Path
+    command: list[str],
+    process_start_path: Path,
+    process_exit_path: Path,
+    machine_output_path: Path | None = None,
 ) -> str:
     """Wrap a shell command with an attempt-scoped process lifecycle marker.
 
@@ -247,10 +250,15 @@ def _injected_command_with_markers(
     quoted_command = " ".join(shlex.quote(part) for part in command)
     start = shlex.quote(str(process_start_path))
     exit_path = shlex.quote(str(process_exit_path))
+    stdout = (
+        f" > {shlex.quote(str(machine_output_path))}"
+        if machine_output_path is not None
+        else ""
+    )
     return (
         "( set +e; "
         f"printf '%s\\n' \"$$\" > {start}; "
-        f"{quoted_command}; "
+        f"{quoted_command}{stdout}; "
         "__turn_exit=$?; "
         f"printf '%s\\n' \"$__turn_exit\" > {exit_path} )"
     )
@@ -277,7 +285,11 @@ async def run_until_result(
     environment: dict[str, str] | None = None,
     process_start_path: Path | None = None,
     process_exit_path: Path | None = None,
+    machine_output_path: Path | None = None,
+    machine_output_handler: Callable[[str], Awaitable[None]] | None = None,
+    capture_machine_output: bool = False,
     keep_attached: bool = True,
+    input_delivery_timeout: float = 5.0,
 ):
     """Keep a native TUI alive until its Turn handoff file is available.
 
@@ -306,6 +318,47 @@ async def run_until_result(
             process_start_path.unlink(missing_ok=True)
         process_exit_path = result_path.with_suffix(".exit")
         process_exit_path.unlink(missing_ok=True)
+    if machine_output_path is not None:
+        machine_output_path.unlink(missing_ok=True)
+    machine_output_offset = 0
+    machine_output_buffer = ""
+
+    async def drain_machine_output(*, final: bool = False) -> None:
+        """Forward complete JSONL records from an explicit structured channel.
+
+        The channel can be captured stdout for a headless process or a
+        provider-owned sidecar written independently of a native TUI. Native
+        sidecars deliberately leave ``capture_machine_output`` false, so this
+        helper never redirects, reads, or repackages PTY output.
+        """
+        nonlocal machine_output_offset, machine_output_buffer
+        if machine_output_path is None or machine_output_handler is None:
+            return
+        try:
+            with machine_output_path.open("rb") as stream:
+                stream.seek(machine_output_offset)
+                chunk = stream.read()
+            machine_output_offset += len(chunk)
+            if chunk:
+                machine_output_buffer += chunk.decode("utf-8", errors="replace")
+            lines = machine_output_buffer.splitlines(keepends=True)
+            machine_output_buffer = ""
+            for line in lines:
+                if line.endswith(("\n", "\r")):
+                    try:
+                        await machine_output_handler(line)
+                    except Exception:
+                        pass
+                else:
+                    machine_output_buffer += line
+            if final and machine_output_buffer:
+                try:
+                    await machine_output_handler(machine_output_buffer)
+                except Exception:
+                    pass
+                machine_output_buffer = ""
+        except OSError:
+            return
 
     async def abort_owned_attachment() -> None:
         if not owns_attachment:
@@ -498,13 +551,21 @@ async def run_until_result(
                     idle_reap=idle_reap,
                 )
             )
-            await wait_for_attachment()
+            try:
+                await asyncio.wait_for(wait_for_attachment(), timeout=10.0)
+            except asyncio.TimeoutError as error:
+                raise RuntimeError(
+                    "harness pane did not become ready before Turn launched the command"
+                ) from error
             injected_command = " ".join(shlex.quote(part) for part in command)
             if injected_markers:
                 assert process_start_path is not None
                 assert process_exit_path is not None
                 injected_command = _injected_command_with_markers(
-                    command, process_start_path, process_exit_path
+                    command,
+                    process_start_path,
+                    process_exit_path,
+                    machine_output_path if capture_machine_output else None,
                 )
             injected = await transport.inject_command(
                 node_id,
@@ -513,7 +574,12 @@ async def run_until_result(
             )
             if not injected:
                 raise RuntimeError("Turn could not inject the harness command into Herdr")
-            await wait_for_process_start()
+            try:
+                await asyncio.wait_for(wait_for_process_start(), timeout=10.0)
+            except asyncio.TimeoutError as error:
+                raise RuntimeError(
+                    "harness command did not start after Herdr accepted it"
+                ) from error
         else:
             task = asyncio.create_task(
                 transport.run(
@@ -540,7 +606,12 @@ async def run_until_result(
             # command starts. Native provider commands carry their prompt in
             # the launch command and never enter this branch.
             if getattr(transport, "supports_inject", False):
-                await wait_for_foreground_harness()
+                try:
+                    await asyncio.wait_for(wait_for_foreground_harness(), timeout=10.0)
+                except asyncio.TimeoutError as error:
+                    raise RuntimeError(
+                        "harness did not become ready to receive the Turn prompt"
+                    ) from error
             else:
                 await wait_for_local_process()
             if task is None or not task.done():
@@ -555,11 +626,26 @@ async def run_until_result(
                     if not payload.endswith(("\n", "\r")):
                         payload += "\n"
                     for offset in range(0, len(payload), 512):
-                        sent = await transport.write(node_id, payload[offset : offset + 512])
+                        try:
+                            sent = await asyncio.wait_for(
+                                transport.write(node_id, payload[offset : offset + 512]),
+                                timeout=input_delivery_timeout,
+                            )
+                        except asyncio.TimeoutError as error:
+                            raise RuntimeError(
+                                "Herdr did not acknowledge Turn prompt delivery"
+                            ) from error
                         if getattr(transport, "supports_inject", False) and not sent:
                             raise RuntimeError("Turn could not inject the harness prompt into Herdr")
                         await asyncio.sleep(0.01)
-                    sent = await transport.write(node_id, "\x04")
+                    try:
+                        sent = await asyncio.wait_for(
+                            transport.write(node_id, "\x04"), timeout=input_delivery_timeout
+                        )
+                    except asyncio.TimeoutError as error:
+                        raise RuntimeError(
+                            "Herdr did not acknowledge Turn prompt EOF"
+                        ) from error
                     if getattr(transport, "supports_inject", False) and not sent:
                         raise RuntimeError("Turn could not close the harness prompt input in Herdr")
                 else:
@@ -569,11 +655,26 @@ async def run_until_result(
                     # instead of submitting it.
                     paste = f"\x1b[200~{initial_input}\x1b[201~"
                     for offset in range(0, len(paste), 512):
-                        sent = await transport.write(node_id, paste[offset : offset + 512])
+                        try:
+                            sent = await asyncio.wait_for(
+                                transport.write(node_id, paste[offset : offset + 512]),
+                                timeout=input_delivery_timeout,
+                            )
+                        except asyncio.TimeoutError as error:
+                            raise RuntimeError(
+                                "Herdr did not acknowledge Turn prompt delivery"
+                            ) from error
                         if getattr(transport, "supports_inject", False) and not sent:
                             raise RuntimeError("Turn could not inject the harness prompt into Herdr")
                         await asyncio.sleep(0.01)
-                    sent = await transport.write(node_id, "\r")
+                    try:
+                        sent = await asyncio.wait_for(
+                            transport.write(node_id, "\r"), timeout=input_delivery_timeout
+                        )
+                    except asyncio.TimeoutError as error:
+                        raise RuntimeError(
+                            "Herdr did not acknowledge Turn prompt submission"
+                        ) from error
                     if getattr(transport, "supports_inject", False) and not sent:
                         raise RuntimeError("Turn could not submit the harness prompt in Herdr")
     except BaseException:
@@ -607,6 +708,7 @@ async def run_until_result(
             ):
                 await abort_owned_attachment()
                 raise asyncio.TimeoutError
+            await drain_machine_output()
             if session_callback is not None and discovered_session is None:
                 discovered_session = _new_codex_session_id(
                     cwd,
@@ -747,3 +849,5 @@ async def run_until_result(
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         raise
+    finally:
+        await drain_machine_output(final=True)

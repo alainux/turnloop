@@ -43,6 +43,7 @@ import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
 import { LogsPanel } from "./components/LogsPanel";
+import { QualityPanel } from "./components/QualityPanel";
 import { ModelControl } from "./components/ModelControl";
 import { deriveStatus } from "./state";
 
@@ -55,6 +56,7 @@ const defaultPolicy: RunPolicy = {
   retry_backoff_ms: 750,
   retry_choked_models: true,
   compact_on_context_pressure: true,
+  behavior_expectations: null,
 };
 const emptyAgent: Agent = {
   id: crypto.randomUUID(),
@@ -211,6 +213,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
+  const [qualityOpen, setQualityOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const { sidebarWidth, inspectorWidth, beginResize, adjustResize } = usePanelResize();
   const [nodeMenu, setNodeMenu] = useState<{
@@ -417,6 +420,12 @@ export default function App() {
             setSelectedTrigger(null);
           }
         }}
+        onWorkspaceClosed={(id) => {
+          if (id === projectId) {
+            setSelected(null);
+            setSelectedTrigger(null);
+          }
+        }}
         notify={notify}
       />
       {sidebar && (
@@ -614,6 +623,11 @@ export default function App() {
         </span>
         <span className="status-spacer" />
         {projectId && (
+          <button className="status-action" onClick={() => setQualityOpen(true)} title="Open quality and behavior dashboard">
+            <Icon name="gauge" /> Quality
+          </button>
+        )}
+        {projectId && (
           <button className="status-action" onClick={() => setLogsOpen(true)} title="Open project logs">
             <Icon name="file" /> Logs
           </button>
@@ -627,6 +641,14 @@ export default function App() {
       </footer>
       {logsOpen && projectId && (
         <LogsPanel projectId={projectId} onClose={() => setLogsOpen(false)} />
+      )}
+      {qualityOpen && projectId && (
+        <QualityPanel
+          projectId={projectId}
+          onClose={() => setQualityOpen(false)}
+          onOpenLogs={() => { setQualityOpen(false); setLogsOpen(true); }}
+          onSelectNode={(nodeId) => { setQualityOpen(false); selectNode(nodeId); }}
+        />
       )}
       {settingsOpen && (
         <Settings
@@ -705,6 +727,7 @@ function Projects({
   onSelect,
   onChanged,
   onDeleted,
+  onWorkspaceClosed,
   notify,
 }: {
   projects: Project[];
@@ -713,6 +736,7 @@ function Projects({
   onSelect: (id: string) => void;
   onChanged: () => Promise<void>;
   onDeleted: (id: string) => void;
+  onWorkspaceClosed: (id: string) => void;
   notify: (s: string) => void;
 }) {
   const [filter, setFilter] = useState("");
@@ -831,15 +855,7 @@ function Projects({
     setRenaming(false);
     try {
       await closeProjectTerminals(project.id);
-      // Closing a project workspace is an explicit user action. Unmount the
-      // active inspector terminal before its websocket sees the server-side
-      // close; otherwise TerminalView treats that intentional close as a
-      // transient disconnect and reconnects, recreating the Herdr workspace
-      // immediately.
-      if (project.id === projectId) {
-        setSelected(null);
-        setSelectedTrigger(null);
-      }
+      onWorkspaceClosed(project.id);
       notify(`Closed all terminals for ${displayProjectTitle(project)}`);
     } catch (error) {
       notify(String(error));
@@ -1518,6 +1534,32 @@ function Policy({
               </label>
             ))}
           </div>
+        </section>
+        <section className="settings-section">
+          <h3>Optional behavior expectations</h3>
+          <p className="settings-hint">These report whether generic evidence exists; they do not score agents.</p>
+          {([
+            ["read_docs", "Read docs"],
+            ["use_skills", "Use skills"],
+            ["verify_after_changes", "Verify after changes"],
+          ] as const).map(([key, label]) => (
+            <label className="check" key={key}>
+              <input
+                type="checkbox"
+                checked={Boolean(value.behavior_expectations?.[key])}
+                onChange={(event) => setValue({
+                  ...value,
+                  behavior_expectations: {
+                    read_docs: value.behavior_expectations?.read_docs ?? null,
+                    use_skills: value.behavior_expectations?.use_skills ?? null,
+                    verify_after_changes: value.behavior_expectations?.verify_after_changes ?? null,
+                    [key]: event.target.checked,
+                  },
+                })}
+              />
+              {label}
+            </label>
+          ))}
         </section>
         <div className="panel-actions">
           <button className="button accent" disabled={!dirty}>

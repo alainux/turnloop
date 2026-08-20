@@ -37,6 +37,7 @@ from turn.config import settings
 from turn.workers import parsing
 from turn.workers.base import NodeExecutionContext, Worker, render_context_block
 from turn.workers.terminal import LocalPtyTransport
+from turn.metrics import emit_jsonl_telemetry
 from turn.workers.harness_catalog import (
     MODEL_DISCOVERY_COMMANDS,
     HarnessCommandFactory,
@@ -50,6 +51,17 @@ from turn.workers.interactive import (
     format_verification_result,
     run_until_result,
 )
+from turn.workers.pi_telemetry import (
+    prepare_interactive_pi_telemetry,
+    with_interactive_pi_telemetry,
+)
+from turn.workers.native_telemetry import (
+    NativeTelemetrySidecar,
+    emit_telemetry_status,
+    prepare_claude_hook_telemetry,
+    with_claude_telemetry,
+)
+from turn.workers.opencode_telemetry import OpenCodeSseTelemetry, reserve_loopback_port
 
 logger = logging.getLogger("turn.harnesses")
 
@@ -435,6 +447,7 @@ class CLIHarnessWorker(Worker):
         prompt_via_stdin: bool = False,
         mcp_config: str | None = None,
         skill_paths: list[str] | None = None,
+        interactive_server_port: int | None = None,
     ) -> list[str]:
         return self.commands.worker_command(
             self.harness,
@@ -446,6 +459,7 @@ class CLIHarnessWorker(Worker):
             prompt_via_stdin=prompt_via_stdin,
             mcp_config=mcp_config,
             skill_paths=skill_paths,
+            interactive_server_port=interactive_server_port,
         )
 
     async def execute(self, ctx: NodeExecutionContext) -> WorkerResult:
@@ -488,6 +502,17 @@ class CLIHarnessWorker(Worker):
         environment = agent_environment(
             cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
         )
+        telemetry_sidecar: NativeTelemetrySidecar | None = None
+        claude_settings = None
+        if native and self.harness is HarnessKind.PI:
+            environment.update(prepare_interactive_pi_telemetry(cwd, ctx.node.id))
+            telemetry_sidecar = NativeTelemetrySidecar(
+                path=Path(environment["TURN_METRICS_FILE"]), source="pi.extension",
+                detail="Pi lifecycle extension will export structured tool and turn events.",
+            )
+        elif native and self.harness is HarnessKind.CLAUDE:
+            telemetry_sidecar, claude_settings = prepare_claude_hook_telemetry(cwd, ctx.node.id)
+            environment.update(telemetry_sidecar.environment)
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         resume = had_session
         if not agent.session_id and self.harness == HarnessKind.CLAUDE:
@@ -539,6 +564,9 @@ class CLIHarnessWorker(Worker):
         # positional argument. Passing ``-`` and then injecting stdin makes
         # the CLI display help and exit before the model starts.
         inject_prompt = bool(getattr(transport, "supports_inject", False)) and self.harness is not HarnessKind.OPENCODE
+        opencode_port = reserve_loopback_port() if native and self.harness is HarnessKind.OPENCODE else None
+        opencode_telemetry = OpenCodeSseTelemetry(opencode_port, ctx.telemetry) if opencode_port is not None else None
+        opencode_telemetry_unavailable = native and self.harness is HarnessKind.OPENCODE and opencode_port is None
         cmd = self._command(
             agent,
             prompt,
@@ -548,8 +576,36 @@ class CLIHarnessWorker(Worker):
             prompt_via_stdin=inject_prompt,
             mcp_config=environment.get("TURN_AGENT_MCP_CONFIG"),
             skill_paths=[item for item in environment.get("TURN_AGENT_SKILLS", "").split(",") if item],
+            interactive_server_port=opencode_telemetry.port if opencode_telemetry else None,
         )
+        if native and self.harness is HarnessKind.PI:
+            cmd = with_interactive_pi_telemetry(cmd, environment)
+        if native and self.harness is HarnessKind.CLAUDE:
+            cmd = with_claude_telemetry(cmd, claude_settings)
+        telemetry_records = 0
+
+        async def emit_sidecar_event(line: str) -> None:
+            nonlocal telemetry_records
+            telemetry_records += 1
+            if telemetry_records == 1 and telemetry_sidecar is not None:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness=self.harness.value, source=telemetry_sidecar.source,
+                    status="connected", detail=f"{self.harness.value} delivered structured telemetry.",
+                )
+            await emit_jsonl_telemetry(self.harness.value, line, ctx.telemetry)
         try:
+            if telemetry_sidecar is not None:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness=self.harness.value, source=telemetry_sidecar.source,
+                    status="ready", detail=telemetry_sidecar.detail,
+                )
+            if opencode_telemetry is not None:
+                await opencode_telemetry.start()
+            elif opencode_telemetry_unavailable:
+                await emit_telemetry_status(
+                    ctx.telemetry, harness="opencode", source="opencode.server-sse", status="unavailable",
+                    detail="Turn could not reserve a loopback port for OpenCode's event stream; the interactive run continues with lifecycle evidence only.",
+                )
             if native:
                 terminal = await run_until_result(
                     transport,
@@ -569,6 +625,8 @@ class CLIHarnessWorker(Worker):
                     else None,
                     harness_name=binary,
                     environment=environment,
+                    machine_output_path=telemetry_sidecar.path if telemetry_sidecar else None,
+                    machine_output_handler=emit_sidecar_event if telemetry_sidecar else None,
                 )
             elif inject_prompt:
                 terminal = await run_until_result(
@@ -608,7 +666,18 @@ class CLIHarnessWorker(Worker):
             return WorkerResult(outcome=Outcome.FAIL, summary=f"{self.name} is not installed")
         except asyncio.TimeoutError:
             return WorkerResult(outcome=Outcome.FAIL, summary=f"{self.name} exceeded the run timeout", error="execution timeout")
+        finally:
+            if opencode_telemetry is not None:
+                await opencode_telemetry.stop()
         raw_out = terminal.output.decode(errors="replace")
+        if not native:
+            await emit_jsonl_telemetry(self.harness.value, raw_out, ctx.telemetry)
+        if telemetry_sidecar is not None and telemetry_records == 0:
+            await emit_telemetry_status(
+                ctx.telemetry, harness=self.harness.value, source=telemetry_sidecar.source,
+                status="degraded",
+                detail=f"{self.harness.value} completed without structured hook events; lifecycle evidence remains available but tool metrics are unavailable for this run.",
+            )
         if terminal.idle_reaped:
             return WorkerResult(
                 outcome=Outcome.FAIL,

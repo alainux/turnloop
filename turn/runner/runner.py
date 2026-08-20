@@ -49,6 +49,7 @@ from turn.workers.base import NodeExecutionContext, Worker
 from turn.workers.herdr import HerdrAdapter
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.metrics import HarnessEvent
 from turn.workers.interactive import read_result_file
 from turn.workers.capabilities import CapabilityLaunch, harness_capability_adapter
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
@@ -754,12 +755,12 @@ class Runner:
         *,
         forbidden_session_id: str | None = None,
     ) -> list[Node]:
-        ctx = await self._build_context(node)
-        ctx.forbidden_session_id = forbidden_session_id
         # The planner and all descendants use the same assigned project
         # directory, so files are immediately available downstream.
         prior_runs = await self.store.get_runs(node.id)
         run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
+        ctx = await self._build_context(node, run_id=str(run.id))
+        ctx.forbidden_session_id = forbidden_session_id
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
 
@@ -784,6 +785,7 @@ class Runner:
             "session_id": node.agent.session_id if node.agent else None, "attempt": run.attempt,
             "timeout_seconds": ctx.timeout_seconds, "purpose": "plan", "repo_path": ctx.repo_path,
             "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
+            "role": "setup" if node.id == project_id else (node.agent.type_id.value if node.agent else None),
         })
 
         async def remember_live_session(session_id: str) -> None:
@@ -899,8 +901,6 @@ class Runner:
         *,
         forbidden_session_id: str | None = None,
     ) -> None:
-        ctx = await self._build_context(node)
-        ctx.forbidden_session_id = forbidden_session_id
         # Deterministic is an in-process unit-test adapter. It deliberately
         # does not overload the Mock process harness even when the test node
         # carries a Mock agent configuration for schema compatibility.
@@ -920,6 +920,8 @@ class Runner:
             return
         prior_runs = await self.store.get_runs(node.id)
         run = await self.store.create_run(node, worker.name, len(prior_runs) + 1)
+        ctx = await self._build_context(node, run_id=str(run.id))
+        ctx.forbidden_session_id = forbidden_session_id
         ctx.attempt = run.attempt
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._emit("run.created", project_id, _dump(run))
@@ -945,6 +947,7 @@ class Runner:
             "session_id": node.agent.session_id if node.agent else None, "attempt": run.attempt,
             "timeout_seconds": ctx.timeout_seconds, "purpose": "execute", "repo_path": ctx.repo_path,
             "flags": self._launch_flags(node, resume=bool(node.agent and node.agent.session_id)),
+            "role": "setup" if node.id == project_id else (node.agent.type_id.value if node.agent else None),
         })
 
         async def remember_live_session(session_id: str) -> None:
@@ -1178,6 +1181,20 @@ class Runner:
                 else NodeStatus.RUNNING
             ),
         ) or current
+        await self._emit("verification.completed", project_id, {
+            "node_id": str(current.id),
+            "decision": decision.decision.value,
+            "target_node_id": str(decision.target_node_id) if decision.target_node_id else None,
+        })
+        if decision.decision is VerificationDecision.APPROVE:
+            nodes, edges, _ = await self.store.get_workgraph(project_id)
+            target = rejection_target(current, decision, GraphWalker(nodes, edges).indexes)
+            if target is not None:
+                await self._emit("verification.outcome", project_id, {
+                    "node_id": str(target.id),
+                    "reviewer_node_id": str(current.id),
+                    "decision": decision.decision.value,
+                })
         # Verification completion is useful as a general agent-action event,
         # while acceptance/rejection are the precise workflow events needed
         # for routing. A loop can therefore subscribe to acceptance without
@@ -1209,6 +1226,11 @@ class Runner:
                 raise RuntimeError(
                     "rejection requires a valid target_node_id when the verifier has multiple preceding stages"
                 )
+            await self._emit("verification.outcome", project_id, {
+                "node_id": str(target.id),
+                "reviewer_node_id": str(current.id),
+                "decision": decision.decision.value,
+            })
             await self._notify_rejection(target, reviewer, decision)
             # A reviewer may be the active member of a manual Step barrier.
             # Rejection moves that reviewer back behind the corrected target,
@@ -1875,7 +1897,7 @@ class Runner:
 
     # -- helpers ---------------------------------------------------------
 
-    async def _build_context(self, node: Node) -> NodeExecutionContext:
+    async def _build_context(self, node: Node, *, run_id: str | None = None) -> NodeExecutionContext:
         ancestry = await self.store.ancestry(node.id)
         resource_refs = []
         for a in ancestry + [node]:
@@ -1892,6 +1914,23 @@ class Runner:
 
         async def _stream(nid, chunk):
             await self._emit("node.terminal", pid, {"node_id": str(nid), "chunk": chunk})
+
+        async def _telemetry(event: HarnessEvent) -> None:
+            try:
+                event = event.model_copy(update={
+                    "node_id": event.node_id or str(node.id),
+                    "run_id": event.run_id or run_id,
+                    "role": event.role or ("setup" if node.id == node.project_id else (node.agent.type_id.value if node.agent else None)),
+                    "harness": event.harness or (node.agent.harness.value if node.agent else None),
+                    "model": event.model or (node.agent.model if node.agent else None),
+                })
+                # This is the one structured Turn event stream: EventBus
+                # persists it in the ordinary project log and publishes it to
+                # live UI subscribers. Do not create a parallel telemetry
+                # transport or infer events from the terminal transcript.
+                await self._emit("harness.event", pid, event.model_dump(mode="json"))
+            except Exception:
+                return
 
         return NodeExecutionContext(
             node=node,
@@ -1911,6 +1950,7 @@ class Runner:
             ),
             timeout_seconds=policy.timeout_seconds if policy else self.s.default_run_timeout_seconds,
             stall_timeout_seconds=policy.stall_timeout_seconds if policy else self.s.stall_timeout_seconds,
+            telemetry=_telemetry,
         )
 
     async def _resolve_resources(self, refs: list[str]) -> list[Resource]:

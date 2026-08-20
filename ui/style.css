@@ -2268,6 +2268,9 @@ form.composer:has(.composer-config-panel) {
   border-radius: var(--radius-sm);
   font-size: 8px;
 }
+.terminal-view-switch { display: inline-flex; gap: 1px; padding: 1px; border: 1px solid #303846; border-radius: var(--radius-sm); }
+.terminal-view-switch button { border: 0; border-radius: 2px; padding: 2px 5px; background: transparent; color: #788495; font: inherit; font-size: 8px; cursor: pointer; }
+.terminal-view-switch button.active { background: #303846; color: var(--text); }
 .terminal-disconnected {
   grid-row: 2;
   display: flex;
@@ -2298,8 +2301,22 @@ form.composer:has(.composer-config-panel) {
   min-height: 0;
 }
 .terminal-shadow-host.is-collapsed {
-  display: none;
+  /* xterm's setup intentionally writes ``display:block`` inline. The
+     inspector view switch must still hide that raw renderer completely so
+     the structured activity stream owns the panel, not a narrow side column. */
+  display: none !important;
 }
+.harness-activity { grid-row: 3; min-height: 0; overflow: auto; padding: 7px 9px; background: #090b0e; color: var(--text-2); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.harness-activity > p { margin: 4px 0; color: var(--text-3); }
+.harness-telemetry { display: grid; gap: 2px; margin: 2px 0 8px; padding: 7px; border: 1px solid #303846; color: var(--text-2); background: #121720; }
+.harness-telemetry strong { color: var(--accent); font-size: 10px; text-transform: capitalize; }
+.harness-telemetry span { color: var(--text-2); }
+.harness-telemetry.telemetry-degraded, .harness-telemetry.telemetry-unavailable { border-color: #735a2e; background: #1b1710; }
+.harness-telemetry.telemetry-degraded strong, .harness-telemetry.telemetry-unavailable strong { color: #d9ad58; }
+.harness-activity-line { display: grid; grid-template-columns: 72px minmax(92px, .65fr) minmax(0, 1.8fr); gap: 8px; padding: 5px 3px; border-bottom: 1px solid #1d232d; }
+.harness-activity-line time { color: var(--text-3); }
+.harness-activity-line span { color: var(--accent); text-transform: capitalize; }
+.harness-activity-line small { min-width: 0; overflow: hidden; color: var(--text-2); font: inherit; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-shell-collapsed {
   height: auto;
   min-height: 0;
@@ -2484,6 +2501,63 @@ form.composer:has(.composer-config-panel) {
   color: var(--text);
   animation: logs-enter var(--motion-normal) ease-out;
 }
+
+.quality-panel {
+  overflow: hidden;
+}
+.quality-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-0);
+}
+.quality-filter input,
+.quality-filter select {
+  min-width: 104px;
+  height: var(--control-sm);
+  font-size: 10px;
+}
+.quality-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 24px 28px;
+}
+.quality-trends {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+.quality-trend {
+  display: grid;
+  gap: 4px;
+  min-height: 64px;
+  padding: 10px 12px;
+  background: var(--surface-1);
+}
+.quality-trend span,
+.quality-section-head small,
+.quality-expectations { color: var(--text-3); font-size: 10px; }
+.quality-trend strong { color: var(--text); font-size: 15px; font-weight: 560; }
+.quality-expectations { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.quality-section-head { display: flex; justify-content: space-between; align-items: center; padding: 16px 0 7px; font-size: 11px; font-weight: 600; }
+.quality-section-head button,
+.quality-agent-actions button { border: 0; background: transparent; color: var(--accent); font-size: 10px; cursor: pointer; }
+.quality-agent-list, .quality-recent, .quality-run-list { padding: 0 0 12px; }
+.quality-agent, .quality-run { border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent); }
+.quality-agent summary, .quality-recent > div { display: grid; grid-template-columns: 1.2fr .9fr .8fr .8fr .8fr; gap: 8px; padding: 8px; color: var(--text-2); font-size: 10px; cursor: pointer; }
+.quality-agent summary:hover, .quality-run summary:hover { background: var(--surface-1); }
+.quality-agent summary span:first-child, .quality-recent > div span:first-child { color: var(--text); font-weight: 540; }
+.quality-agent-actions { display: flex; gap: 10px; padding: 5px 8px; }
+.quality-agent pre, .quality-run pre { max-height: 300px; margin: 0 0 8px 28px; padding: 10px; overflow: auto; border-left: 2px solid var(--border-strong); background: var(--surface-1); color: var(--text-2); font-size: 10px; line-height: 1.5; user-select: text; white-space: pre-wrap; }
+.quality-run summary { display: grid; grid-template-columns: 1.35fr 1fr .75fr .65fr .75fr; gap: 8px; padding: 8px; color: var(--text-2); font-size: 10px; cursor: pointer; }
+.quality-run summary span:first-child { color: var(--text); font-weight: 540; }
+.quality-run-meta, .quality-assessments { display: flex; flex-wrap: wrap; gap: 10px; padding: 3px 8px; color: var(--text-3); font-size: 10px; }
+@media (max-width: 760px) { .quality-filter { padding-left: 14px; padding-right: 14px; } .quality-content { padding-left: 10px; padding-right: 10px; } .quality-agent summary, .quality-recent > div { grid-template-columns: 1fr 1fr; } }
 @keyframes logs-enter {
   from { transform: translateY(18px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
