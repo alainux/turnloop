@@ -4,6 +4,11 @@ Turn depends on this small port for workspace and pane management. The
 concrete adapter is the only place that knows Herdr's CLI command shape and
 JSON response envelope; the terminal transport remains responsible for Turn's
 durable node-to-pane mapping and short-lived control streams.
+
+Herdr is an external, user-owned daemon. Turn is a client of that daemon: it
+must never start, stop, or otherwise own the Herdr server lifecycle. Every
+command in this adapter is a client operation sent through Herdr's existing
+socket service.
 """
 from __future__ import annotations
 
@@ -28,6 +33,21 @@ class HerdrResourceNotFound(HerdrAdapterError):
         super().__init__(f"{resource}_not_found: {resource_id}")
 
 
+def is_stale_resource_error(error: BaseException, *, resource: str) -> bool:
+    """Identify a missing Herdr resource reported by a lookup operation.
+
+    Herdr normally returns a structured ``*_not_found`` code.  Generic
+    permission failures are deliberately not treated as absence: they may be
+    transient daemon backpressure or an actual authorization problem, and
+    turning them into a workspace close would be unsafe.
+    """
+    if isinstance(error, HerdrResourceNotFound):
+        return error.resource == resource
+    if not isinstance(error, HerdrAdapterError):
+        return False
+    return False
+
+
 @dataclass(frozen=True)
 class HerdrWorkspace:
     workspace_id: str
@@ -45,6 +65,18 @@ class HerdrWorkspaceCreation:
 @dataclass(frozen=True)
 class HerdrPane:
     pane_id: str
+    workspace_id: str | None = None
+    target: str | None = None
+    agent_session: str | None = None
+
+
+@dataclass(frozen=True)
+class HerdrAgent:
+    target: str
+    pane_id: str | None = None
+    agent_session: str | None = None
+    provider: str | None = None
+    state: str | None = None
 
 
 class HerdrAdapter(Protocol):
@@ -64,6 +96,12 @@ class HerdrAdapter(Protocol):
     async def close_workspace(self, workspace_id: str) -> bool: ...
 
     async def get_pane(self, pane_id: str) -> HerdrPane: ...
+
+    async def list_panes(self, workspace_id: str) -> tuple[HerdrPane, ...]: ...
+
+    async def list_agents(self) -> tuple[HerdrAgent, ...]: ...
+
+    async def get_agent(self, target: str) -> HerdrAgent: ...
 
     async def create_tab(
         self, *, workspace_id: str, cwd: str, label: str, focus: bool = False
@@ -98,7 +136,12 @@ class HerdrAdapter(Protocol):
 
 
 class HerdrCliAdapter:
-    """Call the documented Herdr CLI bridge from an external Turn process."""
+    """Call the documented Herdr client bridge from an external Turn process.
+
+    This adapter intentionally has no daemon lifecycle methods. In particular,
+    ``herdr server`` is an administrative headless-server command and must not
+    be used by Turn.
+    """
 
     def __init__(self, herdr_binary: str | None = None, session: str | None = None):
         self._herdr = herdr_binary or shutil.which("herdr")
@@ -117,6 +160,16 @@ class HerdrCliAdapter:
         command.extend(args)
         return command
 
+    @staticmethod
+    def _client_environment() -> dict[str, str]:
+        """Give each CLI child the context required by the Herdr client."""
+        environment = os.environ.copy()
+        # Herdr's installed client contract requires this marker for commands
+        # sent to the user-owned daemon. It is scoped to Turn's child process;
+        # Turn still does not own or launch the daemon lifecycle.
+        environment["HERDR_ENV"] = "1"
+        return environment
+
     async def _run(self, *args: str) -> dict[str, object]:
         if not self.available:
             raise HerdrAdapterError("Herdr is required for project terminal management")
@@ -124,6 +177,7 @@ class HerdrCliAdapter:
             *self.command(*args),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._client_environment(),
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -149,6 +203,7 @@ class HerdrCliAdapter:
             *self.command(*args),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._client_environment(),
         )
         _, stderr = await process.communicate()
         if process.returncode != 0:
@@ -242,7 +297,52 @@ class HerdrCliAdapter:
     async def get_pane(self, pane_id: str) -> HerdrPane:
         result = self._result(await self._run("pane", "get", pane_id))
         raw = result.get("pane")
-        return HerdrPane(self._required_id(raw, "pane_id", "id"))
+        return self._parse_pane(raw)
+
+    @classmethod
+    def _parse_pane(cls, raw: object) -> HerdrPane:
+        if not isinstance(raw, dict):
+            raise HerdrAdapterError("Herdr pane response was invalid")
+        return HerdrPane(
+            cls._required_id(raw, "pane_id", "id"),
+            raw.get("workspace_id") if isinstance(raw.get("workspace_id"), str) else None,
+            raw.get("target") if isinstance(raw.get("target"), str) else None,
+            raw.get("agent_session") if isinstance(raw.get("agent_session"), str) else None,
+        )
+
+    @classmethod
+    def _parse_agent(cls, raw: object) -> HerdrAgent:
+        if not isinstance(raw, dict):
+            raise HerdrAdapterError("Herdr agent response was invalid")
+        target = cls._required_id(raw, "target", "agent_id", "id", "name")
+        pane_id = raw.get("pane_id") or raw.get("pane")
+        if isinstance(pane_id, dict):
+            pane_id = pane_id.get("pane_id") or pane_id.get("id")
+        return HerdrAgent(
+            target,
+            pane_id if isinstance(pane_id, str) else None,
+            raw.get("agent_session") if isinstance(raw.get("agent_session"), str) else None,
+            raw.get("provider") if isinstance(raw.get("provider"), str) else raw.get("harness") if isinstance(raw.get("harness"), str) else None,
+            raw.get("state") if isinstance(raw.get("state"), str) else None,
+        )
+
+    async def list_panes(self, workspace_id: str) -> tuple[HerdrPane, ...]:
+        result = self._result(await self._run("pane", "list", "--workspace", workspace_id))
+        raw_panes = result.get("panes")
+        if not isinstance(raw_panes, list):
+            raise HerdrAdapterError("Herdr pane list response was invalid")
+        return tuple(self._parse_pane(raw) for raw in raw_panes)
+
+    async def list_agents(self) -> tuple[HerdrAgent, ...]:
+        result = self._result(await self._run("agent", "list"))
+        raw_agents = result.get("agents")
+        if not isinstance(raw_agents, list):
+            raise HerdrAdapterError("Herdr agent list response was invalid")
+        return tuple(self._parse_agent(raw) for raw in raw_agents)
+
+    async def get_agent(self, target: str) -> HerdrAgent:
+        result = self._result(await self._run("agent", "get", target))
+        return self._parse_agent(result.get("agent"))
 
     async def create_tab(
         self, *, workspace_id: str, cwd: str, label: str, focus: bool = False
@@ -341,6 +441,7 @@ class HerdrCliAdapter:
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._client_environment(),
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
@@ -352,6 +453,8 @@ class HerdrCliAdapter:
         result = self._result(await self._run("pane", "process-info", "--pane", pane_id))
         info = result.get("process_info")
         processes = info.get("foreground_processes") if isinstance(info, dict) else None
+        if processes is None:
+            processes = result.get("foreground_processes") or result.get("processes")
         if not isinstance(processes, list):
             return ()
         names: list[str] = []
@@ -360,7 +463,7 @@ class HerdrCliAdapter:
                 # Node-based CLIs such as Pi report `name: node` while their
                 # argv0 remains the provider command. Preserve both so
                 # foreground readiness can match the configured harness.
-                for field in ("name", "argv0"):
+                for field in ("name", "argv0", "command", "executable"):
                     name = process.get(field)
                     if isinstance(name, str) and name:
                         names.append(name.rsplit("/", 1)[-1])

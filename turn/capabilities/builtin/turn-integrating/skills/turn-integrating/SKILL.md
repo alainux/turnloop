@@ -26,6 +26,11 @@ domain work, reconcile incompatible contracts at the existing boundaries,
 wire the pieces together, and make the actual product or deliverable runnable
 according to the user's request.
 
+When the runtime gives the integrator a worktree containing merged predecessor
+branches, resolve conflicts there and validate the combined product rather
+than assuming that individually passing branches compose. Emit integration
+evidence for the resulting entry point, contracts, and end-to-end scenario.
+
 Treat each prerequisite as an exported contract, not as a suggestion. Make a
 small integration map before editing: owner → files/API/assets → canonical
 state → real entry point → acceptance evidence. Check that every required
@@ -53,7 +58,7 @@ composition boundary. The final result must be one product:
   orphaned asset that is not part of the requested experience;
 - no prerequisite hidden behind an unmounted or unreachable module.
 
-For a browser or game product, inspect the rendered experience at the actual
+For a browser, interactive, or other visual product, inspect the rendered experience at the actual
 entry point. Confirm that the visible scene, controls, interaction feedback,
 and narrative/content state agree with one another. If the pieces cannot be
 made coherent without inventing missing product decisions, return FAIL with

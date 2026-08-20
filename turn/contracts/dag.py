@@ -20,7 +20,6 @@ from turn.domain.schemas import (
     WorkerResult,
     concise_node_title,
 )
-from turn.graph.logic import validate_single_workflow_leaf
 
 # The domain models are the single source of truth. Artifact strings are the
 # one intentionally compact wire form accepted by the agent CLI; they are
@@ -45,7 +44,51 @@ def parse_result(value: str | dict[str, Any]) -> WorkerResult:
 
 
 def parse_verification(value: str | dict[str, Any]) -> VerificationResult:
-    return VerificationResult.model_validate(_decode(value))
+    payload = _decode(value)
+    if not isinstance(payload, dict):
+        return VerificationResult.model_validate(payload)
+
+    # Verifiers commonly start with the compact ``evidence_refs`` field and
+    # then grow criterion-level evidence as they inspect the implementation.
+    # Some harnesses serialize those evidence objects into that field instead
+    # of switching to ``evidence``.  Normalize both object and JSON-string
+    # forms at this boundary so the runner receives the typed evidence it
+    # needs for acceptance checks. Plain path/reference strings keep their
+    # original meaning.
+    normalized = dict(payload)
+    evidence = normalized.get("evidence")
+    if evidence is None:
+        evidence = []
+    refs = normalized.get("evidence_refs")
+    if isinstance(evidence, list) and isinstance(refs, list):
+        plain_refs: list[Any] = []
+
+        def structured_item(candidate: Any) -> Any | None:
+            if isinstance(candidate, dict):
+                return candidate if {"criterion_id", "status", "summary"}.issubset(candidate) else None
+            if not isinstance(candidate, str):
+                return None
+            try:
+                decoded = json.loads(candidate)
+            except (TypeError, json.JSONDecodeError):
+                return None
+            return decoded if isinstance(decoded, dict) and {"criterion_id", "status", "summary"}.issubset(decoded) else None
+
+        # Rebuild the existing evidence list without mutating it while it is
+        # being iterated. This also handles JSON-encoded items in ``evidence``.
+        canonical_evidence = []
+        for item in evidence:
+            decoded = structured_item(item)
+            canonical_evidence.append(decoded if decoded is not None else item)
+        for ref in refs:
+            decoded = structured_item(ref)
+            if decoded is None:
+                plain_refs.append(ref)
+            else:
+                canonical_evidence.append(decoded)
+        normalized["evidence"] = canonical_evidence
+        normalized["evidence_refs"] = plain_refs
+    return VerificationResult.model_validate(normalized)
 
 
 def validate_agent_submission(
@@ -83,7 +126,6 @@ def validate_subgraph_sources(
     def visit(current: PlanResult, source: Path | None, depth: int) -> None:
         if depth > max_depth:
             raise ValueError(f"subgraph reference depth exceeds {max_depth}")
-        validate_single_workflow_leaf(current)
         references = [
             *current.subgraph_refs,
             *(reference for node in current.nodes for reference in node.subgraph_refs),
@@ -224,7 +266,19 @@ def _normalize_artifacts(raw: Any) -> Any:
                 "ref": item,
             })
         elif isinstance(item, dict):
-            artifacts.append(dict(item))
+            value = dict(item)
+            kind = value.get("kind")
+            if isinstance(kind, str):
+                aliases = {
+                    "markdown": "text", "md": "text", "document": "file",
+                    "document_ref": "file", "source": "file", "source_file": "file",
+                    "test_report": "evidence", "test-report": "evidence",
+                    "acceptance_evidence": "evidence", "criterion_evidence": "evidence",
+                    "verification": "evidence", "test_output": "log", "test-output": "log",
+                    "diff": "code_diff", "patch": "code_diff", "url": "link",
+                }
+                value["kind"] = aliases.get(kind.casefold(), kind)
+            artifacts.append(value)
         else:
             artifacts.append(item)
     return artifacts

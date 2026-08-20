@@ -81,6 +81,7 @@ Everything else is a capability plugin or a harness/runtime concern.
 - DRY. Don't repeat yourself. If you find yourself repeating code or adding things in multiple places, flag it.
 - Clean up when done. Don't wait the human to say it. Don't end your work leaving experiments, temp files, or strange artifacts unless they need to be there for a reason.
 - The CLI is the only communication resource of agents with the system. No observing for completion or status. No shortcuts. Only observing for a crash or a system failure is allowed. 
+- Your code must be correct and verifiable via tests only. If tests are passing, but you found a bug, discover where is the verifiability gap and close it. Everything is testable when properly designed.
 
 ## Success criteria
 
@@ -138,8 +139,10 @@ Everything else is a capability plugin or a harness/runtime concern.
 - <root>/.turn holds config data for this workspace
 - `/projects/<project_name>/.turn` - that project’s state, runs, logs, etc.
 - For development, we use `./projects` for projects, and we also have `./turn` for configs, because we both use and develop the product. Don't be confused by this. 
-- Don't launch projects in /tmp, use the `./projects` repo dir instead, so we can inspect the state and artifacts
 
-# Cautionary notes
+# Cautionary notes and common pitfalls
 
+- Use the `./projects/my-project` repo dir for demo projects, so we can inspect the state and artifacts. Not `/tmp` or `/.demo-x`. 
 - This document and the real implementation may diverge. When that happens, steer it back to match this document.
+- Herdr is a daemon. It runs constantly, _it doesn't need to be launched or restarted_. The CLI can be used to access it and control it.
+- When launching a node, immediately observe the terminal, either in herdr or in the UI. Most problems appear instantly.

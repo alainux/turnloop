@@ -26,6 +26,9 @@ turn/server.lock
 turn/demo-data/
 turn-demo-state/
 .demo-turn
+.turn-browser-demo
+.turn-browser-demo
+.turn-browser-real
 
 # Per-project repos (user deliverables; each is its own git repository)
 projects/

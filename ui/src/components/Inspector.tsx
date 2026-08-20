@@ -14,6 +14,7 @@ import {
   primaryNodeAction,
   primaryNodeActionIcon,
   primaryNodeActionLabel,
+  organizationManagerPhase,
 } from "../domain";
 import { editNode, getNodeDetail, provideNodeInput, runNodeAction } from "../api/nodes";
 import { Icon } from "./Icon";
@@ -133,6 +134,154 @@ export function Inspector({
   );
 }
 
+function OrganizationDetails({ node }: { node: Detail["node"] }) {
+  const contract = node.organization_contract;
+  const review = node.organization_review;
+  const materialManager = organizationManagerPhase(node) === null ? null : review;
+  const evidence = node.verification?.evidence ?? [];
+  const managerReasons = node.manager_review_reasons ?? [];
+  const handoffs = [
+    ...(node.exported_handoffs ?? []).map((item) => ({ ...item, direction: "exports" })),
+    ...(node.required_handoffs ?? []).map((item) => ({ ...item, direction: "requires" })),
+  ];
+  const workspaceVisible = Boolean(
+    node.workspace || node.workspace_path || node.workspace_commit || node.output_branch ||
+    node.run_policy?.workspace_isolation,
+  );
+  if (!contract && !review && !workspaceVisible && node.resource_refs.length === 0) return null;
+  const audit = review?.audit;
+  const auditDecision = review?.audit_decision ?? (audit ? (audit.accepted ? "APPROVE" : "REJECT") : null);
+  const auditLabel = auditDecision === "APPROVE"
+    ? "Approved" + (review?.audit_correction_count ? " after " + review.audit_correction_count + " correction" + (review.audit_correction_count === 1 ? "" : "s") : "")
+    : auditDecision === "REJECT"
+      ? "Correction required"
+      : "Not yet audited";
+  return (
+    <>
+      {(contract || review) && (
+        <section className="section organization-section">
+          <div className="section-heading">
+            <span>Organization</span>
+            {contract && <span className="badge neutral">{contract.scale}</span>}
+          </div>
+          {contract && (
+            <>
+              <p className="organization-charter">{contract.charter}</p>
+              <div className="organization-facts">
+                <span>Minimum owners {contract.min_first_level_production_owners}</span>
+                <span>{contract.require_independent_verification ? "Independent evaluation required" : "Evaluation policy is contract-defined"}</span>
+              </div>
+              {contract.deliverables.length > 0 && (
+                <div className="organization-list">
+                  <small>Deliverables</small>
+                  {contract.deliverables.map((item) => <span key={item}>{item}</span>)}
+                </div>
+              )}
+              {contract.acceptance_criteria.length > 0 && (
+                <div className="organization-list">
+                  <small>Acceptance criteria</small>
+                  {contract.acceptance_criteria.map((criterion) => (
+                    <span key={criterion.id}><code>{criterion.id}</code> {criterion.description}</span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+          {materialManager && (
+            <div className="organization-manager">
+              <div className="organization-facts">
+                <span>Manager {node.manager_phase ?? materialManager.last_decision ?? materialManager.phase}</span>
+                <span>Iteration {node.manager_iteration ?? 0}</span>
+              </div>
+              {(managerReasons.length > 0 || materialManager.last_reason) && (
+                <div className="organization-reasons">
+                  <small>Reason</small>
+                  {managerReasons.map((reason) => <span key={reason}>{reason}</span>)}
+                  {managerReasons.length === 0 && materialManager.last_reason && <span>{materialManager.last_reason}</span>}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+      {review && (audit || review.audit_decision || review.audit_summary) && (
+        <section className="section organization-section">
+          <div className="section-heading">
+            <span>Plan audit</span>
+            <span className={"badge " + (auditDecision === "APPROVE" ? "complete" : auditDecision === "REJECT" ? "failed" : "neutral")}>
+              {auditLabel}
+            </span>
+          </div>
+          {review.audit_summary && <p className="verification-summary">{review.audit_summary}</p>}
+          {review.audit_findings.length > 0 && (
+            <ul className="verification-findings">
+              {review.audit_findings.map((finding) => <li key={finding}>{finding}</li>)}
+            </ul>
+          )}
+          {review.audit_required_changes.length > 0 && (
+            <div className="organization-reasons">
+              <small>Required changes</small>
+              {review.audit_required_changes.map((change) => <span key={change}>{change}</span>)}
+            </div>
+          )}
+          {audit && <small className="detail-muted">Structural score {Math.round(audit.score * 100)}%</small>}
+        </section>
+      )}
+      {contract && contract.acceptance_criteria.length > 0 && (
+        <section className="section organization-section">
+          <div className="section-heading"><span>Evidence</span></div>
+          <div className="organization-evidence">
+            {contract.acceptance_criteria.map((criterion) => {
+              const item = evidence.find((candidate) => candidate.criterion_id === criterion.id);
+              return (
+                <div className="evidence-row" key={criterion.id}>
+                  <span className={"evidence-dot " + (item?.status?.toLowerCase() ?? "pending")} />
+                  <span><code>{criterion.id}</code> {item?.summary ?? "No evidence submitted"}</span>
+                  {item && <small>{item.refs.length > 0 ? item.refs.length + " reference" + (item.refs.length === 1 ? "" : "s") : "No references"}</small>}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+      {handoffs.length > 0 && (
+        <section className="section organization-section">
+          <div className="section-heading"><span>Handoffs</span></div>
+          <div className="organization-list">
+            {handoffs.map((handoff) => (
+              <span key={handoff.direction + "-" + handoff.name}>
+                <code>{handoff.direction}</code> {handoff.name} · {handoff.schema_name} {handoff.required ? "· required" : ""}
+              </span>
+            ))}
+          </div>
+        </section>
+      )}
+      {(workspaceVisible || node.resource_refs.length > 0) && (
+        <section className="section organization-section">
+          <div className="section-heading"><span>Resources and workspace</span></div>
+          {node.resource_refs.length > 0 && (
+            <div className="organization-list">
+              <small>Resource references</small>
+              {node.resource_refs.map((ref) => <span key={ref}>{ref}</span>)}
+            </div>
+          )}
+          {workspaceVisible && (
+            <div className="organization-facts workspace-facts">
+              {node.workspace?.branch && <span>Branch {node.workspace.branch}</span>}
+              {node.workspace_path && <span>Path {node.workspace_path}</span>}
+              {node.workspace_commit && <span>Commit {node.workspace_commit.slice(0, 12)}</span>}
+              {node.output_branch && <span>Output {node.output_branch}</span>}
+              {!node.workspace && !node.workspace_path && !node.workspace_commit && node.run_policy?.workspace_isolation === "shared" && (
+                <span>Shared project workspace</span>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+    </>
+  );
+}
+
 function Overview({
   detail,
   capabilities,
@@ -189,6 +338,18 @@ function Overview({
               : node.ui_state.replaceAll("_", " ")}
         </span>
       </div>
+      <OrganizationDetails node={node} />
+      {node.control_activity && (
+        <section className="section control-activity" aria-label="Control activity">
+          <div className="section-heading"><span>Control activity</span><span className="badge neutral">Running</span></div>
+          <p className="verification-summary">
+            {node.control_activity.kind === "plan_audit" ? "Plan audit running…" : "Manager review running…"}
+            {node.control_activity.kind === "manager_review" && node.manager_iteration
+              ? ` Iteration ${node.manager_iteration}.`
+              : ""}
+          </p>
+        </section>
+      )}
       {node.verification && (
         <section className="section verification-section">
           <div className="section-heading">

@@ -27,6 +27,18 @@ from turn.domain.schemas import (
     Run,
     RunPolicy,
     WorkerResult,
+    ManagerResult,
+)
+from turn.domain.organization import (
+    AcceptanceCriterion,
+    AcceptanceEvidence,
+    BudgetRequest,
+    Handoff,
+    OrganizationBudget,
+    OrganizationContract,
+    OrganizationMetrics,
+    WorkItem,
+    PlanAuditResult,
 )
 from turn.metrics import BehaviorExpectations
 
@@ -58,6 +70,16 @@ PUBLIC_DOMAIN_MODELS = {
     "Run": Run,
     "PlanResult": PlanResult,
     "WorkerResult": WorkerResult,
+    "ManagerResult": ManagerResult,
+    "AcceptanceCriterion": AcceptanceCriterion,
+    "AcceptanceEvidence": AcceptanceEvidence,
+    "BudgetRequest": BudgetRequest,
+    "Handoff": Handoff,
+    "OrganizationBudget": OrganizationBudget,
+    "OrganizationContract": OrganizationContract,
+    "OrganizationMetrics": OrganizationMetrics,
+    "WorkItem": WorkItem,
+    "PlanAuditResult": PlanAuditResult,
 }
 
 

@@ -223,7 +223,7 @@ def test_basics_and_planning_guidance_live_in_capabilities():
     assert "adaptive workflow planner" in basics
     assert "super-planner" in setup
     assert "Scope classification gate" in setup
-    assert "department-shaped" in setup
+    assert "no industry checklist is mandatory" in setup
     assert "native" in planning
     assert "turn capabilities search" in planning
     assert "generated_prompt" in planning
@@ -241,36 +241,30 @@ def test_basics_and_planning_guidance_live_in_capabilities():
     assert "do not hard-code an unavailable browser" in planning
     assert "$control-chrome" in planning
     assert "The absence of either individual binding is not a\nrejection finding." in verifying
-    assert "Release-scale game decomposition gate" in planning
-    assert "multi-discipline production" in planning
-    assert "genuine parallel lanes" in planning
-    assert "entire released game in one executor" in planning
     assert "Product-scale default and uncertainty protocol" in planning
     assert "Vague wording is not\npermission to reduce the product" in planning
-    assert "**planner** clarification boundary" in planning
+    assert "there is no universal set of disciplines or runtime roles" in planning
+    assert "only the gates and composition points the outcome" in planning
     assert "one to three precise `required_inputs`" in planning
-    assert "Release lifecycle and reintegration default" in planning
-    assert "vertical-slice review" in planning
-    assert "repeatedly integrate and review" in planning
-    assert "release phases,\nowners, gate criteria" in planning
-    assert "single-page POC" in setup
-    assert "planner clarification\n  boundary" in setup
-    assert "right-sized release lifecycle" in setup
-    assert "recurring integration, QA/polish, and release" in setup
+    assert "Delivery lifecycle and composition" in planning
+    assert "right-sized lifecycle" in planning
+    assert "planner clarification" in setup
     assert "Local delivery is not dependency austerity" in planning
     assert "normal\npackage installation" in planning
     assert "rebuild commodity infrastructure" in planning
     assert "not a ban on normal packages" in setup
     assert "right-sized complete Turn organization" in setup
-    assert "recursive organization" in setup
-    assert "root should therefore look like an executive organization" in setup
+    assert "Use recursion when" in setup
     assert "Recursive organization and leaf fitness" in planning
-    assert "Recursive quality gates" in planning
+    assert "Boundary evaluation" in planning
     assert "leaf-fit" in planning
     assert 'agent_type: "planner"' in planning
     assert "Adaptive scope escalation" in executing
     assert "one nested planner child" in executing
     assert "one-child planner escalation" in basics
+    assert "Release-scale game decomposition gate" not in planning
+    assert "department-shaped" not in setup
+    assert "recurring integration, QA/polish, and release" not in setup
 
 
 def test_plan_parser_uses_only_capability_plugin_ids():

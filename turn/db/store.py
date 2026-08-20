@@ -34,6 +34,7 @@ from turn.domain.schemas import (
     Graph,
     InputSpec,
     Node,
+    NodeSpec,
     NodeStatus,
     Outcome,
     PlanResult,
@@ -49,8 +50,25 @@ from turn.domain.schemas import (
     NODE_OBJECTIVE_MAX_LENGTH,
     concise_node_title,
 )
+from turn.domain.organization import (
+    BudgetRequest,
+    BudgetRequestStatus,
+    Handoff,
+    HandoffContract,
+    HandoffStatus,
+    ManagerPhase,
+    OrganizationContract,
+    OrganizationPhase,
+    OrganizationReview,
+    OrganizationScale,
+    WorkItem,
+    WorkItemStatus,
+    WorkspaceRef,
+)
 from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
+from turn.contracts.organization import audit_plan
+from turn.contracts.text import sanitize_control_text
 from turn.db.state import ProjectState
 from turn.graph.logic import GraphWalker
 from turn.graph.mutations import (
@@ -62,6 +80,9 @@ from turn.graph.mutations import (
 from turn.logging import EventLog
 
 PLANNER_EXECUTOR = "planner"
+# The new organization collections are additive and readers already tolerate
+# unknown/missing fields, so keep the existing state version stable for local
+# projects and external tooling that pins the compact format.
 STATE_VERSION = 3
 
 
@@ -254,6 +275,19 @@ class Store:
                     if key != "telemetry_mode"
                 }
                 normalized = True
+            if (
+                node_payload.get("executor") == PLANNER_EXECUTOR
+                and isinstance(agent_payload, dict)
+                and "type_id" not in agent_payload
+            ):
+                # Very old planner nodes omitted the specialization entirely.
+                # Migrate only that missing field; an explicit persisted role
+                # is user state and must remain intact.
+                node_payload["agent"] = {
+                    **agent_payload,
+                    "type_id": AgentType.PLANNER.value,
+                }
+                normalized = True
             # Older planners sometimes put the full assignment in the graph
             # label. Preserve that text as the worker prompt and migrate the
             # persisted label to the same concise form used for new nodes.
@@ -301,6 +335,42 @@ class Store:
                 normalized = True
             trigger = Trigger.model_validate(trigger_payload)
             state.triggers[trigger.id] = trigger
+        for item in raw.get("work_items", []):
+            work_item = WorkItem.model_validate(item)
+            state.work_items[work_item.id] = work_item
+        for item in raw.get("handoffs", []):
+            handoff = Handoff.model_validate(item)
+            state.handoffs[handoff.id] = handoff
+        for item in raw.get("budget_requests", []):
+            request = BudgetRequest.model_validate(item)
+            state.budget_requests[request.id] = request
+        # Give pre-organization projects a durable charter when they are first
+        # reopened.  This is an additive projection migration: it does not
+        # invent tickets or change the existing graph, but it lets the manager
+        # loop and organization dashboard observe the real saved boundary.
+        for node in state.nodes.values():
+            if node.executor != PLANNER_EXECUTOR:
+                continue
+            if node.organization_contract is None:
+                node.organization_contract = OrganizationContract.from_objective(
+                    node.generated_prompt or node.objective
+                )
+                normalized = True
+            if node.organization_review is None:
+                node.organization_review = OrganizationReview()
+                normalized = True
+            if node.manager_phase is None:
+                node.manager_phase = (
+                    ManagerPhase.EXECUTING
+                    if node.status in {NodeStatus.EXPANDED, NodeStatus.COMPLETE}
+                    else ManagerPhase.PLANNING
+                )
+                normalized = True
+            if not node.acceptance_criteria and node.organization_contract.acceptance_criteria:
+                node.acceptance_criteria = list(
+                    node.organization_contract.acceptance_criteria
+                )
+                normalized = True
         for node in state.nodes.values():
             filtered = [artifact_id for artifact_id in node.artifact_refs if artifact_id in state.artifacts]
             if filtered != node.artifact_refs:
@@ -393,6 +463,14 @@ class Store:
         # opted into triggers; readers treat the field as an empty collection.
         if state.triggers:
             payload["triggers"] = [self._model_dump(value) for value in state.triggers.values()]
+        if state.work_items:
+            payload["work_items"] = [self._model_dump(value) for value in state.work_items.values()]
+        if state.handoffs:
+            payload["handoffs"] = [self._model_dump(value) for value in state.handoffs.values()]
+        if state.budget_requests:
+            payload["budget_requests"] = [
+                self._model_dump(value) for value in state.budget_requests.values()
+            ]
         return payload
 
     async def _persist_project(self, project_id: uuid.UUID) -> None:
@@ -462,6 +540,7 @@ class Store:
         root_agent.session_id = None
         explicit_name = name.strip() if name and name.strip() else None
         display_name = explicit_name or concise_node_title(prompt)
+        contract = OrganizationContract.from_objective(prompt)
         node = Node(
             id=root_id,
             project_id=root_id,
@@ -478,6 +557,10 @@ class Store:
             agent=root_agent,
             run_policy=policy,
             repo_path=repo_path,
+            organization_contract=contract,
+            organization_review=OrganizationReview(),
+            manager_phase=ManagerPhase.PLANNING,
+            acceptance_criteria=list(contract.acceptance_criteria),
         )
         project_path = Path(repo_path).expanduser().resolve() if repo_path else self.data_dir / "projects" / f"proj-{root_id.hex[:8]}"
         project_path.mkdir(parents=True, exist_ok=True)
@@ -533,6 +616,394 @@ class Store:
             if node.parent_id == node_id
         ]
 
+    async def list_work_items(
+        self,
+        project_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        status: WorkItemStatus | None = None,
+    ) -> list[WorkItem]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        values = [
+            item
+            for item in state.work_items.values()
+            if (organization_id is None or item.organization_id == organization_id)
+            and (status is None or item.status is status)
+        ]
+        return [
+            item.model_copy(deep=True)
+            for item in sorted(values, key=lambda value: (-value.priority, value.created_at))
+        ]
+
+    async def get_work_item(self, item_id: uuid.UUID) -> WorkItem | None:
+        for state in self._states.values():
+            item = state.work_items.get(item_id)
+            if item is not None:
+                return item.model_copy(deep=True)
+        return None
+
+    async def create_work_item(
+        self,
+        *,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        key: str | None = None,
+        title: str,
+        objective: str,
+        acceptance_criteria: list[Any] | None = None,
+        priority: int = 0,
+        depends_on: list[uuid.UUID] | None = None,
+        node_id: uuid.UUID | None = None,
+        agent_type: str = "executor",
+        organization_contract: OrganizationContract | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> WorkItem:
+        if project_id not in self._states:
+            raise ValueError(f"project not found: {project_id}")
+        item = WorkItem(
+            project_id=project_id,
+            organization_id=organization_id,
+            node_id=node_id,
+            key=key or title,
+            agent_type=agent_type,
+            organization_contract=organization_contract,
+            title=title,
+            objective=objective,
+            acceptance_criteria=list(acceptance_criteria or []),
+            priority=priority,
+            depends_on=list(depends_on or []),
+            metadata=dict(metadata or {}),
+        )
+        self._states[project_id].work_items[item.id] = item
+        await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="work_item.changed",
+            action="work_item.created",
+            message=f"work item {item.id} created",
+            data={"work_item_id": str(item.id), "organization_id": str(organization_id)},
+        )
+        return item.model_copy(deep=True)
+
+    async def update_work_item(
+        self,
+        item_id: uuid.UUID,
+        *,
+        status: WorkItemStatus | None = None,
+        priority: int | None = None,
+        claimed_by: uuid.UUID | None = None,
+        rejection_reason: str | None = None,
+        artifact_refs: list[uuid.UUID] | None = None,
+        evidence_refs: list[str] | None = None,
+    ) -> WorkItem | None:
+        for project_id, state in self._states.items():
+            item = state.work_items.get(item_id)
+            if item is None:
+                continue
+            if status is not None:
+                item.status = status
+            if priority is not None:
+                item.priority = priority
+            if claimed_by is not None:
+                item.claimed_by = claimed_by
+            if rejection_reason is not None:
+                item.rejection_reason = sanitize_control_text(rejection_reason)
+            if artifact_refs is not None:
+                item.artifact_refs = list(artifact_refs)
+            if evidence_refs is not None:
+                item.evidence_refs = list(evidence_refs)
+            item.updated_at = datetime.now(timezone.utc)
+            await self._persist_project(project_id)
+            await self._log(
+                project_id,
+                kind="work_item.changed",
+                action="work_item.update",
+                message=f"work item {item.id} updated",
+                data={"work_item_id": str(item.id), "status": item.status.value},
+            )
+            return item.model_copy(deep=True)
+        return None
+
+    async def claim_work_item(
+        self, item_id: uuid.UUID, node_id: uuid.UUID | None = None
+    ) -> WorkItem | None:
+        found = next(
+            (
+                (project_id, state, state.work_items[item_id])
+                for project_id, state in self._states.items()
+                if item_id in state.work_items
+            ),
+            None,
+        )
+        if found is None:
+            return None
+        _, state, item = found
+        if item.status not in {WorkItemStatus.BACKLOG, WorkItemStatus.READY}:
+            raise ValueError(f"work item is not claimable: {item.status.value}")
+        incomplete = [
+            dependency
+            for dependency in item.depends_on
+            if dependency not in state.work_items
+            or state.work_items[dependency].status is not WorkItemStatus.COMPLETE
+        ]
+        if incomplete:
+            raise ValueError(
+                "work item dependencies are incomplete: "
+                + ", ".join(str(dependency) for dependency in incomplete)
+            )
+        return await self.update_work_item(
+            item_id,
+            status=WorkItemStatus.CLAIMED,
+            claimed_by=node_id,
+        )
+
+    async def materialize_ready_work_items(
+        self, project_id: uuid.UUID, *, limit: int | None = None
+    ) -> list[Node]:
+        """Turn dependency-ready backlog entries into ordinary graph nodes."""
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        candidates = sorted(
+            (
+                item for item in state.work_items.values()
+                if item.node_id is None
+                and item.status in {WorkItemStatus.BACKLOG, WorkItemStatus.READY}
+                and all(
+                    dependency in state.work_items
+                    and state.work_items[dependency].status is WorkItemStatus.COMPLETE
+                    for dependency in item.depends_on
+                )
+            ),
+            key=lambda item: (-item.priority, item.created_at),
+        )
+        if limit is not None:
+            candidates = candidates[: max(0, limit)]
+        materialized: list[Node] = []
+        for item in candidates:
+            parent = state.nodes.get(item.organization_id)
+            if parent is None:
+                item.status = WorkItemStatus.BLOCKED
+                continue
+            try:
+                role = AgentType(item.agent_type)
+            except ValueError:
+                role = None
+            spec = NodeSpec(
+                key=f"ticket-{item.id.hex}",
+                objective=item.title,
+                generated_prompt=item.objective,
+                executor=None if role is not None else item.agent_type,
+                agent_type=role,
+                organization_contract=item.organization_contract,
+                acceptance_criteria=list(item.acceptance_criteria),
+                priority=item.priority,
+            )
+            plan = PlanResult(nodes=[spec])
+            created = apply_graph_plan(state, parent, plan)
+            node = created[0]
+            node.work_item_id = item.id
+            state.nodes[node.id] = node.model_copy(deep=True)
+            item.node_id = node.id
+            # Materialization is the scheduler's assignment boundary. Keep
+            # the durable ticket truthful: it is no longer merely queued and
+            # the created graph node is its concrete owner.
+            item.claimed_by = node.id
+            item.status = WorkItemStatus.ACTIVE
+            item.updated_at = datetime.now(timezone.utc)
+            for dependency_id in item.depends_on:
+                dependency = state.work_items.get(dependency_id)
+                if dependency is None or dependency.node_id is None:
+                    continue
+                state.edges[uuid.uuid4()] = Edge(
+                    src=dependency.node_id,
+                    dst=node.id,
+                    type=EdgeType.FOLLOWS,
+                )
+            materialized.append(node.model_copy(deep=True))
+        if materialized or any(item.status is WorkItemStatus.BLOCKED for item in candidates):
+            await self._persist_project(project_id)
+        return materialized
+
+    async def create_budget_request(
+        self,
+        *,
+        project_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        requested_budget,
+        reason: str,
+    ) -> BudgetRequest:
+        """Persist a budget change request without changing the live budget."""
+        organization = await self.get_node(organization_id)
+        if (
+            organization is None
+            or organization.project_id != project_id
+            or organization.organization_contract is None
+        ):
+            raise ValueError("organization_id must identify a planner boundary in this project")
+        request = BudgetRequest(
+            project_id=project_id,
+            organization_id=organization_id,
+            requested_budget=requested_budget,
+            reason=reason,
+        )
+        self._state(project_id).budget_requests[request.id] = request
+        await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="organization.budget",
+            action="budget.requested",
+            message=f"budget request {request.id} submitted",
+            data={
+                "budget_request_id": str(request.id),
+                "organization_id": str(organization_id),
+                "reason": reason,
+            },
+        )
+        return request.model_copy(deep=True)
+
+    async def list_budget_requests(
+        self,
+        project_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        status: BudgetRequestStatus | None = None,
+    ) -> list[BudgetRequest]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        values = [
+            request
+            for request in state.budget_requests.values()
+            if (organization_id is None or request.organization_id == organization_id)
+            and (status is None or request.status is status)
+        ]
+        return [
+            request.model_copy(deep=True)
+            for request in sorted(values, key=lambda value: value.requested_at)
+        ]
+
+    async def decide_budget_request(
+        self,
+        request_id: uuid.UUID,
+        *,
+        status: BudgetRequestStatus,
+        decision_reason: str | None = None,
+    ) -> BudgetRequest | None:
+        """Apply an explicit budget decision at a manager/API boundary."""
+        for project_id, state in self._states.items():
+            request = state.budget_requests.get(request_id)
+            if request is None:
+                continue
+            if request.status is not BudgetRequestStatus.PENDING:
+                raise ValueError("budget request has already been decided")
+            request.status = BudgetRequestStatus(status)
+            request.decision_reason = decision_reason
+            request.reviewed_at = datetime.now(timezone.utc)
+            if request.status is BudgetRequestStatus.APPROVED:
+                organization = state.nodes.get(request.organization_id)
+                if organization is None or organization.organization_contract is None:
+                    raise ValueError("budget request organization no longer exists")
+                organization.organization_contract.budget = (
+                    request.requested_budget.model_copy(deep=True)
+                )
+                organization.updated_at = datetime.now(timezone.utc)
+                state.nodes[organization.id] = organization
+            await self._persist_project(project_id)
+            await self._log(
+                project_id,
+                kind="organization.budget",
+                action="budget.decided",
+                message=f"budget request {request.id} {request.status.value.lower()}",
+                data={
+                    "budget_request_id": str(request.id),
+                    "organization_id": str(request.organization_id),
+                    "status": request.status.value,
+                },
+            )
+            return request.model_copy(deep=True)
+        return None
+
+    async def list_handoffs(
+        self,
+        project_id: uuid.UUID,
+        *,
+        node_id: uuid.UUID | None = None,
+    ) -> list[Handoff]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        values = [
+            item
+            for item in state.handoffs.values()
+            if node_id is None
+            or item.producer_node_id == node_id
+            or item.consumer_node_id == node_id
+        ]
+        return [item.model_copy(deep=True) for item in values]
+
+    async def update_handoff(
+        self,
+        handoff_id: uuid.UUID,
+        *,
+        status: HandoffStatus,
+        artifact_id: uuid.UUID | None = None,
+        evidence_refs: list[str] | None = None,
+        rejection_reason: str | None = None,
+    ) -> Handoff | None:
+        status = HandoffStatus(status)
+        for project_id, state in self._states.items():
+            handoff = state.handoffs.get(handoff_id)
+            if handoff is None:
+                continue
+            artifact = None
+            if artifact_id is not None:
+                artifact = state.artifacts.get(artifact_id)
+                if artifact is None or artifact.node_id != handoff.producer_node_id:
+                    raise ValueError(
+                        "handoff artifact must be produced by its declared producer"
+                    )
+                if (
+                    artifact.schema_name != handoff.contract.schema_name
+                    or artifact.schema_version != handoff.contract.version
+                ):
+                    raise ValueError(
+                        "handoff artifact does not satisfy its schema contract"
+                    )
+            elif handoff.artifact_id is not None:
+                artifact = state.artifacts.get(handoff.artifact_id)
+            if status in {HandoffStatus.AVAILABLE, HandoffStatus.ACCEPTED}:
+                if artifact is None:
+                    raise ValueError(
+                        "available or accepted handoffs require a matching artifact"
+                    )
+                if status is HandoffStatus.ACCEPTED and handoff.contract.evidence_required:
+                    refs = evidence_refs or artifact.evidence_refs
+                    if not refs:
+                        raise ValueError(
+                            "accepted handoffs require acceptance evidence"
+                        )
+            handoff.status = status
+            if artifact_id is not None:
+                handoff.artifact_id = artifact_id
+            if evidence_refs is not None:
+                handoff.evidence_refs = list(evidence_refs)
+            if rejection_reason is not None:
+                handoff.rejection_reason = rejection_reason
+            handoff.updated_at = datetime.now(timezone.utc)
+            await self._persist_project(project_id)
+            await self._log(
+                project_id,
+                kind="handoff.changed",
+                action="handoff.update",
+                message=f"handoff {handoff.id} updated",
+                data={"handoff_id": str(handoff.id), "status": handoff.status.value},
+            )
+            return handoff.model_copy(deep=True)
+        return None
+
     async def get_workgraph(self, project_id: uuid.UUID):
         graph = await self.get_graph(project_id)
         return graph.nodes, graph.edges, graph.artifacts
@@ -551,6 +1022,11 @@ class Store:
             edges=[edge.model_copy(deep=True) for edge in state.edges.values()],
             artifacts=[artifact.model_copy(deep=True) for artifact in state.artifacts.values()],
             triggers=[trigger.model_copy(deep=True) for trigger in state.triggers.values()],
+            work_items=[item.model_copy(deep=True) for item in state.work_items.values()],
+            handoffs=[item.model_copy(deep=True) for item in state.handoffs.values()],
+            budget_requests=[
+                item.model_copy(deep=True) for item in state.budget_requests.values()
+            ],
         )
 
     async def _load_graph(self, project_id: uuid.UUID):
@@ -590,12 +1066,90 @@ class Store:
 
     # -- node writes ------------------------------------------------------
 
+    @staticmethod
+    def _work_item_status(status: NodeStatus) -> WorkItemStatus:
+        return {
+            NodeStatus.PENDING: WorkItemStatus.BACKLOG,
+            NodeStatus.BLOCKED: WorkItemStatus.BLOCKED,
+            NodeStatus.RUNNABLE: WorkItemStatus.READY,
+            NodeStatus.RUNNING: WorkItemStatus.RUNNING,
+            NodeStatus.EXPANDED: WorkItemStatus.CLAIMED,
+            NodeStatus.COMPLETE: WorkItemStatus.COMPLETE,
+            NodeStatus.FAILED: WorkItemStatus.REJECTED,
+            NodeStatus.CANCELLED: WorkItemStatus.CANCELLED,
+        }[status]
+
+    def _sync_work_item(self, node: Node) -> None:
+        if node.work_item_id is None:
+            return
+        item = self._states.get(node.project_id, self._empty_state()).work_items.get(node.work_item_id)
+        if item is None:
+            return
+        state = self._states.get(node.project_id, self._empty_state())
+        item.status = self._work_item_status(node.status)
+        item.artifact_refs = list(node.artifact_refs)
+        item.evidence_refs = list(
+            dict.fromkeys(
+                ref
+                for artifact in state.artifacts.values()
+                if artifact.id in node.artifact_refs
+                and artifact.kind is ArtifactKind.EVIDENCE
+                for ref in artifact.evidence_refs
+            )
+        )
+        item.updated_at = datetime.now(timezone.utc)
+
+    def _sync_handoffs_for_node(self, node_id: uuid.UUID) -> None:
+        """Make matching producer artifacts visible to typed handoffs."""
+        found = self._project_for_node(node_id)
+        if found is None:
+            return
+        project_id, _ = found
+        state = self._states[project_id]
+        produced = [
+            artifact
+            for artifact in state.artifacts.values()
+            if artifact.node_id == node_id
+        ]
+        for handoff in state.handoffs.values():
+            if handoff.producer_node_id != node_id:
+                continue
+            matching = next(
+                (
+                    artifact
+                    for artifact in produced
+                    if artifact.schema_name == handoff.contract.schema_name
+                    and artifact.schema_version == handoff.contract.version
+                ),
+                None,
+            )
+            if matching is None:
+                continue
+            if (
+                handoff.status is HandoffStatus.ACCEPTED
+                and handoff.artifact_id == matching.id
+            ):
+                continue
+            handoff.artifact_id = matching.id
+            handoff.evidence_refs = list(dict.fromkeys(matching.evidence_refs))
+            handoff.status = HandoffStatus.AVAILABLE
+            handoff.rejection_reason = None
+            handoff.updated_at = datetime.now(timezone.utc)
+
     async def _save_node(self, node: Node) -> Node:
         if node.project_id not in self._states:
             return node
         previous = self._states[node.project_id].nodes.get(node.id)
+        if previous is None:
+            # A provider/reconnect callback may hold a snapshot while a plan
+            # replacement removes its subtree. Never let that stale callback
+            # recreate a deleted node; graph creation is owned by apply_plan
+            # and create_node, not by state updates.
+            return node.model_copy(deep=True)
         saved = node.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
         self._states[node.project_id].nodes[node.id] = saved
+        self._sync_work_item(saved)
+        self._sync_handoffs_for_node(saved.id)
         await self._persist_project(node.project_id)
         if previous is not None:
             before = previous.model_dump(mode="json")
@@ -676,8 +1230,43 @@ class Store:
         node = await self.get_node(node_id)
         if node is None:
             return None
-        node.agent_state = state
-        node.agent_message = message
+        node.agent_state = sanitize_control_text(state) if state is not None else None
+        node.agent_message = sanitize_control_text(message) if message is not None else None
+        return await self._save_node(node)
+
+    async def set_organization_review(
+        self, node_id: uuid.UUID, review: OrganizationReview
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        clean = review.model_copy(deep=True)
+        clean.last_reason = sanitize_control_text(clean.last_reason) if clean.last_reason else None
+        clean.audit_summary = sanitize_control_text(clean.audit_summary) if clean.audit_summary else None
+        clean.audit_findings = [sanitize_control_text(item) for item in clean.audit_findings]
+        clean.audit_required_changes = [sanitize_control_text(item) for item in clean.audit_required_changes]
+        if clean.audit is not None:
+            clean.audit.errors = [sanitize_control_text(item) for item in clean.audit.errors]
+            clean.audit.warnings = [sanitize_control_text(item) for item in clean.audit.warnings]
+        node.organization_review = clean
+        return await self._save_node(node)
+
+    async def set_manager_state(
+        self,
+        node_id: uuid.UUID,
+        *,
+        phase: ManagerPhase,
+        iteration: int | None = None,
+        reasons: list[str] | None = None,
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.manager_phase = phase
+        if iteration is not None:
+            node.manager_iteration = iteration
+        if reasons is not None:
+            node.manager_review_reasons = list(dict.fromkeys(sanitize_control_text(item) for item in reasons))
         return await self._save_node(node)
 
     async def set_paused(self, node_id: uuid.UUID, paused: bool) -> Optional[Node]:
@@ -699,6 +1288,35 @@ class Store:
         if node is None:
             return None
         node.resource_refs = list(refs)
+        return await self._save_node(node)
+
+    async def set_workspace_path(self, node_id: uuid.UUID, path: str | None) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.workspace_path = path
+        return await self._save_node(node)
+
+    async def set_workspace_ref(
+        self,
+        node_id: uuid.UUID,
+        *,
+        path: str | None,
+        branch: str | None,
+    ) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.workspace_path = path
+        node.workspace = WorkspaceRef(path=path, branch=branch) if path and branch else None
+        node.output_branch = branch
+        return await self._save_node(node)
+
+    async def set_workspace_commit(self, node_id: uuid.UUID, commit: str | None) -> Optional[Node]:
+        node = await self.get_node(node_id)
+        if node is None:
+            return None
+        node.workspace_commit = commit
         return await self._save_node(node)
 
     async def rename_project(self, project_id: uuid.UUID, name: str) -> Optional[Node]:
@@ -809,8 +1427,8 @@ class Store:
         if node is None:
             return None
         node.status = status
-        node.agent_state = agent_state
-        node.agent_message = agent_message
+        node.agent_state = sanitize_control_text(agent_state) if agent_state is not None else None
+        node.agent_message = sanitize_control_text(agent_message) if agent_message is not None else None
         return await self._save_node(node)
 
     # -- settings ---------------------------------------------------------
@@ -954,6 +1572,19 @@ class Store:
         for key, artifact in list(state.artifacts.items()):
             if artifact.node_id in ids:
                 del state.artifacts[key]
+        removed_work_items = {
+            item_id
+            for item_id, item in state.work_items.items()
+            if item.node_id in ids
+        }
+        for item_id in removed_work_items:
+            del state.work_items[item_id]
+        for handoff_id, handoff in list(state.handoffs.items()):
+            if (
+                handoff.producer_node_id in ids
+                or handoff.consumer_node_id in ids
+            ):
+                del state.handoffs[handoff_id]
         removed_triggers = [
             trigger_id
             for trigger_id, trigger in state.triggers.items()
@@ -979,15 +1610,139 @@ class Store:
             )
         return [item.id for item in descendants]
 
-    async def apply_plan(self, parent: Node, plan: PlanResult) -> list[Node]:
-        """Persist a validated graph mutation without interpreting its policy."""
+    async def apply_plan(
+        self,
+        parent: Node,
+        plan: PlanResult,
+        *,
+        enforce_organization_audit: bool = False,
+    ) -> list[Node]:
+        """Persist a graph mutation and materialize its accountable work.
+
+        The runner enables the independent organization audit before applying a
+        provider handoff. Direct storage callers may leave enforcement off for
+        graph inspection and migration tools that intentionally preserve older
+        plans while exposing their audit result.
+        """
         project_root = self.project_path(parent.project_id)
         if plan.nodes and project_root is None:
             raise RuntimeError(f"project directory is not known: {parent.project_id}")
-        created = apply_graph_plan(self._state(parent.project_id), parent, plan)
-        by_key = {spec.key: node for spec, node in zip(plan.nodes, created, strict=True)}
+        contract = plan.organization_contract or parent.organization_contract
+        if parent.organization_contract is not None:
+            scale_rank = {
+                OrganizationScale.FOCUSED: 0,
+                OrganizationScale.DELIVERY: 1,
+                OrganizationScale.ORGANIZATION: 2,
+            }
+            proposed = plan.organization_contract
+            if (
+                proposed is not None
+                and scale_rank[proposed.scale]
+                < scale_rank[parent.organization_contract.scale]
+            ):
+                raise RuntimeError(
+                    "organization plan cannot downgrade its parent contract scale"
+                )
+            # The existing boundary remains the authority when the planner
+            # omits a contract; an explicit same-or-broader proposal may
+            # refine it.
+            contract = proposed or parent.organization_contract
+        audit = audit_plan(contract, plan) if contract is not None else None
+        if enforce_organization_audit and audit is not None and not audit.accepted:
+            raise RuntimeError("organization plan rejected: " + "; ".join(audit.errors))
+        if contract is not None:
+            parent.organization_contract = contract
+            review = parent.organization_review or OrganizationReview()
+            review.audit = audit
+            review.phase = (
+                OrganizationPhase.EXECUTE_FRONTIER
+                if audit is None or audit.accepted
+                else OrganizationPhase.REPLAN
+            )
+            review.replan_requested = bool(audit is not None and not audit.accepted)
+            review.last_reason = (
+                "; ".join(audit.errors)
+                if audit is not None and audit.errors
+                else "plan accepted"
+            )
+            review.reviewed_at = datetime.now(timezone.utc)
+            parent.organization_review = review
+        applied_plan = (
+            plan.model_copy(update={"organization_contract": contract})
+            if contract is not None
+            else plan
+        )
+        created = apply_graph_plan(self._state(parent.project_id), parent, applied_plan)
+        by_key = {
+            spec.key: node
+            for spec, node in zip(applied_plan.nodes, created, strict=True)
+        }
+        state = self._state(parent.project_id)
+        work_items_by_key: dict[str, WorkItem] = {}
+        ticketing_enabled = (
+            contract is not None and contract.scale is not OrganizationScale.FOCUSED
+        ) or any(spec.required_handoffs for spec in applied_plan.nodes)
+        if ticketing_enabled:
+            for spec, node in zip(applied_plan.nodes, created, strict=True):
+                item = WorkItem(
+                    project_id=parent.project_id,
+                    organization_id=parent.id,
+                    node_id=node.id,
+                    key=spec.key,
+                    agent_type=(node.agent.type_id.value if node.agent else "executor"),
+                    organization_contract=node.organization_contract,
+                    title=node.objective,
+                    objective=node.generated_prompt or node.objective,
+                    acceptance_criteria=list(node.acceptance_criteria),
+                    priority=spec.priority,
+                    status=self._work_item_status(node.status),
+                )
+                state.work_items[item.id] = item
+                node.work_item_id = item.id
+                state.nodes[node.id] = node.model_copy(deep=True)
+                work_items_by_key[spec.key] = item
+            for spec in applied_plan.nodes:
+                item = work_items_by_key[spec.key]
+                dependency_ids = [
+                    work_items_by_key[pred].id
+                    for pred in spec.follows
+                    if pred in work_items_by_key
+                ]
+                dependency_ids.extend(
+                    work_items_by_key[edge.src].id
+                    for edge in applied_plan.edges
+                    if edge.type is EdgeType.FOLLOWS
+                    and edge.dst == spec.key
+                    and edge.src in work_items_by_key
+                )
+                item.depends_on = list(dict.fromkeys(dependency_ids))
+            for spec in applied_plan.nodes:
+                consumer = by_key[spec.key]
+                predecessors = [
+                    by_key[pred]
+                    for pred in spec.follows
+                    if pred in by_key
+                ]
+                predecessors.extend(
+                    by_key[edge.src]
+                    for edge in applied_plan.edges
+                    if edge.type is EdgeType.FOLLOWS
+                    and edge.dst == spec.key
+                    and edge.src in by_key
+                )
+                if not predecessors:
+                    continue
+                for predecessor in predecessors:
+                    for contract_spec in spec.required_handoffs:
+                        handoff = Handoff(
+                            project_id=parent.project_id,
+                            producer_node_id=predecessor.id,
+                            consumer_node_id=consumer.id,
+                            contract=contract_spec,
+                        )
+                        state.handoffs[handoff.id] = handoff
         created_trigger_ids: list[uuid.UUID] = []
-        for spec in plan.triggers:
+        for spec in applied_plan.triggers:
             target = by_key[spec.target_key]
             trigger = Trigger(
                 project_id=parent.project_id,
@@ -1007,10 +1762,12 @@ class Store:
         for node in created:
             for capability_id in capability_ids_for_agent_type(node.agent.type_id):
                 catalog.load_into_project(capability_id, project_root)
+        for node in created:
+            self._sync_handoffs_for_node(node.id)
         await self._persist_project(parent.project_id)
-        edge_count = sum(len(spec.follows) + (1 if spec.parent_key else 0) for spec in plan.nodes) + len(plan.edges)
+        edge_count = sum(len(spec.follows) + (1 if spec.parent_key else 0) for spec in applied_plan.nodes) + len(applied_plan.edges)
         await self._log(parent.project_id, kind="graph.transition", action="plan.applied", message=f"plan applied; created {len(created)} node(s)", data={"parent_id": str(parent.id), "node_id": str(parent.id), "created_node_ids": [str(item.id) for item in created], "created_roles": [item.agent.type_id.value if item.agent else None for item in created], "edge_count": edge_count})
-        if plan.triggers:
+        if applied_plan.triggers:
             await self._log(
                 parent.project_id,
                 kind="trigger.changed",
@@ -1195,11 +1952,11 @@ class Store:
         if outcome is not None:
             run.outcome = outcome
         if summary is not None:
-            run.summary = summary
+            run.summary = sanitize_control_text(summary)
         if logs is not None:
-            run.logs = logs
+            run.logs = sanitize_control_text(logs)
         if error is not None:
-            run.error = error
+            run.error = sanitize_control_text(error)
         elif status == RunStatus.COMPLETE:
             # A run may have been marked orphaned while its owner was being
             # registered. Completing that same run must remove the transient
@@ -1282,6 +2039,10 @@ class Store:
         project_id, _ = found
         state = self._states[project_id]
         artifacts = append_artifacts(state, node_id, specs)
+        node = state.nodes.get(node_id)
+        if node is not None:
+            self._sync_work_item(node)
+        self._sync_handoffs_for_node(node_id)
         await self._persist_project(project_id)
         if artifacts:
             await self._log(project_id, kind="state.changed", action="artifact.created", message=f"created {len(artifacts)} artifact(s)", data={"node_id": str(node_id), "artifact_ids": [str(item.id) for item in artifacts]})
@@ -1371,6 +2132,8 @@ class Store:
             for artifact_id in node.artifact_refs
             if artifact_id in state.artifacts
         ]
+        self._sync_work_item(node)
+        self._sync_handoffs_for_node(node_id)
         await self._persist_project(project_id)
         await self._log(project_id, kind="state.changed", action="artifacts.cleared", message=f"cleared {len(removed)} generated artifact(s)", data={"node_id": str(node_id), "artifact_ids": [str(item) for item in removed]})
         return removed

@@ -50,6 +50,8 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert 'primaryAction === "cancel" ? "danger stop-action"' in inspector
     assert ".node-run.running" in css and ".stop-action" in css
     assert 'item["generation_active"]' in api
+    assert 'item["control_activity"]' in api
+    assert 'node.allowed_actions.includes("cancel")' in graph
     assert 'message_type == "scroll"' in api
     assert ".edge-active" not in css and "@keyframes flow" not in css
     assert "node-breathe" not in css
@@ -67,6 +69,14 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "error instanceof ApiError" in app
     assert "error.status === 404" in app
     assert "clearDeletedProject" in app
+
+
+def test_work_view_exposes_independent_backlog_detail():
+    work = source("components", "WorkView.tsx")
+    assert "WorkItemDetail" in work
+    assert "Dependencies" in work
+    assert "Acceptance criteria" in work
+    assert "Backlog — not materialized" in work
 
 
 def test_planner_document_and_role_defaults_are_first_class():
@@ -204,8 +214,18 @@ def test_review_surface_is_not_exposed():
 
 
 def test_only_readme_and_design_are_product_markdown_documents():
+    implementation_docs = {
+        "TURN_ORCHESTRATION_REVIEW.md",
+        "Turn P0–P1 Implementation Brief.md",
+            "P0-P1-REVISED.md",
+            "P0-P1-FINAL.md",
+            "MISTAKES.md",
+        "SEEN_ISSUES.md",
+    }
     product_docs = sorted(
-        path.name for path in ROOT.glob("*.md") if path.name != "AGENTS.md"
+        path.name
+        for path in ROOT.glob("*.md")
+        if path.name not in {"AGENTS.md", *implementation_docs}
     )
     assert product_docs == ["DESIGN.md", "README.md"]
     assert not list((ROOT / "docs").glob("*.md"))

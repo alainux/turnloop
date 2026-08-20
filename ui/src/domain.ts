@@ -1,51 +1,110 @@
 import type {
   Agent,
   AgentType,
-  Artifact,
+  AcceptanceCriterion,
+  AcceptanceEvidence,
+  Artifact as GeneratedArtifact,
   CapabilityStatus,
   DocumentRef,
   Edge,
   FlowEdge,
-  GraphNodeView,
-  GraphView,
+  GraphNodeView as GeneratedGraphNodeView,
+  GraphView as GeneratedGraphView,
+  Handoff,
   HarnessKind,
   Node,
   NodeUIState,
+  OrganizationBudget,
+  OrganizationContract,
+  OrganizationReview,
+  PlanAudit,
+  PlanAuditResult,
   ReasoningLevel,
   Run,
-  RunPolicy,
+  RunPolicy as GeneratedRunPolicy,
   SubgraphRef,
   Trigger,
   TriggerContext,
   TriggerKind,
   Usage,
+  WorkItem,
+  WorkItemStatus,
 } from "./generated/domain";
 
 export type {
   Agent,
   AgentType,
-  Artifact,
+  AcceptanceCriterion,
+  AcceptanceEvidence,
   CapabilityStatus,
   DocumentRef,
   Edge,
   FlowEdge,
-  GraphNodeView,
-  GraphView,
+  Handoff,
   HarnessKind,
   InputSpec,
   Node,
   NodeAction,
   NodeStatus,
   NodeUIState,
+  OrganizationBudget,
+  OrganizationContract,
+  OrganizationReview,
+  PlanAudit,
+  PlanAuditResult,
   ReasoningLevel,
   Run,
-  RunPolicy,
   SubgraphRef,
   Usage,
   Trigger,
   TriggerContext,
   TriggerKind,
+  WorkItem,
+  WorkItemStatus,
 } from "./generated/domain";
+
+type OptionalGenerated<T, K extends keyof T> = Omit<T, K> &
+  Partial<Pick<T, K>>;
+
+// These aliases keep hand-authored UI fixtures and older API responses
+// readable while the server's generated contract remains strict. New
+// organization fields are additive; production responses include them.
+export type Artifact = OptionalGenerated<
+  GeneratedArtifact,
+  "schema_name" | "schema_version" | "evidence_refs"
+>;
+export type RunPolicy = OptionalGenerated<
+  GeneratedRunPolicy,
+  | "max_parallel_agents"
+  | "max_total_runs"
+  | "max_input_tokens"
+  | "max_output_tokens"
+  | "max_cost_usd"
+  | "max_wall_time_seconds"
+  | "workspace_isolation"
+>;
+export type GraphNodeView = OptionalGenerated<
+  GeneratedGraphNodeView,
+  | "workspace_path"
+  | "workspace_commit"
+  | "workspace"
+  | "output_branch"
+  | "organization_contract"
+  | "organization_review"
+  | "manager_phase"
+  | "manager_iteration"
+  | "manager_review_reasons"
+  | "work_item_id"
+  | "acceptance_criteria"
+  | "exported_handoffs"
+  | "required_handoffs"
+  | "priority"
+  | "control_activity"
+>;
+export type GraphView = OptionalGenerated<
+  GeneratedGraphView,
+  "work_items" | "handoffs" | "budget_requests"
+>;
 
 /** UI aliases are generated contract types, kept short at call sites. */
 export type GraphNode = Omit<GraphNodeView, "subgraph_refs" | "trigger_context"> & {
@@ -53,7 +112,23 @@ export type GraphNode = Omit<GraphNodeView, "subgraph_refs" | "trigger_context">
   trigger_context?: TriggerContext | null;
 };
 export type Graph = GraphView;
-export type Project = Omit<Node, "subgraph_refs" | "trigger_context"> & {
+export type Project = OptionalGenerated<
+  Omit<Node, "subgraph_refs" | "trigger_context">,
+  | "workspace_path"
+  | "workspace_commit"
+  | "workspace"
+  | "output_branch"
+  | "organization_contract"
+  | "organization_review"
+  | "manager_phase"
+  | "manager_iteration"
+  | "manager_review_reasons"
+  | "work_item_id"
+  | "acceptance_criteria"
+  | "exported_handoffs"
+  | "required_handoffs"
+  | "priority"
+> & {
   subgraph_refs?: SubgraphRef[];
   trigger_context?: TriggerContext | null;
 };
@@ -157,6 +232,18 @@ export type PrimaryNodeAction = "run" | "retry" | "regenerate" | "cancel";
 export function primaryNodeAction(node: GraphNode): PrimaryNodeAction | null {
   const priority: PrimaryNodeAction[] = ["cancel", "run", "retry", "regenerate"];
   return priority.find((action) => node.allowed_actions.includes(action)) ?? null;
+}
+
+/**
+ * Material organizations have a manager acceptance gate. Focused workflows
+ * are one-shot boundaries and deliberately bypass that loop; any persisted
+ * manager phase on one is historical state, not a live UI status.
+ */
+export function organizationManagerPhase(
+  node: Pick<GraphNode, "organization_contract" | "manager_phase" | "organization_review">,
+): string | null {
+  if (node.organization_contract?.scale === "focused") return null;
+  return node.manager_phase ?? node.organization_review?.phase ?? null;
 }
 
 export function primaryNodeActionLabel(action: PrimaryNodeAction, freshRun = false): string {

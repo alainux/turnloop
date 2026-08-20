@@ -7,6 +7,8 @@ harness is an error, never an implicit substitution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 from turn.domain.schemas import AgentConfig, HarnessKind
 
@@ -166,9 +168,22 @@ MODEL_DISCOVERY_COMMANDS = {
 }
 
 
-def codex_project_root_flags() -> list[str]:
-    """Keep Codex project discovery anchored to Turn's assigned directory."""
-    return ["-c", "project_root_markers=[]"]
+def codex_project_root_flags(cwd: str | None = None) -> list[str]:
+    """Keep Codex scoped to, and trusted for, Turn's assigned directory.
+
+    Codex asks for an interactive trust decision the first time it enters a
+    newly created project directory. Turn launches Codex through a durable
+    Herdr pane, so that prompt would otherwise block the node while the
+    scheduler still reports it as running. The assigned directory is created
+    by Turn (or explicitly supplied by the user), and the trust override is
+    scoped to that one canonical directory rather than changing global Codex
+    trust policy.
+    """
+    flags = ["-c", "project_root_markers=[]"]
+    if cwd:
+        project_path = str(Path(cwd).expanduser().resolve())
+        flags.extend(["-c", f"projects.{json.dumps(project_path)}.trust_level=\"trusted\""])
+    return flags
 
 class HarnessCommandFactory:
     """Build provider commands for workers, planners, and reconnects."""
@@ -305,7 +320,7 @@ class HarnessCommandFactory:
                         if agent.reasoning.value != "default" else [])
             mcp_flags = [item for override in capability_mcp_overrides for item in ("-c", override)]
             command = [self.codex_binary, "resume", *model, *thinking,
-                       *codex_project_root_flags(), *mcp_flags,
+                       *codex_project_root_flags(cwd), *mcp_flags,
                        "--no-alt-screen", "-C", cwd, session_id]
             return [*command, prompt] if prompt is not None else command
         if agent.harness == HarnessKind.PI:

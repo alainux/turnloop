@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import uuid
 from typing import Literal
 
+from turn.domain.organization import BudgetRequest, Handoff, WorkItem
 from turn.domain.schemas import Artifact, Edge, Node, Run, Trigger
 
 
@@ -22,13 +23,16 @@ class ProjectState:
     runs: dict[uuid.UUID, Run] = field(default_factory=dict)
     artifacts: dict[uuid.UUID, Artifact] = field(default_factory=dict)
     triggers: dict[uuid.UUID, Trigger] = field(default_factory=dict)
+    work_items: dict[uuid.UUID, WorkItem] = field(default_factory=dict)
+    handoffs: dict[uuid.UUID, Handoff] = field(default_factory=dict)
+    budget_requests: dict[uuid.UUID, BudgetRequest] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> "ProjectState":
         return cls()
 
     def __getitem__(
-        self, collection: Literal["nodes", "edges", "runs", "artifacts", "triggers"]
-    ) -> dict[uuid.UUID, Node | Edge | Run | Artifact | Trigger]:
+        self, collection: Literal["nodes", "edges", "runs", "artifacts", "triggers", "work_items", "handoffs", "budget_requests"]
+    ) -> dict[uuid.UUID, Node | Edge | Run | Artifact | Trigger | WorkItem | Handoff | BudgetRequest]:
         """Read-only compatibility for existing diagnostic callers."""
         return getattr(self, collection)

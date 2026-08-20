@@ -6,11 +6,12 @@ import uuid
 
 import pytest
 
-from turn.__main__ import _project_info, parser
+from turn.__main__ import _project_info, organization_command, parser, work_command
 from turn.__main__ import discover_project_state
 from turn.config import Settings
+from turn.db.store import Store
 from turn.core import TurnCore
-from turn.domain.schemas import AgentConfig, HarnessKind, Node, RunPolicy
+from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, Node, NodeSpec, PlanResult, RunPolicy
 from turn.logging import EventLog
 from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 
@@ -26,6 +27,41 @@ def test_cli_exposes_headless_commands_and_policy_flags():
     assert parser().parse_args(["capabilities", "delete", "created"]).capabilities_command == "delete"
     assert parser().parse_args(["project", "info"]).project_command == "info"
     assert parser().parse_args(["serve", "--port", "9000"]).port == 9000
+    assert parser().parse_args(["work", "list"]).work_command == "list"
+    assert parser().parse_args(["tickets", "claim", str(uuid.uuid4())]).work_command == "claim"
+    assert parser().parse_args(["org", "show"]).organization_command == "show"
+
+
+@pytest.mark.asyncio
+async def test_cli_exposes_real_work_items_and_organization_metrics(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "turn-data"
+    projects_dir = tmp_path / "projects"
+    monkeypatch.setattr("turn.__main__.settings.data_dir", str(data_dir))
+    monkeypatch.setattr("turn.__main__.settings.projects_dir", str(projects_dir))
+    store = Store(data_dir, projects_dir=projects_dir)
+    await store.init()
+    root = await store.create_project(
+        "Deliver a complete interactive workgraph",
+        repo_path=str(projects_dir / "workgraph"),
+    )
+    created = await store.apply_plan(root, PlanResult(nodes=[
+        NodeSpec(key="product", objective="Run product", agent_type=AgentType.PLANNER),
+        NodeSpec(key="verify", objective="Verify", agent_type=AgentType.VERIFIER, follows=["product"]),
+    ]))
+    await store.dispose()
+
+    await work_command(parser().parse_args(["work", "list", str(root.id)]))
+    listed = json.loads(capsys.readouterr().out)
+    assert len(listed) == 2
+    item_id = uuid.UUID(listed[0]["id"])
+    await work_command(parser().parse_args(["work", "claim", str(item_id)]))
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["status"] == "CLAIMED"
+
+    await organization_command(parser().parse_args(["organization", "show", str(root.id)]))
+    organization = json.loads(capsys.readouterr().out)
+    assert organization["metrics"]["boundary_count"] == 2
+    assert organization["organizations"]
 
 
 def test_project_info_exposes_defaults_and_native_harness_surfaces(tmp_path, monkeypatch):
@@ -215,6 +251,30 @@ def test_agent_cli_accepts_verification_stdin_and_completes_status(tmp_path, mon
     assert agent_command(args) == 0
     assert json.loads(handoff.read_text()) == payload
     assert json.loads(status.read_text())["state"] == "complete"
+
+
+def test_verification_parser_promotes_structured_evidence_refs():
+    from turn.contracts.dag import parse_verification
+
+    embedded = {
+        "criterion_id": "journey",
+        "status": "PASS",
+        "summary": "The complete user journey was exercised.",
+        "refs": ["README.md", "tests/test_cli.py"],
+    }
+    result = parse_verification({
+        "decision": "APPROVE",
+        "summary": "verified",
+        "evidence_refs": [embedded, json.dumps({
+            "criterion_id": "quality",
+            "status": "PASS",
+            "summary": "The quality checks passed.",
+            "refs": ["tests/"],
+        }), "README.md"],
+    })
+
+    assert [item.criterion_id for item in result.evidence] == ["journey", "quality"]
+    assert result.evidence_refs == ["README.md"]
 
 
 def test_agent_cli_rejects_json_that_does_not_match_the_turn_contract(tmp_path, monkeypatch):

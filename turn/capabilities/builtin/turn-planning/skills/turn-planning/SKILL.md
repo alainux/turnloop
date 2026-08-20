@@ -19,6 +19,11 @@ when the current boundary is already planned, return `nodes: []` and submit
 only the documents or artifacts that this turn actually produced. An empty
 handoff must preserve the existing child composition and its source links.
 
+For the root planning turn, always include an explicit `organization_contract`
+in the returned `PlanResult`, even when the request is focused. The contract
+must confirm or refine the requested delivery scale, acceptance criteria, and
+verification expectations; the initial lexical classification is only a hint.
+
 Every node `objective` is a short graph label (at most 72 characters), such as
 `"Implement chapter progression"` or `"Integrate the narrative"`. Never put
 the full assignment, acceptance criteria, or a multi-sentence prompt in the
@@ -62,16 +67,13 @@ for an MVP, prototype, experiment, or other bounded slice. Vague wording is not
 permission to reduce the product to one screen, one happy path, a static mock,
 or one generalist agent.
 
-First infer the real delivery surface: who uses it, the primary end-to-end
-journey, the durable data/content or state it needs, the runtime or publishing
-path, and the disciplines required to make that journey feel finished. Build an
-organization around the resulting material contracts, with accountable owners
-for work that has a different craft, source boundary, acceptance evidence, or
-can proceed independently. The organization must be legible in the graph: a
-generic "build the product" executor is not an acceptable substitute for
-separate product/design, domain or platform engineering, content or data,
-presentation, integration, quality, and release ownership when those are
-material to the requested outcome.
+First infer the real delivery surface: who receives or uses it, the primary
+journey, the durable data/content or state it needs, the delivery path, and the
+material contracts required to make the outcome complete. Build ownership
+around work with different craft, source boundary, acceptance evidence, or
+information dependency. Name boundaries from the actual outcome; a generic
+"build everything" executor is suspect when it hides multiple contracts, but
+there is no universal set of disciplines or runtime roles.
 
 Do not invent consequential product direction merely to avoid asking. If a
 missing decision would materially change the audience, platform, business or
@@ -79,96 +81,80 @@ safety constraints, core interaction, visual direction, delivery target, or
 success criteria, create a short initial **planner** clarification boundary
 with one to three precise `required_inputs`. Its prompt must explain the
 decision, present useful options or a recommended default, and say which later
-departments depend on it. That node waits in the UI for the user and then plans
-the organization; it is not an executor asked to guess the entire product.
+boundaries depend on it. That node waits in the UI for the user and then plans
+the organization; it is not an executor asked to guess the entire outcome.
 Ask only what is truly consequential. For ordinary implementation choices, make
 a documented, reversible, domain-appropriate decision and continue.
 
-### Release lifecycle and reintegration default
+### Delivery lifecycle and composition
 
-For a medium or larger product, first model how a credible small team would
-actually carry it from an idea to a usable release. Do this before choosing
-nodes or writing implementation prompts. The usual lifecycle is not one
-generalist implementation pass: validate the problem and audience; define the
-product, experience, and success criteria; reduce material technical risk;
-prove a vertical slice of the core journey; produce the full feature/content
-surface through independent disciplines; repeatedly integrate and review those
-lanes; harden the complete result through QA and polish; then make a release
-readiness decision. Use the domain's names for these stages, not this generic
-wording.
+For medium or larger work, first model how the requested outcome becomes
+usable, publishable, or otherwise deliverable. Do this before choosing nodes or
+writing implementation prompts. Identify the necessary decisions, material
+risk reduction, production waves, composition points, evaluation gates, and
+delivery/readiness decision. Use the domain's names for these stages, not a
+generic checklist.
 
-The graph must express the justified gates and reintegration points. Product
-or creative direction precedes production when it changes what later workers
-should make. A technical discovery or prototype boundary exists when it
-retires a real risk and feeds a production decision; it is never the shipped
-product. A vertical-slice review proves the most important end-to-end journey
-before broad production. After that review, fan out genuinely independent
-departments—such as domain engineering, UX/presentation, content/assets,
-platform/runtime, data/integrations, QA, release, or their domain
-equivalents—and converge their outputs repeatedly, not only at the final
-hour. Independent verification must assess the assembled release candidate,
-not merely the first implementation or a list of unit tests.
+The graph must express only the gates and composition points the outcome
+needs. A discovery or prototype boundary exists when it retires a real risk
+and feeds a later decision; it is never the delivered outcome by itself. Fan
+out genuinely independent responsibilities, and add a downstream composer or
+other consumer when multiple outputs must become one. An independent
+evaluator must assess the assembled result when the contract or quality policy
+requires it; it must not be reduced to a generic checklist of tests.
 
-This is a right-sized lifecycle, not a ritual or fixed department count. Omit
-or combine a stage only when the planner records why the product's delivery
-surface has no corresponding risk, craft boundary, or acceptance need. Never
-use an omitted product brief, technical discovery, vertical-slice gate,
-production lane, or release check as an excuse to replace a requested release
-with a single-page POC. Planning documents must state the release phases,
-owners, gate criteria, parallel lanes, and every planned convergence/review
-point so a human can see how the organization reaches a real working product.
+This is a right-sized lifecycle, not a ritual or fixed organization shape.
+Omit or combine a stage when the outcome has no corresponding risk, craft
+boundary, or acceptance need, and record that rationale. Never use an omitted
+decision or gate as an excuse to replace the requested result with a narrow
+slice. Planning documents should state the stages, owners, gate criteria,
+parallel work, and composition/review points that actually matter.
 
 ### Recursive organization and leaf fitness
 
 Turn's unit of decomposition is an accountable work boundary, not a user
-request. A single user request can require many organizations, and a single
-department label can still hide work that no one agent should own. Recursion
-ends only when a proposed executor is **leaf-fit**: it owns one cohesive
-contract, one primary craft or implementation boundary, a bounded set of
-source/output ownership, and one concrete acceptance path that it can exercise
-itself. If the boundary contains multiple material contracts, multiple
-independent crafts, a sizeable backlog of features/content, or work that should
-be integrated and reviewed internally before a parent consumes it, create a
-nested planner instead of a generalist executor.
+request. A single request can require many boundaries, while one broad label
+can still hide work no agent should own. Recursion ends only when an executor
+is **leaf-fit**: one cohesive contract, one primary craft or implementation
+boundary, bounded source/output ownership, and one concrete acceptance path.
+If a boundary contains multiple material contracts, independent crafts, a
+sizeable backlog, or its own composition/evaluation need, create a nested
+planner instead of a generalist executor.
 
-Use nested planners as department heads. A large root plan should normally stop
-at department boundaries and let those planners build their own organizations.
-Those planners apply the same leaf-fitness test recursively, so an engineering
-department may create platform, gameplay/domain, persistence, tooling, and
-integration sub-organizations; a content department may create research,
-authoring, review, and production lanes; and another domain should use its own
-real boundaries. Do not flatten a hierarchy merely because all of the work
-ultimately serves one user prompt.
+Use nested planners as boundary owners, not as a prescribed company chart. A
+planner stops at the boundary it owns and lets that planner choose the
+domain-appropriate internal shape. Do not flatten a hierarchy merely because
+all work ultimately serves one user request, and do not add depth when one
+worker can truthfully own the contract.
 
 Declare a nested planner unambiguously with `agent_type: "planner"` and
 `plan: true` (Turn also normalizes either planner declaration to the planner
-operation). The planner node's `generated_prompt` should state the department's
-mission, inherited constraints, exported contract, and the acceptance evidence
-its parent expects—not pre-author its descendants. Stop planning at that node;
-its own Turn planning turn owns the subtree.
+operation). The planner node's `generated_prompt` should state its mission,
+inherited constraints, exported contract, and acceptance evidence its parent
+expects—not pre-author its descendants. Stop planning at that node; its own
+Turn planning turn owns the subtree.
 
 Recursive decomposition is adaptive, not ceremonial. A medium product may need
-only one nested department while a large product may need several levels. An
+only one nested boundary while a large product may need several levels. An
 atomic, truly leaf-fit assignment should remain a leaf. The stopping question
 is never "is this one user request?"; it is "can one agent own and verify this
 contract without silently becoming an entire team?"
 
-### Recursive quality gates
+### Boundary evaluation
 
-Quality control belongs at the boundary where defects can still be attributed
-and repaired cheaply. When a planner boundary fans out into multiple production
-contracts, it should normally converge those contracts through an integrator
-and an independent verifier before exposing the department's result to its
-parent. The root still needs release-level integration and independent
-verification of the assembled user journey. This creates QA at multiple levels
-without making every atomic leaf pass through ritual review.
+Evaluation belongs at the boundary where defects can still be attributed and
+repaired cheaply. When a boundary contains independent outputs that must form
+one result, give it an explicit composition path before exposing that result to
+its parent. Add an independent evaluator when the contract or quality policy
+requires it. The evaluator's user-facing title should come from the actual
+domain (for example, a reviewer or editor); `verifier` is only the internal
+runtime role. Atomic work should not pass through ritual review.
 
-Do not rely on a final verifier to discover that an entire department was never
-built. Department-level verification checks the exported contract and rejects
-the responsible internal node; parent-level verification checks composition;
-release verification checks the real delivered result. A parent should consume
-verified department outputs whenever the boundary is material to release
-quality, safety, data integrity, or the core user experience.
+Do not rely on a final evaluator to discover that a material responsibility was
+never owned. Boundary evaluation checks the exported contract; parent
+evaluation checks composition when composition is required; final evaluation
+checks the actual delivered result. A parent should consume evidence-bearing
+outputs whenever the contract makes that boundary material.
 
 ### Local delivery is not dependency austerity
 
@@ -187,21 +173,38 @@ Never reinterpret local-only as a reason to rebuild commodity infrastructure
 from scratch—for example an audio engine, persistence layer, renderer, parser,
 or accessibility primitive—or as an excuse to reduce the product to a POC.
 Record the runtime dependency boundary and any deliberate local fallback in the
-architecture and release evidence.
+architecture and delivery evidence.
 
 The organization decision is itself reviewable. Before submitting a graph,
-record in the architecture/brief deliverable: the inferred release promise,
-the material disciplines and their owners, the fan-out and convergence points,
+record in the architecture/brief deliverable: the requested outcome, material
+responsibilities and owners, required information flow and composition points,
 the assumptions made, and every user clarification that still blocks planning.
-An integrator owns assembly of approved deliverables; it may not silently
-replace an omitted department with generic placeholders or a narrow fallback.
+A composition owner assembles approved deliverables when the contract needs
+one; it may not silently replace an omitted responsibility with a placeholder
+or narrow fallback.
 
-Start by preserving the requested product in the plan. Identify what the user
-must be able to receive, launch, read, use, or play when the graph is complete.
-For software, explicitly identify the concrete runtime/host, entry point,
-user-facing interaction loop, and end-to-end acceptance scenario. Contracts,
-ports, mocks, schemas, and tests are supporting work; they are not a product
-unless the user asked for them.
+## Persistent organization manager
+
+A material planner boundary owns a durable organization contract, not just its
+first plan. The first wave is a frontier, not an assumption that the lifetime
+backlog is complete. Keep known-but-not-yet-active work as bounded tickets when
+it does not need immediate materialization, and use nested planners where a
+responsibility contains its own meaningful organization.
+
+At safe points the retained planner acts as manager: inspect completed and
+failed work, artifacts and criterion evidence, verifier decisions, handoffs,
+backlog, and budget consumption. Return only the supported management decision
+(`ACCEPT`, `CONTINUE`, or `BLOCK`). Accept a charter only when its contract is
+actually evidenced; use `CONTINUE` for bounded corrective waves or tickets and
+`BLOCK` for a real human or hard-resource gate. Completed history remains
+evidence and must not be deleted merely to make a later wave look clean.
+
+Start by preserving the requested outcome in the plan. Identify what the user
+must be able to receive, launch, read, use, or otherwise rely on when the graph
+is complete. When a runtime or host exists, identify its entry point and
+end-to-end acceptance scenario. Contracts, ports, mocks, schemas, and checks
+are supporting work; they are not the deliverable unless the user asked for
+them.
 
 Planning is an evidence-gathering job. Before choosing work or skills, inspect
 the live graph, repository, and relevant project documentation. Research the
@@ -269,7 +272,7 @@ not add a new automatic activation path.
 
 ### Interactive verification capability
 
-For a browser, desktop, mobile, game, or other graphical product, the
+For a browser, desktop, mobile, or other graphical product, the
 verifier's `generated_prompt` must bind its real-UI inspection to a browser
 control skill that is actually available to that verifier's target harness.
 Have the verifier inspect its native catalog first. For Codex, prefer
@@ -310,95 +313,53 @@ a good plan.
 Use this practical organization lens when the request does not name a scale:
 
 - Small work has one clear owner and one concrete acceptance path. It may be a
-  single node; do not add departments, research, or integration ceremony that
+  single node; do not add boundaries, research, or composition ceremony that
   does not improve the requested result.
-- Medium work is one complete product or deliverable with several real
-  boundaries. Typical lanes are product/domain logic, user experience or
-  content, delivery/runtime, and quality, converging through an integrator or
-  final verifier. Name the lanes from the domain rather than copying a generic
-  checklist.
-- Large work is an organization or product family. Preserve departments such
-  as narrative, engineering, art, audio, QA, operations, marketing, or their
-  domain equivalents at the first level; use nested planners for departments
-  whose internal plan contains more than one leaf-fit contract, not only when
-  it is uncertain.
-  “Hundreds of agents” is not a quota: create as many meaningful boundaries as
-  the work requires and let nested planners expand them.
+- Medium work is one complete deliverable with several real boundaries. Name
+  the boundaries from the domain and connect them through explicit information
+  flow, composition, or evaluation only when the outcome requires it.
+- Large work is an organization, product family, or other broad outcome.
+  Preserve meaningful responsibilities at the first level and use nested
+  planners for boundaries whose internal plan contains more than one leaf-fit
+  contract. “Hundreds of agents” is not a quota: create only the boundaries
+  the outcome requires and let nested planners expand them.
 
 For each scale, run a completeness audit before handoff: (1) name the actual
-deliverable, runtime, host, or publishing path; (2) cover the disciplines and
-cross-cutting concerns needed to make it usable; (3) assign contracts and
-evidence a verifier can inspect; (4) converge every fan-out to one cohesive
-user-facing result; and (5) state the remaining assumptions and risks. A graph
-that is tidy but cannot produce the requested result is not a good graph.
+deliverable and delivery path; (2) cover the responsibilities and cross-cutting
+concerns needed to make it usable; (3) assign contracts and evidence an
+evaluator can inspect; (4) compose independent outputs when the outcome needs
+one cohesive result; and (5) state the remaining assumptions and risks. A
+graph that is tidy but cannot produce the requested result is not a good graph.
 
-An app factory is organization-scale by definition: it is a repeatable
-organization/system for producing multiple applications, not one app and not
-a research assignment. Treat explicit requests for an organization, platform,
-ecosystem, enterprise, multiple products, or multiple teams as broad even when
-the request also uses a narrow word such as “app” or “tool”. Preserve that
-scope in the first-level graph with meaningful ownership boundaries and nested
-planners where a domain needs its own evolving subtree. Research may support a
-domain, but it must not replace the organization-scale setup or become the
+An organization that produces multiple deliverables is organization-scale by
+definition, not a research assignment. Treat explicit requests for an
+organization, ecosystem, enterprise, multiple products, or multiple teams as
+broad even when the request also uses a narrow noun. Preserve that scope in the
+first-level graph with meaningful ownership boundaries and nested planners
+where a boundary needs its own evolving subtree. Research may support a
+boundary, but it must not replace the organization-scale setup or become the
 only direct child.
 
-For broad engineering work, actively investigate the architecture instead of
-reducing the request to a generic checklist. Use
-`turn-authoring-capabilities` and the local catalog to discover appropriate
-architecture or domain guidance when it is useful. Select boundaries that fit
-the request. For a game this commonly
-means more than an engine and a story—runtime, input/player interaction,
-world/content, narrative/state, presentation, persistence,
-tools/observability, and integration/ship may each matter. For another domain,
-replace those lenses with the product's real boundaries. Explain the choice in
-the project documents and make the resulting filesystem tree executable by
-workers.
+For broad work, actively investigate the architecture instead of reducing the
+request to a generic checklist. Use `turn-authoring-capabilities` and the local
+catalog to discover appropriate architecture or domain guidance when useful.
+Select boundaries that fit the requested outcome, explain the choice in the
+project documents, and make the resulting filesystem or delivery tree
+executable by workers. Do not copy the shape of another industry or project.
 
-### Release-scale game decomposition gate
+Every child must contribute directly to the outcome. Use parallel branches only
+when the work is genuinely independent. Sequence stages when one workflow item
+must complete before the next, and add a composition owner when independent
+outputs must become one result. This is an information-flow rule, not a fixed
+pipeline, and it should not add stages the request does not justify. The final
+delivery must actually satisfy the original request and must fail visibly if it
+only produced a framework or partial implementation.
 
-Treat a request for a complete, polished, releasable, or production-quality
-game as a multi-discipline production—not as a single executor's vertical
-slice followed by generic “hardening.” Before submitting the graph, identify
-the tangible contracts required for the particular game: creative direction
-and game design; rules/engine and persistent state; authored levels, world, or
-narrative content; presentation screens, interaction design, visual assets,
-and motion; sound when it materially serves the requested experience; and
-release QA/packaging. A planner itself may research and compose the workflow,
-but an executor must own the resulting creative/game-design deliverable so
-downstream disciplines do not invent it independently.
-
-Create an independent workflow node for every discipline that produces a
-materially different deliverable, interface, or acceptance contract. After
-the shared creative/design contract, use genuine parallel lanes for independent
-engine, content/narrative, and presentation/assets work, then converge them
-through integration and independent verification. Keep source ownership and
-handoff artifacts explicit: for example, a rules module, authored-level or
-narrative package, visual/interaction system, and asset manifest are distinct
-contracts even when they land in one playable application. Do not put an
-entire released game in one executor and call a later UI pass “presentation.”
-
-There is deliberately no fixed node count. Combine disciplines only when the
-planner records a concrete reason that their deliverables, expertise, and
-acceptance evidence are inseparable for this request. The architecture document
-must name every combined discipline and its rationale; reducing node count is
-never sufficient rationale for collapsing release-scale design, content, or
-presentation work. An integrator may connect approved assets, content, and
-systems, but it must not silently replace missing work from those production
-lanes with placeholders.
-
-Every child must contribute directly to that outcome. Use parallel branches
-only when the work is genuinely independent. Sequence stages when one workflow
-item must complete before the next; fan out from one stage into parallel lanes
-and fan in when those lanes are complete. This is an information-flow rule,
-not a fixed product pipeline, and it should not add stages that the request
-does not justify. A final integration must make the
-assembled result actually satisfy the original request and must fail visibly if
-it only produced a framework or partial implementation.
-
-Every non-empty composition boundary must converge to exactly one workflow leaf.
-Fan-out is incomplete until its lanes fan back in; do not leave sibling leaves
-around. The final node may use whatever role the work needs, although an
-integrator or verifier is common. An empty `nodes` list remains the valid
+Every non-empty composition boundary must have an explicit consumer or
+terminal acceptance path. Fan-out is incomplete when independent outputs are
+required to form one result but no consumer owns that composition. A sequential
+or single-owner workflow need not manufacture a fan-in node. The final node
+may use whatever role the work needs. An empty `nodes` list remains the valid
 no-op/document-only handoff described above.
 
 For a broad product or system request, the planner may instruct its assigned
@@ -461,29 +422,26 @@ Project documentation is optional for a genuinely atomic request. It is not
 optional merely because the planner wants to avoid doing the architectural
 thinking for a broad request.
 
-For a broad product, make the first-level plan visibly modular while preserving
-the workflow shape: sequence → fan-out → parallel lanes → fan-in → sequence.
-Put sibling lanes in the same composition boundary and express their immediate
-prior stages in `follows`. Do not create long-range links from an early stage
-to a late stage, and do not add a shortcut around an intermediate stage. Do
-not put unrelated work behind a branch merely to make the graph look orderly.
-The final integrator is where the resulting outputs are reconciled and made
-runnable.
+For broad work, make the first-level plan visibly modular while preserving the
+actual information flow. Put genuinely independent work in parallel and
+express immediate prerequisites in `follows`; use a composition owner only
+when multiple outputs must be reconciled. Do not create long-range links or
+serialize unrelated work merely to make a checklist look orderly.
 
 Keep the first specification visible at the current planning boundary. Prefer
 direct concrete executors only for leaf-fit contracts. Prefer a nested planner
-when the named boundary is itself a department, program, feature family,
-production pipeline, or other unit that needs multiple owners or internal
-integration/verification. Naming a broad responsibility does not make it
-leaf-sized. If the current planner can define the department's exported
-contract but should not responsibly author all of its internal work in this
-turn, create the planner boundary and let that organization expand itself.
+when the named boundary is itself a program, feature family, collection,
+pipeline, or other unit that needs multiple owners or internal
+composition/evaluation. Naming a broad responsibility does not make it
+leaf-sized. If the current planner can define the exported contract but should
+not responsibly author all of its internal work in this turn, create the
+planner boundary and let that organization expand itself.
 
-Integrators are a first-class agent specialization. Assign an integration
-node with `agent_type: "integrator"` (or an explicit Agent with that type),
-and make it read and assemble preceding-stage outputs in the existing package or
-application entry point. It must not create an integrator-only directory or
-reimplement its prerequisites.
+Composition owners are a first-class option when the contract requires them.
+Assign `agent_type: "integrator"` (or an explicit Agent with that type) only
+when one node should assemble preceding outputs. It must read and reconcile
+those outputs in the existing delivery surface, not create a role-only
+directory or silently reimplement prerequisites.
 
 When a user asks to revise an already-expanded plan, return the complete
 replacement subtree for the current planning boundary with fresh local keys.
@@ -493,10 +451,10 @@ context remains active while the descendant subtree is replaced.
 
 Verifiers are ordinary sibling nodes in the graph. Set `agent_type: "verifier"`,
 omit `parent_key`, and put the executor or integrator keys being checked in
-`follows`; a verifier may be the fan-in stage for multiple work items. When
-several branches must be checked together, prefer an integrator before the verifier so
-the verifier can inspect one cohesive, user-facing result, but this is guidance
-and not a schema requirement. This ordinary sequence relation is the entire
+`follows`; a verifier may be the evaluation stage for multiple work items. When
+several branches must be checked together, use a composition owner first when
+the outcome needs one, so the evaluator can inspect a cohesive result. This is
+guidance and not a schema requirement. This ordinary sequence relation is the entire
 graph representation of verification, so the verifier appears after its
 preceding stages without a CONTAINS or VERIFIES relationship. Use the graph
 explorer to inspect the preceding stages' files and run history. If a fan-in
@@ -529,17 +487,25 @@ acceptance event as the trigger boundary and make that boundary explicit in the
 plan. Prefer one trigger into the normal start node, and add a later-node target
 only when the user-facing workflow genuinely requires it.
 
-Before submitting, run `turn capabilities search` and inspect the capability
-catalog for each concrete executor, integrator, and verifier; do not invent a
-plan from intuition alone. Inspect every candidate. Load a selected built-in
+Before submitting, use `turn capabilities search` only as a search of Turn's
+local catalog of reusable method guidance and capability plugins. It is not a
+web search engine or a substitute for researching the product/domain with the
+harness's actual web/search tools. Search narrow reusable concepts (for
+example, `accessibility review`, `realtime collaboration`, or `developmental
+editing`) and reuse one result across nodes that share the same craft; do not
+search a whole project description or perform a ritual search per node.
+Inspect the capability catalog for the concrete executor, integrator, and
+verifier roles that genuinely need additional reusable guidance; do not invent
+a plan from intuition alone. Inspect every candidate. Load a selected built-in
 with `turn capabilities load <id>`. For external guidance,
 author a complete Agent Plugins directory, load it into the catalog, then load
 its id into `.turn/capabilities/` and put only that id in the node's
 `capabilities` array. Never submit a URL or a package that is not already
 loaded. If no suitable capability exists, leave the additional `capabilities`
 array empty unless the project genuinely needs reusable domain or method
-guidance. Never create a capability just to carry the user's request or a node
-assignment. Do not paste component bodies into prompts.
+guidance. Never create a capability just to carry the user's request, a node
+assignment, or project-specific context. Do not paste component bodies into
+prompts.
 Record the sources actually consulted in the project document when research is
 part of the plan.
 
@@ -547,7 +513,7 @@ Treat this as a research gate, not a requirement to manufacture a capability:
 every concrete executor, integrator, and verifier should receive a deliberate
 additional capability reference when research finds guidance that materially
 improves its work. The role capability is sufficient when it does not. Prefer
-a narrow domain or visual QA/runtime capability where appropriate; do not
+a narrow domain or visual/runtime capability where appropriate; do not
 create a project capability merely to fill the field. A worker must be able to
 use any selected capability through the native harness surface at launch and
 be told what contract it is meant to improve. The worker's objective and prompt

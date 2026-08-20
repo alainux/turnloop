@@ -93,7 +93,10 @@ async def test_server_runtime_is_deterministic_with_replaced_ports(tmp_path):
                     "name": "Deterministic boundary project",
                     "prompt": "Build a deterministic integration fixture",
                     "agent": {"harness": "mock", "type_id": "executor"},
-                    "run_policy": {"auto_run": False},
+                    "run_policy": {
+                        "auto_run": False,
+                        "workspace_isolation": "shared",
+                    },
                 },
             )
             assert created.status_code == 200, created.text

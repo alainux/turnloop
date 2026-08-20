@@ -558,6 +558,7 @@ async def test_corrected_handoff_releases_reconnect_for_later_rejections(tmp_pat
     reconnect = runner._reconnect_tasks.get(work.id)
     if reconnect is not None:
         await asyncio.gather(reconnect, return_exceptions=True)
+    await runner.stop()
     await store.dispose()
 
 

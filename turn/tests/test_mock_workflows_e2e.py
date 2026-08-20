@@ -519,7 +519,18 @@ async def test_mock_process_verifier_acceptance_is_the_only_loop_entry(tmp_path,
             and record.get("status") == "ok"
             for record in components.logs.read(project.id)
         )
-        assert not terminal.sessions
+        assert not terminal.sessions, {
+            "sessions": {
+                str(node_id): {
+                    "ended": session.ended,
+                    "returncode": session.process.returncode,
+                }
+                for node_id, session in terminal.sessions.items()
+            },
+            "work": str(work.id),
+            "review": str(review.id),
+            "persistent_tasks": [str(node_id) for node_id in terminal.persistent_tasks],
+        }
     finally:
         components.events.unsubscribe(terminal_events)
         await runtime.stop()
@@ -649,11 +660,18 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
                         "follows": ["chapter_plan"],
                     },
                     {
+                        "key": "chapter_compose",
+                        "objective": "Assemble both chapters",
+                        "executor": "mock",
+                        "agent_type": "integrator",
+                        "follows": ["chapter_a", "chapter_b"],
+                    },
+                    {
                         "key": "verify_chapters",
                         "objective": "Verify both chapters",
                         "executor": "mock",
                         "agent_type": "verifier",
-                        "follows": ["chapter_a", "chapter_b"],
+                        "follows": ["chapter_compose"],
                     },
                 ],
             })
@@ -679,7 +697,8 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
             assert submitted.returncode == 0, submitted.stderr or submitted.stdout
 
             expected_objectives = {
-                "Plan the tiny chapters", "Write chapter A", "Write chapter B", "Verify both chapters"
+                "Plan the tiny chapters", "Write chapter A", "Write chapter B",
+                "Assemble both chapters", "Verify both chapters",
             }
             deadline = asyncio.get_running_loop().time() + 5
             while True:
@@ -696,7 +715,7 @@ async def test_process_e2e_revises_plan_rejects_work_and_cleans_project(tmp_path
             assert revised_root.agent_state is None
             assert revised_root.agent_message is None
 
-            fan_in = next(node for node in revised if node.objective == "Verify both chapters")
+            fan_in = next(node for node in revised if node.objective == "Assemble both chapters")
             predecessors = await store.predecessors(fan_in.id)
             assert {node.objective for node in predecessors} == {"Write chapter A", "Write chapter B"}
 

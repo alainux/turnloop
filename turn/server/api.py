@@ -31,6 +31,14 @@ from turn.domain.schemas import (
     RunPolicy,
     TriggerKind,
 )
+from turn.domain.organization import (
+    BudgetRequestStatus,
+    HandoffStatus,
+    OrganizationBudget,
+    OrganizationContract,
+    WorkItemStatus,
+)
+from turn.contracts.organization import organization_metrics
 from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
@@ -156,6 +164,7 @@ class SettingsUpdate(BaseModel):
     max_retries: Optional[int] = Field(default=None, ge=0, le=20)
     retry_backoff_ms: Optional[int] = Field(default=None, ge=0, le=600000)
     delay_between_jobs_ms: Optional[int] = Field(default=None, ge=0, le=600000)
+    max_parallel_agents: Optional[int] = Field(default=None, ge=1, le=10000)
     retry_choked_models: Optional[bool] = None
     log_max_records: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     agent_defaults: Optional[dict[str, dict[str, str]]] = None
@@ -197,6 +206,47 @@ class UpdateTrigger(BaseModel):
     enabled: Optional[bool] = None
 
 
+class CreateWorkItem(BaseModel):
+    organization_id: Optional[uuid.UUID] = None
+    node_id: Optional[uuid.UUID] = None
+    key: Optional[str] = Field(default=None, max_length=120)
+    title: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=1)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    priority: int = Field(default=0, ge=-100_000, le=100_000)
+    depends_on: list[uuid.UUID] = Field(default_factory=list)
+    agent_type: str = "executor"
+    organization_contract: Optional[OrganizationContract] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateWorkItem(BaseModel):
+    status: Optional[WorkItemStatus] = None
+    priority: Optional[int] = Field(default=None, ge=-100_000, le=100_000)
+    claimed_by: Optional[uuid.UUID] = None
+    rejection_reason: Optional[str] = None
+    artifact_refs: Optional[list[uuid.UUID]] = None
+    evidence_refs: Optional[list[str]] = None
+
+
+class UpdateHandoff(BaseModel):
+    status: HandoffStatus
+    artifact_id: Optional[uuid.UUID] = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    rejection_reason: Optional[str] = None
+
+
+class CreateBudgetRequest(BaseModel):
+    organization_id: Optional[uuid.UUID] = None
+    requested_budget: OrganizationBudget
+    reason: str = Field(min_length=1)
+
+
+class DecideBudgetRequest(BaseModel):
+    status: BudgetRequestStatus
+    decision_reason: Optional[str] = None
+
+
 class EmitEvent(BaseModel):
     event_name: str = Field(min_length=1, max_length=200)
     data: dict[str, Any] = Field(default_factory=dict)
@@ -231,6 +281,9 @@ def _dump(n: Node):
 async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner | None = None) -> dict:
     nodes, edges, artifacts = await store.get_workgraph(project_id)
     triggers = await store.list_triggers(project_id)
+    work_items = await store.list_work_items(project_id)
+    handoffs = await store.list_handoffs(project_id)
+    budget_requests = await store.list_budget_requests(project_id)
     walker = GraphWalker(nodes, edges)
     ev = walker.evaluate()
     for n in nodes:
@@ -267,6 +320,23 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         # Only a runner-owned provider task is generation; an open user shell
         # must not animate a completed node as if the agent were still working.
         item["generation_active"] = generation_active
+        control_run = next(
+            (
+                run for run in reversed(await store.get_runs(n.id))
+                if run.status.value == "RUNNING"
+                and run.worker in {"semantic-plan-auditor", "organization-manager"}
+            ),
+            None,
+        )
+        if control_run is not None:
+            item["control_activity"] = {
+                "kind": "plan_audit"
+                if control_run.worker == "semantic-plan-auditor"
+                else "manager_review",
+                "status": "running",
+                "started_at": control_run.started_at.isoformat(),
+                "attempt": control_run.attempt,
+            }
         statuses = []
         if n.agent is not None and project_root is not None:
             for capability_id in n.agent.capabilities:
@@ -298,6 +368,11 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         ],
         "artifacts": [a.model_dump(mode="json") for a in artifacts],
         "triggers": [trigger.model_dump(mode="json") for trigger in triggers],
+        "work_items": [item.model_dump(mode="json") for item in work_items],
+        "handoffs": [item.model_dump(mode="json") for item in handoffs],
+        "budget_requests": [
+            item.model_dump(mode="json") for item in budget_requests
+        ],
     }).model_dump(mode="json")
 
 
@@ -372,6 +447,7 @@ async def create_project(body: CreateProject, request: Request):
             auto_run=str(await store.get_setting("default_auto_run", "0")).lower() not in ("0", "false", ""),
             delay_between_jobs_ms=app_settings.delay_between_jobs_ms,
             timeout_seconds=app_settings.default_run_timeout_seconds,
+            max_parallel_agents=app_settings.max_parallel_agents,
             max_retries=app_settings.max_retries,
             retry_backoff_ms=app_settings.retry_backoff_ms,
             retry_choked_models=app_settings.retry_choked_models,
@@ -424,6 +500,7 @@ async def get_settings(request: Request):
         "max_retries": app_settings.max_retries,
         "retry_backoff_ms": app_settings.retry_backoff_ms,
         "delay_between_jobs_ms": app_settings.delay_between_jobs_ms,
+        "max_parallel_agents": app_settings.max_parallel_agents,
         "retry_choked_models": app_settings.retry_choked_models,
         "log_max_records": int(await store.get_setting("log_max_records", str(app_settings.log_max_records))),
         "data_dir": str(Path(app_settings.data_dir).resolve()),
@@ -470,6 +547,7 @@ async def update_settings(body: SettingsUpdate, request: Request):
         "max_retries": "max_retries",
         "retry_backoff_ms": "retry_backoff_ms",
         "delay_between_jobs_ms": "delay_between_jobs_ms",
+        "max_parallel_agents": "max_parallel_agents",
         "retry_choked_models": "retry_choked_models",
         "log_max_records": "log_max_records",
     }
@@ -891,6 +969,222 @@ async def project_behavior(project_id: str, request: Request):
             root.run_policy.behavior_expectations if root.run_policy else None,
         ),
     }
+
+
+@router.get("/api/projects/{project_id}/work-items")
+async def project_work_items(
+    project_id: str,
+    request: Request,
+    organization_id: str | None = None,
+    status: WorkItemStatus | None = None,
+):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    organization = uuid.UUID(organization_id) if organization_id else None
+    items = await store.list_work_items(pid, organization_id=organization, status=status)
+    return {"project_id": project_id, "work_items": [item.model_dump(mode="json") for item in items]}
+
+
+@router.get("/api/projects/{project_id}/organizations")
+async def project_organizations(project_id: str, request: Request):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    nodes, edges, _ = await store.get_workgraph(pid)
+    walker = GraphWalker(nodes, edges)
+    work_items = await store.list_work_items(pid)
+    handoffs = await store.list_handoffs(pid)
+    budget_requests = await store.list_budget_requests(pid)
+    runs = await store.get_project_runs(pid)
+    organizations = []
+    for node in nodes:
+        if node.executor != "planner" or node.organization_contract is None:
+            continue
+        descendants = walker.descendants(node.id)
+        organizations.append({
+            "node": _dump(node),
+            "depth": walker.depth(node.id),
+            "descendant_count": len(descendants),
+            "work_item_count": len(await store.list_work_items(pid, organization_id=node.id)),
+            "handoff_count": len(await store.list_handoffs(pid, node_id=node.id)),
+            "audit": (
+                node.organization_review.audit.model_dump(mode="json")
+                if node.organization_review and node.organization_review.audit
+                else None
+            ),
+        })
+    return {
+        "project_id": project_id,
+        "organizations": organizations,
+        "budget_requests": [
+            item.model_dump(mode="json") for item in budget_requests
+        ],
+        "metrics": organization_metrics(
+            nodes,
+            edges,
+            work_items=work_items,
+            handoffs=handoffs,
+            runs=runs,
+        ).model_dump(mode="json"),
+    }
+
+
+@router.post("/api/projects/{project_id}/work-items")
+async def create_project_work_item(
+    project_id: str,
+    body: CreateWorkItem,
+    request: Request,
+):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    root = await store.get_node(pid)
+    if root is None:
+        raise HTTPException(404, "project not found")
+    organization_id = body.organization_id or pid
+    organization = await store.get_node(organization_id)
+    if organization is None or organization.project_id != pid:
+        raise HTTPException(422, "organization_id must identify a node in this project")
+    if body.node_id is not None:
+        node = await store.get_node(body.node_id)
+        if node is None or node.project_id != pid:
+            raise HTTPException(422, "node_id must identify a node in this project")
+    for dependency in body.depends_on:
+        item = await store.get_work_item(dependency)
+        if item is None or item.project_id != pid:
+            raise HTTPException(422, f"unknown work-item dependency: {dependency}")
+    item = await store.create_work_item(
+        project_id=pid,
+        organization_id=organization_id,
+        node_id=body.node_id,
+        key=body.key,
+        title=body.title,
+        objective=body.objective,
+        acceptance_criteria=body.acceptance_criteria,
+        priority=body.priority,
+        depends_on=body.depends_on,
+        agent_type=body.agent_type,
+        organization_contract=body.organization_contract,
+        metadata=body.metadata,
+    )
+    return {"work_item": item.model_dump(mode="json")}
+
+
+@router.get("/api/projects/{project_id}/budget-requests")
+async def project_budget_requests(project_id: str, request: Request):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    requests = await store.list_budget_requests(pid)
+    return {
+        "project_id": project_id,
+        "budget_requests": [item.model_dump(mode="json") for item in requests],
+    }
+
+
+@router.post("/api/projects/{project_id}/budget-requests")
+async def create_project_budget_request(
+    project_id: str,
+    body: CreateBudgetRequest,
+    request: Request,
+):
+    pid = uuid.UUID(project_id)
+    organization_id = body.organization_id or pid
+    try:
+        item = await request.app.state.store.create_budget_request(
+            project_id=pid,
+            organization_id=organization_id,
+            requested_budget=body.requested_budget,
+            reason=body.reason,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    return {"budget_request": item.model_dump(mode="json")}
+
+
+@router.patch("/api/budget-requests/{request_id}")
+async def decide_project_budget_request(
+    request_id: str,
+    body: DecideBudgetRequest,
+    request: Request,
+):
+    try:
+        item = await request.app.state.store.decide_budget_request(
+            uuid.UUID(request_id),
+            status=body.status,
+            decision_reason=body.decision_reason,
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if item is None:
+        raise HTTPException(404, "budget request not found")
+    return {"budget_request": item.model_dump(mode="json")}
+
+
+@router.patch("/api/work-items/{work_item_id}")
+async def update_project_work_item(
+    work_item_id: str,
+    body: UpdateWorkItem,
+    request: Request,
+):
+    item = await request.app.state.store.get_work_item(uuid.UUID(work_item_id))
+    if item is None:
+        raise HTTPException(404, "work item not found")
+    updated = await request.app.state.store.update_work_item(
+        item.id,
+        status=body.status,
+        priority=body.priority,
+        claimed_by=body.claimed_by,
+        rejection_reason=body.rejection_reason,
+        artifact_refs=body.artifact_refs,
+        evidence_refs=body.evidence_refs,
+    )
+    return {"work_item": updated.model_dump(mode="json") if updated else None}
+
+
+@router.post("/api/work-items/{work_item_id}/claim")
+async def claim_project_work_item(work_item_id: str, request: Request):
+    try:
+        item = await request.app.state.store.claim_work_item(uuid.UUID(work_item_id))
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if item is None:
+        raise HTTPException(404, "work item not found")
+    return {"work_item": item.model_dump(mode="json")}
+
+
+@router.get("/api/projects/{project_id}/handoffs")
+async def project_handoffs(project_id: str, request: Request, node_id: str | None = None):
+    pid = uuid.UUID(project_id)
+    if await request.app.state.store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    node = uuid.UUID(node_id) if node_id else None
+    handoffs = await request.app.state.store.list_handoffs(pid, node_id=node)
+    return {"project_id": project_id, "handoffs": [item.model_dump(mode="json") for item in handoffs]}
+
+
+@router.patch("/api/handoffs/{handoff_id}")
+async def update_project_handoff(
+    handoff_id: str,
+    body: UpdateHandoff,
+    request: Request,
+):
+    try:
+        handoff = await request.app.state.store.update_handoff(
+            uuid.UUID(handoff_id),
+            status=body.status,
+            artifact_id=body.artifact_id,
+            evidence_refs=body.evidence_refs,
+            rejection_reason=body.rejection_reason,
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if handoff is None:
+        raise HTTPException(404, "handoff not found")
+    return {"handoff": handoff.model_dump(mode="json")}
 
 
 @router.get("/api/behavior")
@@ -1339,6 +1633,19 @@ async def retry(node_id: str, request: Request):
         return {"ok": True, "ran": None}
     ran = await runner.run_node(nid)
     return {"ok": ran is not None, "ran": str(ran) if ran else None}
+
+
+@router.post("/api/nodes/{node_id}/review/resume")
+async def resume_organization_review(node_id: str, request: Request):
+    """Resume an already-materialized organization after review failure."""
+    runner = await _runner(request)
+    try:
+        node = await runner.resume_organization_review(uuid.UUID(node_id))
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"ok": True, "node": node.model_dump(mode="json")}
 
 
 @router.post("/api/nodes/{node_id}/reconnect")

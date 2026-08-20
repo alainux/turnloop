@@ -75,7 +75,8 @@ async def _launch(
 ) -> dict[str, Any]:
     if not ctx.repo_path or not Path(ctx.repo_path).is_dir():
         raise RuntimeError("assigned project directory is unavailable")
-    result_path = _active_result_path(ctx.repo_path, ctx.node.id, kind, ctx.attempt)
+    control_root = ctx.project_repo_path or ctx.repo_path
+    result_path = _active_result_path(control_root, ctx.node.id, kind, ctx.attempt)
     process_exit_path = result_path.with_suffix(".exit")
     process_exit_path.unlink(missing_ok=True)
     process_start_path = result_path.with_suffix(".started")
@@ -90,6 +91,7 @@ async def _launch(
         result_path,
         ctx.node.agent,
         data_dir=runtime.data_dir,
+        project_repo_path=ctx.project_repo_path,
     )
     session_id = _session_for(ctx)
     # This fixture deliberately keeps the injected shell command short. The

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from turn.config import settings
 from turn.capabilities.catalog import CapabilityCatalog
+from turn.contracts.dag import parse_plan
 from turn.workers import parsing
 from turn.domain.schemas import (
     AgentConfig,
@@ -38,6 +39,10 @@ from turn.domain.schemas import (
     Usage,
     NODE_OBJECTIVE_MAX_LENGTH,
     concise_node_title,
+)
+from turn.domain.organization import (
+    HandoffContract,
+    OrganizationContract,
 )
 from turn.workers.base import NodeExecutionContext, Planner, render_context_block
 from turn.workers.harnesses import recover_session_id
@@ -183,6 +188,7 @@ class CodexPlanner(Planner):
             prompt, cwd, agent=ctx.node.agent,
             stream=getattr(ctx, "stream", None), node_id=ctx.node.id,
             project_id=ctx.node.project_id,
+            project_repo_path=ctx.project_repo_path,
             terminal=ctx.terminal, timeout=ctx.timeout_seconds,
             stall_timeout=ctx.stall_timeout_seconds,
             session_callback=ctx.session_callback,
@@ -191,7 +197,11 @@ class CodexPlanner(Planner):
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None:
-            self._validate_setup_scope(ctx, plan)
+            # The runner owns the stateful structural/semantic audit loop. Do
+            # not reject here: a valid provider correction needs the runner's
+            # persisted feedback and retained session before the plan can be
+            # accepted. The pure helper remains available to callers that
+            # intentionally want a one-shot setup-scope check.
             plan.usage = usage
             plan.session_id = session_id
             return plan
@@ -199,161 +209,15 @@ class CodexPlanner(Planner):
 
     @staticmethod
     def _validate_setup_scope(ctx: NodeExecutionContext, plan: PlanResult) -> None:
-        """Reject root plans whose organization contradicts explicit broad scope.
-
-        Prompt guidance alone is too easy for a model to satisfy cosmetically:
-        a plan can name five "departments" while still assigning each department
-        to one heroic executor. Broad root intent therefore has one structural
-        invariant at the runtime boundary: the first level must actually expose
-        recursive ownership, convergence, and independent quality control.
-
-        This is intentionally limited to explicit organization/release-scale
-        intent. Ordinary requests remain free to use a small flat graph.
-        """
+        """Apply the same domain-neutral contract audit used by the runner."""
         node = ctx.node
-        if node.parent_id is not None:
+        if node.parent_id is not None or plan.organization_contract is None:
             return
-        intent = " ".join((node.objective, node.generated_prompt or "")).lower()
-        broad_markers = (
-            "app factory",
-            "organization-scale",
-            "organization scale",
-            "entire organization",
-            "multi-organization",
-            "multiple organizations",
-            "multiple products",
-            "multiple teams",
-            "multi-team",
-            "enterprise",
-            "platform",
-            "ecosystem",
-            "large-scale",
-            "large scale",
-            "full-scale",
-            "full scale",
-            "production-ready",
-            "production ready",
-            "production-quality",
-            "production quality",
-            "not a demo",
-            "not a poc",
-            "multi-level game",
-            "multi level game",
-            "complete game",
-            "full game",
-            "build a game",
-            "create a game",
-            "make a game",
-            "develop a game",
-            "ship a game",
-            "playable game",
-        )
-        if not any(marker in intent for marker in broad_markers):
-            return
+        from turn.contracts.organization import audit_plan
 
-        direct = [spec for spec in plan.nodes if spec.parent_key is None]
-        if not direct:
-            raise RuntimeError(
-                "root planner returned no first-level organization for an explicitly "
-                "organization-scale request"
-            )
-
-        def role(spec: NodeSpec) -> AgentType | None:
-            if spec.agent_type is not None:
-                return spec.agent_type
-            if spec.agent is not None:
-                return spec.agent.type_id
-            return AgentType.PLANNER if spec.plan or spec.executor == "planner" else None
-
-        # A single child with required inputs is a legitimate clarification
-        # gate. Once scope is executable, however, handing the whole broad
-        # request to one child merely moves the same under-decomposition down a
-        # level and adds ceremony rather than organization.
-        if (
-            len(direct) == 1
-            and direct[0].required_inputs
-            and role(direct[0]) is AgentType.PLANNER
-        ):
-            return
-
-        planners = [spec for spec in direct if role(spec) is AgentType.PLANNER]
-        if not planners:
-            raise RuntimeError(
-                "root planner produced a flat graph for an explicitly organization-scale "
-                "request; make at least one broad first-level responsibility a nested "
-                "planner boundary instead of a department-named executor"
-            )
-
-        integrators = [spec for spec in direct if role(spec) is AgentType.INTEGRATOR]
-        if not integrators:
-            raise RuntimeError(
-                "organization-scale root plan has no first-level integrator; add an "
-                "explicit convergence owner that consumes the department outputs"
-            )
-
-        verifiers = [spec for spec in direct if role(spec) is AgentType.VERIFIER]
-        if not verifiers:
-            raise RuntimeError(
-                "organization-scale root plan has no independent first-level verifier; "
-                "add a release/acceptance gate after integration"
-            )
-
-        production_owners = [
-            spec for spec in direct
-            if role(spec) not in {AgentType.INTEGRATOR, AgentType.VERIFIER}
-        ]
-        if len(production_owners) < 2:
-            raise RuntimeError(
-                "organization-scale root plan still has only one production ownership "
-                "branch; expose at least two independently accountable first-level "
-                "responsibilities before convergence"
-            )
-
-        direct_keys = {spec.key for spec in direct}
-        sequence: dict[str, set[str]] = {key: set() for key in direct_keys}
-        for spec in direct:
-            for predecessor in spec.follows:
-                if predecessor in direct_keys:
-                    sequence[predecessor].add(spec.key)
-        for edge in plan.edges:
-            if (
-                edge.type is EdgeType.FOLLOWS
-                and edge.src in direct_keys
-                and edge.dst in direct_keys
-            ):
-                sequence[edge.src].add(edge.dst)
-
-        def reaches(src: str, dst: str) -> bool:
-            frontier = [src]
-            seen: set[str] = set()
-            while frontier:
-                current = frontier.pop()
-                if current == dst:
-                    return True
-                if current in seen:
-                    continue
-                seen.add(current)
-                frontier.extend(sequence[current] - seen)
-            return False
-
-        convergence = next(
-            (
-                integrator
-                for integrator in integrators
-                if all(reaches(owner.key, integrator.key) for owner in production_owners)
-            ),
-            None,
-        )
-        if convergence is None:
-            raise RuntimeError(
-                "organization-scale root integrator is not downstream of every first-level "
-                "production branch; sequence the organization so its outputs actually converge"
-            )
-        if not any(reaches(convergence.key, verifier.key) for verifier in verifiers):
-            raise RuntimeError(
-                "organization-scale root verifier is not downstream of the convergence owner; "
-                "make independent acceptance a real post-integration release gate"
-            )
+        audit = audit_plan(plan.organization_contract, plan)
+        if not audit.accepted:
+            raise RuntimeError("organization plan rejected: " + "; ".join(audit.errors))
 
     def _build_prompt(self, ctx: NodeExecutionContext) -> str:
         """Send only node data; planning behavior lives in turn-planning."""
@@ -369,6 +233,8 @@ class CodexPlanner(Planner):
         stream=None, node_id=None, terminal=None, timeout=None, stall_timeout=None,
         session_callback=None, project_id=None, telemetry=None,
         forbidden_session_id: str | None = None,
+        project_repo_path: str | None = None,
+        handoff_kind: str = "plan",
     ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
@@ -377,10 +243,17 @@ class CodexPlanner(Planner):
         # durable pane. Injection is only the delivery mechanism; it must not
         # switch Codex from its native TUI to JSON/exec output.
         native = isinstance(transport, LocalPtyTransport)
-        result_path = prepare_result_file(cwd, node_id, "plan")
+        control_root = project_repo_path or cwd
+        result_path = prepare_result_file(control_root, node_id, handoff_kind)
         machine_output_path = result_path.with_suffix(".jsonl") if not native else None
         environment = agent_environment(
-            cwd, node_id, "plan", result_path, agent, data_dir=self.s.data_dir
+            cwd,
+            node_id,
+            handoff_kind,
+            result_path,
+            agent,
+            data_dir=self.s.data_dir,
+            project_repo_path=project_repo_path,
         )
         if project_id is not None:
             environment["TURN_PROJECT_ID"] = str(project_id)
@@ -413,27 +286,27 @@ class CodexPlanner(Planner):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
+                    *codex_project_root_flags(cwd), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
+                    *codex_project_root_flags(cwd), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
             prompt_arg = prompt
             cmd = [
                 self.s.codex_binary, "exec", "--json", "resume", *model_flags,
-                *reasoning_flags, *codex_project_root_flags(), *mcp_flags,
+                *reasoning_flags, *codex_project_root_flags(cwd), *mcp_flags,
                 "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = prompt
             cmd = [
                 self.s.codex_binary, "exec", "--json", *model_flags, *reasoning_flags,
-                *codex_project_root_flags(), *mcp_flags, "-C", cwd,
+                *codex_project_root_flags(cwd), *mcp_flags, "-C", cwd,
                 prompt_arg,
             ]
         live_machine_events = bool(
@@ -490,7 +363,13 @@ class CodexPlanner(Planner):
                 capture_machine_output=machine_output_path is not None,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"planner harness exited {result.returncode}")
+                detail = result.output.decode(errors="replace").strip()
+                if len(detail) > 2000:
+                    detail = detail[-2000:]
+                raise RuntimeError(
+                    f"planner harness exited {result.returncode}"
+                    + (f": {detail}" if detail else "")
+                )
             if machine_output_path is not None and not live_machine_events:
                 raw_output = (
                     machine_output_path.read_text(encoding="utf-8", errors="replace")
@@ -563,10 +442,61 @@ class AgentPlanner(Planner):
         text = await self._call_harness(agent, prompt, ctx)
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None:
-            CodexPlanner._validate_setup_scope(ctx, plan)
             plan.session_id = agent.session_id
             return plan
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
+
+    async def call_structured(
+        self,
+        ctx: NodeExecutionContext,
+        prompt: str,
+        *,
+        handoff_kind: str = "result",
+    ) -> tuple[dict, Usage, str | None]:
+        """Run one provider turn that returns a normal Turn result envelope.
+
+        Manager reviews and semantic audits are not graph nodes, but they still
+        use the same provider adapters and atomic handoff protocol as ordinary
+        work. The caller decides whether the returned payload is a manager
+        result or an audit artifact.
+        """
+        agent = ctx.node.agent or AgentConfig(
+            harness=HarnessKind.CODEX,
+            type_id=AgentType.PLANNER,
+        )
+        if agent.harness is HarnessKind.CODEX:
+            raw, usage, session_id = await self.codex._call_codex(
+                prompt,
+                ctx.repo_path or os.getcwd(),
+                agent=agent,
+                stream=ctx.stream,
+                node_id=ctx.node.id,
+                terminal=ctx.terminal,
+                timeout=ctx.timeout_seconds,
+                stall_timeout=ctx.stall_timeout_seconds,
+                session_callback=ctx.session_callback,
+                project_id=ctx.node.project_id,
+                telemetry=ctx.telemetry,
+                forbidden_session_id=ctx.forbidden_session_id,
+                project_repo_path=ctx.project_repo_path,
+                handoff_kind=handoff_kind,
+            )
+        else:
+            raw = await self._call_harness(
+                agent,
+                prompt,
+                ctx,
+                handoff_kind=handoff_kind,
+            )
+            usage = Usage()
+            session_id = agent.session_id
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("provider returned no structured Turn payload") from error
+        if not isinstance(payload, dict):
+            raise RuntimeError("provider structured Turn payload must be an object")
+        return payload, usage, session_id
 
     def _command(
         self,
@@ -600,7 +530,8 @@ class AgentPlanner(Planner):
         return command
 
     async def _call_harness(
-        self, agent: AgentConfig, prompt: str, ctx: NodeExecutionContext
+        self, agent: AgentConfig, prompt: str, ctx: NodeExecutionContext,
+        *, handoff_kind: str = "plan",
     ) -> str:
         binary = {HarnessKind.OPENCODE: "opencode", HarnessKind.PI: "pi", HarnessKind.CLAUDE: "claude"}[agent.harness]
         if shutil.which(binary) is None:
@@ -641,9 +572,16 @@ class AgentPlanner(Planner):
                     None,
                 )
 
-            result_path = prepare_result_file(cwd, ctx.node.id, "plan")
+            control_root = ctx.project_repo_path or cwd
+            result_path = prepare_result_file(control_root, ctx.node.id, handoff_kind)
             environment = agent_environment(
-                cwd, ctx.node.id, "plan", result_path, agent, data_dir=self.s.data_dir
+                cwd,
+                ctx.node.id,
+                handoff_kind,
+                result_path,
+                agent,
+                data_dir=self.s.data_dir,
+                project_repo_path=ctx.project_repo_path,
             )
             telemetry_sidecar: NativeTelemetrySidecar | None = None
             claude_settings = None
@@ -747,7 +685,13 @@ class AgentPlanner(Planner):
                     idle_reap=self.s.terminal_idle_reap_seconds,
                 )
             if result.returncode != 0:
-                raise RuntimeError(f"{agent.harness.value} planner harness exited {result.returncode}")
+                detail = result.output.decode(errors="replace").strip()
+                if len(detail) > 2000:
+                    detail = detail[-2000:]
+                raise RuntimeError(
+                    f"{agent.harness.value} planner harness exited {result.returncode}"
+                    + (f": {detail}" if detail else "")
+                )
             if result.stalled:
                 raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
             raw_output = result.output.decode(errors="replace")
@@ -791,6 +735,14 @@ class AgentPlanner(Planner):
                 raise ValueError(
                     f"plan node {index} uses removed depends_on; use immediate follows stages"
                 )
+        # All provider plans cross the shared wire codec before this planner
+        # applies its domain-neutral duplicate/coordinator cleanup. This keeps
+        # artifact aliases, graph-reference aliases, and strict schema errors
+        # identical for Codex, Luna, OpenCode, Claude, and Pi.
+        try:
+            data = parse_plan(data).model_dump(mode="json")
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"provider returned an invalid turn-plan: {error}") from error
 
         def document_refs(values):
             return [
@@ -859,6 +811,21 @@ class AgentPlanner(Planner):
                 ],
                 resource_refs=list(n.get("resource_refs", [])),
                 document_refs=document_refs(n.get("document_refs")),
+                organization_contract=(
+                    OrganizationContract.model_validate(n["organization_contract"])
+                    if n.get("organization_contract") is not None
+                    else None
+                ),
+                exported_handoffs=[
+                    HandoffContract.model_validate(item)
+                    for item in n.get("exported_handoffs", [])
+                ],
+                required_handoffs=[
+                    HandoffContract.model_validate(item)
+                    for item in n.get("required_handoffs", [])
+                ],
+                acceptance_criteria=list(n.get("acceptance_criteria", [])),
+                priority=int(n.get("priority", 0)),
                 subgraph_refs=subgraph_refs(
                     n.get("subgraph_refs", n.get("graph_file"))
                 ),
@@ -932,4 +899,9 @@ class AgentPlanner(Planner):
             edges=[],
             triggers=[TriggerSpec.model_validate(item) for item in data.get("triggers", [])],
             notes=data.get("notes"),
+            organization_contract=(
+                OrganizationContract.model_validate(data["organization_contract"])
+                if data.get("organization_contract") is not None
+                else None
+            ),
         )

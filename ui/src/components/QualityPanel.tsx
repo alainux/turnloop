@@ -7,6 +7,10 @@ import {
   type BehaviorRunMetrics,
   type ProjectBehaviorResponse,
 } from "../api/behavior";
+import {
+  getProjectOrganizations,
+  type OrganizationDashboardResponse,
+} from "../api/organizations";
 import { Icon } from "./Icon";
 
 function count(metrics: BehaviorMetrics, numerator: keyof BehaviorMetrics, denominator: keyof BehaviorMetrics) {
@@ -52,6 +56,7 @@ export function QualityPanel({
 }) {
   const [project, setProject] = useState<ProjectBehaviorResponse | null>(null);
   const [dashboard, setDashboard] = useState<BehaviorDashboardResponse | null>(null);
+  const [organization, setOrganization] = useState<OrganizationDashboardResponse | null>(null);
   const [role, setRole] = useState("");
   const [harness, setHarness] = useState("");
   const [model, setModel] = useState("");
@@ -69,6 +74,17 @@ export function QualityPanel({
     // Metrics are a projection of the existing structured event/log stream.
     // A short refresh makes a running attempt legible without introducing a
     // second live-observability channel.
+    const interval = window.setInterval(load, 1200);
+    return () => { active = false; window.clearInterval(interval); };
+  }, [projectId]);
+  useEffect(() => {
+    let active = true;
+    const load = () => {
+      void getProjectOrganizations(projectId)
+        .then((value) => { if (active) setOrganization(value); })
+        .catch(() => { if (active) setOrganization(null); });
+    };
+    load();
     const interval = window.setInterval(load, 1200);
     return () => { active = false; window.clearInterval(interval); };
   }, [projectId]);
@@ -108,6 +124,19 @@ export function QualityPanel({
         <input value={dateTo} onChange={(event) => setDateTo(event.target.value)} type="date" aria-label="To date" />
       </div>
       <div className="quality-content">
+      {organization && <>
+        <div className="quality-section-head"><span>Organization execution</span><small>{organization.organizations.length} boundaries</small></div>
+        <div className="quality-trends">
+          <Trend label="Org depth" value={compact(organization.metrics.max_depth)} />
+          <Trend label="Managers / workers" value={`${compact(organization.metrics.planner_count)} / ${compact(organization.metrics.production_leaf_count)}`} />
+          <Trend label="Manager iterations" value={compact(organization.metrics.manager_iteration_count)} />
+          <Trend label="Verifier rejects" value={compact(organization.metrics.verifier_rejection_count)} />
+          <Trend label="Verified boundaries" value={`${compact(organization.metrics.verified_boundary_count)} / ${compact(organization.metrics.boundary_count)}`} />
+          <Trend label="Backlog open / active / done" value={`${compact(organization.metrics.open_work_item_count)} / ${compact(organization.metrics.active_work_item_count)} / ${compact(organization.metrics.completed_work_item_count)}`} />
+          <Trend label="Peak concurrency" value={compact(organization.metrics.peak_concurrency)} />
+          <Trend label="Budget spent" value={`$${compact(organization.metrics.budget_spent_usd, 2)}`} />
+        </div>
+      </>}
       {!metrics ? <div className="logs-empty">No behavior evidence has been recorded yet.</div> : <>
         <div className="quality-trends">
           <Trend label="Docs before material action" value={count(metrics, "docs_before_action_successes", "docs_before_action_runs")} />

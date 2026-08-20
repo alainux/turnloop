@@ -11,6 +11,7 @@ import uuid
 
 from turn.config import Settings
 from turn.domain.schemas import AgentConfig, RunPolicy
+from turn.graph.logic import GraphWalker
 from turn.workers.filesystem import init_project_directory
 from turn.runtime import TurnRuntime
 
@@ -81,14 +82,31 @@ class TurnCore:
         # A direct headless run is an explicit execution request, even if the
         # project was authored in step mode.
         await self.runner.set_mode(project_id, True)
+        # A worker finishing is not itself a scheduler pass. Keep one bounded
+        # probe after the frontier becomes idle so the runner can propagate a
+        # newly-unblocked node and finalize a focused root container. Material
+        # organizations still return after that probe when their manager needs
+        # a decision; this is not an unbounded polling loop.
+        settlement_probe_pending = True
         for _ in range(max_rounds):
             await self.runner.schedule_once(project_id)
             await self.runner.wait_for_idle(project_id)
             if self.runner.active_node_ids(project_id):
+                settlement_probe_pending = True
                 continue
-            nodes, _, _ = await self.store.get_workgraph(project_id)
-            active = [n for n in nodes if n.status.value in {"PENDING", "RUNNABLE", "RUNNING"}]
+            nodes, edges, _ = await self.store.get_workgraph(project_id)
+            evaluation = GraphWalker(nodes, edges).evaluate()
+            active = [
+                node
+                for node in nodes
+                if node.status.value in {"PENDING", "RUNNABLE", "RUNNING"}
+                or node.id in evaluation.runnable
+            ]
             if not active:
+                if settlement_probe_pending:
+                    settlement_probe_pending = False
+                    continue
                 return nodes
+            settlement_probe_pending = True
             await asyncio.sleep(self.settings.runner_tick_seconds)
         raise TimeoutError(f"workgraph did not settle after {max_rounds} scheduler rounds")

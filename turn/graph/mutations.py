@@ -18,6 +18,7 @@ from turn.domain.schemas import (
     PlanResult,
     SubgraphRef,
 )
+from turn.domain.organization import ManagerPhase, OrganizationContract, OrganizationReview
 
 PLANNER_EXECUTOR = "planner"
 
@@ -68,6 +69,9 @@ def append_artifacts(state: Any, node_id: uuid.UUID, specs: list[ArtifactSpec]) 
             name=spec.name,
             content=spec.content,
             ref=spec.ref,
+            schema_name=spec.schema_name,
+            schema_version=spec.schema_version,
+            evidence_refs=list(spec.evidence_refs),
         )
         state.artifacts[artifact.id] = artifact
         existing.add(key)
@@ -82,6 +86,10 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
     """Apply a validated PlanResult to a ProjectState-like aggregate."""
     parent.document_refs = merge_document_refs(parent.document_refs, plan.document_refs)
     parent.subgraph_refs = merge_subgraph_refs(parent.subgraph_refs, plan.subgraph_refs)
+    if plan.organization_contract is not None:
+        parent.organization_contract = plan.organization_contract
+    if parent.organization_review is None and parent.executor == PLANNER_EXECUTOR:
+        parent.organization_review = OrganizationReview()
     if parent.parent_id is None and parent.project_name is None and plan.project_name:
         candidate_name = plan.project_name.strip()
         if candidate_name:
@@ -159,6 +167,14 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             *node_agent.capabilities,
             *spec.capabilities,
         ]))
+        node_contract = (
+            spec.organization_contract
+            or (
+                OrganizationContract.from_objective(spec.objective)
+                if executor == PLANNER_EXECUTOR
+                else None
+            )
+        )
         node = Node(
             id=node_id,
             project_id=parent.project_id,
@@ -172,6 +188,20 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             resource_refs=spec.resource_refs,
             document_refs=spec.document_refs,
             subgraph_refs=spec.subgraph_refs,
+            organization_contract=node_contract,
+            organization_review=OrganizationReview() if executor == PLANNER_EXECUTOR else None,
+            manager_phase=ManagerPhase.PLANNING if executor == PLANNER_EXECUTOR else None,
+            acceptance_criteria=list(
+                spec.acceptance_criteria
+                or (
+                    node_contract.acceptance_criteria
+                    if node_contract is not None
+                    else []
+                )
+            ),
+            exported_handoffs=list(spec.exported_handoffs),
+            required_handoffs=list(spec.required_handoffs),
+            priority=spec.priority,
         )
         state.nodes[node.id] = node
         append_artifacts(state, node.id, spec.artifacts)
@@ -186,6 +216,8 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
     for item in plan.edges:
         add_edge(keys_to_ids[item.src], keys_to_ids[item.dst], item.type)
     parent.status = NodeStatus.EXPANDED
+    if parent.executor == PLANNER_EXECUTOR:
+        parent.manager_phase = ManagerPhase.EXECUTING
     state.nodes[parent.id] = parent.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
     append_artifacts(state, parent.id, plan.artifacts)
     return [node.model_copy(deep=True) for node in created]

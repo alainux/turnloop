@@ -87,8 +87,10 @@ def test_recursive_subgraph_validation_checks_each_composition_boundary(tmp_path
             {"key": "right", "objective": "Right lane", "parent_key": "branch"},
         ]
     }))
-    with pytest.raises(ValueError, match="exactly one leaf"):
-        validate_subgraph_sources(root, tmp_path)
+    # Source validation checks references and parses the nested plan, while
+    # composition requirements are decided by the boundary's contract-aware
+    # audit rather than by a universal single-leaf rule.
+    validate_subgraph_sources(root, tmp_path)
 
 
 def test_workflow_shape_has_one_leaf_per_composition_boundary():
@@ -276,13 +278,16 @@ def test_cli_graph_file_submission_links_source_and_preserves_atomic_handoff(
             {"key": "right", "objective": "Right"},
         ],
     }))
-    with pytest.raises(SystemExit, match="exactly one leaf"):
-        agent_command(args)
+    # Nested composition sources may contain multiple leaves. The source
+    # validator checks references and graph validity, not a universal shape.
+    assert agent_command(args) == 0
+    revised = json.loads(handoff.read_text())
+    assert revised["nodes"][0]["key"] == "left"
 
     source.write_text("not json")
     with pytest.raises(SystemExit, match="invalid agent submission"):
         agent_command(args)
-    assert json.loads(handoff.read_text()) == submitted
+    assert json.loads(handoff.read_text()) == revised
 
 
 def test_plan_submission_receipt_keeps_the_composition_source_link():

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Trigger, Usage } from "../domain";
+import type { Edge, FlowEdge, GraphNode, PrimaryNodeAction, Trigger, Usage, WorkItem } from "../domain";
 import {
   displayNodeTitle,
+  organizationManagerPhase,
   primaryNodeAction,
   primaryNodeActionLabel,
   capabilityTooltip,
@@ -23,6 +24,7 @@ interface Props {
   nodes: GraphNode[];
   edges: Edge[];
   flowEdges: FlowEdge[];
+  workItems?: WorkItem[];
   usage: Record<string, Usage>;
   selected: string | null;
   onSelect: (id: string) => void;
@@ -75,6 +77,7 @@ export function Graph({
   nodes,
   edges,
   flowEdges,
+  workItems = [],
   usage,
   selected,
   onSelect,
@@ -245,7 +248,7 @@ export function Graph({
         // a completed/cancelled PTY is being released.
         const running = node.status === "RUNNING" || node.generation_active;
         const preparing = node.ui_state === "preparing";
-        const active = running || preparing;
+        const active = node.allowed_actions.includes("cancel") && (running || preparing);
         const primaryAction = primaryNodeAction(node);
         const runAction = active ? "cancel" : primaryAction;
         const actionable = runAction !== null;
@@ -257,6 +260,10 @@ export function Graph({
         const capabilityTitle = capabilities.length
           ? capabilityTooltip(capabilities)
           : capabilityIds.join("\n");
+        const organizationWork = node.organization_contract
+          ? workItems.filter((item) => item.organization_id === node.id)
+          : [];
+        const managerPhase = organizationManagerPhase(node);
         return (
           <article
             key={node.id}
@@ -290,6 +297,19 @@ export function Graph({
                     ? `${tokens(usage[node.id]).toLocaleString()} tok`
                     : "—"}
                 </small>
+                {node.organization_contract && (
+                  <small className="node-organization-state">
+                    {managerPhase ? `Manager ${managerPhase.replaceAll("_", " ")}` : "Organization"}
+                    {organizationWork.length > 0
+                      ? ` · ${organizationWork.filter((item) => item.status === "COMPLETE").length}/${organizationWork.length} work done`
+                      : ""}
+                  </small>
+                )}
+                {node.control_activity && (
+                  <small className="node-control-activity">
+                    {node.control_activity.kind === "plan_audit" ? "Plan audit running…" : "Manager review running…"}
+                  </small>
+                )}
               </span>
               <span className="node-icons">
                 <span className="node-glyph">

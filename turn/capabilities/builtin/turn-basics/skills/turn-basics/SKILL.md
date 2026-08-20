@@ -105,6 +105,12 @@ one-child planner escalation above: it promotes an oversized leaf into a new
 planning boundary without letting the executor decide that boundary's internal
 organization.
 
+Material planner boundaries are persistent organizations. A completed child
+wave is only a safe point for manager review, not proof that the charter is
+complete. The manager inspects the durable contract, backlog, budget,
+handoffs, verifier decisions, and criterion evidence before accepting; it may
+continue with additional bounded work or block on a genuine missing input.
+
 ## Triggers and events
 
 Triggers are durable subscriptions that activate the immediately next node in

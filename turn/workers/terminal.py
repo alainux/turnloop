@@ -26,8 +26,10 @@ from typing import Awaitable, Callable, Literal, Protocol, runtime_checkable
 
 from turn.workers.herdr import (
     HerdrAdapter,
+    HerdrAdapterError,
     HerdrCliAdapter,
     HerdrResourceNotFound,
+    is_stale_resource_error,
 )
 
 StreamCallback = Callable[[uuid.UUID, str], Awaitable[None]]
@@ -104,7 +106,11 @@ class TerminalTransport(Protocol):
         self, node_id: uuid.UUID, *, cwd: str, environment: dict[str, str] | None = None
     ) -> bool: ...
     async def has_persistent_session(self, node_id: uuid.UUID) -> bool: ...
+    async def foreground_process_names(self, node_id: uuid.UUID) -> tuple[str, ...]: ...
     async def project_workspace_state(self, project_key: str) -> WorkspaceLinkState: ...
+    async def project_workspace_states(
+        self, project_keys: set[str]
+    ) -> dict[str, WorkspaceLinkState]: ...
     async def close_project_workspace(self, project_key: str) -> bool: ...
     async def close_orphaned_project_workspaces(self, project_keys: set[str]) -> int: ...
     async def detach(self, node_id: uuid.UUID) -> bool: ...
@@ -421,9 +427,18 @@ class LocalPtyTransport:
         session = self.sessions.get(node_id)
         return session is not None and not session.ended
 
+    async def foreground_process_names(self, node_id: uuid.UUID) -> tuple[str, ...]:
+        """Local PTYs cannot outlive this process, so there is no recovery target."""
+        return ()
+
     async def project_workspace_state(self, project_key: str) -> WorkspaceLinkState:
         """Local PTYs have no external project workspace to reconcile."""
         return "unmapped"
+
+    async def project_workspace_states(
+        self, project_keys: set[str]
+    ) -> dict[str, WorkspaceLinkState]:
+        return {project_key: "unmapped" for project_key in project_keys}
 
     async def close_project_workspace(self, project_key: str) -> bool:
         """There is no multiplexer workspace in the local process adapter."""
@@ -544,6 +559,11 @@ class HerdrPtyTransport(LocalPtyTransport):
         self._control_closed: dict[uuid.UUID, asyncio.Event] = {}
         self._pane_ready_events: dict[uuid.UUID, asyncio.Event] = {}
         self._node_projects: dict[uuid.UUID, str] = {}
+        # A fresh retry may be unable to close a durable provider pane while
+        # Herdr is temporarily denying mutation. Keep the durable mapping,
+        # but force the next launch to inject its new command into that pane
+        # instead of mistaking the retained shell for a completed provider.
+        self._fresh_launch_nodes: set[uuid.UUID] = set()
 
     @staticmethod
     def _is_interactive_shell(command: list[str]) -> bool:
@@ -577,8 +597,14 @@ class HerdrPtyTransport(LocalPtyTransport):
     async def _pane_exists(self, pane_id: str) -> bool:
         try:
             await self.adapter.get_pane(pane_id)
-        except HerdrResourceNotFound:
-            return False
+        except HerdrAdapterError as error:
+            if is_stale_resource_error(error, resource="pane"):
+                return False
+            # Herdr's lookup surface can temporarily deny inspection while
+            # the user-owned daemon is busy. The durable Turn mapping is the
+            # safe source for this launch; only an explicit not-found result
+            # authorizes replacing it.
+            return True
         return True
 
     async def _ensure_project(
@@ -594,7 +620,13 @@ class HerdrPtyTransport(LocalPtyTransport):
                 workspace_id = record["workspace_id"]
                 try:
                     await self.adapter.get_workspace(workspace_id)
-                except HerdrResourceNotFound:
+                except HerdrAdapterError as error:
+                    if not is_stale_resource_error(error, resource="workspace"):
+                        # Do not create a second workspace when Herdr merely
+                        # refuses a transient inspection. The persisted
+                        # mapping remains authoritative until a structured
+                        # not-found response proves it stale.
+                        return record
                     # Herdr is authoritative for externally closed spaces.
                     # Drop only this project's stale mapping before creating a
                     # new one; never reuse a workspace id from another node or
@@ -635,9 +667,38 @@ class HerdrPtyTransport(LocalPtyTransport):
             return "unmapped"
         try:
             await self.adapter.get_workspace(workspace_id)
-        except HerdrResourceNotFound:
-            return "missing"
+        except HerdrAdapterError as error:
+            if is_stale_resource_error(error, resource="workspace"):
+                return "missing"
+            raise
         return "mapped"
+
+    async def project_workspace_states(
+        self, project_keys: set[str]
+    ) -> dict[str, WorkspaceLinkState]:
+        """Read all project workspace links with one Herdr request.
+
+        Reconciliation is a health check, not a per-project polling loop.
+        Herdr owns the external workspace set, so take one snapshot and map
+        the durable Turn records against it. This keeps a large project list
+        from opening a burst of CLI requests against the global daemon.
+        """
+        async with self._metadata_lock:
+            records = {
+                key: record.get("workspace_id")
+                for key, record in self._projects.items()
+                if key in project_keys and isinstance(record, dict)
+            }
+        live = {workspace.workspace_id for workspace in await self.adapter.list_workspaces()}
+        return {
+            key: (
+                "unmapped"
+                if not isinstance(workspace_id, str) or not workspace_id
+                else "mapped" if workspace_id in live else "missing"
+            )
+            for key in project_keys
+            for workspace_id in [records.get(key)]
+        }
 
     def project_workspace_id(self, project_key: str) -> str | None:
         record = self._projects.get(project_key)
@@ -708,6 +769,14 @@ class HerdrPtyTransport(LocalPtyTransport):
                 self._pane_ready_events.setdefault(node_id, asyncio.Event()).set()
                 return existing
 
+            # An explicit Herdr pane-not-found is authoritative. Invalidate
+            # only this node's stale mapping before allocating a replacement;
+            # never close or recreate the whole project workspace here.
+            if isinstance(existing, str):
+                panes.pop(str(node_id), None)
+                self._node_projects.pop(node_id, None)
+                await self._save_metadata()
+
             # The root shell is created together with the workspace. Subsequent
             # nodes receive their own tab, which keeps Herdr's project space easy
             # to scan even when a graph grows beyond a handful of nodes.
@@ -727,7 +796,59 @@ class HerdrPtyTransport(LocalPtyTransport):
             self._pane_ready_events.setdefault(node_id, asyncio.Event()).set()
             return pane_id
 
+    async def reconcile_provider_session(
+        self,
+        node_id: uuid.UUID,
+        *,
+        project_key: str,
+        session_id: str,
+        provider: str,
+    ) -> bool:
+        """Repair a stale local pane map from Herdr's live agent identity.
+
+        The saved pane UUID is only a cache. Herdr's agent/session inventory is
+        authoritative after a Turn restart, so an exact native session match
+        may move the node to a newly reported pane without launching or
+        stopping the provider.
+        """
+        record = self._projects.get(project_key)
+        workspace_id = record.get("workspace_id") if isinstance(record, dict) else None
+        if not isinstance(workspace_id, str) or not workspace_id:
+            return False
+        list_agents = getattr(self.adapter, "list_agents", None)
+        list_panes = getattr(self.adapter, "list_panes", None)
+        if list_agents is None and list_panes is None:
+            return False
+        candidates = []
+        if list_agents is not None:
+            candidates.extend(
+                agent for agent in await list_agents()
+                if agent.agent_session == session_id
+                and (not agent.provider or agent.provider.casefold() == provider.casefold())
+                and agent.pane_id
+            )
+        if not candidates and list_panes is not None:
+            candidates.extend(
+                pane for pane in await list_panes(workspace_id)
+                if pane.agent_session == session_id
+            )
+        if not candidates:
+            return False
+        pane_id = candidates[0].pane_id
+        if not isinstance(pane_id, str) or not pane_id:
+            return False
+        async with self._metadata_lock:
+            current = self._projects.get(project_key)
+            if not isinstance(current, dict):
+                return False
+            current.setdefault("panes", {})[str(node_id)] = pane_id
+            self._node_projects[node_id] = project_key
+            await self._save_metadata()
+        return True
+
     async def has_persistent_session(self, node_id: uuid.UUID) -> bool:
+        if node_id in self._fresh_launch_nodes:
+            return False
         project_key = self._node_projects.get(node_id)
         if project_key is None:
             for key, record in self._projects.items():
@@ -801,6 +922,7 @@ class HerdrPtyTransport(LocalPtyTransport):
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
             limit=self.backlog_limit,
+            env={**os.environ, "HERDR_ENV": "1"},
         )
         session = _Session(
             node_id=node_id,
@@ -1107,7 +1229,17 @@ class HerdrPtyTransport(LocalPtyTransport):
         detached = await self._close_control(node_id)
         if not pane_id or not self.available:
             return detached
-        closed = await self.adapter.close_pane(pane_id)
+        try:
+            closed = await self.adapter.close_pane(pane_id)
+        except HerdrAdapterError as error:
+            if is_stale_resource_error(error, resource="pane"):
+                closed = False
+            else:
+                # A failed close must not make a fresh retry fail before its
+                # harness starts. Keep the pane mapping and explicitly force
+                # the next run to submit a new provider command into it.
+                self._fresh_launch_nodes.add(node_id)
+                return True
         async with self._metadata_lock:
             for record in self._projects.values():
                 (record.get("panes") or {}).pop(str(node_id), None)
@@ -1116,4 +1248,5 @@ class HerdrPtyTransport(LocalPtyTransport):
             if pane_ready is not None:
                 pane_ready.set()
             await self._save_metadata()
+        self._fresh_launch_nodes.discard(node_id)
         return detached or closed

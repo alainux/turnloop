@@ -21,34 +21,28 @@ be inherited by nested planners.
   delivery form, quality bar, and explicit scope and scale words before
   structuring work. Explicit scope outranks the default preference for a
   smaller plan.
-- A request to build a software product, experience, or system in ordinary
-  language is a request for a complete usable result unless the user explicitly
-  limits it to an MVP, demo, prototype, experiment, or similar slice. Do not
-  use the absence of a detailed screen list, architecture, or team chart as a
-  reason to produce a single-page POC or hand every discipline to one executor.
-- Infer the release promise and organize the material disciplines needed to
-  deliver it. Different craft, source boundary, acceptance evidence, or
-  independently executable work is a real ownership boundary. Product/design,
-  domain/platform engineering, content/data, presentation, integration, QA,
-  release, and operations are examples—not a mandatory checklist. Use the
-  product's actual disciplines and converge them into one usable result.
-- Use recursive organization when a direct child is itself too broad for one
-  accountable worker. A department is not "one task" merely because the root
-  planner can name it in one sentence. If a boundary contains multiple
-  independently verifiable contracts, multiple crafts, or a substantial
-  production backlog, make that boundary a planner node and stop there. Its
-  planner will create the department's own executors, integrators, and QA. The
-  root should therefore look like an executive organization for large work,
-  not a flat checklist of oversized executor assignments.
-- For medium and larger products, establish a right-sized release lifecycle
-  before choosing individual work nodes: discovery and product definition,
-  material technical-risk reduction, a vertical-slice review, independent
-  feature-production lanes, recurring integration, QA/polish, and release
-  readiness when each is justified. This is how the root planner builds an
-  organization instead of jumping from a vague request to one implementation
-  node. It is not a fixed ceremony: record why any normally material stage is
-  omitted or combined, and never use that omission to deliver a POC in place
-  of the requested release.
+- A request for a product, experience, system, publication, service, or other
+  deliverable is a request for the complete usable result unless the user
+  explicitly limits it to an MVP, demo, prototype, experiment, or similar
+  slice. Do not use missing detail as permission to produce a disconnected
+  proof of concept or hand a broad outcome to one heroic worker.
+- Infer the requested outcome, audience, delivery form, material contracts,
+  acceptance evidence, and genuinely independent work. Different craft,
+  source boundary, evidence path, or information dependency can justify a
+  boundary; no industry checklist is mandatory. Name responsibilities from
+  the actual request and preserve them through composition when the outcome
+  needs composition.
+- Use recursion when a direct child is too broad for one accountable worker.
+  If a boundary contains multiple independently verifiable contracts,
+  independent crafts, a substantial backlog, or its own composition/evaluation
+  need, make it a planner node and stop there. The nested planner owns the
+  boundary's internal shape; do not pre-author a universal organization.
+- For larger work, model the actual delivery lifecycle before selecting work
+  nodes: identify the outcome, retire material risks, produce the required
+  work, compose independent outputs when necessary, and evaluate the result
+  at the boundary where defects can still be repaired. Omit or combine stages
+  when the domain does not need them and record that rationale. This is a
+  judgment, not a fixed domain-specific ceremony.
 - If an omitted decision would materially change the audience, platform,
   interaction model, visual direction, delivery target, business/safety
   constraints, or success measure, create a short planner clarification
@@ -63,24 +57,18 @@ be inherited by nested planners.
   hosted databases, third-party runtime services, remote APIs, and required
   runtime network access; use conventional local dependencies rather than
   rebuilding commodity subsystems from scratch.
-- Choose the shape that fits: one focused worker, a lean MVP or demo, a
-  book-writing workflow, a routine automation, a broad product or system, or
-  another domain-specific workflow.
-- An app factory is organization-scale by definition: it is a repeatable
-  organization/system for producing multiple applications, not one app and
-  not a research assignment. Treat explicit requests for an organization,
-  platform, ecosystem, enterprise, multiple products, or multiple teams as
-  broad even when the request also uses a narrow word such as "app" or "tool".
-  Do not collapse that scope into a single research, design, or implementation
-  worker. Use broad first-level ownership and nested planners for domains that
-  need their own evolving subtree; research is only a supporting domain. A
-  flat graph of department-named executors is still under-decomposed if those
-  departments contain multiple material contracts.
-- A broad product or system may need research, design, engineering,
-  verification, integration, launch or adoption, and operations stages, but
-  add only stages the request actually justifies. When organization-scale
-  scope is explicit, preserving that scale is part of what the request
-  justifies.
+- Choose the shape that fits: one focused worker, a limited slice, a broad
+  product or system, a publication, a routine automation, or another
+  domain-specific workflow.
+- An explicit organization, ecosystem, enterprise, multi-product, or
+  multi-team request is organization-scale by definition. Preserve that scope
+  with meaningful ownership and nested planners where a boundary needs its own
+  evolving subtree; research or any other single activity must not replace the
+  requested organization.
+- A broad outcome may need discovery, creation, composition, evaluation,
+  delivery, or stewardship stages, but add only stages justified by the actual
+  outcome. When organization-scale scope is explicit, preserving that scale
+  is part of the contract.
 - A small or atomic request should remain small. Do not add organizational
   stages merely because they are available when the request did not ask for
   organization-scale scope.
@@ -101,8 +89,8 @@ disciplines, delivery surface, and verification burden:
 | Scale | Typical request | Initial shape |
 | --- | --- | --- |
 | Small | one focused command, page, comparison, chapter, or narrow automation | one executor when one owner is sufficient; add a verifier only when the quality bar needs an independent check |
-| Medium | one complete app, landing site, micro-SaaS, book, store, or focused game | a delivery organization with real domain lanes; use a nested planner for any lane that itself contains multiple contracts, then converge through integration and independent QA |
-| Large | a platform, app factory, enterprise, multi-product system, multiplatform product, robotics program, physical product line, or full-scale game | department-shaped first-level planner ownership, nested organizations where departments need further decomposition, shared architecture/contracts, integration, release, operations, and final verification |
+| Medium | one complete deliverable with several real contracts | domain-shaped ownership; use a nested planner for a boundary that contains multiple contracts, then compose/evaluate only where the outcome needs it |
+| Large | an explicit organization, ecosystem, enterprise, multi-product outcome, or another broad system | meaningful first-level ownership, recursive boundaries where needed, and explicit composition/evaluation paths justified by the contract |
 
 This is a judgment gate, not a node-count quota. A request for an MVP, POC,
 prototype, demo, spike, or deliberately limited slice overrides the default
@@ -112,11 +100,11 @@ enterprise is broad even if it contains a narrow noun such as “app” or “to
 Never collapse a broad request into research plus one implementation node.
 
 Before submitting, audit the setup against four questions: does the graph
-cover the user's actual deliverable and user journey; does every meaningful
-discipline have an owner and a verifiable handoff; is every direct executor
-actually leaf-sized rather than a department disguised as one task; and does
-every branch converge to one runnable, user-facing result? If any answer is no,
-revise the setup or make the broad boundary a nested planner.
+cover the requested outcome and delivery path; does every material
+responsibility have an owner and inspectable acceptance path; is every direct
+worker leaf-fit rather than hiding multiple contracts; and are all required
+composition/evaluation paths explicit? If any answer is no, revise the setup
+or make the broad boundary a nested planner.
 
 ## Topology ownership
 

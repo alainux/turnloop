@@ -498,9 +498,16 @@ class CLIHarnessWorker(Worker):
                 agent.session_id = str(uuid.uuid4())
         verification = bool(agent.type_id is AgentType.VERIFIER)
         protocol_kind = "verification" if verification else "result"
-        result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
+        control_root = ctx.project_repo_path or cwd
+        result_path = prepare_result_file(control_root, ctx.node.id, protocol_kind)
         environment = agent_environment(
-            cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
+            cwd,
+            ctx.node.id,
+            protocol_kind,
+            result_path,
+            agent,
+            data_dir=self.s.data_dir,
+            project_repo_path=ctx.project_repo_path,
         )
         telemetry_sidecar: NativeTelemetrySidecar | None = None
         claude_settings = None

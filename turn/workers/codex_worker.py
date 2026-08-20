@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from turn.config import settings
-from turn.contracts.dag import parse_plan, parse_result
+from turn.contracts.dag import parse_plan, parse_result, parse_verification
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
@@ -74,10 +74,17 @@ class CodexWorker(Worker):
         native = isinstance(transport, LocalPtyTransport)
         verification = bool(agent and agent.type_id is AgentType.VERIFIER)
         protocol_kind = "verification" if verification else "result"
-        result_path = prepare_result_file(cwd, ctx.node.id, protocol_kind)
+        control_root = ctx.project_repo_path or cwd
+        result_path = prepare_result_file(control_root, ctx.node.id, protocol_kind)
         machine_output_path = result_path.with_suffix(".jsonl") if not native else None
         environment = agent_environment(
-            cwd, ctx.node.id, protocol_kind, result_path, agent, data_dir=self.s.data_dir
+            cwd,
+            ctx.node.id,
+            protocol_kind,
+            result_path,
+            agent,
+            data_dir=self.s.data_dir,
+            project_repo_path=ctx.project_repo_path,
         )
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         sidecar = prepare_codex_notify_telemetry(cwd, ctx.node.id) if native else None
@@ -114,13 +121,13 @@ class CodexWorker(Worker):
             if session_id:
                 cmd = [
                     self.s.codex_binary, "resume", *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
+                    *codex_project_root_flags(cwd), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, session_id, prompt,
                 ]
             else:
                 cmd = [
                     self.s.codex_binary, *model_flags, *reasoning_flags,
-                    *codex_project_root_flags(), *mcp_flags, *telemetry_flags,
+                    *codex_project_root_flags(cwd), *mcp_flags, *telemetry_flags,
                     "--no-alt-screen", "-C", cwd, prompt,
                 ]
         elif session_id:
@@ -133,13 +140,13 @@ class CodexWorker(Worker):
             prompt_arg = prompt
             cmd = [
                 self.s.codex_binary, "exec", "--json", "resume", *model_flags, *reasoning_flags,
-                *codex_project_root_flags(), *mcp_flags, "-C", cwd, session_id, prompt_arg,
+                *codex_project_root_flags(cwd), *mcp_flags, "-C", cwd, session_id, prompt_arg,
             ]
         else:
             prompt_arg = prompt
             cmd = [
                 self.s.codex_binary, "exec", "--json", *model_flags, *reasoning_flags,
-                *codex_project_root_flags(), *mcp_flags, "-C", cwd, prompt_arg,
+                *codex_project_root_flags(cwd), *mcp_flags, "-C", cwd, prompt_arg,
             ]
 
         # Both sources below are documented structured channels, never
@@ -320,7 +327,7 @@ class CodexWorker(Worker):
                     session_id=discovered_session or session_id,
                 )
             try:
-                decision = VerificationResult.model_validate(json.loads(structured_text))
+                decision = parse_verification(json.loads(structured_text))
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 return WorkerResult(
                     outcome=Outcome.FAIL,
@@ -348,7 +355,7 @@ class CodexWorker(Worker):
         # contain a decision, so this remains unambiguous.
         if structured_text:
             try:
-                decision = VerificationResult.model_validate(json.loads(structured_text))
+                decision = parse_verification(json.loads(structured_text))
             except (TypeError, ValueError, json.JSONDecodeError):
                 decision = None
             if decision is not None:
@@ -402,11 +409,39 @@ class CodexWorker(Worker):
             if ctx.node.agent_state == "correction_requested"
             else None
         )
+        acceptance_contract = self._acceptance_evidence_prompt(ctx)
         return "\n".join([
             render_context_block(ctx),
             f"objective={ctx.node.objective}",
             f"instructions={gp}",
+            *([acceptance_contract] if acceptance_contract else []),
             *([f"correction={correction}"] if correction else []),
+        ])
+
+    @staticmethod
+    def _acceptance_evidence_prompt(ctx: "NodeExecutionContext") -> str:
+        """Make the typed completion contract visible at the launch boundary.
+
+        The skill explains the workflow, but the node's actual criterion ids
+        only exist in the graph. Include those ids in the provider prompt so a
+        real harness can produce a complete ``WorkerResult`` on its first
+        handoff instead of relying on a prose summary or generic artifact list.
+        """
+        if not ctx.node.acceptance_criteria:
+            return ""
+        criteria = json.dumps(
+            [
+                {"id": criterion.id, "description": criterion.description}
+                for criterion in ctx.node.acceptance_criteria
+            ],
+            ensure_ascii=False,
+        )
+        return "\n".join([
+            "TURN_ACCEPTANCE_EVIDENCE",
+            f"criteria={criteria}",
+            "Before outcome COMPLETE, exercise every criterion and include one evidence item per criterion in the turn-result JSON.",
+            'Evidence item shape: {"criterion_id":"<exact id>","status":"PASS","summary":"what was checked and observed","refs":["repo-relative/path"]}.',
+            "Use PASS only for checks you actually ran; use FAIL or UNVERIFIED when the criterion is not proven. Generic artifacts or a prose summary do not replace criterion-level evidence.",
         ])
 
     # -- parsing ---------------------------------------------------------

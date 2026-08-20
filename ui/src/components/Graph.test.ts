@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { nodeAgentIcon, nodeRunIcon, nodeRunLabel, triggerIcon } from "./Graph";
-import { primaryNodeAction } from "../domain";
+import { organizationManagerPhase, primaryNodeAction } from "../domain";
 import type { GraphNode, Trigger } from "../domain";
 
 const node = (overrides: Partial<GraphNode> = {}): GraphNode =>
@@ -64,6 +64,57 @@ describe("graph node controls", () => {
         node({
           ui_state: "waiting_sequence",
           allowed_actions: ["pause", "edit"],
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("does not present historical manager state for a focused organization", () => {
+    expect(
+      organizationManagerPhase(
+        node({
+          organization_contract: {
+            charter: "Ship one focused service",
+            scale: "focused",
+            deliverables: [],
+            acceptance_criteria: [],
+            constraints: [],
+            quality_policy: [],
+            decomposition_policy: "",
+            completion_policy: "",
+            budget: {
+              max_active_workers: null,
+              max_tokens: null,
+              max_total_runs: null,
+              max_input_tokens: null,
+              max_output_tokens: null,
+              max_cost_usd: null,
+              max_wall_time_seconds: null,
+            },
+            min_first_level_production_owners: 1,
+            require_independent_verification: false,
+            max_replans: 0,
+          },
+          manager_phase: "REVIEW_PENDING",
+          organization_review: {
+            phase: "REPLAN",
+            revision: 0,
+            last_reason: null,
+            audit: null,
+            reviewed_at: null,
+            replan_requested: false,
+            review_count: 0,
+            accept_count: 0,
+            continue_count: 0,
+            block_count: 0,
+            last_decision: null,
+            audit_decision: null,
+            audit_summary: null,
+            audit_findings: [],
+            audit_required_changes: [],
+            audit_correction_count: 0,
+            audit_updated_at: null,
+          },
         }),
       ),
     ).toBeNull();

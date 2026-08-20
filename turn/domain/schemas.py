@@ -24,7 +24,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from turn.domain.capability_contracts import (
     BUILTIN_CAPABILITY_IDS,
@@ -32,6 +32,21 @@ from turn.domain.capability_contracts import (
     validate_capability_id,
 )
 from turn.metrics import BehaviorExpectations
+from turn.domain.organization import (
+    AcceptanceCriterion,
+    AcceptanceEvidence,
+    BudgetRequest,
+    Handoff,
+    HandoffContract,
+    ManagerDecision,
+    ManagerPhase,
+    OrganizationContract,
+    OrganizationReview,
+    WorkItem,
+    WorkItemSpec,
+    WorkspaceRef,
+    WorkspaceIsolation,
+)
 
 
 def _utcnow() -> datetime:
@@ -80,6 +95,7 @@ class NodeUIState(str, Enum):
     PREPARING = "preparing"
     PAUSED = "paused"
     WAITING_INPUT = "waiting_input"
+    CORRECTION_REQUIRED = "correction_required"
     WAITING_SEQUENCE = "waiting_sequence"
     COMPLETE = "complete"
     CONTAINER = "container"
@@ -264,6 +280,7 @@ class VerificationResult(BaseModel):
     findings: list[str] = Field(default_factory=list)
     required_changes: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
+    evidence: list[AcceptanceEvidence] = Field(default_factory=list)
     target_node_id: Optional[uuid.UUID] = None
 
 
@@ -372,6 +389,15 @@ class RunPolicy(BaseModel):
     retry_choked_models: bool = True
     compact_on_context_pressure: bool = True
     behavior_expectations: BehaviorExpectations | None = None
+    # Capacity is explicit because recursive organizations must not assume
+    # provider processes or tokens are infinite.
+    max_parallel_agents: int = Field(default=4, ge=1, le=10_000)
+    max_total_runs: int | None = Field(default=None, ge=1)
+    max_input_tokens: int | None = Field(default=None, ge=1)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    max_cost_usd: float | None = Field(default=None, gt=0)
+    max_wall_time_seconds: float | None = Field(default=None, gt=0)
+    workspace_isolation: WorkspaceIsolation = WorkspaceIsolation.WORKTREE
 
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
@@ -505,6 +531,13 @@ class Node(BaseModel):
     # the user chose or Turn created). Non-root nodes leave this null and
     # inherit it from the root.
     repo_path: Optional[str] = None
+    # A node may receive a private workspace when the project opts into
+    # worktree isolation. ``repo_path`` remains the project root; this field
+    # is the actual cwd for this node's provider turn.
+    workspace_path: Optional[str] = None
+    workspace_commit: Optional[str] = None
+    workspace: WorkspaceRef | None = None
+    output_branch: str | None = None
 
     executor: Optional[str] = None  # worker name (e.g. "codex", "planner")
     agent: Optional[Agent] = None
@@ -519,6 +552,20 @@ class Node(BaseModel):
     auto_run: bool = True
     # Project-only policy. Descendants inherit it from the root at runtime.
     run_policy: Optional[RunPolicy] = None
+
+    # Planner boundaries own a charter and a durable manager-loop observation.
+    # Old state files may omit both fields; the runtime treats that as a
+    # focused, one-shot boundary until the next explicit planner handoff.
+    organization_contract: OrganizationContract | None = None
+    organization_review: OrganizationReview | None = None
+    manager_phase: ManagerPhase | None = None
+    manager_iteration: int = Field(default=0, ge=0)
+    manager_review_reasons: list[str] = Field(default_factory=list)
+    work_item_id: uuid.UUID | None = None
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    exported_handoffs: list[HandoffContract] = Field(default_factory=list)
+    required_handoffs: list[HandoffContract] = Field(default_factory=list)
+    priority: int = Field(default=0, ge=-100_000, le=100_000)
 
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
@@ -610,6 +657,9 @@ class Artifact(BaseModel):
     name: str
     content: Optional[Any] = None  # text/json/structured data
     ref: Optional[str] = None       # file path / external id / url
+    schema_name: Optional[str] = None
+    schema_version: Optional[str] = None
+    evidence_refs: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -629,6 +679,18 @@ class Graph(BaseModel):
     edges: list[Edge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
     triggers: list[Trigger] = Field(default_factory=list)
+    work_items: list[WorkItem] = Field(default_factory=list)
+    handoffs: list[Handoff] = Field(default_factory=list)
+    budget_requests: list[BudgetRequest] = Field(default_factory=list)
+
+
+class ControlActivity(BaseModel):
+    """A view-only projection of an active control-plane Run."""
+
+    kind: Literal["plan_audit", "manager_review"]
+    status: Literal["running"] = "running"
+    started_at: datetime
+    attempt: int = 1
 
 
 class GraphNodeView(Node):
@@ -639,6 +701,7 @@ class GraphNodeView(Node):
     state_reason: Optional[str] = None
     generation_active: bool = False
     capability_status: list[CapabilityStatus] = Field(default_factory=list)
+    control_activity: Optional[ControlActivity] = None
 
 
 class GraphView(BaseModel):
@@ -650,6 +713,9 @@ class GraphView(BaseModel):
     flow_edges: list[FlowEdge] = Field(default_factory=list)
     artifacts: list[Artifact] = Field(default_factory=list)
     triggers: list[Trigger] = Field(default_factory=list)
+    work_items: list[WorkItem] = Field(default_factory=list)
+    handoffs: list[Handoff] = Field(default_factory=list)
+    budget_requests: list[BudgetRequest] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -694,6 +760,11 @@ class NodeSpec(BaseModel):
     required_inputs: list[InputSpec] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
+    organization_contract: OrganizationContract | None = None
+    exported_handoffs: list[HandoffContract] = Field(default_factory=list)
+    required_handoffs: list[HandoffContract] = Field(default_factory=list)
+    acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
+    priority: int = Field(default=0, ge=-100_000, le=100_000)
     subgraph_refs: list[SubgraphRef] = Field(
         default_factory=list,
         validation_alias=AliasChoices("subgraph_refs", "graph_refs", "graph_files", "graph_ref", "graph_file"),
@@ -701,6 +772,18 @@ class NodeSpec(BaseModel):
     artifacts: list["ArtifactSpec"] = Field(default_factory=list)
     # Capability plugin ids loaded by the planner into the project.
     capabilities: list[str] = Field(default_factory=list)
+
+    @field_validator("acceptance_criteria", mode="before")
+    @classmethod
+    def normalize_acceptance_criteria(cls, value):
+        if value is None:
+            return []
+        return [
+            item
+            if isinstance(item, (dict, AcceptanceCriterion))
+            else {"id": f"criterion-{index + 1}", "description": str(item)}
+            for index, item in enumerate(value)
+        ]
 
     # placement within the generated graph
     parent_key: Optional[str] = None          # CONTAINS parent (another key)
@@ -812,6 +895,7 @@ class PlanResult(BaseModel):
     edges: list[EdgeSpec] = Field(default_factory=list)
     triggers: list[TriggerSpec] = Field(default_factory=list)
     notes: Optional[str] = None
+    organization_contract: OrganizationContract | None = None
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
 
@@ -940,6 +1024,18 @@ class PlanResult(BaseModel):
         return self
 
 
+class ManagerResult(BaseModel):
+    """Small retained-session result for a planner's management review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ManagerDecision
+    summary: str = Field(min_length=1)
+    plan: PlanResult | None = None
+    work_items: list[WorkItemSpec] = Field(default_factory=list)
+    missing_inputs: list[InputSpec] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Execute operation result
 # --------------------------------------------------------------------------
@@ -954,6 +1050,9 @@ class ArtifactSpec(BaseModel):
     name: str
     content: Optional[Any] = None
     ref: Optional[str] = None
+    schema_name: Optional[str] = None
+    schema_version: Optional[str] = None
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class WorkerResult(BaseModel):
@@ -964,6 +1063,7 @@ class WorkerResult(BaseModel):
     outcome: Outcome
     summary: str = ""
     artifacts: list[ArtifactSpec] = Field(default_factory=list)
+    evidence: list[AcceptanceEvidence] = Field(default_factory=list)
     document_refs: list[DocumentRef] = Field(default_factory=list)
     subgraph_refs: list[SubgraphRef] = Field(
         default_factory=list,

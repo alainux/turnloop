@@ -24,6 +24,7 @@ from turn.domain.schemas import (
     VerificationResult,
     WorkerResult,
 )
+from turn.domain.organization import AcceptanceEvidence, EvidenceStatus
 from turn.workers.base import NodeExecutionContext, Planner, Worker
 from turn.workers import parsing
 
@@ -63,6 +64,15 @@ class DeterministicWorker(Worker):
                     name="deterministic",
                     content=summary,
                 )
+            ],
+            evidence=[
+                AcceptanceEvidence(
+                    criterion_id=criterion.id,
+                    status=EvidenceStatus.PASS,
+                    summary="deterministic worker completed the declared criterion",
+                    refs=["deterministic"],
+                )
+                for criterion in ctx.node.acceptance_criteria
             ],
         )
 
@@ -116,6 +126,10 @@ class DeterministicWorker(Worker):
                 if data.get("verification") is not None
                 else None
             ),
+            evidence=[
+                AcceptanceEvidence.model_validate(item)
+                for item in data.get("evidence", [])
+            ],
         )
 
 

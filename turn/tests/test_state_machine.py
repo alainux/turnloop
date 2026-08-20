@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from turn.domain.schemas import InputSpec, Node, NodeStatus
+from turn.domain.organization import ManagerPhase, OrganizationContract, OrganizationScale
+from turn.domain.schemas import Edge, EdgeType, InputSpec, Node, NodeStatus
 from turn.domain.state_machine import Action, UIState, present_node
 from turn.graph.logic import evaluate
 from turn.runner.recovery import DamageKind, backoff_seconds, classify_failure, should_retry
@@ -163,6 +164,64 @@ def test_completed_container_satisfies_integrator_sequence():
 
     assert result.status[branch.id] == NodeStatus.COMPLETE
     assert integrator.id in result.runnable
+
+
+@pytest.mark.parametrize(
+    ("manager_phase", "expected_branch_status", "integrator_runnable"),
+    [
+        (ManagerPhase.REVIEW_PENDING, NodeStatus.EXPANDED, False),
+        (ManagerPhase.ACCEPTED, NodeStatus.COMPLETE, True),
+    ],
+)
+def test_material_planner_requires_manager_acceptance_before_parent_progress(
+    manager_phase, expected_branch_status, integrator_runnable
+):
+    root = Node(
+        id="00000000-0000-0000-0000-000000000031",
+        project_id="00000000-0000-0000-0000-000000000031",
+        objective="root",
+        status=NodeStatus.EXPANDED,
+    )
+    branch = Node(
+        id="00000000-0000-0000-0000-000000000032",
+        project_id=root.id,
+        parent_id=root.id,
+        objective="delivery organization",
+        executor="planner",
+        organization_contract=OrganizationContract(
+            charter="produce a coherent multi-part outcome",
+            scale=OrganizationScale.ORGANIZATION,
+            acceptance_criteria=["the outcome is usable"],
+            min_first_level_production_owners=1,
+        ),
+        manager_phase=manager_phase,
+        status=NodeStatus.EXPANDED,
+    )
+    output = Node(
+        id="00000000-0000-0000-0000-000000000033",
+        project_id=root.id,
+        parent_id=branch.id,
+        objective="completed output",
+        status=NodeStatus.COMPLETE,
+    )
+    integrator = Node(
+        id="00000000-0000-0000-0000-000000000034",
+        project_id=root.id,
+        parent_id=root.id,
+        objective="integrate",
+        status=NodeStatus.PENDING,
+    )
+    edges = [
+        Edge(src=root.id, dst=branch.id, type=EdgeType.CONTAINS),
+        Edge(src=branch.id, dst=output.id, type=EdgeType.CONTAINS),
+        Edge(src=root.id, dst=integrator.id, type=EdgeType.CONTAINS),
+        Edge(src=branch.id, dst=integrator.id, type=EdgeType.FOLLOWS),
+    ]
+
+    result = evaluate([root, branch, output, integrator], edges)
+
+    assert result.status[branch.id] == expected_branch_status
+    assert (integrator.id in result.runnable) is integrator_runnable
 
 
 def test_integrator_waits_for_every_nested_branch_output():

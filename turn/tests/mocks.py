@@ -7,6 +7,7 @@ import uuid
 from turn.domain.schemas import Node
 from turn.domain.schemas import WorkerResult
 from turn.workers.herdr import (
+    HerdrAgent,
     HerdrPane,
     HerdrWorkspace,
     HerdrWorkspaceCreation,
@@ -68,6 +69,24 @@ class MockHerdrAdapter:
             return self.panes[pane_id][1]
         except KeyError as error:
             raise HerdrResourceNotFound("pane", pane_id) from error
+
+    async def list_panes(self, workspace_id: str) -> tuple[HerdrPane, ...]:
+        await self.get_workspace(workspace_id)
+        return tuple(
+            pane
+            for owner, pane in self.panes.values()
+            if owner == workspace_id
+        )
+
+    async def list_agents(self) -> tuple[HerdrAgent, ...]:
+        return tuple()
+
+    async def get_agent(self, target: str) -> HerdrAgent:
+        raise HerdrResourceNotFound("agent", target)
+
+    async def foreground_process_names(self, pane_id: str) -> tuple[str, ...]:
+        await self.get_pane(pane_id)
+        return ()
 
     async def create_tab(self, *, workspace_id: str, cwd: str, label: str, focus: bool = False):
         await self.get_workspace(workspace_id)
@@ -213,6 +232,9 @@ class MockTerminalTransport:
 
     async def project_workspace_state(self, project_key: str) -> str:
         return "present"
+
+    async def project_workspace_states(self, project_keys: set[str]) -> dict[str, str]:
+        return {project_key: "present" for project_key in project_keys}
 
 
 class DeterministicExecutionAdapter:

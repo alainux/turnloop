@@ -24,6 +24,11 @@ point or if its visible behavior contradicts the requested experience. When
 rejecting, name the exact user-visible failure, the evidence observed, and the
 smallest concrete change that would make the predecessor resubmittable.
 
+Evaluate the assigned contract and each acceptance criterion directly. Cite
+the evidence that supports every approval, reject material gaps even when a
+worker claims completion, and do not modify implementation merely to make a
+test pass; correction belongs to the responsible worker.
+
 Review across the full usability spectrum: functional behavior and failure
 paths, typed contracts and persistence, accessibility and keyboard operation,
 visual hierarchy and responsive layout, performance or operational limits,
@@ -59,7 +64,7 @@ the report contents into graph state or attach a terminal transcript.
 Use three evidence layers when the boundary warrants them: source/contracts and
 focused tests; the documented build or launch command from a clean-project
 equivalent; and the real user-facing journey. For browser or interactive work,
-use the browser QA skill to inspect rendered pixels, controls, transitions,
+use the available browser-control skill to inspect rendered pixels, controls, transitions,
 console/runtime errors, and whether controls alter the real state. Reject the
 smallest concrete gap with exact evidence and an actionable required change;
 approve only when the predecessor's actual boundary is usable by the real

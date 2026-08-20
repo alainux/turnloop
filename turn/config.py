@@ -118,6 +118,9 @@ class Settings:
     delay_between_jobs_ms: int = field(
         default_factory=lambda: int(os.getenv("TURN_JOB_DELAY_MS", "0"))
     )
+    max_parallel_agents: int = field(
+        default_factory=lambda: max(1, int(os.getenv("TURN_MAX_PARALLEL_AGENTS", "4")))
+    )
     log_max_records: int = field(
         default_factory=lambda: max(1, int(os.getenv("TURN_LOG_MAX_RECORDS", "1000")))
     )

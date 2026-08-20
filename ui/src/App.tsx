@@ -44,6 +44,7 @@ import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
 import { LogsPanel } from "./components/LogsPanel";
 import { QualityPanel } from "./components/QualityPanel";
+import { WorkView } from "./components/WorkView";
 import { ModelControl } from "./components/ModelControl";
 import { deriveStatus } from "./state";
 
@@ -208,7 +209,7 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<"graph" | "document">("graph");
+  const [viewMode, setViewMode] = useState<"graph" | "document" | "work">("graph");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
@@ -321,7 +322,14 @@ export default function App() {
         /* ignore malformed external event */
       }
     };
-    return () => stream.close();
+    // SSE is the low-latency path. Reconcile periodically as well so a tab
+    // that missed events during a server/provider restart cannot keep showing
+    // an obsolete graph or work-item projection indefinitely.
+    const reconciliation = window.setInterval(refreshGraph, 2000);
+    return () => {
+      stream.close();
+      window.clearInterval(reconciliation);
+    };
   }, [projectId, loadGraph, loadProjects, notify]);
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -478,6 +486,18 @@ export default function App() {
                   >
                     Document
                   </button>
+                  <button
+                    role="tab"
+                    aria-selected={viewMode === "work"}
+                    className={viewMode === "work" ? "selected" : ""}
+                    onClick={() => {
+                      clearDocumentNavigation();
+                      setSelected(null);
+                      setViewMode("work");
+                    }}
+                  >
+                    Work
+                  </button>
                 </div>
                 <div className="segmented">
                   <button
@@ -524,12 +544,22 @@ export default function App() {
                   projectId={projectId}
                   refreshKey={graphRevision}
                 />
+              ) : viewMode === "work" ? (
+                <WorkView
+                  items={graph!.work_items ?? []}
+                  nodes={graph!.nodes}
+                  onSelectNode={(nodeId) => {
+                    setViewMode("graph");
+                    selectNode(nodeId);
+                  }}
+                />
               ) : (
                 <div id="graph" className="graph">
                   <GraphCanvas
                     nodes={graph!.nodes}
                     edges={graph!.edges}
                     flowEdges={graph!.flow_edges}
+                    workItems={graph!.work_items ?? []}
                     usage={usage?.by_node ?? {}}
                     selected={selected}
                     triggers={graph!.triggers}

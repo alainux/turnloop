@@ -22,6 +22,7 @@ from turn.domain.schemas import (
     RunPolicy,
     WorkerResult,
 )
+from turn.domain.organization import WorkspaceIsolation
 from turn.graph.logic import evaluate
 from turn.runner.events import EventBus
 from turn.runner.runner import Runner
@@ -216,7 +217,13 @@ async def test_auto_runner_dispatches_all_independent_lanes_together(tmp_path) -
         settings=cfg,
         herdr_adapter=MockHerdrAdapter(),
     )
-    root = await store.create_project("parallel demo", run_policy=RunPolicy(auto_run=True))
+    root = await store.create_project(
+        "parallel demo",
+        run_policy=RunPolicy(
+            auto_run=True,
+            workspace_isolation=WorkspaceIsolation.SHARED,
+        ),
+    )
     seed_project_capabilities(store, root.id)
     await store.apply_plan(
         root,
@@ -251,7 +258,10 @@ async def test_manual_step_uses_sequence_order_not_uuid_order(tmp_path) -> None:
     root = await store.create_project(
         "ordered manual demo",
         agent=AgentConfig(harness=HarnessKind.MOCK),
-        run_policy=RunPolicy(auto_run=False),
+        run_policy=RunPolicy(
+            auto_run=False,
+            workspace_isolation=WorkspaceIsolation.SHARED,
+        ),
     )
     seed_project_capabilities(store, root.id)
     created = await store.apply_plan(
@@ -285,7 +295,10 @@ async def test_manual_step_dispatches_the_entire_parallel_stage(tmp_path) -> Non
     root = await store.create_project(
         "parallel manual demo",
         agent=AgentConfig(harness=HarnessKind.MOCK),
-        run_policy=RunPolicy(auto_run=False),
+        run_policy=RunPolicy(
+            auto_run=False,
+            workspace_isolation=WorkspaceIsolation.SHARED,
+        ),
     )
     seed_project_capabilities(store, root.id)
     created = await store.apply_plan(

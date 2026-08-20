@@ -14,20 +14,37 @@ import os
 import shlex
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger("turn.runner")
 
 from turn.db.store import PLANNER_EXECUTOR, Store
 from turn.capabilities.catalog import CapabilityCatalog
+from turn.contracts.organization import audit_plan
+from turn.domain.organization import (
+    EvidenceStatus,
+    HandoffStatus,
+    ManagerDecision,
+    ManagerPhase,
+    OrganizationPhase,
+    OrganizationReview,
+    OrganizationScale,
+    PlanAuditDecision,
+    PlanAuditResult,
+    WorkItemStatus,
+)
 from turn.domain.schemas import (
     Artifact,
     ArtifactKind,
     ArtifactSpec,
+    AgentConfig,
+    AgentType,
     EdgeType,
     EventSource,
     HarnessKind,
+    ManagerResult,
     Node,
     NodeStatus,
     Outcome,
@@ -44,9 +61,11 @@ from turn.runner.events import EventBus
 from turn.runner.execution import NodeExecutor
 from turn.runner.recovery import backoff_seconds, should_retry
 from turn.runner.scheduler import Scheduler
+from turn.runner.organization import ManagerReviewDecision, OrganizationManager
+from turn.runner.workspaces import WorkspaceError, WorkspaceManager
 from turn.runner.sessions import SessionController
-from turn.workers.base import NodeExecutionContext, Worker
-from turn.workers.herdr import HerdrAdapter
+from turn.workers.base import NodeExecutionContext, Worker, render_context_block
+from turn.workers.herdr import HerdrAdapter, HerdrAdapterError, HerdrResourceNotFound
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.metrics import HarnessEvent
@@ -62,6 +81,16 @@ from turn.contracts.dag import (
     parse_verification,
     validate_subgraph_sources,
 )
+from turn.contracts.organization_codecs import (
+    parse_manager_result,
+    parse_plan_audit,
+    parse_structured_artifact,
+)
+from turn.contracts.text import sanitize_control_text
+
+
+class ControlOperationUnavailable(RuntimeError):
+    """A bounded provider/control operation could not return a decision."""
 
 
 def _dump(obj):
@@ -131,12 +160,22 @@ class Runner:
         herdr_adapter: HerdrAdapter | None = None,
         terminal_transport: TerminalTransport | None = None,
         trigger_dispatcher=None,
+        semantic_plan_auditor: Callable[
+            [object, PlanResult], Awaitable[PlanAuditResult]
+        ] | None = None,
+        manager_reviewer: Callable[[dict], Awaitable[ManagerResult]] | None = None,
     ):
         settings = settings or Settings()
         self.store = store
         self.registry = registry or build_registry(settings)
         self.events = events or EventBus()
         self.trigger_dispatcher = trigger_dispatcher
+        self.semantic_plan_auditor = semantic_plan_auditor
+        self.manager_reviewer = manager_reviewer
+        # The served runtime enables fresh provider review turns explicitly.
+        # Unit/test runners remain provider-neutral unless they inject a
+        # callback, so deterministic fixtures never contact a live harness.
+        self.provider_reviews_enabled = False
         self.s = settings
         self.harness_commands = HarnessCommandFactory(
             codex_binary=settings.codex_binary,
@@ -164,8 +203,16 @@ class Runner:
         self._shell_tasks: dict[uuid.UUID, asyncio.Task] = self.sessions.shell_tasks
         self._status_watchers: dict[uuid.UUID, asyncio.Task] = {}
         self._handoff_watchers: dict[uuid.UUID, asyncio.Task] = {}
+        # A production daemon restart can detach from a provider while Herdr
+        # keeps that provider's pane alive. These maps let the next Runner
+        # generation preserve the in-flight run and settle that same Run when
+        # the provider writes its handoff.
+        self._recovered_active_node_ids: set[uuid.UUID] = set()
+        self._recovered_run_ids: dict[uuid.UUID, uuid.UUID] = {}
         self._reconnect_tasks = self.sessions.reconnect_tasks
         self._forbidden_fresh_sessions = self.sessions.forbidden_fresh_sessions
+        self.organization_manager = OrganizationManager()
+        self.workspaces = WorkspaceManager(self.s.data_dir)
         self.scheduler = Scheduler(
             store=self.store,
             settings=self.s,
@@ -176,7 +223,9 @@ class Runner:
             is_externally_busy=lambda node_id: bool(
                 (task := self._reconnect_tasks.get(node_id))
                 and not task.done()
-            ),
+            ) or node_id in self._recovered_active_node_ids,
+            isolation_available=self._workspace_isolation_available,
+            request_review=self._request_organization_review,
         )
         self.node_executor = NodeExecutor(
             store=self.store,
@@ -212,6 +261,7 @@ class Runner:
     # -- lifecycle -------------------------------------------------------
 
     async def start(self) -> None:
+        await self._recover_external_runs()
         self._task = asyncio.create_task(self._loop())
         # Restore editability for retained provider sessions after a daemon
         # restart. The CLI writes the same handoff files during an agent's
@@ -231,7 +281,14 @@ class Runner:
         self._deleting_projects.clear()
         running = list(self._running.values())
         for node_id in list(self._running):
-            await self.terminal.stop(node_id)
+            # Herdr owns the provider process. A production daemon restart
+            # must detach Turn's control stream without interrupting the
+            # interactive provider; test runtimes that own their workspace
+            # still use the hard stop path.
+            if close_workspaces:
+                await self.terminal.stop(node_id)
+            else:
+                await self.terminal.detach(node_id)
         for t in running:
             t.cancel()
         await self.sessions.stop_all()
@@ -258,6 +315,65 @@ class Runner:
             # from the test store. Production shutdown intentionally preserves
             # project workspaces across a daemon restart.
             await self.terminal.close_orphaned_project_workspaces(set())
+
+    async def _recover_external_runs(self) -> None:
+        """Preserve persisted RUNNING runs whose Herdr provider is alive."""
+        self._recovered_active_node_ids.clear()
+        self._recovered_run_ids.clear()
+        if not getattr(self.terminal, "supports_inject", False):
+            return
+        reconcile = getattr(self.terminal, "reconcile_provider_session", None)
+        foreground = getattr(self.terminal, "foreground_process_names", None)
+        if reconcile is None and foreground is None:
+            return
+        for project in await self.store.list_projects():
+            nodes = [project, *await self.store.descendants(project.id)]
+            for node in nodes:
+                if node.status is not NodeStatus.RUNNING or node.agent is None:
+                    continue
+                runs = await self.store.get_runs(node.id)
+                active_run = next(
+                    (run for run in reversed(runs) if run.status is RunStatus.RUNNING),
+                    None,
+                )
+                if active_run is None or not node.agent.session_id:
+                    continue
+                try:
+                    matched = False
+                    if reconcile is not None:
+                        matched = await reconcile(
+                            node.id,
+                            project_key=str(project.id),
+                            session_id=node.agent.session_id,
+                            provider=node.agent.harness.value,
+                        )
+                    if not matched and not await self.terminal.has_persistent_session(node.id):
+                        continue
+                    if foreground is None:
+                        matched = True
+                    else:
+                        names = {
+                            Path(name).name.lower()
+                            for name in await foreground(node.id)
+                            if isinstance(name, str) and name
+                        }
+                        provider = node.agent.harness.value.lower()
+                        matched = matched or provider in names
+                except (HerdrResourceNotFound, OSError, RuntimeError):
+                    continue
+                if not matched:
+                    continue
+                self._recovered_active_node_ids.add(node.id)
+                self._recovered_run_ids[node.id] = active_run.id
+
+    def _take_recovered_run(
+        self, node_id: uuid.UUID, runs: list[Run]
+    ) -> Run | None:
+        run_id = self._recovered_run_ids.pop(node_id, None)
+        self._recovered_active_node_ids.discard(node_id)
+        if run_id is None:
+            return None
+        return next((run for run in runs if run.id == run_id), None)
 
     def wake(self) -> None:
         self._wake.set()
@@ -313,8 +429,14 @@ class Runner:
     async def tick(self) -> None:
         projects = await self.store.list_projects()
         now = time.monotonic()
-        if now - self._last_workspace_reconcile_at >= 1.0:
-            await self._reconcile_project_workspaces(projects)
+        if now - self._last_workspace_reconcile_at >= 5.0:
+            try:
+                await self._reconcile_project_workspaces(projects)
+            except HerdrAdapterError as error:
+                # Workspace reconciliation is advisory. A transient failure
+                # from the user-owned daemon must not block graph scheduling
+                # or be mistaken for an externally deleted workspace.
+                logger.warning("Herdr workspace reconciliation deferred: %s", error)
             self._last_workspace_reconcile_at = now
             projects = await self.store.list_projects()
         for p in projects:
@@ -327,6 +449,7 @@ class Runner:
 
     async def schedule_once(self, project_id: uuid.UUID) -> None:
         """Run one scheduler pass for a project through the public contract."""
+        await self._review_safe_organizations(project_id)
         await self.scheduler.schedule_once(project_id)
 
     def active_node_ids(self, project_id: uuid.UUID | None = None) -> frozenset[uuid.UUID]:
@@ -348,6 +471,9 @@ class Runner:
         await self.terminal.close_orphaned_project_workspaces(
             {str(project.id) for project in projects}
         )
+        states = await self.terminal.project_workspace_states(
+            {str(project.id) for project in projects}
+        )
         for project in projects:
             # Reconciliation runs from the same heartbeat as scheduling. A
             # provider can briefly report a stale/missing workspace while a
@@ -356,7 +482,7 @@ class Runner:
             nodes, _, _ = await self.store.get_workgraph(project.id)
             if any(self.generation_active(node.id) for node in nodes):
                 continue
-            state = await self.terminal.project_workspace_state(str(project.id))
+            state = states.get(str(project.id), "unmapped")
             if state != "missing":
                 continue
             await self.cancel_project_runs(project.id)
@@ -394,10 +520,96 @@ class Runner:
         project_path = self.store.project_path(project_id)
         return str(project_path.expanduser().resolve()) if project_path is not None else None
 
+    async def _workspace_isolation_available(self, project_id: uuid.UUID) -> bool:
+        """Ask the workspace adapter whether this project may run in parallel."""
+        repo = await self._project_repo(project_id)
+        return bool(repo and await self.workspaces.isolation_available(repo))
+
+    async def _request_organization_review(
+        self, organization_id: uuid.UUID, reason: str
+    ) -> None:
+        await self.organization_manager.request_review(self.store, organization_id, reason)
+
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         # Compatibility shim for older in-process callers. Scheduling
         # decisions and task reservation live in Scheduler.
+        await self._review_safe_organizations(project_id)
         await self.scheduler.schedule_once(project_id)
+
+    async def _review_safe_organizations(self, project_id: uuid.UUID) -> None:
+        """Review settled material boundaries before the scheduler stalls.
+
+        Scheduler finalization only runs when every projected node is terminal.
+        A material planner is intentionally projected as EXPANDED until its
+        manager accepts it, so waiting for that finalizer would deadlock the
+        organization at the exact safe point where a manager should decide.
+        Reviews are deepest-first and only happen when no descendant provider
+        is live and no runnable frontier remains.
+        """
+        nodes, edges, _ = await self.store.get_workgraph(project_id)
+        if not nodes:
+            return
+        walker = GraphWalker(nodes, edges)
+        evaluation = walker.evaluate()
+        material = [
+            node
+            for node in nodes
+            if node.executor == PLANNER_EXECUTOR
+            and node.organization_contract is not None
+            and node.organization_contract.scale.value != "focused"
+            and node.manager_phase in {
+                ManagerPhase.EXECUTING,
+                ManagerPhase.REVIEW_PENDING,
+            }
+            and node.status in {NodeStatus.EXPANDED, NodeStatus.COMPLETE}
+        ]
+        material.sort(key=lambda item: walker.depth(item.id), reverse=True)
+        safe: list[Node] = []
+        material_ids = {node.id for node in material}
+        for boundary in material:
+            descendants = walker.descendants(boundary.id)
+            descendant_ids = {node.id for node in descendants}
+            if any(self.generation_active(node_id) for node_id in descendant_ids):
+                continue
+            if any(
+                node.id in descendant_ids
+                and node.status
+                in {NodeStatus.PENDING, NodeStatus.RUNNABLE, NodeStatus.RUNNING}
+                for node in nodes
+            ):
+                # A settled-looking graph can still contain an in-process or
+                # not-yet-runnable descendant. Do not promote the boundary to
+                # review until that execution frontier is genuinely settled.
+                continue
+            if any(
+                node.id in descendant_ids
+                and node.manager_phase not in {
+                    ManagerPhase.ACCEPTED,
+                    ManagerPhase.BLOCKED,
+                }
+                and node.id in material_ids
+                for node in descendants
+            ):
+                # Let the deepest unsettled organization finish its own
+                # review before its parent judges the combined charter.
+                continue
+            if evaluation.runnable & descendant_ids:
+                continue
+            work_items = await self.store.list_work_items(
+                project_id, organization_id=boundary.id
+            )
+            if any(
+                item.status not in {
+                    WorkItemStatus.COMPLETE,
+                    WorkItemStatus.CANCELLED,
+                }
+                and item.node_id is None
+                for item in work_items
+            ):
+                continue
+            safe.append(boundary)
+        if safe:
+            await self._review_organizations(project_id, boundaries=safe)
 
     # -- execution -------------------------------------------------------
 
@@ -406,6 +618,9 @@ class Runner:
         await self.node_executor.execute(node, project_id)
 
     async def _agent_status_path(self, node: Node) -> Path | None:
+        # Status is control-plane state. It must remain visible after a
+        # worker worktree is removed and must never be confused with source
+        # files in the execution workspace.
         repo = await self._project_repo(node.project_id)
         if not repo:
             return None
@@ -445,6 +660,8 @@ class Runner:
         self, node_id: uuid.UUID, project_id: uuid.UUID, repo_path: str | None
     ) -> None:
         """Keep every retained provider conversation able to accept edits."""
+        if self._stop:
+            return
         if not repo_path or not getattr(self.terminal, "supports_inject", False):
             return
         node = await self.store.get_node(node_id)
@@ -484,6 +701,16 @@ class Runner:
         """Apply later plan, result, or verification submissions."""
         try:
             while not self._stop:
+                # A live provider worker owns the attempt-scoped handoff file
+                # and will parse it when its PTY returns. Retained-session
+                # watchers are for edits after that run has settled; letting
+                # one consume the file first creates a second Run and leaves
+                # the real provider task waiting forever for a file that was
+                # already unlinked.
+                active_run = self._running.get(node_id)
+                if active_run is not None and not active_run.done():
+                    await asyncio.sleep(0.05)
+                    continue
                 submission: tuple[str, Path, dict, bool] | None = None
                 for path in paths:
                     payload = read_result_file(path)
@@ -549,14 +776,20 @@ class Runner:
                             node_id=node_id,
                             data={"node_id": str(node_id), "kind": kind},
                         )
+                    current = await self.store.get_node(node_id)
+                    if current is not None and current.agent_state == "correction_required":
+                        await self.store.set_agent_status(node_id, state=None, message=None)
                 except Exception as error:
                     logger.exception("agent %s revision failed for node %s", kind, node_id)
                     current = await self.store.get_node(node_id)
                     if current is not None:
                         await self.store.set_agent_status(
                             node_id,
-                            state="failed",
-                            message=f"{kind} revision failed: {error}",
+                            state="correction_required",
+                            message=(
+                                f"{kind} submission rejected: "
+                                f"{sanitize_control_text(error)}. Correct and resubmit in the live provider session."
+                            ),
                         )
                         await self._emit(
                             "node.updated", project_id, _dump(await self.store.get_node(node_id))
@@ -586,6 +819,63 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return []
+        contract = self._organization_contract_for_plan(node, plan)
+        structural_audit = None
+        semantic_audit = None
+        if contract is not None:
+            scale_rank = {
+                OrganizationScale.FOCUSED: 0,
+                OrganizationScale.DELIVERY: 1,
+                OrganizationScale.ORGANIZATION: 2,
+            }
+            if (
+                node.organization_contract is not None
+                and scale_rank[contract.scale]
+                < scale_rank[node.organization_contract.scale]
+            ):
+                raise RuntimeError(
+                    "organization plan cannot downgrade its existing contract scale"
+                )
+            structural_audit = audit_plan(contract, plan)
+            if not structural_audit.accepted:
+                rejection = PlanAuditResult(
+                    decision=PlanAuditDecision.REJECT,
+                    summary="Deterministic plan audit rejected the proposal.",
+                    findings=list(structural_audit.errors),
+                    required_changes=list(structural_audit.errors),
+                )
+                await self._record_plan_audit(
+                    node.id, structural=structural_audit, semantic=rejection
+                )
+                raise RuntimeError(
+                    "organization plan rejected: " + "; ".join(structural_audit.errors)
+                )
+            if node.id == project_id or contract.scale.value != "focused":
+                try:
+                    semantic_audit = await self._run_semantic_plan_audit(node, contract, plan)
+                except ControlOperationUnavailable as error:
+                    await self.store.set_status(node.id, NodeStatus.RUNNABLE)
+                    await self._emit(
+                        "organization.audit_control_failed",
+                        project_id,
+                        {"node_id": str(node.id), "reason": sanitize_control_text(error), "retryable": True},
+                    )
+                    return []
+                if semantic_audit is not None:
+                    await self._record_plan_audit(
+                        node.id,
+                        structural=structural_audit,
+                        semantic=semantic_audit,
+                    )
+                if semantic_audit is not None and semantic_audit.decision is PlanAuditDecision.REJECT:
+                    raise RuntimeError(
+                        "semantic organization plan audit rejected the plan: "
+                        + "; ".join(
+                            semantic_audit.required_changes or semantic_audit.findings
+                        )
+                    )
+            else:
+                await self._record_plan_audit(node.id, structural=structural_audit)
         incoming_refs = {
             reference.ref
             for reference in [
@@ -604,7 +894,9 @@ class Runner:
         if node is None:
             return []
         prior_runs = await self.store.get_runs(node.id)
-        run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
+        run = self._take_recovered_run(node.id, prior_runs)
+        if run is None:
+            run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         # A successful user-directed revision supersedes any error/status
         # message left by an earlier failed submission.
         node.agent_state = None
@@ -613,7 +905,18 @@ class Runner:
         # links omitted by the planner are intentionally removed with the
         # descendants above.
         node.subgraph_refs = []
-        created = await self.store.apply_plan(node, plan)
+        created = await self.store.apply_plan(
+            node,
+            plan,
+            enforce_organization_audit=True,
+        )
+        if not created and (
+            node.organization_contract is None
+            or node.organization_contract.scale.value == "focused"
+        ):
+            # An explicit empty replacement is a valid focused no-op handoff;
+            # its boundary has no remaining executable frontier.
+            await self.store.set_status(node.id, NodeStatus.COMPLETE)
         artifacts = await self.store.add_artifacts(
             node.id,
             [_plan_submission_artifact(plan)],
@@ -652,11 +955,13 @@ class Runner:
         if node is None:
             return
         prior_runs = await self.store.get_runs(node.id)
-        run = await self.store.create_run(
-            node,
-            node.agent.harness.value if node.agent else node.executor or "agent",
-            len(prior_runs) + 1,
-        )
+        run = self._take_recovered_run(node.id, prior_runs)
+        if run is None:
+            run = await self.store.create_run(
+                node,
+                node.agent.harness.value if node.agent else node.executor or "agent",
+                len(prior_runs) + 1,
+            )
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._handle_outcome(node, run, project_id, result)
 
@@ -668,11 +973,13 @@ class Runner:
         if node is None:
             return
         prior_runs = await self.store.get_runs(node.id)
-        run = await self.store.create_run(
-            node,
-            node.agent.harness.value if node.agent else node.executor or "agent",
-            len(prior_runs) + 1,
-        )
+        run = self._take_recovered_run(node.id, prior_runs)
+        if run is None:
+            run = await self.store.create_run(
+                node,
+                node.agent.harness.value if node.agent else node.executor or "agent",
+                len(prior_runs) + 1,
+            )
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._handle_outcome(
             node,
@@ -773,6 +1080,354 @@ class Runner:
             # browser cannot leave a completed/cancelled node spinning.
             await self._emit("node.updated", project_id, _dump(node))
 
+    def _review_planner_for(self, node: Node):
+        """Return the real planner adapter used for provider review turns.
+
+        Reviews are management operations, not graph nodes. They still use
+        the provider adapter that owns the planner contract, but only the
+        served runtime enables this path. Test runners remain deterministic
+        unless they inject a review callback.
+        """
+        agent = node.agent
+        if (
+            not self.provider_reviews_enabled
+            or agent is None
+            or agent.harness.value not in REAL_HARNESSES
+        ):
+            return None
+        planner = self.registry.get_planner("real") or self.registry.planner
+        if planner is None or not callable(getattr(planner, "call_structured", None)):
+            return None
+        return planner
+
+    @staticmethod
+    def _structured_artifact_payload(
+        payload: dict,
+        *,
+        schema_name: str,
+        artifact_name: str,
+        schema_version: str = "v1",
+    ) -> dict:
+        """Extract one typed JSON artifact from a normal WorkerResult envelope."""
+        return parse_structured_artifact(
+            payload,
+            schema_name=schema_name,
+            artifact_name=artifact_name,
+            schema_version=schema_version,
+        )
+
+    @staticmethod
+    def _normalize_plan_audit_payload(content: dict) -> dict:
+        """Normalize provider-friendly finding objects to the audit contract.
+
+        The semantic-audit artifact is intentionally small, but providers
+        commonly add useful fields such as ``area`` and ``severity`` to each
+        finding.  Keep that information in the persisted human-readable
+        strings instead of failing the whole planning run at the Pydantic
+        boundary.
+        """
+        return parse_plan_audit(content).model_dump(mode="python")
+
+    @staticmethod
+    def _normalize_manager_result_payload(content: dict) -> dict:
+        """Normalize provider manager reports to the retained manager schema.
+
+        A manager review is a decision about an already-materialized
+        boundary. Providers sometimes put their completion report under the
+        JSON key ``plan`` even when they are not proposing a graph plan. Only
+        a dictionary containing the real PlanResult ``nodes`` field is a
+        graph plan; report metadata must not be validated as one.
+        """
+        return parse_manager_result(content).model_dump(mode="python")
+
+    @staticmethod
+    def _organization_contract_for_plan(node: Node, plan: PlanResult):
+        """Resolve the contract declared by the current planner boundary.
+
+        A nested planner may refine its inherited boundary with an explicit
+        contract. Explicit contracts are authoritative here; the structural
+        audit and store guard still reject a downgrade. An omitted contract
+        inherits the persisted boundary.
+        """
+        return plan.organization_contract or node.organization_contract
+
+    @staticmethod
+    def _review_context(
+        base: NodeExecutionContext,
+        node: Node,
+        *,
+        purpose: str,
+        repo_path: str | None,
+    ) -> NodeExecutionContext:
+        """Build an isolated provider context for a non-graph review turn."""
+        if node.agent is None:
+            raise RuntimeError("provider review requires a planner agent")
+        review_node = node.model_copy(
+            update={
+                # A review writes the ordinary result handoff protocol, but it
+                # must not collide with a live planner handoff watcher.
+                "id": uuid.uuid4(),
+            }
+        )
+        return base.model_copy(
+            update={
+                "node": review_node,
+                "repo_path": repo_path or base.repo_path,
+                "project_repo_path": base.project_repo_path or repo_path,
+                # A review is deliberately a bounded one-shot provider turn.
+                # LocalPtyTransport is selected by AgentPlanner when terminal
+                # is None, while the retained session remains on the copied
+                # planner agent when the manager invokes this context.
+                "terminal": None,
+                "session_callback": None,
+                "forbidden_session_id": None,
+                "purpose": purpose,
+                "review_feedback": None,
+                "interactive_terminal": False,
+            }
+        )
+
+    async def _run_semantic_plan_audit(
+        self,
+        node: Node,
+        contract,
+        plan: PlanResult,
+        ctx: NodeExecutionContext | None = None,
+    ) -> PlanAuditResult | None:
+        """Run an injected or provider-backed independent plan audit."""
+        if self.semantic_plan_auditor is not None:
+            runs = await self.store.get_runs(node.id)
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                run = await self.store.create_run(
+                    node, "semantic-plan-auditor", len(runs) + attempt
+                )
+                try:
+                    audit = await self.semantic_plan_auditor(contract, plan)
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.COMPLETE,
+                        outcome=Outcome.COMPLETE,
+                        summary=audit.summary,
+                    )
+                    return audit
+                except Exception as error:
+                    last_error = error
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.FAILED,
+                        outcome=Outcome.FAIL,
+                        summary="semantic organization plan audit failed",
+                        error=sanitize_control_text(error),
+                        retry_recommended=attempt < 3,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(0.05 * attempt)
+            raise ControlOperationUnavailable(
+                "semantic organization plan audit unavailable after 3 attempts: "
+                + sanitize_control_text(last_error)
+            ) from last_error
+        planner = self._review_planner_for(node)
+        if planner is None:
+            return None
+        base = ctx or await self._build_context(node)
+        if node.agent is None:
+            raise RuntimeError("provider semantic audit requires a planner agent")
+        audit_agent = node.agent.as_type(AgentType.PLANNER).model_copy(
+            update={"session_id": None}
+        )
+        audit_node = node.model_copy(update={"agent": audit_agent})
+        review_ctx = self._review_context(
+            base,
+            audit_node,
+            purpose="semantic-plan-audit",
+            repo_path=base.project_repo_path or base.repo_path,
+        )
+        prompt = "\n".join(
+            [
+                render_context_block(review_ctx),
+                "TURN_INDEPENDENT_PLAN_AUDIT",
+                "You are an independent semantic auditor for the organization charter below.",
+                "Inspect the real project files and the proposed plan. Do not edit files, create graph nodes, or perform the work.",
+                "Approve only a coherent plan that preserves the charter, assigns one cohesive verifiable responsibility per leaf, includes real convergence and independent verification where required, and can complete within the stated budget.",
+                "Reject plans that compress an organization into a flat checklist, duplicate ownership, hide unfinished work in a single vague executor, or claim evidence without an inspectable artifact.",
+                "Mechanical guarantees: Turn injects role capabilities (including turn-basics and role-specific planning/execution skills), normalizes planner roles, inherits organization contracts for omitted nested planner contracts, and canonicalizes equivalent provider payload aliases. Do not reject a plan for omitting any property Turn guarantees mechanically; audit material semantic adequacy only.",
+                "Return exactly one normal Turn WorkerResult envelope with outcome COMPLETE and one JSON artifact named 'plan-audit' (schema_name 'turn.plan-audit', schema_version 'v1'). The artifact content must be: decision APPROVE or REJECT, summary, findings, required_changes.",
+                "ORGANIZATION_CONTRACT_JSON="
+                + json.dumps(contract.model_dump(mode="json"), sort_keys=True),
+                "PROPOSED_PLAN_JSON="
+                + json.dumps(plan.model_dump(mode="json"), sort_keys=True),
+            ]
+        )
+        runs = await self.store.get_runs(node.id)
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            run = await self.store.create_run(
+                node, "semantic-plan-auditor", len(runs) + attempt
+            )
+            try:
+                payload, usage, session_id = await planner.call_structured(
+                    review_ctx,
+                    prompt,
+                    handoff_kind="result",
+                )
+                content = self._structured_artifact_payload(
+                    payload,
+                    schema_name="turn.plan-audit",
+                    artifact_name="plan-audit",
+                )
+                audit = parse_plan_audit(content)
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.COMPLETE,
+                    outcome=Outcome.COMPLETE,
+                    summary=audit.summary,
+                    usage=usage,
+                    session_id=session_id,
+                )
+                return audit
+            except Exception as error:
+                last_error = error
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.FAILED,
+                    outcome=Outcome.FAIL,
+                    summary="semantic organization plan audit failed",
+                    error=sanitize_control_text(error),
+                    retry_recommended=attempt < 3,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(0.05 * attempt)
+        raise ControlOperationUnavailable(
+            "semantic organization plan audit unavailable after 3 attempts: "
+            + sanitize_control_text(last_error)
+        ) from last_error
+
+    async def _record_plan_audit(
+        self,
+        node_id: uuid.UUID,
+        *,
+        structural=None,
+        semantic: PlanAuditResult | None = None,
+        correction_count: int = 0,
+    ) -> None:
+        """Persist concise audit operations data without hidden reasoning."""
+        current = await self.store.get_node(node_id)
+        if current is None:
+            return
+        review = current.organization_review or OrganizationReview()
+        if structural is not None:
+            review.audit = structural
+        if semantic is not None:
+            review.audit_decision = semantic.decision
+            review.audit_summary = semantic.summary
+            review.audit_findings = list(semantic.findings)
+            review.audit_required_changes = list(semantic.required_changes)
+            review.audit_correction_count = correction_count
+            review.audit_updated_at = datetime.now(timezone.utc)
+            review.replan_requested = semantic.decision is PlanAuditDecision.REJECT
+            review.last_reason = semantic.summary
+            review.phase = (
+                OrganizationPhase.REPLAN
+                if semantic.decision is PlanAuditDecision.REJECT
+                else OrganizationPhase.EXECUTE_FRONTIER
+            )
+        elif structural is not None:
+            review.audit_updated_at = datetime.now(timezone.utc)
+        await self.store.set_organization_review(node_id, review)
+
+    async def _provider_manager_review(self, snapshot: dict) -> ManagerResult:
+        """Ask the retained planner session for a typed management decision."""
+        boundary_data = snapshot.get("boundary") or {}
+        try:
+            boundary_id = uuid.UUID(str(boundary_data["id"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("manager snapshot has no valid boundary id") from error
+        boundary = await self.store.get_node(boundary_id)
+        if boundary is None:
+            raise RuntimeError(f"manager boundary disappeared: {boundary_id}")
+        planner = self._review_planner_for(boundary)
+        if planner is None:
+            raise RuntimeError("no real planner adapter is available for manager review")
+        if boundary.agent is None:
+            raise RuntimeError("manager review requires the retained planner agent")
+        base = await self._build_context(boundary)
+        manager_agent = boundary.agent.as_type(AgentType.PLANNER)
+        manager_node = boundary.model_copy(update={"agent": manager_agent})
+        review_ctx = self._review_context(
+            base,
+            manager_node,
+            purpose="organization-manager-review",
+            repo_path=base.project_repo_path or base.repo_path,
+        )
+        # A completed native planner handoff leaves its Codex TUI in the
+        # durable pane so the user can inspect or reconnect it. Manager
+        # review resumes the same provider session in a separate, bounded
+        # structured call; close that stale writer first or Codex rejects the
+        # resume with an "active writer" error. A live Turn-owned generation
+        # is never touched here.
+        if not self.generation_active(boundary_id):
+            await self.terminal.close_persistent_session(boundary_id)
+        prompt = "\n".join(
+            [
+                render_context_block(review_ctx),
+                "TURN_ORGANIZATION_MANAGER_REVIEW",
+                "You are the retained planner acting as the organization manager at a safe point.",
+                "Observe the current persisted snapshot and real project files. Do not directly edit files or mutate Turn state.",
+                "Choose ACCEPT only when the charter, deliverables, every acceptance criterion, independent verification, required handoffs, and the backlog are actually complete with inspectable evidence.",
+                "Choose CONTINUE when more bounded work is required. Return work_items only; graph changes belong to a retained planner turn, not the manager result. Every work item must have a unique key, precise instructions, explicit acceptance criteria when needed, and dependencies that refer to existing or same-response keys.",
+                "Choose BLOCK when missing user input, an impossible constraint, or a hard budget/workspace failure prevents safe progress. Include missing_inputs when user action is required.",
+                "Return exactly one normal Turn WorkerResult envelope with outcome COMPLETE and one JSON artifact named 'manager-result' (schema_name 'turn.manager-result', schema_version 'v1'). The artifact content must be a ManagerResult object with decision ACCEPT, CONTINUE, or BLOCK, summary, and the relevant work_items or missing_inputs. ACCEPT has no work_items; CONTINUE returns work_items only; BLOCK may return missing_inputs.",
+                "ORGANIZATION_SNAPSHOT_JSON="
+                + json.dumps(snapshot, sort_keys=True),
+            ]
+        )
+        runs = await self.store.get_runs(boundary.id)
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            run = await self.store.create_run(
+                boundary, "organization-manager", len(runs) + attempt
+            )
+            try:
+                payload, usage, session_id = await planner.call_structured(
+                    review_ctx,
+                    prompt,
+                    handoff_kind="result",
+                )
+                content = self._structured_artifact_payload(
+                    payload,
+                    schema_name="turn.manager-result",
+                    artifact_name="manager-result",
+                )
+                result = parse_manager_result(content)
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.COMPLETE,
+                    outcome=Outcome.COMPLETE,
+                    summary=result.summary,
+                    usage=usage,
+                    session_id=session_id,
+                )
+                if session_id:
+                    await self._remember_session(boundary, session_id)
+                return result
+            except Exception as error:
+                last_error = error
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.FAILED,
+                    outcome=Outcome.FAIL,
+                    summary="organization manager review failed",
+                    error=sanitize_control_text(error),
+                    retry_recommended=attempt < 3,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(0.05 * attempt)
+        raise ControlOperationUnavailable(
+            "organization manager review unavailable after 3 attempts: "
+            + sanitize_control_text(last_error)
+        ) from last_error
+
     async def _plan_node(
         self,
         node: Node,
@@ -782,6 +1437,8 @@ class Runner:
     ) -> list[Node]:
         # The planner and all descendants use the same assigned project
         # directory, so files are immediately available downstream.
+        self._recovered_active_node_ids.discard(node.id)
+        self._recovered_run_ids.pop(node.id, None)
         prior_runs = await self.store.get_runs(node.id)
         run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         ctx = await self._build_context(node, run_id=str(run.id))
@@ -838,39 +1495,147 @@ class Runner:
             planner = self._planner_for(node)
             if planner is None:
                 raise RuntimeError("no planner registered")
-            plan: PlanResult = await planner.plan(ctx)
-            current = await self.store.get_node(node.id)
-            if current is not None and current.status is NodeStatus.CANCELLED:
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.CANCELLED,
-                    outcome=Outcome.FAIL,
-                    summary="run cancelled",
-                    error="run cancelled by user",
-                    retry_recommended=False,
+            plan: PlanResult | None = None
+            contract = node.organization_contract
+            last_structural_audit = None
+            last_semantic_audit: PlanAuditResult | None = None
+            corrections_used = 0
+            for correction_attempt in range(3):
+                corrections_used = correction_attempt
+                plan = await planner.plan(ctx)
+                current = await self.store.get_node(node.id)
+                if current is not None and current.status is NodeStatus.CANCELLED:
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.CANCELLED,
+                        outcome=Outcome.FAIL,
+                        summary="run cancelled",
+                        error="run cancelled by user",
+                        retry_recommended=False,
+                    )
+                    return []
+                await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
+                await self._emit_trigger_event(
+                    "agent.plan.submitted",
+                    project_id=project_id,
+                    node_id=node.id,
+                    data={"node_id": str(node.id), "kind": "plan", "created": len(plan.nodes)},
                 )
-                return []
-            await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
-            await self._emit_trigger_event(
-                "agent.plan.submitted",
-                project_id=project_id,
-                node_id=node.id,
-                data={"node_id": str(node.id), "kind": "plan", "created": len(plan.nodes)},
-            )
-            if forbidden_session_id and plan.session_id == forbidden_session_id:
-                raise RuntimeError("provider reused the previous session during a fresh run")
-            if ctx.repo_path:
-                catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
-                plan_payload = plan.model_dump(mode="json")
-                catalog.load_plan_role_capabilities(plan_payload, ctx.repo_path)
-                catalog.validate_plan(
-                    plan_payload,
-                    ctx.repo_path,
-                    planner_capabilities=node.agent.capabilities if node.agent else None,
+                if forbidden_session_id and plan.session_id == forbidden_session_id:
+                    raise RuntimeError("provider reused the previous session during a fresh run")
+                validation_repo = ctx.project_repo_path or ctx.repo_path
+                if validation_repo:
+                    catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+                    plan_payload = plan.model_dump(mode="json")
+                    catalog.load_plan_role_capabilities(plan_payload, validation_repo)
+                    catalog.validate_plan(
+                        plan_payload,
+                        validation_repo,
+                        planner_capabilities=node.agent.capabilities if node.agent else None,
+                    )
+                    validate_subgraph_sources(plan, validation_repo)
+                contract = self._organization_contract_for_plan(node, plan)
+                structural_errors: list[str] = []
+                if contract is not None:
+                    scale_rank = {
+                        OrganizationScale.FOCUSED: 0,
+                        OrganizationScale.DELIVERY: 1,
+                        OrganizationScale.ORGANIZATION: 2,
+                    }
+                    if (
+                        node.organization_contract is not None
+                        and scale_rank[contract.scale]
+                        < scale_rank[node.organization_contract.scale]
+                    ):
+                        structural_errors.append(
+                            "organization plan cannot downgrade its existing contract scale"
+                        )
+                    audit = audit_plan(contract, plan)
+                    last_structural_audit = audit
+                    structural_errors.extend(audit.errors)
+                if structural_errors:
+                    deterministic = PlanAuditResult(
+                        decision=PlanAuditDecision.REJECT,
+                        summary="Deterministic plan audit rejected the proposal.",
+                        findings=list(structural_errors),
+                        required_changes=list(structural_errors),
+                    )
+                    last_semantic_audit = deterministic
+                    await self._record_plan_audit(
+                        node.id,
+                        structural=last_structural_audit,
+                        semantic=deterministic,
+                        correction_count=correction_attempt,
+                    )
+                    if correction_attempt >= 2:
+                        raise RuntimeError(
+                            "deterministic organization audit rejected the plan "
+                            "after two correction attempts: "
+                            + "; ".join(structural_errors)
+                        )
+                    ctx.review_feedback = (
+                        "Deterministic organization audit rejected the previous plan. "
+                        "Correct these structural errors before resubmitting: "
+                        + "; ".join(structural_errors)
+                    )
+                    refreshed = await self.store.get_node(node.id)
+                    if refreshed is not None:
+                        ctx.node = refreshed
+                    continue
+                if contract is None:
+                    break
+                semantic = await self._run_semantic_plan_audit(
+                    node, contract, plan, ctx
+                ) if node.id == project_id or contract.scale.value != "focused" else None
+                if semantic is None:
+                    last_semantic_audit = None
+                    await self._record_plan_audit(
+                        node.id,
+                        structural=last_structural_audit,
+                        correction_count=correction_attempt,
+                    )
+                    break
+                last_semantic_audit = semantic
+                await self._record_plan_audit(
+                    node.id,
+                    structural=last_structural_audit,
+                    semantic=semantic,
+                    correction_count=correction_attempt,
                 )
-                validate_subgraph_sources(plan, ctx.repo_path)
+                if semantic.decision is PlanAuditDecision.APPROVE:
+                    break
+                if correction_attempt >= 2:
+                    raise RuntimeError(
+                        "semantic organization audit rejected the plan after two correction attempts: "
+                        + "; ".join(semantic.required_changes or semantic.findings)
+                    )
+                ctx.review_feedback = (
+                    "Independent semantic audit rejected the previous plan. "
+                    + semantic.summary
+                    + " Required changes: "
+                    + "; ".join(semantic.required_changes or semantic.findings)
+                )
+                refreshed = await self.store.get_node(node.id)
+                if refreshed is not None:
+                    ctx.node = refreshed
+            if plan is None:
+                raise RuntimeError("planner returned no plan")
             plan = await self._ensure_plan_source(node, plan)
-            created = await self.store.apply_plan(node, plan)
+            created = await self.store.apply_plan(
+                node,
+                plan,
+                enforce_organization_audit=True,
+            )
+            # Store.apply_plan records the deterministic structural audit. The
+            # second write preserves the semantic decision and correction
+            # count using the fresh persisted node rather than the planner's
+            # stale in-memory snapshot.
+            await self._record_plan_audit(
+                node.id,
+                structural=last_structural_audit,
+                semantic=last_semantic_audit,
+                correction_count=corrections_used,
+            )
             submitted = await self.store.add_artifacts(
                 node.id,
                 [_plan_submission_artifact(plan)],
@@ -892,7 +1657,9 @@ class Runner:
             await self._emit("plan.applied", project_id, {"parent": _dump(applied_parent), "created": len(created)})
             for c in created:
                 await self._emit("node.created", project_id, _dump(c))
-            await self._ensure_handoff_watcher(node.id, project_id, ctx.repo_path)
+            await self._ensure_handoff_watcher(
+                node.id, project_id, ctx.project_repo_path or ctx.repo_path
+            )
             return created
         except asyncio.CancelledError:
             await self.store.update_run(
@@ -904,6 +1671,25 @@ class Runner:
                 retry_recommended=False,
             )
             raise
+        except ControlOperationUnavailable as error:
+            # A control-plane audit could not return a decision. Keep the
+            # planner node runnable so a later scheduler tick can retry it;
+            # this is not evidence that the proposed organization failed.
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.COMPLETE,
+                outcome=Outcome.BLOCK,
+                summary="control audit unavailable; retry pending",
+                error=sanitize_control_text(error),
+                retry_recommended=True,
+            )
+            await self.store.set_status(node.id, NodeStatus.RUNNABLE)
+            await self._emit(
+                "organization.audit_control_failed",
+                project_id,
+                {"node_id": str(node.id), "reason": sanitize_control_text(error), "retryable": True},
+            )
+            return []
         except Exception as error:
             current = await self.store.get_node(node.id)
             if current is not None and current.status is NodeStatus.CANCELLED:
@@ -972,6 +1758,8 @@ class Runner:
         if worker is None:
             await self._mark_failed(node, f"no worker registered for executor '{node.executor}'")
             return
+        self._recovered_active_node_ids.discard(node.id)
+        self._recovered_run_ids.pop(node.id, None)
         prior_runs = await self.store.get_runs(node.id)
         run = await self.store.create_run(node, worker.name, len(prior_runs) + 1)
         ctx = await self._build_context(node, run_id=str(run.id))
@@ -1033,6 +1821,13 @@ class Runner:
                 if root and root.run_policy else self.s.stall_timeout_seconds
             )
             result: WorkerResult = await self.exec_adapter.run(worker, ctx, timeout=timeout)
+            # Short-lived process transports detach before returning from the
+            # worker, but their completed PTY remains in the transport until
+            # release(). Publish the attempt outcome only after that release
+            # so terminal/session state cannot lag a COMPLETE verification or
+            # trigger event. A live Herdr/Codex pane is unaffected: release
+            # evicts ended control sessions and never closes an active pane.
+            self.terminal.release(node.id)
             await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": result.outcome.value, "session_id": result.session_id, "summary": result.summary, "error": result.error, "usage": _dump(result.usage)})
             if forbidden_session_id and result.session_id == forbidden_session_id:
                 raise RuntimeError("provider reused the previous session during a fresh run")
@@ -1107,8 +1902,91 @@ class Runner:
             )
             await self._emit("node.updated", project_id, _dump(current))
             return
+        if result.outcome in {Outcome.COMPLETE, Outcome.EXPAND}:
+            try:
+                await self._commit_workspace_result(node)
+            except WorkspaceError as error:
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.FAILED,
+                    outcome=Outcome.FAIL,
+                    summary="workspace merge failed",
+                    error=str(error),
+                    retry_recommended=False,
+                )
+                await self.store.set_status(node.id, NodeStatus.FAILED)
+                await self._request_reviews_for_node(node.id, "workspace_merge_failed")
+                await self._emit("organization.workspace_failed", project_id, {
+                    "node_id": str(node.id),
+                    "error": str(error),
+                })
+                return
         await self._persist_result_materials(node.id, project_id, result)
+        if result.outcome is Outcome.COMPLETE and node.acceptance_criteria:
+            evidence_items = [
+                *result.evidence,
+                *(
+                    result.verification.evidence
+                    if result.verification is not None
+                    else []
+                ),
+            ]
+            evidence_by_id = {item.criterion_id: item for item in evidence_items}
+            missing = [
+                criterion.id
+                for criterion in node.acceptance_criteria
+                if criterion.id not in evidence_by_id
+            ]
+            failed = [
+                item.criterion_id
+                for item in evidence_items
+                if item.status is EvidenceStatus.FAIL
+            ]
+            unverified = [
+                item.criterion_id
+                for item in evidence_items
+                if item.status is EvidenceStatus.UNVERIFIED
+            ]
+            unreferenced = [
+                item.criterion_id
+                for item in evidence_items
+                if not item.refs
+            ]
+            if missing or failed or unverified or unreferenced:
+                reason_parts = []
+                if missing:
+                    reason_parts.append("missing evidence for " + ", ".join(missing))
+                if failed:
+                    reason_parts.append("failed criteria: " + ", ".join(failed))
+                if unverified:
+                    reason_parts.append(
+                        "unverified criteria: " + ", ".join(unverified)
+                    )
+                if unreferenced:
+                    reason_parts.append(
+                        "evidence has no inspectable refs for "
+                        + ", ".join(unreferenced)
+                    )
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.FAILED,
+                    outcome=Outcome.FAIL,
+                    summary="acceptance evidence rejected",
+                    error="; ".join(reason_parts),
+                    retry_recommended=False,
+                )
+                await self.store.set_status(node.id, NodeStatus.FAILED)
+                await self._request_reviews_for_node(
+                    node.id, "acceptance_evidence_failed"
+                )
+                await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
+                return
         if result.verification is not None:
+            if (
+                result.outcome is Outcome.COMPLETE
+                and result.verification.decision is VerificationDecision.APPROVE
+            ):
+                await self._accept_consumed_handoffs(node, result)
             await self._handle_verification(node, run, project_id, result)
             return
         fresh = await self.store.get_node(node.id)
@@ -1120,6 +1998,7 @@ class Runner:
             )
             await self._remember_session(node, result.session_id)
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
+            await self._accept_consumed_handoffs(node, result)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
             repo_path = await self._project_repo(project_id)
@@ -1133,8 +2012,98 @@ class Runner:
                     planner_capabilities=node.agent.capabilities if node.agent else None,
                 )
                 validate_subgraph_sources(plan, repo_path)
+            contract = self._organization_contract_for_plan(node, plan)
+            structural_audit = None
+            semantic_audit = None
+            if contract is not None:
+                structural_audit = audit_plan(contract, plan)
+                if not structural_audit.accepted:
+                    rejection = PlanAuditResult(
+                        decision=PlanAuditDecision.REJECT,
+                        summary="Deterministic plan audit rejected the proposal.",
+                        findings=list(structural_audit.errors),
+                        required_changes=list(structural_audit.errors),
+                    )
+                    await self._record_plan_audit(
+                        node.id, structural=structural_audit, semantic=rejection
+                    )
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.FAILED,
+                        outcome=Outcome.FAIL,
+                        summary="organization plan rejected",
+                        error="; ".join(structural_audit.errors),
+                        retry_recommended=False,
+                    )
+                    await self.store.set_status(node.id, NodeStatus.FAILED)
+                    await self._request_reviews_for_node(
+                        node.id, "organization_plan_rejected"
+                    )
+                    await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
+                    return
+                if node.id == project_id or contract.scale.value != "focused":
+                    try:
+                        semantic_audit = await self._run_semantic_plan_audit(
+                            node, contract, plan
+                        )
+                    except ControlOperationUnavailable as error:
+                        await self.store.update_run(
+                            run.id,
+                            status=RunStatus.COMPLETE,
+                            outcome=Outcome.EXPAND,
+                            summary="control audit unavailable; retry pending",
+                            error=sanitize_control_text(error),
+                            retry_recommended=True,
+                        )
+                        await self.store.set_status(node.id, NodeStatus.RUNNABLE)
+                        await self._emit(
+                            "organization.audit_control_failed",
+                            project_id,
+                            {"node_id": str(node.id), "reason": sanitize_control_text(error), "retryable": True},
+                        )
+                        return
+                    if semantic_audit is not None:
+                        await self._record_plan_audit(
+                            node.id,
+                            structural=structural_audit,
+                            semantic=semantic_audit,
+                        )
+                    if semantic_audit is not None and semantic_audit.decision is PlanAuditDecision.REJECT:
+                        await self.store.update_run(
+                            run.id,
+                            status=RunStatus.FAILED,
+                            outcome=Outcome.FAIL,
+                            summary="semantic organization plan rejected",
+                            error="; ".join(
+                                semantic_audit.required_changes or semantic_audit.findings
+                            ),
+                            retry_recommended=False,
+                        )
+                        await self.store.set_status(node.id, NodeStatus.FAILED)
+                        await self._request_reviews_for_node(
+                            node.id, "semantic_plan_rejected"
+                        )
+                        await self._emit(
+                            "node.updated",
+                            project_id,
+                            _dump(await self.store.get_node(node.id)),
+                        )
+                        return
+                else:
+                    await self._record_plan_audit(
+                        node.id, structural=structural_audit
+                    )
             plan = await self._ensure_plan_source(node, plan)
-            created = await self.store.apply_plan(node, plan)
+            created = await self.store.apply_plan(
+                node,
+                plan,
+                enforce_organization_audit=True,
+            )
+            await self._record_plan_audit(
+                node.id,
+                structural=structural_audit,
+                semantic=semantic_audit,
+            )
             await self.store.update_run(
                 run.id, status=RunStatus.COMPLETE, outcome=Outcome.EXPAND,
                 summary=result.summary, logs=result.executor_notes or result.summary or "",
@@ -1187,6 +2156,16 @@ class Runner:
                 await self.store.set_status(node.id, NodeStatus.FAILED)
 
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
+        latest_outcome_node = await self.store.get_node(node.id)
+        if latest_outcome_node is not None and latest_outcome_node.status in {
+            NodeStatus.FAILED,
+            NodeStatus.BLOCKED,
+        }:
+            await self._request_reviews_for_node(
+                node.id,
+                "child_failed" if latest_outcome_node.status is NodeStatus.FAILED else "child_blocked",
+            )
+        fresh_node = await self.store.get_node(node.id)
         await self._ensure_handoff_watcher(
             node.id,
             project_id,
@@ -1194,13 +2173,104 @@ class Runner:
         )
         self.wake()
 
+    async def _accept_consumed_handoffs(
+        self, node: Node, result: WorkerResult
+    ) -> None:
+        """Derive handoff acceptance from a successful consumer turn.
+
+        Producers only make a matching artifact AVAILABLE. A consumer that
+        completes successfully and cites inspectable evidence is the narrow
+        authority that can move that input to ACCEPTED.
+        """
+        if result.outcome is not Outcome.COMPLETE:
+            return
+        evidence = [
+            *result.evidence,
+            *(
+                result.verification.evidence
+                if result.verification is not None
+                else []
+            ),
+        ]
+        evidence_refs = list(
+            dict.fromkeys(
+                [
+                    *(
+                        ref
+                        for item in evidence
+                        if item.status is EvidenceStatus.PASS
+                        for ref in item.refs
+                    ),
+                    *(
+                        ref
+                        for artifact in result.artifacts
+                        for ref in artifact.evidence_refs
+                    ),
+                ]
+            )
+        )
+        for handoff in await self.store.list_handoffs(
+            node.project_id, node_id=node.id
+        ):
+            if (
+                handoff.consumer_node_id != node.id
+                or handoff.status is not HandoffStatus.AVAILABLE
+                or (
+                    handoff.contract.evidence_required
+                    and not evidence_refs
+                )
+            ):
+                continue
+            await self.store.update_handoff(
+                handoff.id,
+                status=HandoffStatus.ACCEPTED,
+                artifact_id=handoff.artifact_id,
+                evidence_refs=evidence_refs,
+            )
+
+    async def _commit_workspace_result(self, node: Node) -> None:
+        """Commit one isolated worker without mutating the canonical branch."""
+        node = await self.store.get_node(node.id) or node
+        root = await self.store.get_node(node.project_id)
+        if (
+            root is None
+            or root.run_policy is None
+            or root.run_policy.workspace_isolation.value != "worktree"
+            or not node.workspace_path
+        ):
+            return
+        commit = await self.workspaces.commit(node.workspace_path, node.id)
+        if commit is None:
+            return
+        await self.store.set_workspace_commit(node.id, commit)
+
     async def _persist_result_materials(
         self, node_id: uuid.UUID, project_id: uuid.UUID, result: WorkerResult
     ) -> list[Artifact]:
         """Persist concise output identities without retaining terminal transcripts."""
         linked = await self.store.add_document_refs(node_id, result.document_refs)
         await self.store.add_subgraph_refs(node_id, result.subgraph_refs)
-        explicit = await self.store.add_artifacts(node_id, result.artifacts)
+        evidence_items = [
+            *result.evidence,
+            *(
+                result.verification.evidence
+                if result.verification is not None
+                else []
+            ),
+        ]
+        evidence_specs = [
+            ArtifactSpec(
+                kind=ArtifactKind.EVIDENCE,
+                name=f"evidence-{item.criterion_id}",
+                content=item.model_dump(mode="json"),
+                evidence_refs=list(item.refs),
+            )
+            for item in evidence_items
+        ]
+        explicit = await self.store.add_artifacts(
+            node_id,
+            [*result.artifacts, *evidence_specs],
+        )
         for artifact in [*linked, *explicit]:
             await self._emit("artifact.created", project_id, _dump(artifact))
         return [*linked, *explicit]
@@ -1357,6 +2427,7 @@ class Runner:
                         agent_message=correction if item.id == target.id else None,
                     )
                     await self._emit("node.updated", project_id, _dump(updated or item))
+            await self._request_reviews_for_node(reviewer.id, "verification_rejected")
         await self._emit("node.updated", project_id, _dump(await self.store.get_node(reviewer.id)))
         await self._ensure_handoff_watcher(
             reviewer.id,
@@ -1452,6 +2523,31 @@ class Runner:
 
     async def _maybe_finalize(self, root: Node) -> None:
         """Mark a settled project complete after direct filesystem execution."""
+        decisions = await self._review_organizations(root.project_id)
+        if any(decision.replan for decision in decisions):
+            return
+        if any(decision.phase.value == "BLOCKED" for decision in decisions):
+            await self.store.set_status(root.id, NodeStatus.BLOCKED)
+            await self._emit("organization.blocked", root.project_id, {
+                "project_id": str(root.project_id),
+                "reasons": [decision.reason for decision in decisions if decision.phase.value == "BLOCKED"],
+            })
+            return
+        if any(
+            decision.decision is not ManagerDecision.ACCEPT
+            for decision in decisions
+        ):
+            # A manager can return CONTINUE without an immediate replan while
+            # a safe-point frontier is still executing. Settled descendants
+            # are not, by themselves, proof that the charter is accepted.
+            return
+        if (
+            root.organization_contract is not None
+            and root.organization_contract.scale.value != "focused"
+            and root.manager_phase is not ManagerPhase.ACCEPTED
+        ):
+            return
+        await self._merge_accepted_root_output(root)
         if root.status != NodeStatus.COMPLETE:
             await self.store.set_status(root.id, NodeStatus.COMPLETE)
             await self._emit(
@@ -1465,6 +2561,214 @@ class Runner:
                 source=EventSource.TRANSITION,
             )
 
+    async def _merge_accepted_root_output(self, root: Node) -> None:
+        """Merge only the accepted project output into the user's branch."""
+        fresh_root = await self.store.get_node(root.id) or root
+        policy = fresh_root.run_policy
+        if policy is None or policy.workspace_isolation.value != "worktree":
+            return
+        nodes, edges, _ = await self.store.get_workgraph(root.project_id)
+        walker = GraphWalker(nodes, edges)
+        descendants = walker.descendants(root.id)
+        candidates = [
+            node
+            for node in descendants
+            if node.workspace_commit
+            and node.status is NodeStatus.COMPLETE
+            and node.executor == "integrator"
+            and node.parent_id == root.id
+        ]
+        if not candidates:
+            candidates = [
+                node
+                for node in descendants
+                if node.workspace_commit
+                and node.status is NodeStatus.COMPLETE
+                and node.executor == "integrator"
+            ]
+        if not candidates:
+            candidates = [
+                node
+                for node in descendants
+                if node.workspace_commit and node.status is NodeStatus.COMPLETE
+            ]
+        commit = fresh_root.workspace_commit or (
+            candidates[0].workspace_commit if candidates else None
+        )
+        if not commit:
+            return
+        repo = await self._project_repo(root.project_id)
+        if not repo:
+            raise WorkspaceError("project root is unavailable for accepted output merge")
+        await self.workspaces.merge(repo, commit, root.id)
+        if fresh_root.workspace_commit != commit:
+            await self.store.set_workspace_commit(root.id, commit)
+
+    async def _review_organizations(
+        self,
+        project_id: uuid.UUID,
+        *,
+        boundaries: list[Node] | None = None,
+    ):
+        """Run the durable manager review before a project is accepted."""
+        nodes, edges, _ = await self.store.get_workgraph(project_id)
+        if boundaries is None:
+            boundaries = [
+                node for node in nodes
+                if node.executor == PLANNER_EXECUTOR
+                and node.organization_contract is not None
+                and node.organization_contract.scale.value != "focused"
+                and node.status in {NodeStatus.EXPANDED, NodeStatus.COMPLETE}
+                and node.manager_phase not in {ManagerPhase.ACCEPTED, ManagerPhase.BLOCKED}
+            ]
+        else:
+            current = {node.id: node for node in nodes}
+            boundaries = [
+                current[node.id]
+                for node in boundaries
+                if node.id in current
+            ]
+        boundaries.sort(
+            key=lambda node: len(GraphWalker(nodes, edges).ancestors(node.id)),
+            reverse=True,
+        )
+        decisions = []
+        for boundary in boundaries:
+            if boundary.manager_phase not in {
+                ManagerPhase.ACCEPTED,
+                ManagerPhase.BLOCKED,
+            }:
+                await self.organization_manager.request_review(
+                    self.store, boundary.id, "frontier_settled"
+                )
+            reviewer = self.manager_reviewer
+            if reviewer is None and self.provider_reviews_enabled:
+                reviewer = self._provider_manager_review
+            if reviewer is not None:
+                await self.store.set_manager_state(
+                    boundary.id,
+                    phase=ManagerPhase.REVIEWING,
+                    iteration=boundary.manager_iteration + 1,
+                    reasons=boundary.manager_review_reasons or ["frontier_settled"],
+                )
+                snapshot = await self.organization_manager.snapshot(
+                    self.store, boundary.id
+                )
+                try:
+                    manager_result = await reviewer(snapshot)
+                    if manager_result.plan is not None:
+                        contract = boundary.organization_contract
+                        if contract is not None:
+                            plan_audit = audit_plan(contract, manager_result.plan)
+                            if not plan_audit.accepted:
+                                raise RuntimeError(
+                                    "organization manager plan rejected: "
+                                    + "; ".join(plan_audit.errors)
+                                )
+                            if contract.scale.value != "focused":
+                                semantic = await self._run_semantic_plan_audit(
+                                    boundary,
+                                    contract,
+                                    manager_result.plan,
+                                )
+                                if (
+                                    semantic is not None
+                                    and semantic.decision is PlanAuditDecision.REJECT
+                                ):
+                                    raise RuntimeError(
+                                        "semantic organization manager plan rejected: "
+                                        + "; ".join(
+                                            semantic.required_changes
+                                            or semantic.findings
+                                        )
+                                    )
+                    decision = await self.organization_manager.apply_result(
+                        self.store, boundary.id, manager_result
+                    )
+                except Exception as error:
+                    reason = "manager review unavailable: " + sanitize_control_text(error)
+                    await self.organization_manager.request_review(
+                        self.store,
+                        boundary.id,
+                        reason,
+                    )
+                    await self.store.set_manager_state(
+                        boundary.id,
+                        phase=ManagerPhase.REVIEW_PENDING,
+                        reasons=[reason],
+                    )
+                    await self._emit("organization.review_control_failed", project_id, {
+                        "node_id": str(boundary.id),
+                        "reason": reason,
+                        "retryable": True,
+                    })
+                    # A failed control operation is not a manager decision and
+                    # must not strand a healthy frontier in BLOCKED/FAILED.
+                    continue
+            else:
+                decision = await self.organization_manager.review(
+                    self.store, boundary.id
+                )
+            if decision is None:
+                continue
+            decisions.append(decision)
+            if decision.decision is ManagerDecision.ACCEPT:
+                await self._expose_boundary_output_commit(boundary.id)
+            await self._emit("organization.reviewed", project_id, {
+                "node_id": str(boundary.id),
+                "phase": decision.phase.value,
+                "replan": decision.replan,
+                "reason": decision.reason,
+            })
+            if decision.replan and reviewer is None:
+                try:
+                    current = await self.store.get_node(boundary.id)
+                    if current is None:
+                        break
+                    # A manager review appends the next wave to the existing
+                    # boundary. Completed nodes remain history and evidence;
+                    # only the retained planner session is re-engaged.
+                    await self._plan_node(current, project_id)
+                except Exception as error:
+                    current = await self.store.get_node(boundary.id)
+                    if current is not None:
+                        review = current.organization_review or OrganizationReview()
+                        review.phase = OrganizationPhase.BLOCKED
+                        review.replan_requested = False
+                        review.last_reason = f"manager replan failed: {error}"
+                        await self.store.set_organization_review(boundary.id, review)
+                break
+        return decisions
+
+    async def _expose_boundary_output_commit(self, boundary_id: uuid.UUID) -> None:
+        """Expose the accepted nested integrator commit to its parent edge."""
+        boundary = await self.store.get_node(boundary_id)
+        if boundary is None:
+            return
+        nodes, edges, _ = await self.store.get_workgraph(boundary.project_id)
+        walker = GraphWalker(nodes, edges)
+        descendants = walker.descendants(boundary_id)
+        candidates = [
+            node
+            for node in descendants
+            if node.workspace_commit
+            and node.status is NodeStatus.COMPLETE
+            and node.executor == "integrator"
+        ]
+        if not candidates:
+            candidates = [
+                node
+                for node in descendants
+                if node.workspace_commit and node.status is NodeStatus.COMPLETE
+            ]
+        if not candidates:
+            return
+        candidates.sort(key=lambda node: walker.depth(node.id), reverse=True)
+        await self.store.set_workspace_commit(
+            boundary.id,
+            candidates[0].workspace_commit,
+        )
+
     # -- user actions ----------------------------------------------------
 
     async def provide_input(self, node_id: uuid.UUID, input_id: str, value: str) -> None:
@@ -1473,7 +2777,33 @@ class Runner:
             # re-evaluate: if all inputs satisfied, it becomes runnable
             still_missing = [i for i in node.required_inputs if i.satisfied_by is None]
             if not still_missing:
-                await self.store.set_status(node_id, NodeStatus.RUNNABLE)
+                if (
+                    node.executor == PLANNER_EXECUTOR
+                    and node.manager_phase is ManagerPhase.BLOCKED
+                    and node.organization_contract is not None
+                ):
+                    review = node.organization_review or OrganizationReview()
+                    review.phase = OrganizationPhase.REVIEW
+                    review.replan_requested = True
+                    review.last_reason = "required manager input satisfied"
+                    await self.store.set_organization_review(node.id, review)
+                    descendants = await self.store.descendants(node.id)
+                    work_items = await self.store.list_work_items(
+                        node.project_id, organization_id=node.id
+                    )
+                    resume_status = (
+                        NodeStatus.EXPANDED
+                        if descendants or work_items
+                        else NodeStatus.RUNNABLE
+                    )
+                    await self.store.set_manager_state(
+                        node.id,
+                        phase=ManagerPhase.REVIEW_PENDING,
+                        reasons=["required manager input satisfied"],
+                    )
+                    await self.store.set_status(node.id, resume_status)
+                else:
+                    await self.store.set_status(node_id, NodeStatus.RUNNABLE)
             await self._emit("node.updated", node.project_id, _dump(node))
         self.wake()
 
@@ -1576,6 +2906,54 @@ class Runner:
             if refreshed is not None:
                 await self._emit("node.updated", refreshed.project_id, _dump(refreshed))
             self.wake()
+
+    async def resume_organization_review(self, node_id: uuid.UUID) -> Node:
+        """Reopen a materialized manager boundary after a provider failure.
+
+        This is deliberately different from ``retry``: retrying a planner
+        clears its provider session and starts a fresh planning run, while a
+        review failure must preserve the already-audited graph and its
+        evidence. The operation only changes the control-plane state needed
+        for the scheduler to revisit the persisted frontier.
+        """
+        node = await self.store.get_node(node_id)
+        if node is None:
+            raise ValueError("node not found")
+        if (
+            node.executor != PLANNER_EXECUTOR
+            or node.organization_contract is None
+            or node.organization_contract.scale is OrganizationScale.FOCUSED
+        ):
+            raise ValueError("node is not a material organization boundary")
+        if self.generation_active(node_id):
+            raise RuntimeError("organization provider is still active")
+        descendants = await self.store.descendants(node_id)
+        work_items = await self.store.list_work_items(
+            node.project_id, organization_id=node_id
+        )
+        if not descendants and not work_items:
+            raise ValueError("organization has no materialized frontier to resume")
+
+        # A failed review may leave the provider TUI in a durable Herdr pane.
+        # Closing that stale writer is safe here because generation_active()
+        # already proved that Turn does not own a live provider task.
+        await self.close_provider_terminal(node_id)
+        review = node.organization_review or OrganizationReview()
+        review.phase = OrganizationPhase.EXECUTE_FRONTIER
+        review.replan_requested = False
+        review.last_reason = "organization review resumed after provider failure"
+        await self.store.set_organization_review(node_id, review)
+        await self.store.set_manager_state(
+            node_id,
+            phase=ManagerPhase.REVIEW_PENDING,
+            reasons=[review.last_reason],
+        )
+        resumed = await self.store.set_status(node_id, NodeStatus.EXPANDED)
+        if resumed is None:
+            raise ValueError("node disappeared while resuming organization review")
+        await self._emit("node.updated", resumed.project_id, _dump(resumed))
+        self.wake()
+        return resumed
 
     def _reconnect_command(
         self,
@@ -1751,7 +3129,11 @@ class Runner:
     async def close_provider_terminal(self, node_id: uuid.UUID) -> bool:
         """Close a reconnected completed-session PTY, never a live run."""
         node = await self.store.get_node(node_id)
-        if node is None or node.status == NodeStatus.RUNNING:
+        # A daemon restart can leave the durable provider pane alive while
+        # there is no corresponding Turn task in this process. Persisted
+        # RUNNING is therefore not sufficient to identify a live generation;
+        # only refuse cleanup when this runner still owns an active task.
+        if node is None or (node.status == NodeStatus.RUNNING and self.generation_active(node_id)):
             return False
         await self._stop_handoff_watcher(node_id)
         task = self._reconnect_tasks.get(node_id)
@@ -1848,6 +3230,8 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return
+        self._recovered_active_node_ids.discard(node_id)
+        self._recovered_run_ids.pop(node_id, None)
         await self._stop_handoff_watcher(node_id)
         reconnect = self._reconnect_tasks.get(node_id)
         if reconnect is not None and not reconnect.done():
@@ -2001,11 +3385,67 @@ class Runner:
         for a in ancestry + [node]:
             resource_refs.extend(a.resource_refs)
         resources = await self._resolve_resources(resource_refs)
+        graph_nodes, graph_edges, graph_artifacts = await self.store.get_workgraph(
+            node.project_id
+        )
+        walker = GraphWalker(graph_nodes, graph_edges)
+        predecessors = walker.predecessors(node.id)
+        predecessor_ids = {predecessor.id for predecessor in predecessors}
+        predecessor_commits = [
+            predecessor.workspace_commit
+            for predecessor in predecessors
+            if predecessor.workspace_commit
+        ]
+        predecessor_artifacts = [
+            artifact
+            for artifact in graph_artifacts
+            if artifact.node_id in predecessor_ids
+        ]
 
-        # The project's assigned filesystem directory (root node's repo_path).
+        # The project's assigned filesystem directory is the canonical control
+        # root. A worker may receive a durable Git worktree as its cwd, but all
+        # Turn protocol files and state remain rooted at this control path.
         project_repo = await self._project_repo(node.project_id)
+        execution_repo = project_repo
         root = await self.store.get_node(node.project_id)
         policy = root.run_policy if root else None
+        if (
+            project_repo
+            and policy is not None
+            and policy.workspace_isolation.value == "worktree"
+            and node.id != node.project_id
+        ):
+            isolated = await self.workspaces.isolation_available(project_repo)
+            if not isolated:
+                # Dirty/non-Git repositories are an explicit serial fallback.
+                # Check before allocating a worktree so this path agrees with
+                # the scheduler's isolation decision.
+                execution_repo = project_repo
+            else:
+                if node.workspace_path and Path(node.workspace_path).is_dir():
+                    execution_repo = node.workspace_path
+                else:
+                    execution_repo = await self.workspaces.ensure(
+                        project_repo,
+                        node.id,
+                        node.project_id,
+                    )
+                    branch = self.workspaces.branch_name(
+                        project_repo, node.id, node.project_id
+                    )
+                    await self.store.set_workspace_ref(
+                        node.id,
+                        path=execution_repo,
+                        branch=branch,
+                    )
+                if predecessor_commits:
+                    await self.workspaces.merge_into_workspace(
+                        execution_repo,
+                        predecessor_commits,
+                        node.id,
+                    )
+        elif node.workspace_path:
+            execution_repo = node.workspace_path
         # Wire a live terminal stream: the worker emits raw output chunks and we
         # fan them out over the project SSE bus as `node.terminal` events.
         pid = node.project_id
@@ -2035,7 +3475,9 @@ class Runner:
             ancestry=ancestry,
             resources=resources,
             trigger_context=node.trigger_context,
-            repo_path=project_repo,
+            repo_path=execution_repo,
+            project_repo_path=project_repo,
+            predecessor_artifacts=predecessor_artifacts,
             stream=_stream,
             terminal=self.terminal,
             session_callback=None,
@@ -2107,7 +3549,17 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return None
-        await self.terminal.close_persistent_session(node_id)
+        try:
+            await self.terminal.close_persistent_session(node_id)
+        except HerdrAdapterError as error:
+            if getattr(self.terminal, "backend_name", None) != "herdr":
+                raise
+            # A retry must retire the provider session even when Herdr
+            # temporarily rejects the optional pane-close cleanup. The pane
+            # remains durable and the next native launch can reuse it; a
+            # cleanup denial must not turn a user-requested retry into HTTP
+            # 500 or leave the graph failed.
+            logger.warning("Herdr pane cleanup deferred during fresh run: %s", error)
         previous = await self._reset_provider_session(node_id)
         if previous:
             self.sessions.retire_fresh_session(node_id, previous)
@@ -2125,7 +3577,23 @@ class Runner:
             return
         n = await self.store.get_node(node.id)
         if n is not None:
+            await self._request_reviews_for_node(node.id, "child_failed")
             await self._emit("node.updated", n.project_id, _dump(n))
+
+    async def _request_reviews_for_node(
+        self, node_id: uuid.UUID, reason: str
+    ) -> None:
+        """Coalesce management review requests on every owning boundary."""
+        node = await self.store.get_node(node_id)
+        if node is None or node.parent_id is None:
+            return
+        nodes, edges, _ = await self.store.get_workgraph(node.project_id)
+        for ancestor in GraphWalker(nodes, edges).ancestors(node.id):
+            if ancestor.organization_contract is None:
+                continue
+            await self.organization_manager.request_review(
+                self.store, ancestor.id, reason
+            )
 
     async def _emit(self, etype: str, project_id: uuid.UUID, data) -> None:
         await self.events.publish(

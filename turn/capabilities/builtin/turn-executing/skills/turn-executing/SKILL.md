@@ -27,7 +27,7 @@ genuine external requirement.
    one cohesive contract with one primary craft or implementation boundary,
    bounded ownership, and one concrete acceptance path. If the assignment
    actually contains several independently ownable contracts, multiple crafts,
-   a substantial internal backlog, or its own integration/QA problem, do not
+   a substantial internal backlog, or its own composition/evaluation problem, do not
    silently turn one executor into an entire team. Escalate it to a nested
    planning boundary as described below.
 
@@ -42,6 +42,17 @@ genuine external requirement.
 - Define and preserve typed inputs, outputs, invariants, and integration seams.
   Keep the canonical state and ownership clear so another worker can compose
   your result without guessing.
+- Honor every explicit acceptance criterion. Return criterion-level evidence
+  with inspectable repository-relative references; do not mark a criterion
+  satisfied from a summary alone.
+- The completion envelope must include one evidence item for every declared
+  criterion. Use the exact criterion id, `status: "PASS"` only after running
+  the check, a concise observed result, and at least one repository-relative
+  `refs` entry. Generic `artifacts` or a prose summary do not substitute for
+  criterion evidence. Use `FAIL` or `UNVERIFIED` when the work is not proven.
+- Work only in the execution workspace assigned to this node. Do not merge
+  unrelated branches or modify another node's workspace; the integrator owns
+  cross-branch assembly.
 - Stay inside the assigned boundary. Do not rewrite sibling ownership or absorb
   another worker's responsibility. Executors do not author arbitrary graph
   topology. The one exception is **scope escalation**: when the current node is
@@ -74,7 +85,7 @@ and prerequisite contracts, it clearly requires a team, **do not compress the
 team into one heroic executor**. Return `EXPAND` and delegate the whole current
 contract to exactly one nested planner child.
 
-That child is a department/program boundary. Give it the inherited mission,
+That child is a nested organization boundary. Give it the inherited mission,
 constraints, exported contract, relevant document/resource references, and the
 evidence that revealed the larger scope. Do not pre-author its descendants;
 the child planner will use `$turn-planning` to choose the organization. Declare
@@ -84,7 +95,7 @@ Example handoff:
 
 ```sh
 turn agent submit --kind result --stdin <<'TURN_PAYLOAD'
-{"outcome":"EXPAND","summary":"The assigned subsystem contains multiple independently verifiable contracts and needs departmental decomposition.","missing_inputs":[],"artifacts":[],"children":{"nodes":[{"key":"department","objective":"Plan and deliver the subsystem","agent_type":"planner","plan":true,"generated_prompt":"Own the full inherited subsystem mission. Decompose it into leaf-fit work, integrate the descendants, and independently verify the exported contract before returning it to the parent. Preserve the existing repository and prerequisite contracts."}]}}
+{"outcome":"EXPAND","summary":"The assigned boundary contains multiple independently verifiable contracts and needs nested decomposition.","missing_inputs":[],"artifacts":[],"children":{"nodes":[{"key":"nested-boundary","objective":"Plan and deliver the inherited boundary","agent_type":"planner","plan":true,"generated_prompt":"Own the inherited mission. Decompose it into leaf-fit work, compose descendants when required, and independently evaluate the exported contract before returning it to the parent. Preserve the existing project and prerequisite contracts."}]}}
 TURN_PAYLOAD
 ```
 
@@ -96,8 +107,8 @@ work; it is the escape valve that prevents accidental under-decomposition.
 
 Before reporting `COMPLETE`, exercise the real boundary you own: run the
 focused tests and the documented build or launch command from the project
-structure. For visual or interactive work, use the available browser QA skill
-and inspect the rendered result, controls, state transitions, and console
+structure. For visual or interactive work, use the available browser-control
+or UI inspection skill and inspect the rendered result, controls, state transitions, and console
 errors. Controls must change real application state, and the requested user
 journey must be reachable from the actual entry point; green unit tests alone
 are not sufficient. If an external dependency prevents this check, report the
@@ -110,3 +121,16 @@ ordinary summaries inline and use a document reference only when the output
 is too large to read comfortably in the CLI. Never write Turn result/status
 JSON files directly and never claim completion from a build alone when the
 requested user journey is not usable.
+
+For a node with acceptance criteria, the result handoff has this shape (use the
+exact ids from the live graph):
+
+```sh
+turn agent submit --kind result --stdin <<'TURN_PAYLOAD'
+{"outcome":"COMPLETE","summary":"Implemented and checked the boundary.","missing_inputs":[],"artifacts":[{"kind":"text","name":"implementation-notes","ref":"IMPLEMENTATION.md"}],"evidence":[{"criterion_id":"typed-core","status":"PASS","summary":"Typed records and inventory calculation passed the focused tests.","refs":["src/inventory/models.py","tests/test_inventory_core.py"]}]}
+TURN_PAYLOAD
+```
+
+Repeat the `evidence` object for every criterion. The server validates these
+records before advancing downstream work, so omitting them will correctly
+reject an otherwise plausible completion summary.

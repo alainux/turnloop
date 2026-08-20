@@ -7,6 +7,7 @@ Neither owns Turn's data model — they only read context and emit results.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import json
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from turn.capabilities.plugin import CapabilityPluginError, load_capability_plugin
 from turn.domain.schemas import (
+    Artifact,
     ArtifactSpec,
     Node,
     PlanResult,
@@ -34,7 +36,10 @@ class NodeExecutionContext(BaseModel):
     ancestry: list[Node] = Field(default_factory=list)  # root .. immediate parent
     resources: list[Resource] = Field(default_factory=list)
     repo_path: Optional[str] = None
+    project_repo_path: Optional[str] = None
+    predecessor_artifacts: list[Artifact] = Field(default_factory=list)
     purpose: str = "execute"
+    review_feedback: str | None = None
     # Optional live stream plus provider-neutral terminal transport. Local
     # harnesses use a true PTY; future cloud adapters can expose equivalent
     # event/input semantics without changing the graph or worker protocol.
@@ -114,6 +119,10 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             f"project_id={ctx.node.project_id}",
             f"node_id={ctx.node.id}",
             f"repo={ctx.repo_path or ''}",
+            f"project_repo={ctx.project_repo_path or ctx.repo_path or ''}",
+            f"purpose={ctx.purpose}",
+            f"review_feedback={ctx.review_feedback or ''}",
+            f"predecessor_artifacts={json.dumps([item.model_dump(mode='json') for item in ctx.predecessor_artifacts])}",
         ])
 
     skill_names = _capability_skill_names(ctx)
@@ -127,6 +136,10 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         f"node_id={ctx.node.id}",
         f"role={agent.type_id.value}",
         f"repo={ctx.repo_path or ''}",
+        f"project_repo={ctx.project_repo_path or ctx.repo_path or ''}",
+        f"purpose={ctx.purpose}",
+        f"review_feedback={ctx.review_feedback or ''}",
+        f"predecessor_artifacts={json.dumps([item.model_dump(mode='json') for item in ctx.predecessor_artifacts])}",
         f"harness={agent.harness.value}",
         f"model={agent.model or ''}",
         f"reasoning={agent.reasoning.value}",

@@ -5,8 +5,10 @@ import sys
 import uuid
 from types import SimpleNamespace
 
+import pytest
+
 from turn.tests.mocks import MockHerdrAdapter
-from turn.workers.herdr import HerdrCliAdapter
+from turn.workers.herdr import HerdrAdapterError, HerdrCliAdapter, HerdrResourceNotFound
 from turn.workers.terminal import HerdrPtyTransport, LocalPtyTransport
 
 
@@ -250,6 +252,47 @@ async def test_herdr_replaces_an_externally_closed_workspace_mapping(tmp_path):
     assert await adapter.get_workspace(replacement)
 
 
+async def test_herdr_keeps_a_durable_pane_mapping_on_transient_permission_error(tmp_path):
+    class StalePaneAdapter(MockHerdrAdapter):
+        async def get_pane(self, pane_id: str):
+            raise HerdrAdapterError(
+                f"Error: Os {{ kind: PermissionDenied, message: Operation not permitted }} for {pane_id}"
+            )
+
+    transport = HerdrPtyTransport(str(tmp_path), adapter=StalePaneAdapter())
+
+    assert await transport._pane_exists("w-stale:p1")
+
+
+async def test_herdr_retry_forces_new_command_when_pane_close_is_denied(tmp_path):
+    class DeferredCloseAdapter(MockHerdrAdapter):
+        async def close_pane(self, pane_id: str):
+            del pane_id
+            raise HerdrAdapterError("Operation not permitted")
+
+    adapter = DeferredCloseAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    node_id = uuid.uuid4()
+    await transport.ensure_persistent_shell(
+        node_id,
+        cwd=str(tmp_path),
+        environment={"TURN_PROJECT_ID": "project-1"},
+    )
+
+    assert await transport.close_persistent_session(node_id)
+    assert node_id in transport._fresh_launch_nodes
+    assert transport.pane_id(node_id) is not None
+    assert not await transport.has_persistent_session(node_id)
+
+
+def test_herdr_cli_keeps_permission_errors_visible_for_lookup_commands():
+    with pytest.raises(HerdrAdapterError, match="Operation not permitted"):
+        HerdrCliAdapter._raise_command_error(
+            "Error: Os { kind: PermissionDenied, message: Operation not permitted }",
+            ("pane", "get", "w-stale:p1"),
+        )
+
+
 async def test_herdr_scroll_targets_the_node_pane_not_the_control_stream(tmp_path):
     adapter = MockHerdrAdapter()
     transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
@@ -317,6 +360,15 @@ def test_herdr_transport_is_available_from_an_external_turn_server(tmp_path, mon
     ]
 
 
+def test_herdr_adapter_is_a_client_and_never_owns_daemon_lifecycle():
+    adapter = HerdrCliAdapter("herdr")
+
+    assert adapter.command("workspace", "list") == ["herdr", "workspace", "list"]
+    assert "server" not in adapter.command("workspace", "list")
+    assert not hasattr(adapter, "start")
+    assert not hasattr(adapter, "stop")
+
+
 def test_herdr_transport_scopes_nodes_to_project_workspaces(tmp_path):
     transport = HerdrPtyTransport(str(tmp_path), adapter=HerdrCliAdapter("herdr"))
     assert transport._project_key(str(tmp_path), {"TURN_PROJECT_ID": "project-1"}) == "project-1"
@@ -342,6 +394,45 @@ async def test_herdr_atomic_pane_commands_accept_empty_cli_responses(tmp_path):
         "pane send-keys w1:p1 ctrl+c",
         "pane run w1:p1 export X=1; codex",
     ]
+
+
+async def test_herdr_resource_existence_uses_get_surfaces(tmp_path):
+    binary = tmp_path / "herdr"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  'workspace get w1') printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"w1\",\"label\":\"demo\",\"pane_count\":1,\"tab_count\":1}}}' ;;\n"
+        "  'pane get w1:p1') printf '%s\\n' '{\"result\":{\"pane\":{\"pane_id\":\"w1:p1\"}}}' ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    adapter = HerdrCliAdapter(str(binary))
+
+    workspace = await adapter.get_workspace("w1")
+    pane = await adapter.get_pane("w1:p1")
+
+    assert workspace.workspace_id == "w1"
+    assert pane.pane_id == "w1:p1"
+
+
+async def test_herdr_workspace_snapshot_reads_all_projects_once(tmp_path):
+    adapter = MockHerdrAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    await transport.ensure_project_workspace("project-1", cwd=str(tmp_path))
+    calls = 0
+    original = adapter.list_workspaces
+
+    async def counted_list():
+        nonlocal calls
+        calls += 1
+        return await original()
+
+    adapter.list_workspaces = counted_list
+    states = await transport.project_workspace_states({"project-1", "project-2"})
+
+    assert states == {"project-1": "mapped", "project-2": "unmapped"}
+    assert calls == 1
 
 
 async def test_herdr_output_wait_uses_native_wait_command(tmp_path):

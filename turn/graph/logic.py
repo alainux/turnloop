@@ -22,6 +22,7 @@ from turn.domain.schemas import (
     VerificationDecision,
     VerificationResult,
 )
+from turn.domain.organization import ManagerPhase, OrganizationScale
 
 
 @dataclass
@@ -120,6 +121,22 @@ def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
 def _execution_container_ids(idx: Indexes) -> set:
     """Return every node that contains a nested workflow."""
     return set(idx.children)
+
+
+def _requires_manager_acceptance(node: Node) -> bool:
+    """Whether a derived container completion must be approved by its manager.
+
+    Material planner boundaries are organizations, not ordinary structural
+    containers. Their completed leaves only prove that the current frontier
+    settled; the boundary is a usable predecessor after its manager accepts
+    the charter and evidence.
+    """
+    contract = node.organization_contract
+    return (
+        node.executor == "planner"
+        and contract is not None
+        and contract.scale is not OrganizationScale.FOCUSED
+    )
 
 
 def is_runnable(
@@ -308,9 +325,13 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             d for d in active_leaves
             if d.status == NodeStatus.COMPLETE
         ]
+        settled = active_leaves and len(done) == len(active_leaves)
+        manager_accepted = n.manager_phase is ManagerPhase.ACCEPTED
         status[n.id] = (
             NodeStatus.COMPLETE
-            if active_leaves and len(done) == len(active_leaves)
+            if settled and (
+                not _requires_manager_acceptance(n) or manager_accepted
+            )
             else n.status
         )
 
@@ -321,7 +342,21 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             status[n.id] = NodeStatus.RUNNABLE
             reason[n.id] = "ok"
         else:
-            if n.status in (
+            if (
+                n.id in container_ids
+                and _requires_manager_acceptance(n)
+                and n.manager_phase is not ManagerPhase.ACCEPTED
+                and n.status not in {
+                    NodeStatus.FAILED,
+                    NodeStatus.BLOCKED,
+                    NodeStatus.CANCELLED,
+                }
+            ):
+                # A persisted COMPLETE can be stale when the manager review
+                # is still pending. Keep the boundary visibly expanded so a
+                # parent integrator cannot consume an unaccepted organization.
+                status[n.id] = NodeStatus.EXPANDED
+            elif n.status in (
                 NodeStatus.COMPLETE,
                 NodeStatus.FAILED,
                 NodeStatus.CANCELLED,
@@ -356,9 +391,17 @@ def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:
             progress[n.id] = 1.0 if all(d.status == NodeStatus.COMPLETE for d in leaves) else 0.0
         else:
             progress[n.id] = len(done) / total
-        if total > 0 and len(done) == total:
+        manager_gate_open = (
+            not _requires_manager_acceptance(n)
+            or n.manager_phase is ManagerPhase.ACCEPTED
+        )
+        if total > 0 and len(done) == total and manager_gate_open:
             status[n.id] = NodeStatus.COMPLETE
-        elif n.status not in (NodeStatus.CANCELLED, NodeStatus.FAILED):
+        elif n.status not in (
+            NodeStatus.CANCELLED,
+            NodeStatus.FAILED,
+            NodeStatus.BLOCKED,
+        ):
             # Container completion is derived, never sticky. A newly forked,
             # input-blocked descendant reopens its parents
             # until that work is genuinely settled.

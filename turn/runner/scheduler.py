@@ -10,6 +10,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 from turn.config import Settings
 from turn.db.store import Store
@@ -35,6 +36,8 @@ class Scheduler:
         finalize: Callable[[Node], Awaitable[None]],
         wake: Callable[[], None],
         is_externally_busy: Callable[[uuid.UUID], bool] | None = None,
+        isolation_available: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
+        request_review: Callable[[uuid.UUID, str], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -47,12 +50,17 @@ class Scheduler:
         # must not launch a second command for the same node while that
         # continuation is receiving verifier feedback.
         self._is_externally_busy = is_externally_busy or (lambda _node_id: False)
+        self._isolation_available = isolation_available
+        self._request_review = request_review
         self.running: dict[uuid.UUID, asyncio.Task] = {}
         self.running_projects: dict[uuid.UUID, uuid.UUID] = {}
         self.retries: dict[uuid.UUID, int] = {}
         self.manual_stages: dict[uuid.UUID, set[uuid.UUID]] = {}
         self.last_launch_at: dict[uuid.UUID, float] = {}
         self.deleting_projects: set[uuid.UUID] = set()
+        self._budget_notifications: set[uuid.UUID] = set()
+        self._workspace_notifications: set[uuid.UUID] = set()
+        self._organization_budget_notifications: set[tuple[uuid.UUID, uuid.UUID]] = set()
 
     def set_executor(
         self,
@@ -95,6 +103,176 @@ class Scheduler:
             and (project_id is None or self.running_projects.get(node_id) == project_id)
         )
 
+    def _active_count(self, project_id: uuid.UUID | None = None) -> int:
+        return len(self.active_node_ids(project_id))
+
+    @staticmethod
+    def _apply_organization_limit(
+        project_limit: int,
+        organization_contract,
+    ) -> int:
+        """Apply an explicit organization cap while preserving inheritance."""
+        if organization_contract is None:
+            return project_limit
+        limit = organization_contract.budget.max_active_workers
+        return min(project_limit, limit) if limit is not None else project_limit
+
+    def _organization_capacity_available(
+        self, node: Node, walker: GraphWalker, active: set[uuid.UUID]
+    ) -> bool:
+        """Enforce the closest applicable planner budgets by simple counting."""
+        boundaries = [
+            *walker.ancestors(node.id),
+            *([node] if node.executor == "planner" else []),
+        ]
+        for boundary in boundaries:
+            contract = boundary.organization_contract
+            if contract is None:
+                continue
+            owned = {candidate.id for candidate in walker.descendants(boundary.id)}
+            owned.add(boundary.id)
+            limit = contract.budget.max_active_workers
+            if limit is not None and sum(candidate in active for candidate in owned) >= limit:
+                return False
+        return True
+
+    async def _budget_reason(self, root: Node) -> str | None:
+        policy = root.run_policy
+        if policy is None:
+            return None
+        runs = await self.store.get_project_runs(root.project_id)
+        if policy.max_total_runs is not None and len(runs) >= policy.max_total_runs:
+            return f"max_total_runs={policy.max_total_runs} reached"
+        input_tokens = sum(run.usage.input_tokens for run in runs)
+        if policy.max_input_tokens is not None and input_tokens >= policy.max_input_tokens:
+            return f"max_input_tokens={policy.max_input_tokens} reached"
+        output_tokens = sum(run.usage.output_tokens for run in runs)
+        if policy.max_output_tokens is not None and output_tokens >= policy.max_output_tokens:
+            return f"max_output_tokens={policy.max_output_tokens} reached"
+        if policy.max_cost_usd is not None:
+            cost = sum(run.usage.cost_usd or 0 for run in runs)
+            if cost >= policy.max_cost_usd:
+                return f"max_cost_usd={policy.max_cost_usd} reached"
+        if policy.max_wall_time_seconds is not None and runs:
+            started = min(run.started_at for run in runs)
+            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            if elapsed >= policy.max_wall_time_seconds:
+                return (
+                    "max_wall_time_seconds="
+                    f"{policy.max_wall_time_seconds} reached"
+                )
+        contract = root.organization_contract
+        if contract is not None:
+            budget = contract.budget
+            if budget.max_total_runs is not None and len(runs) >= budget.max_total_runs:
+                return f"organization max_total_runs={budget.max_total_runs} reached"
+            total_tokens = sum(
+                run.usage.input_tokens + run.usage.output_tokens for run in runs
+            )
+            if budget.max_tokens is not None and total_tokens >= budget.max_tokens:
+                return f"organization max_tokens={budget.max_tokens} reached"
+            if budget.max_input_tokens is not None and input_tokens >= budget.max_input_tokens:
+                return f"organization max_input_tokens={budget.max_input_tokens} reached"
+            if budget.max_output_tokens is not None and output_tokens >= budget.max_output_tokens:
+                return f"organization max_output_tokens={budget.max_output_tokens} reached"
+            if budget.max_cost_usd is not None and (
+                sum(run.usage.cost_usd or 0 for run in runs) >= budget.max_cost_usd
+            ):
+                return f"organization max_cost_usd={budget.max_cost_usd} reached"
+            if budget.max_wall_time_seconds is not None and runs:
+                started = min(run.started_at for run in runs)
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                if elapsed >= budget.max_wall_time_seconds:
+                    return (
+                        "organization max_wall_time_seconds="
+                        f"{budget.max_wall_time_seconds} reached"
+                    )
+        return None
+
+    async def _workspace_project_limit(self, root: Node, limit: int) -> int:
+        """Serialize mutating work when Git cannot safely isolate it."""
+        policy = root.run_policy
+        if (
+            policy is None
+            or policy.workspace_isolation.value != "worktree"
+            or self._isolation_available is None
+        ):
+            return limit
+        available = await self._isolation_available(root.project_id)
+        if available:
+            self._workspace_notifications.discard(root.project_id)
+            return limit
+        if root.project_id not in self._workspace_notifications:
+            self._workspace_notifications.add(root.project_id)
+            await self._emit(
+                "organization.workspace.serialized",
+                root.project_id,
+                {
+                    "project_id": str(root.project_id),
+                    "reason": "Git worktree isolation unavailable; mutating execution is serialized",
+                },
+            )
+        return min(limit, 1)
+
+    async def _organization_budget_reason(
+        self, node: Node, walker: GraphWalker
+    ) -> tuple[uuid.UUID, str] | None:
+        """Check hard usage budgets on every planner boundary owning a node."""
+        boundaries = [
+            *walker.ancestors(node.id),
+            *([node] if node.executor == "planner" else []),
+        ]
+        runs = await self.store.get_project_runs(node.project_id)
+        for boundary in boundaries:
+            contract = boundary.organization_contract
+            if contract is None:
+                continue
+            owned = {candidate.id for candidate in walker.descendants(boundary.id)}
+            owned.add(boundary.id)
+            scoped = [run for run in runs if run.node_id in owned]
+            budget = contract.budget
+            if budget.max_total_runs is not None and len(scoped) >= budget.max_total_runs:
+                return boundary.id, f"organization max_total_runs={budget.max_total_runs} reached"
+            input_tokens = sum(run.usage.input_tokens for run in scoped)
+            output_tokens = sum(run.usage.output_tokens for run in scoped)
+            total_tokens = input_tokens + output_tokens
+            cost = sum(run.usage.cost_usd or 0 for run in scoped)
+            if budget.max_tokens is not None and total_tokens >= budget.max_tokens:
+                return boundary.id, f"organization max_tokens={budget.max_tokens} reached"
+            if budget.max_input_tokens is not None and input_tokens >= budget.max_input_tokens:
+                return boundary.id, f"organization max_input_tokens={budget.max_input_tokens} reached"
+            if budget.max_output_tokens is not None and output_tokens >= budget.max_output_tokens:
+                return boundary.id, f"organization max_output_tokens={budget.max_output_tokens} reached"
+            if budget.max_cost_usd is not None and cost >= budget.max_cost_usd:
+                return boundary.id, f"organization max_cost_usd={budget.max_cost_usd} reached"
+            if budget.max_wall_time_seconds is not None and scoped:
+                started = min(run.started_at for run in scoped)
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                if elapsed >= budget.max_wall_time_seconds:
+                    return (
+                        boundary.id,
+                        "organization max_wall_time_seconds="
+                        f"{budget.max_wall_time_seconds} reached",
+                    )
+        return None
+
+    async def _notify_budget(self, project_id: uuid.UUID, boundary_id: uuid.UUID, reason: str) -> None:
+        key = (project_id, boundary_id)
+        if key in self._organization_budget_notifications:
+            return
+        self._organization_budget_notifications.add(key)
+        await self._emit(
+            "organization.budget.exhausted",
+            project_id,
+            {
+                "project_id": str(project_id),
+                "organization_id": str(boundary_id),
+                "reason": reason,
+            },
+        )
+        if self._request_review is not None:
+            await self._request_review(boundary_id, f"budget exhausted: {reason}")
+
     async def wait_for_idle(self, project_id: uuid.UUID | None = None) -> None:
         while True:
             tasks = [
@@ -110,11 +288,33 @@ class Scheduler:
     async def schedule_once(self, project_id: uuid.UUID) -> None:
         if project_id in self.deleting_projects:
             return
+        root_snapshot = await self.store.get_node(project_id)
+        if root_snapshot is not None and root_snapshot.auto_run:
+            project_limit = root_snapshot.run_policy.max_parallel_agents if root_snapshot.run_policy else getattr(
+                self.settings, "max_parallel_agents", 4
+            )
+            if root_snapshot.organization_contract is not None:
+                project_limit = self._apply_organization_limit(
+                    project_limit, root_snapshot.organization_contract
+                )
+            project_limit = await self._workspace_project_limit(
+                root_snapshot, project_limit
+            )
+            available = min(
+                project_limit - self._active_count(project_id),
+                getattr(self.settings, "max_parallel_agents", project_limit) - self._active_count(),
+            )
+            if available > 0:
+                await self.store.materialize_ready_work_items(
+                    project_id,
+                    limit=available,
+                )
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return
 
         active = {node_id for node_id, task in self.running.items() if not task.done()}
+        active.update(node.id for node in nodes if self._is_externally_busy(node.id))
         await self.store.cancel_orphaned_runs(project_id, active)
         by_id = {node.id: node for node in nodes}
 
@@ -176,7 +376,12 @@ class Scheduler:
         if root is not None and root.status in (NodeStatus.EXPANDED, NodeStatus.COMPLETE):
             settled = all(
                 evaluation.status.get(node.id)
-                in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED)
+                in (
+                    NodeStatus.COMPLETE,
+                    NodeStatus.FAILED,
+                    NodeStatus.BLOCKED,
+                    NodeStatus.CANCELLED,
+                )
                 for node in nodes
                 if node.id != project_id
             )
@@ -190,7 +395,38 @@ class Scheduler:
         if delay_ms and time.monotonic() - self.last_launch_at.get(project_id, 0) < delay_ms / 1000:
             return
 
-        runnable_order = [
+        budget_reason = await self._budget_reason(root)
+        if budget_reason is not None:
+            if project_id not in self._budget_notifications:
+                self._budget_notifications.add(project_id)
+                await self._emit(
+                    "organization.budget.exhausted",
+                    project_id,
+                    {"project_id": str(project_id), "reason": budget_reason},
+                )
+                if self._request_review is not None:
+                    await self._request_review(root.id, f"budget exhausted: {budget_reason}")
+            return
+        self._budget_notifications.discard(project_id)
+        project_limit = policy.max_parallel_agents if policy else getattr(
+            self.settings, "max_parallel_agents", 4
+        )
+        if root.organization_contract is not None:
+            project_limit = self._apply_organization_limit(
+                project_limit, root.organization_contract
+            )
+        project_limit = await self._workspace_project_limit(root, project_limit)
+        global_limit = max(1, getattr(self.settings, "max_parallel_agents", project_limit))
+
+        topo_index = {
+            candidate.id: index for index, candidate in enumerate(walker.topological())
+        }
+        priority_by_node = {
+            item.node_id: item.priority
+            for item in await self.store.list_work_items(project_id)
+            if item.node_id is not None
+        }
+        runnable_order = sorted([
             candidate.id
             for candidate in walker.topological()
             if candidate.id in evaluation.runnable
@@ -198,10 +434,14 @@ class Scheduler:
                 candidate.id not in trigger_targets
                 or candidate.trigger_context is not None
             )
-        ]
+        ], key=lambda node_id: (-priority_by_node.get(node_id, 0), topo_index[node_id]))
+        project_active = self._active_count(project_id)
+        global_active = self._active_count()
         for node_id in runnable_order:
             if project_id in self.deleting_projects:
                 return
+            if project_active >= project_limit or global_active >= global_limit:
+                break
             if self._is_externally_busy(node_id):
                 continue
             if node_id in self.running:
@@ -215,7 +455,16 @@ class Scheduler:
                 NodeStatus.EXPANDED,
             } or node.paused:
                 continue
+            if not self._organization_capacity_available(node, walker, active):
+                continue
+            budget = await self._organization_budget_reason(node, walker)
+            if budget is not None:
+                await self._notify_budget(project_id, budget[0], budget[1])
+                continue
             self.reserve(node, project_id)
+            active.add(node_id)
+            project_active += 1
+            global_active += 1
             await self._emit("node.updated", project_id, _dump(node))
             self.last_launch_at[project_id] = time.monotonic()
             if delay_ms:
@@ -228,6 +477,28 @@ class Scheduler:
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return []
+        root_snapshot = next((node for node in nodes if node.id == project_id), None)
+        if root_snapshot is not None:
+            project_limit = root_snapshot.run_policy.max_parallel_agents if root_snapshot.run_policy else getattr(
+                self.settings, "max_parallel_agents", 4
+            )
+            if root_snapshot.organization_contract is not None:
+                project_limit = self._apply_organization_limit(
+                    project_limit, root_snapshot.organization_contract
+                )
+            project_limit = await self._workspace_project_limit(
+                root_snapshot, project_limit
+            )
+            available = min(
+                project_limit - self._active_count(project_id),
+                getattr(self.settings, "max_parallel_agents", project_limit) - self._active_count(),
+            )
+            if available > 0:
+                await self.store.materialize_ready_work_items(
+                    project_id,
+                    limit=available,
+                )
+                nodes, edges, _ = await self.store.get_workgraph(project_id)
 
         stage = self.manual_stages.get(project_id)
         if stage:
@@ -236,7 +507,13 @@ class Scheduler:
                 node_id not in self.running
                 and current.get(node_id) is not None
                 and current[node_id].status
-                in (NodeStatus.COMPLETE, NodeStatus.FAILED, NodeStatus.CANCELLED, NodeStatus.EXPANDED)
+                in (
+                    NodeStatus.COMPLETE,
+                    NodeStatus.FAILED,
+                    NodeStatus.BLOCKED,
+                    NodeStatus.CANCELLED,
+                    NodeStatus.EXPANDED,
+                )
                 for node_id in stage
             )
             if not settled:
@@ -250,6 +527,35 @@ class Scheduler:
             for trigger in await self.store.list_triggers(project_id)
             if trigger.enabled
         }
+        policy = next((node.run_policy for node in nodes if node.id == project_id), None)
+        root = next((node for node in nodes if node.id == project_id), None)
+        if root is None:
+            return []
+        budget_reason = await self._budget_reason(root)
+        if budget_reason is not None:
+            if project_id not in self._budget_notifications:
+                self._budget_notifications.add(project_id)
+                await self._emit(
+                    "organization.budget.exhausted",
+                    project_id,
+                    {"project_id": str(project_id), "reason": budget_reason},
+                )
+                if self._request_review is not None:
+                    await self._request_review(root.id, f"budget exhausted: {budget_reason}")
+            return []
+        self._budget_notifications.discard(project_id)
+        project_limit = policy.max_parallel_agents if policy else getattr(
+            self.settings, "max_parallel_agents", 4
+        )
+        if root.organization_contract is not None:
+            project_limit = self._apply_organization_limit(
+                project_limit, root.organization_contract
+            )
+        project_limit = await self._workspace_project_limit(root, project_limit)
+        available = max(0, min(
+            project_limit - self._active_count(project_id),
+            getattr(self.settings, "max_parallel_agents", project_limit) - self._active_count(),
+        ))
         stage_nodes = [
             node
             for node in walker.topological()
@@ -262,11 +568,30 @@ class Scheduler:
         if not stage_nodes:
             return []
 
+        stage_nodes = stage_nodes[:available]
+        if not stage_nodes:
+            return []
+
+        stage_active = set(self.active_node_ids())
+        selected: list[Node] = []
+        for node in stage_nodes:
+            if not self._organization_capacity_available(node, walker, stage_active):
+                continue
+            budget = await self._organization_budget_reason(node, walker)
+            if budget is not None:
+                await self._notify_budget(project_id, budget[0], budget[1])
+                continue
+            selected.append(node)
+            stage_active.add(node.id)
+        stage_nodes = selected
+        if not stage_nodes:
+            return []
         self.manual_stages[project_id] = {node.id for node in stage_nodes}
         for node in stage_nodes:
             if project_id in self.deleting_projects:
                 self.manual_stages.pop(project_id, None)
                 return []
             self.reserve(node, project_id)
+            stage_active.add(node.id)
             await self._emit("node.updated", project_id, _dump(node))
         return [node.id for node in stage_nodes]

@@ -47,6 +47,9 @@ the path matters as much as the final artifact.
 | Project authoring | Prompt-first creation, project explorer, attachments, and working-directory selection |
 | Workgraph | A deterministic left-to-right graph with explicit sequencing, fan-out, and fan-in |
 | Execution | Auto/step policies, retries, timeouts, cancellation, recovery, and human-input gates |
+| Organizations | Durable charters, independent plan audits, recursive manager review, and replan boundaries |
+| Units of work | Priority-ordered tickets with acceptance criteria, dependencies, evidence, and typed handoffs |
+| Capacity | Project/global parallel limits, run/token/cost budgets, and optional isolated Git worktrees |
 | Agent workspace | Durable PTY-backed terminals, reconnectable sessions, and provider-neutral transport |
 | Evidence | Document view, logs, artifacts, diffs, token/cost usage, and server-projected UI state |
 | Harnesses | Codex, Claude Code, OpenCode, and Pi adapters with local availability detection |
@@ -76,6 +79,21 @@ new providers, scheduling policies, and evidence types can be added without
 making the UI own orchestration state. The graph also models derived flow
 edges, such as review rejection returns, separately from the durable workflow
 topology.
+
+For a broad objective, the root is a persistent organization boundary rather
+than a one-shot checklist. Its charter records the desired outcome, deliverables,
+acceptance criteria, constraints, quality and decomposition policy, and budget.
+The runtime audits each proposed composition before applying it, materializes
+work items and handoffs, schedules only within capacity, and reviews settled
+frontiers through:
+
+```text
+PLAN → EXECUTE FRONTIER → OBSERVE → REVIEW → REPLAN → … → ACCEPT CHARTER
+```
+
+The `Store` owns this state on disk; `OrganizationManager` owns the review
+decision; `Scheduler` owns reservation and budget enforcement; and the REST/CLI
+surfaces expose the same records for humans and agents.
 
 ## Screenshots
 
@@ -139,8 +157,13 @@ The main boundaries are deliberately small:
 
 - Python 3.11+
 - Node.js and npm
-- Herdr for project terminals
+- A running Herdr daemon for project terminals
 - At least one supported coding harness installed locally for real runs
+
+Herdr is an external, user-owned daemon. Turn connects to it through the
+`herdr` client CLI and never starts, stops, or restarts the daemon. Verify the
+existing service with `herdr status server` before starting Turn; do not run
+`herdr server` as part of the Turn launch procedure.
 
 ### Install and start
 
@@ -148,7 +171,6 @@ The main boundaries are deliberately small:
 python -m pip install -e ".[dev]"
 npm install
 npm run build
-herdr                    # start or attach the default Herdr service
 ./scripts/run.sh         # start Turn at http://127.0.0.1:8000
 ```
 
@@ -171,6 +193,10 @@ turn create "Build an adaptive narrative engine" --harness codex --run
 turn projects
 turn graph PROJECT_UUID --tree
 turn run PROJECT_UUID
+turn organization show PROJECT_UUID
+turn work list PROJECT_UUID
+turn work claim WORK_ITEM_UUID --node-id NODE_UUID
+turn work update WORK_ITEM_UUID --status COMPLETE --evidence-ref tests/report.json
 turn logs PROJECT_UUID                 # stitched JSONL event history
 turn logs PROJECT_UUID --search error  # free-text search
 turn logs PROJECT_UUID --follow         # JSONL live feed; pipe to jq or another reader
@@ -277,10 +303,16 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Composable graph
 - [x] Triggers
 - [x] Run Quality Dashboard / Metrics
+- [x] Organization contracts / independent plan audit
+- [x] Persistent organization review loop
+- [x] Tickets / units of work / typed handoffs
+- [x] Concurrency and run/token/cost budgets
+- [x] Worktree isolation and explicit merge boundary
+- [x] Organization-fitness metrics
+- [x] Worktrees
 - [ ] Multi-graph projects
-- [ ] Variables / Handoffs / Data passing between nodes
+- [ ] Variables / General data passing between nodes
 - [ ] Repeatable organizations - Skipped / Locked nodes that can be re-run with new data
-- [ ] Tickets board / Units of work / Spec-driven execution
 - [ ] Decision-based Routing for nodes 
 - [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management for Running Processes
 - [ ] Loops / Goals / Hill-climbing with visual feedback and metrics
@@ -292,10 +324,9 @@ is the product, architecture, scope, operation, and verification guide.
 - [ ] In-host multiplexer
 - [ ] Tmux
 - [ ] Ghostty Web
-- [ ] Worktrees
 - [ ] Security / Sandboxes / Permission boundaries
 - [ ] Website / Demos - Capabilities, MCPs, and Skills
 - [ ] Architecture / Hygiene & Cleanups
 - [ ] Plugins / Extensions / Hooks
-- [ ] Evals
+- [ ] Product/domain eval packs
 - [ ] Phoenix integration

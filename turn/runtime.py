@@ -117,6 +117,13 @@ class TurnRuntime:
                 terminal_transport=self._terminal_transport,
                 trigger_dispatcher=self.triggers,
             )
+            if not self.test_mode:
+                # Production organization boundaries receive a fresh semantic
+                # plan audit and a retained-session manager review. Test mode
+                # stays provider-neutral unless a test injects callbacks into
+                # Runner directly.
+                self.runner.provider_reviews_enabled = True
+                self.runner.manager_reviewer = self.runner._provider_manager_review
             self.triggers.set_wake(self.runner.wake)
             await self.runner.start()
             await self.triggers.start()

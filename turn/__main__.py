@@ -20,6 +20,7 @@ from turn.contracts.dag import (
 )
 from turn.core import TurnCore
 from turn.domain.schemas import AgentConfig, HarnessKind, Node, ReasoningLevel, RunPolicy
+from turn.domain.organization import WorkItemStatus
 from turn.logging import EventLog
 
 
@@ -67,6 +68,46 @@ def parser() -> argparse.ArgumentParser:
     )
     graph.add_argument("--format", choices=["tree", "json"], default="json")
     graph.add_argument("--tree", action="store_const", dest="format", const="tree")
+    work = sub.add_parser(
+        "work", aliases=["tickets"], help="inspect and update durable units of work"
+    )
+    work_sub = work.add_subparsers(dest="work_command", required=True)
+    work_list = work_sub.add_parser("list", help="list project work items")
+    work_list.add_argument("project_id", type=uuid.UUID, nargs="?")
+    work_list.add_argument("--organization-id", type=uuid.UUID)
+    work_list.add_argument("--status", choices=[item.value for item in WorkItemStatus])
+    work_list.add_argument("--format", choices=["json", "text"], default="json")
+    work_create = work_sub.add_parser("create", help="create a typed unit of work")
+    work_create.add_argument("title")
+    work_create.add_argument("objective")
+    work_create.add_argument("--project-id", type=uuid.UUID)
+    work_create.add_argument("--organization-id", type=uuid.UUID)
+    work_create.add_argument("--node-id", type=uuid.UUID)
+    work_create.add_argument("--acceptance", action="append", default=[])
+    work_create.add_argument("--priority", type=int, default=0)
+    work_create.add_argument("--depends-on", type=uuid.UUID, action="append", default=[])
+    work_create.add_argument("--agent-type", default="executor")
+    work_create.add_argument("--format", choices=["json", "text"], default="json")
+    work_claim = work_sub.add_parser("claim", help="claim a ready or backlog work item")
+    work_claim.add_argument("work_item_id", type=uuid.UUID)
+    work_claim.add_argument("--node-id", type=uuid.UUID)
+    work_claim.add_argument("--format", choices=["json", "text"], default="json")
+    work_update = work_sub.add_parser("update", help="update work status or evidence")
+    work_update.add_argument("work_item_id", type=uuid.UUID)
+    work_update.add_argument("--status", choices=[item.value for item in WorkItemStatus])
+    work_update.add_argument("--priority", type=int)
+    work_update.add_argument("--claimed-by", type=uuid.UUID)
+    work_update.add_argument("--rejection-reason")
+    work_update.add_argument("--evidence-ref", action="append")
+    work_update.add_argument("--artifact-ref", type=uuid.UUID, action="append")
+    work_update.add_argument("--format", choices=["json", "text"], default="json")
+    organization = sub.add_parser(
+        "organization", aliases=["org"], help="inspect organization contracts and fitness"
+    )
+    organization_sub = organization.add_subparsers(dest="organization_command", required=True)
+    organization_show = organization_sub.add_parser("show", help="show organization metrics and audits")
+    organization_show.add_argument("project_id", type=uuid.UUID, nargs="?")
+    organization_show.add_argument("--format", choices=["json", "text"], default="json")
     run = sub.add_parser("run", help="execute a project headlessly until settled")
     run.add_argument("project_id", type=uuid.UUID)
     logs = sub.add_parser("logs", help="read a project's stitched JSONL event history")
@@ -276,7 +317,13 @@ def _emit_cli_event(
 
 def _cli_action(args: argparse.Namespace) -> str:
     parts = [str(args.command)]
-    for name in ("agent_command", "capabilities_command", "project_command"):
+    for name in (
+        "agent_command",
+        "capabilities_command",
+        "project_command",
+        "work_command",
+        "organization_command",
+    ):
         value = getattr(args, name, None)
         if value:
             parts.append(str(value))
@@ -289,12 +336,21 @@ def _cli_invocation_data(args: argparse.Namespace) -> dict[str, object]:
         "node_id": os.getenv("TURN_NODE_ID"),
         "command": _cli_action(args),
     }
-    for name in ("kind", "state", "query", "capability", "format", "project_id", "graph_file", "force", "event_name", "node_id"):
+    for name in (
+        "kind", "state", "query", "capability", "format", "project_id", "graph_file",
+        "force", "event_name", "node_id", "work_item_id", "organization_id", "status",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             data[name] = value
     argv = ["turn", str(args.command)]
-    for name in ("agent_command", "capabilities_command", "project_command"):
+    for name in (
+        "agent_command",
+        "capabilities_command",
+        "project_command",
+        "work_command",
+        "organization_command",
+    ):
         value = getattr(args, name, None)
         if value:
             argv.append(str(value))
@@ -692,6 +748,183 @@ def local_project_info_command(args) -> int:
     return 0
 
 
+def _required_cli_project_id(args: argparse.Namespace) -> uuid.UUID:
+    raw = _cli_project_id(args)
+    if not raw:
+        raise SystemExit(
+            "project_id is required unless this command runs inside a Turn project"
+        )
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError as error:
+        raise SystemExit(f"invalid project id: {raw}") from error
+
+
+def _print_work_item(item, output_format: str) -> None:
+    payload = item.model_dump(mode="json")
+    if output_format == "text":
+        print(f"{payload['id']}  {payload['status']:>9}  P{payload['priority']:>4}  {payload['title']}")
+        if payload["acceptance_criteria"]:
+            print(
+                "  acceptance: "
+                + "; ".join(
+                    item.get("description", str(item))
+                    if isinstance(item, dict)
+                    else str(item)
+                    for item in payload["acceptance_criteria"]
+                )
+            )
+        if payload["evidence_refs"]:
+            print("  evidence: " + "; ".join(payload["evidence_refs"]))
+        return
+    print(json.dumps(payload, indent=2))
+
+
+async def work_command(args) -> int:
+    """Operate on durable units of work without starting a provider runtime."""
+    from turn.db.store import Store
+
+    store = Store(settings.data_dir, projects_dir=settings.projects_dir)
+    await store.init()
+    try:
+        if args.work_command == "list":
+            project_id = _required_cli_project_id(args)
+            status = WorkItemStatus(args.status) if args.status else None
+            items = await store.list_work_items(
+                project_id,
+                organization_id=args.organization_id,
+                status=status,
+            )
+            if args.format == "text":
+                for item in items:
+                    _print_work_item(item, args.format)
+            else:
+                print(json.dumps([item.model_dump(mode="json") for item in items], indent=2))
+            return 0
+
+        if args.work_command == "create":
+            project_id = _required_cli_project_id(args)
+            organization_id = args.organization_id or project_id
+            organization = await store.get_node(organization_id)
+            if organization is None or organization.project_id != project_id:
+                raise SystemExit("organization_id must identify a node in this project")
+            item = await store.create_work_item(
+                project_id=project_id,
+                organization_id=organization_id,
+                node_id=args.node_id,
+                title=args.title,
+                objective=args.objective,
+                acceptance_criteria=args.acceptance,
+                priority=args.priority,
+                depends_on=args.depends_on,
+                agent_type=args.agent_type,
+            )
+            _print_work_item(item, args.format)
+            return 0
+
+        if args.work_command == "claim":
+            item = await store.claim_work_item(args.work_item_id, args.node_id)
+            if item is None:
+                raise SystemExit("work item not found")
+            _print_work_item(item, args.format)
+            return 0
+
+        if args.work_command == "update":
+            if all(
+                value is None
+                for value in (
+                    args.status,
+                    args.priority,
+                    args.claimed_by,
+                    args.rejection_reason,
+                    args.evidence_ref,
+                    args.artifact_ref,
+                )
+            ):
+                raise SystemExit("work update requires at least one field")
+            item = await store.update_work_item(
+                args.work_item_id,
+                status=WorkItemStatus(args.status) if args.status else None,
+                priority=args.priority,
+                claimed_by=args.claimed_by,
+                rejection_reason=args.rejection_reason,
+                artifact_refs=args.artifact_ref,
+                evidence_refs=args.evidence_ref,
+            )
+            if item is None:
+                raise SystemExit("work item not found")
+            _print_work_item(item, args.format)
+            return 0
+
+        raise SystemExit(f"unsupported work command: {args.work_command}")
+    finally:
+        await store.dispose()
+
+
+async def organization_command(args) -> int:
+    """Inspect persisted charters, audits, evidence, and shape metrics."""
+    from turn.contracts.organization import audit_materialized_boundary, organization_metrics
+    from turn.db.store import Store
+    from turn.graph.logic import GraphWalker
+
+    project_id = _required_cli_project_id(args)
+    store = Store(settings.data_dir, projects_dir=settings.projects_dir)
+    await store.init()
+    try:
+        nodes, edges, _ = await store.get_workgraph(project_id)
+        root = await store.get_node(project_id)
+        if root is None:
+            raise SystemExit(f"project not found: {project_id}")
+        walker = GraphWalker(nodes, edges)
+        work_items = await store.list_work_items(project_id)
+        handoffs = await store.list_handoffs(project_id)
+        runs = await store.get_project_runs(project_id)
+        rows = []
+        for node in nodes:
+            if node.executor != "planner" or node.organization_contract is None:
+                continue
+            audit = audit_materialized_boundary(node.organization_contract, node, nodes, edges)
+            rows.append({
+                "node": node.model_dump(mode="json"),
+                "depth": walker.depth(node.id),
+                "descendant_count": len(walker.descendants(node.id)),
+                "audit": audit.model_dump(mode="json"),
+            })
+        payload = {
+            "project_id": str(project_id),
+            "metrics": organization_metrics(
+                nodes,
+                edges,
+                work_items=work_items,
+                handoffs=handoffs,
+                runs=runs,
+            ).model_dump(mode="json"),
+            "organizations": rows,
+        }
+        if args.format == "text":
+            metrics = payload["metrics"]
+            print(
+                "project {project_id}: {boundary_count} boundaries, depth {max_depth}, "
+                "{planner_count} planners, {production_leaf_count} production leaves".format(
+                    project_id=project_id,
+                    **metrics,
+                )
+            )
+            for row in rows:
+                node = row["node"]
+                audit = row["audit"]
+                print(
+                    f"- {node['id']} {node['objective']}: "
+                    f"{('accepted' if audit['accepted'] else 'rejected')} "
+                    f"score={audit['score']:.2f} depth={row['depth']}"
+                )
+            return 0
+        print(json.dumps(payload, indent=2))
+        return 0
+    finally:
+        await store.dispose()
+
+
 def _run_logged_cli(args: argparse.Namespace) -> int:
     """Run a non-protocol CLI command with an outcome event."""
     project_id = _cli_project_id(args)
@@ -738,6 +971,10 @@ async def async_main(args) -> int:
         if args.project_command == "info":
             return local_project_info_command(args)
         raise SystemExit(f"unsupported project command: {args.project_command}")
+    if args.command in {"work", "tickets"}:
+        return await work_command(args)
+    if args.command in {"organization", "org"}:
+        return await organization_command(args)
     if args.command == "doctor":
         from turn.workers.harnesses import harness_capabilities
 
@@ -785,7 +1022,13 @@ def main() -> None:
             port=getattr(args, "port", 8000),
         )
         return
-    if args.command in {"agent", "capabilities", "logs", "trigger", "event"}:
+    if args.command in {
+        "agent",
+        "capabilities",
+        "logs",
+        "trigger",
+        "event",
+    }:
         raise SystemExit(asyncio.run(async_main(args)))
     raise SystemExit(_run_logged_cli(args))
 

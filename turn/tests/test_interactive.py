@@ -1090,6 +1090,49 @@ async def test_codex_worker_native_path_round_trips_raw_ansi_and_result_file(tmp
     assert "\x1b[2J" not in json.dumps(submission.content)
 
 
+async def test_codex_worker_verifier_normalizes_structured_evidence_refs(tmp_path, monkeypatch):
+    from turn.config import Settings
+    from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, Node
+    from turn.workers.base import NodeExecutionContext
+    from turn.workers.codex_worker import CodexWorker
+    import turn.workers.codex_worker as codex_module
+
+    async def mock_run_until_result(_transport, _node_id, _command, **kwargs):
+        kwargs["result_path"].write_text(json.dumps({
+            "decision": "APPROVE",
+            "summary": "native verifier accepted",
+            "evidence_refs": [{
+                "criterion_id": "journey",
+                "status": "PASS",
+                "summary": "The complete journey passed.",
+                "refs": ["README.md"],
+            }],
+        }))
+        return TerminalResult(returncode=0, output=b"")
+
+    monkeypatch.setattr(codex_module, "run_until_result", mock_run_until_result)
+    monkeypatch.setattr(codex_module, "schedule_late_sidecar_collection", lambda *_args, **_kwargs: None)
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Verify the native result",
+        generated_prompt="Submit the verification.",
+        repo_path=str(tmp_path),
+        executor="codex",
+        agent=AgentConfig(
+            harness=HarnessKind.CODEX,
+            type_id=AgentType.VERIFIER,
+        ),
+    )
+
+    result = await CodexWorker(Settings(codex_binary="codex", codex_model="mock")).execute(
+        NodeExecutionContext(node=node, repo_path=str(tmp_path), terminal=LocalPtyTransport())
+    )
+
+    assert result.outcome.value == "COMPLETE"
+    assert result.verification is not None
+    assert result.verification.evidence[0].criterion_id == "journey"
+
+
 async def test_herdr_transport_keeps_codex_in_native_interactive_mode(tmp_path, monkeypatch):
     from turn.config import Settings
     from turn.domain.schemas import AgentConfig, HarnessKind, Node

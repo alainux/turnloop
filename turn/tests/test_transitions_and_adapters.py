@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from turn.config import Settings
 from turn.db.store import Store
 from turn.__main__ import agent_command, parser
+from turn.domain.organization import OrganizationContract, OrganizationScale
 from turn.domain.schemas import (
     AgentConfig,
     AgentType,
@@ -43,11 +44,11 @@ from turn.workers.base import NodeExecutionContext, Planner, Worker, render_cont
 from turn.workers.deterministic_worker import DeterministicWorker
 from turn.tests.mocks import MockHerdrAdapter, MockTerminalTransport
 from turn.workers.harnesses import CLIHarnessWorker, _json_text_and_session, recover_session_id
-from turn.workers.harness_catalog import HarnessCommandFactory
+from turn.workers.harness_catalog import HarnessCommandFactory, codex_project_root_flags
 import turn.workers.harnesses as harness_module
 from turn.workers import parsing
 from turn.workers.registry import WorkerRegistry
-from turn.workers.herdr import HerdrResourceNotFound
+from turn.workers.herdr import HerdrAdapterError, HerdrResourceNotFound
 from turn.workers.planner import AgentPlanner, CodexPlanner, HeuristicPlanner
 import turn.workers.planner as planner_module
 from turn.workers.terminal import LocalPtyTransport, TerminalResult
@@ -117,7 +118,10 @@ class FixedPlanner(Planner):
 
     async def plan(self, ctx):
         return PlanResult(
-            nodes=[NodeSpec(key="leaf", objective="Alternative ending", executor="codex")]
+            nodes=[NodeSpec(key="leaf", objective="Alternative ending", executor="codex")],
+            organization_contract=OrganizationContract.from_objective(
+                ctx.node.generated_prompt or ctx.node.objective
+            ),
         )
 
 
@@ -152,6 +156,9 @@ class SessionPlanner(Planner):
             await asyncio.Event().wait()
         return PlanResult(
             nodes=[NodeSpec(key="leaf", objective="Fresh branch", executor="deterministic")],
+            organization_contract=OrganizationContract.from_objective(
+                ctx.node.generated_prompt or ctx.node.objective
+            ),
             session_id=self.session_id,
         )
 
@@ -411,6 +418,7 @@ def test_reconnect_commands_use_native_provider_sessions(tmp_path):
     assert codex[1] == "resume"
     assert "exec" not in codex and "--json" not in codex
     assert "project_root_markers=[]" in codex
+    assert f'projects."{tmp_path.resolve()}".trust_level="trusted"' in codex
     assert "--thinking" not in codex
     assert "model_reasoning_effort=\"default\"" not in codex
 
@@ -680,11 +688,14 @@ async def test_cli_plan_revision_replaces_an_expanded_subtree(tmp_path, monkeypa
     args = parser().parse_args([
         "agent", "submit", "--kind", "plan", "--payload",
         json.dumps({
-            "nodes": [
-                {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
-                {"key": "write", "objective": "Write chapters", "executor": "deterministic", "follows": ["chapters"]},
-            ],
-        }),
+                "nodes": [
+                    {"key": "chapters", "objective": "Plan chapters", "executor": "planner", "plan": True},
+                    {"key": "write", "objective": "Write chapters", "executor": "deterministic", "follows": ["chapters"]},
+                ],
+                "organization_contract": OrganizationContract.from_objective(
+                    "revise the lantern"
+                ).model_dump(mode="json"),
+            }),
     ])
     assert agent_command(args) == 0
 
@@ -733,6 +744,108 @@ async def test_runner_restores_retained_handoff_watchers_after_restart(tmp_path)
         assert root.id in runner._handoff_watchers
     finally:
         await runner.stop()
+        await store.dispose()
+
+
+async def test_runner_restart_preserves_a_live_herdr_provider_run(tmp_path):
+    class RecoverableTerminal(MockTerminalTransport):
+        supports_inject = True
+
+        async def foreground_process_names(self, _node_id):
+            return ("codex",)
+
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "restart without interrupting the provider",
+        repo_path=str(tmp_path / "project"),
+        agent=AgentConfig(harness=HarnessKind.CODEX),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    root.agent.session_id = "live-codex-session"
+    root.acceptance_criteria = []
+    await store._save_node(root)
+    await store.set_status(root.id, NodeStatus.RUNNING)
+    run = await store.create_run(root, "planner")
+    terminal = RecoverableTerminal()
+    await terminal.ensure_persistent_shell(root.id, cwd=str(tmp_path / "project"))
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(data_dir=str(tmp_path / "turn"), projects_dir=str(tmp_path / "projects")),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=terminal,
+    )
+
+    await runner.start()
+    try:
+        assert root.id in runner._recovered_active_node_ids
+        await runner.schedule_once(root.id)
+        assert (await store.get_node(root.id)).status is NodeStatus.RUNNING
+        assert (await store.get_runs(root.id))[0].id == run.id
+        await runner._apply_result_revision(
+            root.id,
+            root.id,
+            WorkerResult(outcome=Outcome.COMPLETE, summary="provider completed after restart"),
+        )
+        runs = await store.get_runs(root.id)
+        assert len(runs) == 1
+        assert runs[0].status is RunStatus.COMPLETE
+        assert (await store.get_node(root.id)).status is NodeStatus.COMPLETE
+    finally:
+        await runner.stop()
+        await store.dispose()
+
+
+async def test_retained_handoff_watcher_does_not_steal_a_live_run_submission(tmp_path):
+    store = Store(tmp_path / "state")
+    await store.init()
+    root = await store.create_project(
+        "protect live handoffs",
+        repo_path=str(tmp_path / "project"),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    node = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="Verify the live submission",
+        executor="codex",
+        status=NodeStatus.RUNNING,
+        agent=AgentConfig(harness=HarnessKind.CODEX, session_id="retained-session"),
+    )
+    runner = Runner(
+        store,
+        events=EventBus(),
+        settings=Settings(),
+        herdr_adapter=MockHerdrAdapter(),
+        terminal_transport=MockTerminalTransport(),
+    )
+    live_run = asyncio.create_task(asyncio.Event().wait())
+    runner._running[node.id] = live_run
+    handoff = Path(root.repo_path) / ".turn" / "interactive" / f"{node.id}.verification.json"
+    handoff.parent.mkdir(parents=True, exist_ok=True)
+    handoff.write_text(json.dumps({
+        "decision": "APPROVE",
+        "summary": "live result",
+        "evidence_refs": ["README.md"],
+    }))
+    watcher = asyncio.create_task(
+        runner._watch_agent_handoffs(
+            node.id,
+            root.id,
+            runner._handoff_paths(root.repo_path, node.id),
+            root.repo_path,
+        )
+    )
+    try:
+        await asyncio.sleep(0.15)
+        assert handoff.exists()
+        assert await store.get_runs(node.id) == []
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        live_run.cancel()
+        await asyncio.gather(live_run, return_exceptions=True)
         await store.dispose()
 
 
@@ -912,6 +1025,24 @@ async def test_stop_cancels_an_inflight_regeneration(tmp_path):
     assert cancelled.status == NodeStatus.CANCELLED
     assert not runner.generation_active(root.id)
     assert (await store.get_runs(root.id))[-1].status == RunStatus.CANCELLED
+    await store.dispose()
+
+
+async def test_close_provider_terminal_cleans_a_stale_running_pane_after_restart(tmp_path):
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
+    runner.terminal = MockTerminalTransport()
+    root = await store.create_project(
+        "stale provider pane",
+        agent=AgentConfig(harness=HarnessKind.CODEX),
+        run_policy=RunPolicy(auto_run=False),
+    )
+    await store.set_status(root.id, NodeStatus.RUNNING)
+    await runner.terminal.ensure_persistent_shell(root.id, cwd=str(tmp_path))
+
+    assert not runner.generation_active(root.id)
+    assert await runner.close_provider_terminal(root.id)
+    assert root.id in runner.terminal.closed_nodes
+
     await store.dispose()
 
 
@@ -1096,6 +1227,33 @@ async def test_retry_prepares_a_fresh_provider_call(tmp_path):
     await store.dispose()
 
 
+async def test_retry_survives_a_deferred_herdr_pane_cleanup(tmp_path):
+    class DeferredCleanupTransport(MockTerminalTransport):
+        backend_name = "herdr"
+
+        async def close_persistent_session(self, node_id):
+            del node_id
+            raise HerdrAdapterError("Operation not permitted")
+
+    _, store, runner = await _runtime(tmp_path, DeterministicWorker())
+    runner.terminal = DeferredCleanupTransport()
+    root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
+    node = await store.create_node(
+        project_id=root.id,
+        parent_id=root.id,
+        objective="Retry despite cleanup denial",
+        status=NodeStatus.FAILED,
+        agent=AgentConfig(harness=HarnessKind.CODEX, session_id="stale-session"),
+    )
+
+    await runner.retry(node.id)
+
+    retried = await store.get_node(node.id)
+    assert retried.status == NodeStatus.RUNNABLE
+    assert retried.agent.session_id is None
+    await store.dispose()
+
+
 async def test_late_failure_retries_a_running_node(tmp_path):
     _, store, runner = await _runtime(tmp_path, DeterministicWorker())
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
@@ -1153,10 +1311,21 @@ async def test_codex_planner_resumes_its_own_session(monkeypatch, tmp_path):
     args = captured["args"]
     assert args[:4] == (cfg.codex_binary, "exec", "--json", "resume")
     assert "project_root_markers=[]" in args
+    assert f'projects."{tmp_path.resolve()}".trust_level="trusted"' in args
     assert "--ephemeral" not in args
     assert "planner-session" in args
     assert captured["cwd"] == str(tmp_path)
     assert session == "planner-session"
+
+
+def test_codex_project_flags_scope_trust_to_the_assigned_directory(tmp_path):
+    flags = codex_project_root_flags(str(tmp_path))
+
+    assert flags[:2] == ["-c", "project_root_markers=[]"]
+    assert flags[2:] == [
+        "-c",
+        f'projects."{tmp_path.resolve()}".trust_level="trusted"',
+    ]
 
 
 async def test_graph_explorer_is_read_only_and_integrators_get_glue_contract(tmp_path):
@@ -1304,14 +1473,23 @@ def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
         objective="Build an app factory",
         generated_prompt="Create the organization and platform for an entire organization.",
     )
+    contract = OrganizationContract(
+        charter="operate a repeatable multi-product organization",
+        scale=OrganizationScale.ORGANIZATION,
+        acceptance_criteria=["the organization produces usable outcomes"],
+        min_first_level_production_owners=2,
+        require_independent_verification=True,
+    )
     narrow_plan = PlanResult(
+        organization_contract=contract,
         nodes=[NodeSpec(key="research", objective="Research the market", executor="codex")]
     )
 
-    with pytest.raises(RuntimeError, match="flat graph"):
+    with pytest.raises(RuntimeError, match="too few"):
         CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), narrow_plan)
 
     ceremonial_nested_plan = PlanResult(
+        organization_contract=contract,
         nodes=[
             NodeSpec(
                 key="factory_setup",
@@ -1320,7 +1498,7 @@ def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
             )
         ]
     )
-    with pytest.raises(RuntimeError, match="no first-level integrator"):
+    with pytest.raises(RuntimeError, match="too few"):
         CodexPlanner._validate_setup_scope(
             NodeExecutionContext(node=root), ceremonial_nested_plan
         )
@@ -1337,6 +1515,11 @@ def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
                 objective="Run the product organization",
                 agent_type="planner",
                 follows=["market"],
+                organization_contract=OrganizationContract(
+                    charter="own product definition",
+                    scale=OrganizationScale.FOCUSED,
+                    acceptance_criteria=["the definition is usable"],
+                ),
             ),
             NodeSpec(
                 key="integrate",
@@ -1350,39 +1533,65 @@ def test_root_planner_rejects_a_narrow_leaf_for_an_app_factory():
                 agent_type="verifier",
                 follows=["integrate"],
             ),
-        ]
+        ],
+        organization_contract=contract,
     )
     CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), organization_plan)
 
 
-def test_root_planner_rejects_a_flat_complete_game_even_with_many_departments():
+def test_root_planner_allows_a_sequential_domain_without_synthetic_fan_in():
     root = Node(
         project_id=uuid.uuid4(),
-        objective="Build a game",
-        generated_prompt="Make the requested game playable locally.",
+        objective="Produce a finished sequential work product",
+        generated_prompt="Move through the requested stages in order.",
     )
-    flat_plan = PlanResult(
+    sequential_contract = OrganizationContract(
+        charter="produce a finished sequential work product",
+        scale=OrganizationScale.DELIVERY,
+        acceptance_criteria=["the work product is usable"],
+        require_independent_verification=True,
+    )
+    sequential_plan = PlanResult(
+        organization_contract=sequential_contract,
         nodes=[
-            NodeSpec(key="design", objective="Design the game", agent_type="executor"),
-            NodeSpec(key="engine", objective="Build the engine", agent_type="executor"),
-            NodeSpec(key="content", objective="Create all content", agent_type="executor"),
-            NodeSpec(
-                key="integrate",
-                objective="Integrate the game",
-                agent_type="integrator",
-                follows=["design", "engine", "content"],
-            ),
+            NodeSpec(key="draft", objective="Create the first version", agent_type="executor"),
+            NodeSpec(key="revise", objective="Revise the first version", agent_type="executor", follows=["draft"]),
+            NodeSpec(key="finalize", objective="Finalize the work product", agent_type="executor", follows=["revise"]),
             NodeSpec(
                 key="verify",
-                objective="Verify the game",
+                objective="Evaluate the finished work product",
                 agent_type="verifier",
-                follows=["integrate"],
+                follows=["finalize"],
             ),
         ]
     )
 
-    with pytest.raises(RuntimeError, match="flat graph"):
-        CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), flat_plan)
+    CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), sequential_plan)
+
+
+def test_root_planner_keeps_a_small_production_ready_service_focused():
+    root = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a small production-ready command-line service",
+        generated_prompt="Use typed modules, tests, and local fixtures.",
+    )
+    focused_plan = PlanResult(
+        nodes=[
+            NodeSpec(
+                key="implementation",
+                objective="Implement the command-line service",
+                agent_type="executor",
+            ),
+            NodeSpec(
+                key="verify",
+                objective="Verify the command-line service",
+                agent_type="verifier",
+                follows=["implementation"],
+            ),
+        ]
+    )
+
+    CodexPlanner._validate_setup_scope(NodeExecutionContext(node=root), focused_plan)
 
 
 def test_setup_plan_shape_preserves_stage_handoffs():
@@ -1517,6 +1726,27 @@ def test_worker_context_delivers_assignment_and_live_graph_access():
     assert "instructions=Write the executable command and tests." in prompt
     assert "GRAPH EXPLORATION TOOL" not in prompt
     assert "turn graph" not in prompt
+
+
+def test_codex_worker_prompt_includes_exact_acceptance_evidence_contract():
+    from turn.workers.codex_worker import CodexWorker
+
+    node = Node(
+        project_id=uuid.uuid4(),
+        objective="Build a greeting CLI",
+        generated_prompt="Write the executable command and tests.",
+        acceptance_criteria=[
+            {"id": "commands", "description": "The command runs."},
+            {"id": "errors", "description": "Invalid input fails clearly."},
+        ],
+    )
+    prompt = CodexWorker()._build_prompt(NodeExecutionContext(node=node))
+
+    assert "TURN_ACCEPTANCE_EVIDENCE" in prompt
+    assert '"id": "commands"' in prompt
+    assert '"id": "errors"' in prompt
+    assert '"status":"PASS"' in prompt
+    assert "Generic artifacts or a prose summary do not replace" in prompt
 
 
 def test_codex_worker_keeps_handoff_protocol_in_turn_basics_skill(tmp_path):

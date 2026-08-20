@@ -1392,7 +1392,7 @@ export function DocumentView({ nodes, edges, artifacts, projectId, refreshKey }:
         <h1>{stripMarkdown(root.project_name ?? root.objective)}</h1>
         <div className="document-meta">
           <span className={`badge ${root.ui_state}`}>{statusLabel(root)}</span>
-          <span>{Math.max(nodes.length - 1, 0)} work items</span>
+          <span>{Math.max(nodes.length - 1, 0)} workflow steps</span>
           <span>Ordered workflow</span>
         </div>
         {root.generated_prompt?.trim() && (

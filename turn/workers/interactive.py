@@ -160,6 +160,7 @@ def agent_environment(
     agent: Any | None = None,
     *,
     data_dir: str | Path | None = None,
+    project_repo_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Install loaded capabilities and prepare one native harness launch."""
     capability_ids = list(dict.fromkeys(getattr(agent, "capabilities", None) or []))
@@ -187,7 +188,7 @@ def agent_environment(
     environment = {
         "TURN_NODE_ID": str(node_id),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
-        "TURN_REPO": str(Path(cwd).resolve()),
+        "TURN_REPO": str(Path(project_repo_path or cwd).resolve()),
         "TURN_DATA_DIR": str(Path(data_dir or settings.data_dir).expanduser().resolve()),
         "TURN_HANDOFF_KIND": kind,
         "TURN_HANDOFF_FILE": str(handoff),

@@ -43,6 +43,12 @@ def present_node(
         return NodePresentation(state, (Action.CANCEL,))
     if node.paused:
         return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
+    if node.agent_state == "correction_required":
+        return NodePresentation(
+            UIState.CORRECTION_REQUIRED,
+            (Action.EDIT,),
+            node.agent_message or "Submission needs correction; the provider session remains available.",
+        )
     if node.status == NodeStatus.RUNNING:
         return NodePresentation(UIState.RUNNING, (Action.CANCEL,))
     if node.status == NodeStatus.FAILED:
