@@ -94,6 +94,11 @@ describe("graph node controls", () => {
             min_first_level_production_owners: 1,
             require_independent_verification: false,
             max_replans: 0,
+            escalation: {
+              max_plan_corrections: 2,
+              max_manager_iterations: 5,
+              escalate_on_block: true,
+            },
           },
           manager_phase: "REVIEW_PENDING",
           organization_review: {

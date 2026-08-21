@@ -43,6 +43,7 @@ import { Graph as GraphCanvas } from "./components/Graph";
 import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
+import { LeadInspector, LeadOversight } from "./components/LeadOversight";
 import { LogsPanel } from "./components/LogsPanel";
 import { QualityPanel } from "./components/QualityPanel";
 import { WorkView } from "./components/WorkView";
@@ -210,6 +211,7 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
+  const [leadOpen, setLeadOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"graph" | "document" | "work">("graph");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -579,6 +581,12 @@ export default function App() {
                     }
                     onContextMenu={(node, x, y) => setNodeMenu({ node, x, y })}
                   />
+                  <LeadOversight
+                    lead={graph!.lead ?? null}
+                    bootstrapStatus={graph!.bootstrap_status ?? "READY"}
+                    reviews={graph!.review_requests ?? []}
+                    onOpen={() => setLeadOpen(true)}
+                  />
                 </div>
               )
             ) : (
@@ -646,6 +654,25 @@ export default function App() {
               />
             ) : null;
           })()}
+        </>
+      )}
+      {leadOpen && graph?.lead && projectId && (
+        <>
+          <ResizeHandle
+            target="inspector"
+            value={inspectorWidth}
+            onResize={beginResize}
+            onAdjust={adjustResize}
+          />
+          <LeadInspector
+            projectId={projectId}
+            lead={graph.lead}
+            bootstrapStatus={graph.bootstrap_status ?? "READY"}
+            reviews={graph.review_requests ?? []}
+            onClose={() => setLeadOpen(false)}
+            onChanged={loadGraph}
+            notify={notify}
+          />
         </>
       )}
       <footer className="statusbar">

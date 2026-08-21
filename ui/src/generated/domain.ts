@@ -23,7 +23,7 @@ export interface Agent {
   session_id: string | null;
 }
 
-export type AgentType = "planner" | "executor" | "integrator" | "verifier";
+export type AgentType = "planner" | "executor" | "integrator" | "verifier" | "lead";
 
 export interface Artifact {
   id: string;
@@ -111,6 +111,12 @@ export interface EdgeSpec {
 }
 
 export type EdgeType = "CONTAINS" | "FOLLOWS";
+
+export interface EscalationPolicy {
+  max_plan_corrections: number;
+  max_manager_iterations: number;
+  escalate_on_block: boolean;
+}
 
 export type EventSource = "transition" | "agent_action" | "schedule" | "cli";
 
@@ -205,6 +211,9 @@ export interface GraphNodeView {
 
 export interface GraphView {
   project_id: string;
+  bootstrap_status: string;
+  lead: ProjectLead | null;
+  review_requests: Array<ReviewRequest>;
   nodes: Array<GraphNodeView>;
   edges: Array<Edge>;
   flow_edges: Array<FlowEdge>;
@@ -261,6 +270,8 @@ export interface Integrator {
   capabilities: Array<string>;
   session_id: string | null;
 }
+
+export type LeadStatus = "IDLE" | "RUNNING";
 
 export type ManagerDecision = "ACCEPT" | "CONTINUE" | "BLOCK";
 
@@ -375,6 +386,7 @@ export interface OrganizationContract {
   min_first_level_production_owners: number;
   require_independent_verification: boolean;
   max_replans: number;
+  escalation: EscalationPolicy;
 }
 
 export interface OrganizationMetrics {
@@ -488,7 +500,40 @@ export interface Planner {
 
 export type ProcessState = "LAUNCH_REQUESTED" | "RUNNING" | "EXITED" | "UNKNOWN" | "CANCELLED";
 
+export interface ProjectLead {
+  id: string;
+  project_id: string;
+  terminal_owner_id: string;
+  agent: Agent | null;
+  session_id: string | null;
+  status: LeadStatus;
+  created_at: string;
+}
+
 export type ReasoningLevel = "default" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export type ReviewDecision = "APPROVE" | "REJECT";
+
+export type ReviewKind = "PLAN_REVIEW" | "COMPLETION_REVIEW" | "ESCALATION";
+
+export interface ReviewRequest {
+  id: string;
+  project_id: string;
+  sender_id: string;
+  receiver_id: string;
+  receiver_is_lead: boolean;
+  kind: ReviewKind;
+  status: ReviewStatus;
+  reason: string | null;
+  artifact_refs: Array<string>;
+  decision: ReviewDecision | null;
+  summary: string | null;
+  required_changes: Array<string>;
+  created_at: string;
+  settled_at: string | null;
+}
+
+export type ReviewStatus = "PENDING" | "ACTIVE" | "SETTLED";
 
 export interface Run {
   id: string;

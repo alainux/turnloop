@@ -455,6 +455,8 @@ async def test_manager_control_failure_stays_review_pending_and_exposes_reviewin
 
 @pytest.mark.asyncio
 async def test_provider_review_adapters_require_typed_artifacts_and_session_boundaries(tmp_path):
+    """Root plan review runs on the project lead; manager review resumes the
+    boundary's own session. No synthetic reviewer process owner exists."""
     audit_payload = {
         "outcome": "COMPLETE",
         "summary": "audit returned",
@@ -505,6 +507,8 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
         ),
     )
     root = await store.set_agent_session(root.id, "retained-planner-session")
+    lead_agent = AgentConfig(harness="codex", model="gpt-5.6-luna")
+    lead = await store.ensure_project_lead(root.project_id, agent=lead_agent)
     terminal = ReconcileTrackingTerminal()
     runner = Runner(
         store,
@@ -524,48 +528,51 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
         PlanResult(nodes=[]),
     )
     assert audit.decision.value == "APPROVE"
+    # The lead turn starts from the lead's own retained session (none yet).
     assert planner.contexts[0][0].node.agent.session_id is None
+    assert planner.contexts[0][0].node.id == lead.terminal_owner_id
+    # The lead's harness session is retained on the lead record.
+    retained_lead = await store.project_lead(root.project_id)
+    assert retained_lead.session_id == "review-session"
     manager_snapshot = await runner.organization_manager.snapshot(store, root.id)
-    stale_owner = uuid.uuid4()
-    stale_run = await store.create_run(
-        root,
-        "organization-manager",
-        1,
-        process_owner_id=stale_owner,
-    )
-    await store.update_run(
-        stale_run.id,
-        status=RunStatus.FAILED,
-        outcome=Outcome.FAIL,
-        error="prior control attempt failed",
-    )
     manager_result = await runner._provider_manager_review(manager_snapshot)
     assert manager_result.decision is ManagerDecision.BLOCK
+    # The manager review resumes the boundary itself: its pane is closed for
+    # the stale writer and reconciled against the retained session.
     assert root.id in runner.terminal.close_requests
-    assert stale_owner in runner.terminal.close_requests
     assert terminal.reconciled_sessions == [
         (root.id, str(root.project_id), "retained-planner-session", "codex")
     ]
     assert planner.contexts[1][0].node.agent.session_id == "retained-planner-session"
-    runs = await store.get_runs(root.id)
-    assert {run.worker for run in runs} == {
-        "semantic-plan-auditor",
-        "organization-manager",
-    }
-    audit_run = next(run for run in runs if run.worker == "semantic-plan-auditor")
+    assert planner.contexts[1][0].node.id == root.id
+    runs = await store.get_runs(lead.terminal_owner_id)
+    assert {run.worker for run in runs} == {"project-lead"}
+    lead_run = runs[-1]
+    assert lead_run.process_owner_id == lead.terminal_owner_id
+    assert lead_run.process_state.value == "EXITED"
+    manager_runs = await store.get_runs(root.id)
     manager_run = next(
-        run
-        for run in reversed(runs)
-        if run.worker == "organization-manager" and run.process_owner_id != stale_owner
+        run for run in reversed(manager_runs) if run.worker == "organization-manager"
     )
-    assert audit_run.process_owner_id is not None and audit_run.process_owner_id != root.id
-    assert manager_run.process_owner_id is not None and manager_run.process_owner_id != root.id
-    assert audit_run.process_state.value == "EXITED"
+    assert manager_run.process_owner_id == root.id
     assert manager_run.process_state.value == "EXITED"
-    assert audit_run.process_owner_id in terminal.close_requests
-    assert manager_run.process_owner_id in terminal.close_requests
+    assert lead.terminal_owner_id in terminal.close_requests
+    assert root.id in terminal.close_requests
     refreshed = await store.get_node(root.id)
     assert refreshed.agent.session_id == "review-session"
+    # The review request trail records the settled lead decision plus the
+    # boundary completion review.
+    requests = await store.review_requests(root.project_id)
+    assert {request.kind.value for request in requests} == {
+        "PLAN_REVIEW",
+        "COMPLETION_REVIEW",
+    }
+    plan_request = next(
+        request for request in requests if request.kind.value == "PLAN_REVIEW"
+    )
+    assert plan_request.receiver_is_lead is True
+    assert plan_request.decision.value == "APPROVE"
+    assert plan_request.status.value == "SETTLED"
     await store.dispose()
 
 

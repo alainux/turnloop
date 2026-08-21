@@ -22,6 +22,7 @@ from turn.domain.schemas import (
     SubgraphRef,
     VerificationResult,
 )
+from turn.domain.lead import ProjectLead, ReviewRequest
 
 
 class GraphInspectionRun(BaseModel):
@@ -99,7 +100,10 @@ class GraphInspection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 6
+    schema_version: int = 7
     project_id: uuid.UUID
+    bootstrap_status: str = "READY"
+    lead: Optional[ProjectLead] = None
+    review_requests: list[ReviewRequest] = Field(default_factory=list)
     nodes: list[GraphInspectionNode] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

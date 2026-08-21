@@ -17,6 +17,14 @@ ROLE_CAPABILITY_IDS: dict[str, tuple[str, ...]] = {
     "executor": (BASICS_CAPABILITY_ID, "turn-executing"),
     "integrator": (BASICS_CAPABILITY_ID, "turn-integrating"),
     "verifier": (BASICS_CAPABILITY_ID, "turn-verifying"),
+    # The lead oversees the hierarchy: it reuses planning foundations so it
+    # can read organization contracts and propose corrections, without a
+    # separate capability product.
+    "lead": (
+        BASICS_CAPABILITY_ID,
+        "turn-planning",
+        AUTHORING_CAPABILITY_ID,
+    ),
 }
 
 # ``turn-setup`` is attached only to the root setup planner, but it is still a

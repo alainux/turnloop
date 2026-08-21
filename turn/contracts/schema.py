@@ -40,6 +40,7 @@ from turn.domain.organization import (
     WorkItem,
     PlanAuditResult,
 )
+from turn.domain.lead import ProjectLead, ReviewRequest
 from turn.metrics import BehaviorExpectations
 
 
@@ -80,6 +81,8 @@ PUBLIC_DOMAIN_MODELS = {
     "OrganizationMetrics": OrganizationMetrics,
     "WorkItem": WorkItem,
     "PlanAuditResult": PlanAuditResult,
+    "ProjectLead": ProjectLead,
+    "ReviewRequest": ReviewRequest,
 }
 
 

@@ -20,6 +20,7 @@ from turn.contracts.graph_inspection import (
     GraphInspectionRun,
 )
 from turn.contracts.dag import parse_plan
+from turn.domain.lead import ProjectLead, ReviewRequest
 from turn.domain.schemas import Artifact, Edge, Node, Run
 
 _DELIVERABLE_KINDS = {"file", "code_diff", "log", "evidence"}
@@ -170,6 +171,16 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
 
     inspection = GraphInspection(
         project_id=project_uuid,
+        bootstrap_status=str(raw.get("bootstrap_status") or "READY"),
+        lead=(
+            ProjectLead.model_validate(raw["lead"])
+            if raw.get("lead") is not None
+            else None
+        ),
+        review_requests=[
+            ReviewRequest.model_validate(item)
+            for item in raw.get("review_requests", [])
+        ],
         nodes=inspection_nodes,
         edges=parsed_edges,
     )

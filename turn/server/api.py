@@ -43,7 +43,8 @@ from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
-from turn.runner.runner import Runner
+from turn.runner.runner import Runner, ControlOperationUnavailable
+from turn.domain.lead import ReviewStatus
 from turn.metrics import BehaviorMetricsStore, evaluate_expectations
 from turn.workers.conversations import (
     ConversationProgress,
@@ -242,6 +243,10 @@ class CreateBudgetRequest(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class LeadMessage(BaseModel):
+    message: str = Field(min_length=1)
+
+
 class DecideBudgetRequest(BaseModel):
     status: BudgetRequestStatus
     decision_reason: Optional[str] = None
@@ -382,6 +387,16 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         serialized.append(item)
     return GraphView.model_validate({
         "project_id": str(project_id),
+        "bootstrap_status": await store.bootstrap_status(project_id),
+        "lead": (
+            lead.model_dump(mode="json")
+            if (lead := await store.project_lead(project_id)) is not None
+            else None
+        ),
+        "review_requests": [
+            item.model_dump(mode="json")
+            for item in await store.review_requests(project_id)
+        ],
         "nodes": serialized,
         "edges": [e.model_dump(mode="json") for e in edges],
         "flow_edges": [
@@ -482,6 +497,18 @@ async def create_project(body: CreateProject, request: Request):
     # the inspector later only attaches to this shell; it never creates a new
     # terminal or starts a harness by itself.
     await runner.ensure_node_terminal(root.id)
+    # Every project gets exactly one lead with its own visible terminal, and
+    # starts in bootstrap automation: the lead/planner loop runs the root
+    # plan to acceptance before the project becomes READY (step mode).
+    from turn.domain.schemas import AgentType as _AgentType
+    lead_agent = (
+        body.agent.model_copy(update={"type_id": _AgentType.LEAD})
+        if body.agent is not None
+        else None
+    )
+    await store.ensure_project_lead(root.id, agent=lead_agent)
+    await runner.ensure_lead_terminal(root.id)
+    await store.set_bootstrap_status(root.id, "BOOTSTRAPPING")
     if decoded_attachments:
         attachment_dir = Path(repo_path) / ".turn" / "attachments"
         attachment_dir.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1121,74 @@ async def create_project_work_item(
     return {"work_item": item.model_dump(mode="json")}
 
 
+@router.get("/api/projects/{project_id}/lead")
+async def project_lead(project_id: str, request: Request):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    lead = await store.project_lead(pid)
+    bootstrap = await store.bootstrap_status(pid)
+    return {
+        "project_id": project_id,
+        "bootstrap_status": bootstrap,
+        "lead": lead.model_dump(mode="json") if lead else None,
+    }
+
+
+@router.get("/api/projects/{project_id}/reviews")
+async def project_reviews(project_id: str, request: Request, status: str | None = None):
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    status_filter = None
+    if status is not None:
+        try:
+            status_filter = ReviewStatus(status.upper())
+        except ValueError as error:
+            raise HTTPException(422, f"invalid review status: {status}") from error
+    requests = await store.review_requests(pid, status=status_filter)
+    return {
+        "project_id": project_id,
+        "review_requests": [item.model_dump(mode="json") for item in requests],
+    }
+
+
+@router.post("/api/projects/{project_id}/lead/message")
+async def message_project_lead(project_id: str, body: LeadMessage, request: Request):
+    """Send one user message to the project lead and run one lead turn."""
+    pid = uuid.UUID(project_id)
+    runner: Runner = await _runner(request)
+    if await runner.store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    text = body.message.strip()
+    if not text:
+        raise HTTPException(422, "message must not be empty")
+    try:
+        payload, _usage = await runner._run_lead_turn(
+            pid,
+            purpose="user-message",
+            prompt=(
+                "The project owner sent you the following message. Respond in the "
+                "result envelope; put your plain-language reply in the summary and "
+                "any concrete follow-ups into required_changes.\n\n"
+                f"Owner message:\n{text}\n"
+            ),
+        )
+    except ControlOperationUnavailable as error:
+        raise HTTPException(409, str(error)) from error
+    summary = ""
+    for artifact in payload.get("artifacts", []):
+        if isinstance(artifact, dict) and artifact.get("name") == "plan-audit":
+            content = artifact.get("content") or {}
+            summary = str(content.get("summary") or "")
+            break
+    if not summary:
+        summary = str(payload.get("summary") or "")
+    return {"ok": True, "reply": summary}
+
+
 @router.get("/api/projects/{project_id}/budget-requests")
 async def project_budget_requests(project_id: str, request: Request):
     pid = uuid.UUID(project_id)
@@ -1568,7 +1663,16 @@ async def shell_socket(websocket: WebSocket, node_id: str):
     nid = uuid.UUID(node_id)
     if await _send_runtime_guard(websocket, runner, nid):
         return
-    if not await runner.open_shell(nid):
+    # The id may be a graph node or a project lead's stable terminal owner.
+    is_lead = await runner.store.get_node(nid) is None and (
+        await runner.store.lead_by_terminal_owner(nid) is not None
+    )
+    opened = (
+        await runner.open_lead_shell(nid)
+        if is_lead
+        else await runner.open_shell(nid)
+    )
+    if not opened:
         await websocket.close(code=1011, reason="project directory unavailable")
         return
     async def cleanup_shell() -> bool:
@@ -1593,6 +1697,13 @@ async def _send_runtime_guard(websocket: WebSocket, runner: Runner, node_id: uui
     """
     node = await runner.store.get_node(node_id)
     root = await runner.store.get_node(node.project_id) if node is not None else None
+    if node is None:
+        lead = await runner.store.lead_by_terminal_owner(node_id)
+        root = (
+            await runner.store.get_node(lead.project_id)
+            if lead is not None
+            else None
+        )
     guard = root.runtime_guard if root is not None else None
     if guard is None:
         return False

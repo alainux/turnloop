@@ -67,6 +67,7 @@ from turn.runner.workspaces import WorkspaceError, WorkspaceManager
 from turn.runner.sessions import SessionController
 from turn.runner.process_supervisor import ProcessSupervisor
 from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block, substitute_prompt_variables
+from turn.domain.lead import ReviewDecision, ReviewKind, ReviewRequest, ReviewStatus
 from turn.workers.herdr import (
     HerdrAdapter,
     HerdrAdapterError,
@@ -97,6 +98,18 @@ from turn.contracts.text import sanitize_control_text
 
 class ControlOperationUnavailable(RuntimeError):
     """A bounded provider/control operation could not return a decision."""
+
+
+class PlanReviewEscalated(RuntimeError):
+    """A plan review could not be resolved locally and was escalated.
+
+    The escalation is durable: a PENDING ESCALATION ReviewRequest exists and
+    is actionable by the receiver (parent planner or project lead).
+    """
+
+    def __init__(self, message: str, review_request_id: uuid.UUID) -> None:
+        super().__init__(message)
+        self.review_request_id = review_request_id
 
 
 def _dump(obj):
@@ -489,6 +502,24 @@ class Runner:
             node_id,
             cwd=cwd,
             environment={"TURN_PROJECT_ID": str(node.project_id)},
+        )
+
+    async def ensure_lead_terminal(self, project_id: uuid.UUID) -> bool:
+        """Allocate the project lead's durable Herdr pane.
+
+        The lead is not a graph node; its pane keys off the lead's stable
+        terminal owner identity so it survives restarts and re-runs.
+        """
+        lead = await self.store.project_lead(project_id)
+        if lead is None:
+            return False
+        cwd = await self._project_repo(project_id)
+        if not cwd:
+            return False
+        return await self.terminal.ensure_persistent_shell(
+            lead.terminal_owner_id,
+            cwd=cwd,
+            environment={"TURN_PROJECT_ID": str(project_id)},
         )
 
     async def _loop(self) -> None:
@@ -1335,20 +1366,19 @@ class Runner:
         purpose: str,
         repo_path: str | None,
     ) -> NodeExecutionContext:
-        """Build an isolated provider context for a non-graph review turn."""
+        """Build an isolated provider context for a non-graph review turn.
+
+        The reviewer keeps its real identity: the turn must land in the
+        reviewer's own durable pane and retained session, never in a
+        synthetic sidecar.
+        """
         if node.agent is None:
             raise RuntimeError("provider review requires a planner agent")
         if base.terminal is None:
             raise ControlOperationUnavailable(
                 "provider review requires the registered Turn terminal transport"
             )
-        review_node = node.model_copy(
-            update={
-                # A review writes the ordinary result handoff protocol, but it
-                # must not collide with a live planner handoff watcher.
-                "id": uuid.uuid4(),
-            }
-        )
+        review_node = node.model_copy()
         return base.model_copy(
             update={
                 "node": review_node,
@@ -1431,17 +1461,205 @@ class Runner:
         planner = self._review_planner_for(node)
         if planner is None:
             return None
-        base = ctx or await self._build_context(node)
-        if node.agent is None:
-            raise RuntimeError("provider semantic audit requires a planner agent")
-        audit_agent = node.agent.as_type(AgentType.PLANNER).model_copy(
-            update={"session_id": None}
+        return await self._hierarchical_plan_review(node, contract, plan, ctx, planner)
+
+    async def _lead_pseudo_node(self, project_id: uuid.UUID) -> tuple[Any, Any]:
+        """Return (pseudo Node, ProjectLead) for one lead provider turn.
+
+        The pseudo node is never persisted in the graph; its id is the lead's
+        stable terminal owner so every lead turn lands in the same durable
+        Herdr pane and reuses the retained harness session.
+        """
+        from turn.domain.schemas import Node as NodeModel, NodeStatus
+        lead = await self.store.project_lead(project_id)
+        if lead is None:
+            raise ControlOperationUnavailable("project has no lead")
+        if lead.agent is None:
+            raise ControlOperationUnavailable("project lead has no agent configuration")
+        agent = lead.agent.model_copy(update={"session_id": lead.session_id})
+        pseudo = NodeModel(
+            id=lead.terminal_owner_id,
+            project_id=project_id,
+            parent_id=None,
+            objective="project-lead",
+            status=NodeStatus.RUNNING,
+            agent=agent,
         )
-        audit_node = node.model_copy(update={"agent": audit_agent})
+        return pseudo, lead
+
+    async def _remember_lead_session(self, project_id: uuid.UUID, session_id: str | None) -> None:
+        if session_id:
+            await self.store.update_lead(project_id, session_id=session_id)
+
+    async def _run_lead_turn(
+        self,
+        project_id: uuid.UUID,
+        *,
+        purpose: str,
+        prompt: str,
+        base: NodeExecutionContext | None = None,
+    ) -> tuple[dict, Usage]:
+        """Run exactly one structured provider turn on the project lead."""
+        adapter = self.registry.get_planner("real") or self.registry.planner
+        if adapter is None or not callable(getattr(adapter, "call_structured", None)):
+            raise ControlOperationUnavailable("no real planner adapter is available for the lead turn")
+        pseudo, lead = await self._lead_pseudo_node(project_id)
+        repo_root = await self.store.get_node(project_id)
+        repo_path = str(repo_root.repo_path) if repo_root and repo_root.repo_path else None
+        ctx = await self._build_context(pseudo)
+        ctx = ctx.model_copy(update={
+            "repo_path": repo_path or ctx.repo_path,
+            "project_repo_path": repo_path or ctx.project_repo_path or ctx.repo_path,
+            "purpose": purpose,
+        })
+
+        async def remember_session(session: str) -> None:
+            await self._remember_lead_session(project_id, session)
+
+        ctx.session_callback = remember_session
+        runs = await self.store.get_runs(lead.terminal_owner_id)
+        run = await self.store.create_run(
+            pseudo,
+            "project-lead",
+            len(runs) + 1,
+        )
+        ctx.run_id = str(run.id)
+        await self.store.update_lead(project_id, status="RUNNING")
+        # A completed prior turn leaves the durable pane holding a stale
+        # interactive writer. Close that exact owner first or providers with
+        # single-writer sessions reject the resume.
+        reconcile = getattr(self.terminal, "reconcile_provider_session", None)
+        if callable(reconcile) and lead.session_id:
+            try:
+                await reconcile(
+                    lead.terminal_owner_id,
+                    project_key=str(project_id),
+                    session_id=lead.session_id,
+                    provider=lead.agent.harness.value if lead.agent else None,
+                )
+            except Exception as error:
+                logger.warning("lead session reconciliation failed: %s", error)
+        await self.terminal.close_persistent_session(lead.terminal_owner_id)
+        try:
+            payload, usage, session_id = await adapter.call_structured(
+                ctx,
+                prompt,
+                handoff_kind="result",
+            )
+            await self._remember_lead_session(project_id, session_id)
+            await self.store.mark_run_process(
+                run.id, ProcessState.EXITED, exit_code=0
+            )
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.COMPLETE,
+                outcome=Outcome.COMPLETE,
+                usage=usage,
+                session_id=session_id,
+            )
+            return payload, usage
+        finally:
+            await self.store.update_lead(project_id, status="IDLE")
+            await self.terminal.close_persistent_session(lead.terminal_owner_id)
+
+    async def _escalate_plan_review(
+        self,
+        node: Node,
+        *,
+        reason: str,
+        required_changes: list[str],
+    ) -> ReviewRequest:
+        """Escalate an unresolvable plan review one level up the hierarchy.
+
+        A nested planner escalates to its parent planner; the root planner
+        (or a nested planner without a planner ancestor) escalates to the
+        project lead. The request stays PENDING until the receiver settles it.
+        """
+        project_id = node.project_id
+        receiver_is_lead = False
+        if node.id == project_id:
+            receiver_is_lead = True
+        else:
+            parent = await self._parent_planner_for(node)
+            if parent is None:
+                receiver_is_lead = True
+            else:
+                receiver_id = parent.id
+        if receiver_is_lead:
+            lead = await self.store.project_lead(project_id)
+            if lead is None:
+                raise ControlOperationUnavailable(
+                    "plan review exhausted corrections and no lead exists to escalate to"
+                )
+            receiver_id = lead.terminal_owner_id
+        return await self.store.create_review_request(
+            project_id=project_id,
+            sender_id=node.id,
+            receiver_id=receiver_id,
+            receiver_is_lead=receiver_is_lead,
+            kind=ReviewKind.ESCALATION,
+            reason=reason,
+            required_changes=required_changes,
+        )
+
+    async def _plan_correction_limit(self, node: Node) -> int:
+        contract = node.organization_contract
+        if contract is None:
+            root = await self.store.get_node(node.project_id)
+            contract = root.organization_contract if root else None
+        if contract is not None and contract.escalation is not None:
+            return contract.escalation.max_plan_corrections
+        return 2
+
+    async def _hierarchical_plan_review(
+        self,
+        node: Node,
+        contract,
+        plan: PlanResult,
+        ctx: NodeExecutionContext | None,
+        planner,
+    ) -> PlanAuditResult | None:
+        """Semantic plan review inside the visible agent hierarchy.
+
+        The root plan is reviewed by the project lead in the lead's own
+        terminal; a nested plan is reviewed by the direct parent planner
+        resuming its own retained session. No synthetic reviewer process
+        exists in this path.
+        """
+        project_id = node.project_id
+        is_root = node.id == project_id
+        if is_root:
+            receiver_lead = True
+            pseudo, _lead = await self._lead_pseudo_node(project_id)
+            receiver_id = pseudo.id
+            reviewer_node = pseudo
+            purpose = "lead-plan-review"
+        else:
+            parent = await self._parent_planner_for(node)
+            if parent is None or parent.agent is None:
+                return None
+            receiver_lead = False
+            receiver_id = parent.id
+            reviewer_node = parent
+            purpose = "parent-plan-review"
+        request = await self.store.create_review_request(
+            project_id=project_id,
+            sender_id=node.id,
+            receiver_id=receiver_id,
+            receiver_is_lead=receiver_lead,
+            kind=ReviewKind.PLAN_REVIEW,
+            reason=f"plan proposal from {node.objective[:80]}",
+        )
+        await self.store.update_review_request(
+            project_id, request.id, status=ReviewStatus.ACTIVE
+        )
+        base = ctx or await self._build_context(node)
+        if reviewer_node.agent is None:
+            raise ControlOperationUnavailable("reviewer has no agent configuration")
         review_ctx = self._review_context(
             base,
-            audit_node,
-            purpose="semantic-plan-audit",
+            reviewer_node,
+            purpose=purpose,
             repo_path=base.project_repo_path or base.repo_path,
         )
         prompt = render_plan_audit_prompt(
@@ -1449,101 +1667,112 @@ class Runner:
             contract,
             plan,
         )
-        runs = await self.store.get_runs(node.id)
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            # A control attempt is a real provider process with a short-lived
-            # Herdr pane. Give every attempt its own synthetic owner so the
-            # persisted Run identifies the exact pane used by this call.
-            attempt_ctx = review_ctx.model_copy(
-                update={
-                    "node": review_ctx.node.model_copy(update={"id": uuid.uuid4()}),
-                }
+        try:
+            if receiver_lead:
+                payload, _usage = await self._run_lead_turn(
+                    project_id,
+                    purpose=purpose,
+                    prompt=prompt,
+                    base=base,
+                )
+            else:
+                # Resume the parent planner's own retained session in its own
+                # pane. Reconcile/close the stale writer exactly like manager
+                # review does, then call structured against the boundary.
+                if self.generation_active(parent.id):
+                    raise ControlOperationUnavailable(
+                        "parent planner is active; nested plan review must wait"
+                    )
+                reconcile = getattr(self.terminal, "reconcile_provider_session", None)
+                if callable(reconcile) and parent.agent.session_id:
+                    await reconcile(
+                        parent.id,
+                        project_key=str(project_id),
+                        session_id=parent.agent.session_id,
+                        provider=parent.agent.harness.value,
+                    )
+                await self.terminal.close_persistent_session(parent.id)
+                runs = await self.store.get_runs(parent.id)
+                run = await self.store.create_run(
+                    parent,
+                    "parent-plan-review",
+                    len(runs) + 1,
+                )
+                review_ctx.run_id = str(run.id)
+                try:
+                    payload, usage, session_id = await planner.call_structured(
+                        review_ctx,
+                        prompt,
+                        handoff_kind="result",
+                    )
+                    await self.store.mark_run_process(
+                        run.id, ProcessState.EXITED, exit_code=0
+                    )
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.COMPLETE,
+                        outcome=Outcome.COMPLETE,
+                        usage=usage,
+                        session_id=session_id,
+                    )
+                except asyncio.CancelledError:
+                    await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.CANCELLED,
+                        outcome=Outcome.FAIL,
+                        summary="nested plan review cancelled",
+                    )
+                    raise
+                except Exception as error:
+                    await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=1)
+                    await self.store.update_run(
+                        run.id,
+                        status=RunStatus.FAILED,
+                        outcome=Outcome.FAIL,
+                        summary="nested plan review failed",
+                        error=sanitize_control_text(error),
+                    )
+                    raise
+            content = self._structured_artifact_payload(
+                payload,
+                schema_name="turn.plan-audit",
+                artifact_name="plan-audit",
             )
-            run = await self.store.create_run(
-                node,
-                "semantic-plan-auditor",
-                len(runs) + attempt,
-                process_owner_id=attempt_ctx.node.id,
+            audit = parse_plan_audit(content)
+        except Exception as error:
+            await self.store.update_review_request(
+                project_id,
+                request.id,
+                status=ReviewStatus.SETTLED,
+                summary=f"review turn failed: {sanitize_control_text(error)}",
             )
-            attempt_ctx.run_id = str(run.id)
-            await self.store.mark_run_process(
-                run.id,
-                ProcessState.RUNNING,
-                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
-            )
-            try:
-                payload, usage, session_id = await planner.call_structured(
-                    attempt_ctx,
-                    prompt,
-                    handoff_kind="result",
-                )
-                await self.store.mark_run_process(
-                    run.id,
-                    ProcessState.RUNNING,
-                    pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
-                )
-                content = self._structured_artifact_payload(
-                    payload,
-                    schema_name="turn.plan-audit",
-                    artifact_name="plan-audit",
-                )
-                audit = parse_plan_audit(content)
-                # The result is already in memory; the provider/control
-                # process must be gone before this Run becomes observable as
-                # settled. This is deliberately the exact synthetic owner
-                # passed to the provider context, not the graph boundary.
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
-                accepted = await self.store.accept_run_submission(
-                    run.id,
-                    outcome=Outcome.COMPLETE,
-                )
-                if accepted is None:
-                    raise InvalidSubmission("semantic audit Run became stale")
-                await self.store.mark_run_process(
-                    run.id, ProcessState.EXITED, exit_code=0
-                )
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.COMPLETE,
-                    outcome=Outcome.COMPLETE,
-                    summary=audit.summary,
-                    usage=usage,
-                    session_id=session_id,
-                )
-                return audit
-            except asyncio.CancelledError:
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
-                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.CANCELLED,
-                    outcome=Outcome.FAIL,
-                    summary="semantic organization plan audit cancelled",
-                    error="run cancelled by user",
-                    retry_recommended=False,
-                )
-                raise
-            except Exception as error:
-                last_error = error
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
-                await self.store.mark_run_process(
-                    run.id, ProcessState.EXITED, exit_code=1
-                )
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.FAILED,
-                    outcome=Outcome.FAIL,
-                    summary="semantic organization plan audit failed",
-                    error=sanitize_control_text(error),
-                    retry_recommended=attempt < 3,
-                )
-                if attempt < 3:
-                    await asyncio.sleep(0.05 * attempt)
-        raise ControlOperationUnavailable(
-            "semantic organization plan audit unavailable after 3 attempts: "
-            + sanitize_control_text(last_error)
-        ) from last_error
+            raise
+        await self.store.update_review_request(
+            project_id,
+            request.id,
+            status=ReviewStatus.SETTLED,
+            decision=(
+                ReviewDecision.APPROVE
+                if audit.decision is PlanAuditDecision.APPROVE
+                else ReviewDecision.REJECT
+            ),
+            summary=audit.summary,
+            required_changes=list(audit.required_changes or []),
+        )
+        return audit
+
+    async def _parent_planner_for(self, node: Node) -> Node | None:
+        """Nearest ancestor planner boundary, or None at the root."""
+        nodes_list, edges, _ = await self.store.get_workgraph(node.project_id)
+        nodes = {n.id: n for n in nodes_list}
+        walker = GraphWalker(list(nodes.values()), edges)
+        for ancestor in walker.ancestors(node.id):
+            ancestor_id = getattr(ancestor, "id", ancestor)
+            candidate = nodes.get(ancestor_id)
+            if candidate is not None and candidate.executor == PLANNER_EXECUTOR:
+                return candidate
+        return None
 
     async def _record_plan_audit(
         self,
@@ -1638,53 +1867,42 @@ class Runner:
                 + json.dumps(snapshot, sort_keys=True),
             ]
         )
+        # Manager review resumes the boundary's own retained session in its
+        # own durable pane. There is no synthetic reviewer process and no
+        # synthetic process owner: the planner's terminal visibly becomes
+        # active again for the review turn.
         runs = await self.store.get_runs(boundary.id)
-        # A failed control attempt owns a synthetic pane, not the graph
-        # boundary. Close those exact owners before retrying so a previous
-        # review cannot leak a provider writer or a Herdr tab into the next
-        # attempt.
-        for previous in runs:
-            if (
-                previous.worker == "organization-manager"
-                and previous.status is not RunStatus.RUNNING
-                and previous.process_owner_id is not None
-            ):
-                await self.terminal.close_persistent_session(
-                    previous.process_owner_id
-                )
+        completion_request = await self.store.create_review_request(
+            project_id=boundary.project_id,
+            sender_id=boundary.id,
+            receiver_id=boundary.id,
+            receiver_is_lead=False,
+            kind=ReviewKind.COMPLETION_REVIEW,
+            reason="boundary frontier settled; manager review requested",
+        )
+        await self.store.update_review_request(
+            boundary.project_id,
+            completion_request.id,
+            status=ReviewStatus.ACTIVE,
+        )
         last_error: Exception | None = None
         for attempt in range(1, 4):
-            # Each manager attempt owns a fresh synthetic pane. Reusing the
-            # graph boundary as the process owner makes the UI attach to the
-            # wrong terminal and allows a failed control writer to survive a
-            # retry.
-            attempt_ctx = review_ctx.model_copy(
-                update={
-                    "node": review_ctx.node.model_copy(update={"id": uuid.uuid4()}),
-                }
-            )
             run = await self.store.create_run(
                 boundary,
                 "organization-manager",
                 len(runs) + attempt,
-                process_owner_id=attempt_ctx.node.id,
             )
-            attempt_ctx.run_id = str(run.id)
+            review_ctx.run_id = str(run.id)
             await self.store.mark_run_process(
                 run.id,
                 ProcessState.RUNNING,
-                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
+                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(boundary.id),
             )
             try:
                 payload, usage, session_id = await planner.call_structured(
-                    attempt_ctx,
+                    review_ctx,
                     prompt,
                     handoff_kind="result",
-                )
-                await self.store.mark_run_process(
-                    run.id,
-                    ProcessState.RUNNING,
-                    pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
                 )
                 content = self._structured_artifact_payload(
                     payload,
@@ -1692,7 +1910,17 @@ class Runner:
                     artifact_name="manager-result",
                 )
                 result = parse_manager_result(content)
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.update_review_request(
+                    boundary.project_id,
+                    completion_request.id,
+                    status=ReviewStatus.SETTLED,
+                    decision=(
+                        ReviewDecision.APPROVE
+                        if result.decision is ManagerDecision.ACCEPT
+                        else ReviewDecision.REJECT
+                    ),
+                    summary=result.summary,
+                )
                 accepted = await self.store.accept_run_submission(
                     run.id,
                     outcome=Outcome.COMPLETE,
@@ -1714,7 +1942,12 @@ class Runner:
                     await self._remember_session(boundary, session_id)
                 return result
             except asyncio.CancelledError:
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.update_review_request(
+                    boundary.project_id,
+                    completion_request.id,
+                    status=ReviewStatus.SETTLED,
+                    summary="manager review cancelled",
+                )
                 await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
                 await self.store.update_run(
                     run.id,
@@ -1727,7 +1960,12 @@ class Runner:
                 raise
             except Exception as error:
                 last_error = error
-                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.update_review_request(
+                    boundary.project_id,
+                    completion_request.id,
+                    status=ReviewStatus.SETTLED,
+                    summary=f"manager review failed: {sanitize_control_text(error)}",
+                )
                 await self.store.mark_run_process(
                     run.id, ProcessState.EXITED, exit_code=1
                 )
@@ -1901,11 +2139,20 @@ class Runner:
                         semantic=deterministic,
                         correction_count=correction_attempt,
                     )
-                    if correction_attempt >= 2:
-                        raise RuntimeError(
+                    if correction_attempt >= await self._plan_correction_limit(node):
+                        request = await self._escalate_plan_review(
+                            node,
+                            reason=(
+                                "deterministic organization audit rejected the plan "
+                                "after exhausting correction attempts"
+                            ),
+                            required_changes=list(structural_errors),
+                        )
+                        raise PlanReviewEscalated(
                             "deterministic organization audit rejected the plan "
-                            "after two correction attempts: "
-                            + "; ".join(structural_errors)
+                            "after exhausting correction attempts: "
+                            + "; ".join(structural_errors),
+                            request.id,
                         )
                     ctx.review_feedback = (
                         "Deterministic organization audit rejected the previous plan. "
@@ -1938,10 +2185,19 @@ class Runner:
                 )
                 if semantic.decision is PlanAuditDecision.APPROVE:
                     break
-                if correction_attempt >= 2:
-                    raise RuntimeError(
-                        "semantic organization audit rejected the plan after two correction attempts: "
-                        + "; ".join(semantic.required_changes or semantic.findings)
+                if correction_attempt >= await self._plan_correction_limit(node):
+                    request = await self._escalate_plan_review(
+                        node,
+                        reason=(
+                            "semantic organization audit rejected the plan "
+                            "after exhausting correction attempts"
+                        ),
+                        required_changes=list(semantic.required_changes or semantic.findings),
+                    )
+                    raise PlanReviewEscalated(
+                        "semantic organization audit rejected the plan after exhausting correction attempts: "
+                        + "; ".join(semantic.required_changes or semantic.findings),
+                        request.id,
                     )
                 ctx.review_feedback = (
                     "Independent semantic audit rejected the previous plan. "
@@ -3176,6 +3432,8 @@ class Runner:
             if decision is None:
                 continue
             decisions.append(decision)
+            if decision.decision is ManagerDecision.CONTINUE:
+                await self._maybe_escalate_manager_loop(boundary, decision)
             if decision.decision is ManagerDecision.ACCEPT:
                 await self._expose_boundary_output_commit(boundary.id)
             await self._emit("organization.reviewed", project_id, {
@@ -3203,6 +3461,40 @@ class Runner:
                         await self.store.set_organization_review(boundary.id, review)
                 break
         return decisions
+
+    async def _maybe_escalate_manager_loop(self, boundary: Node, decision) -> None:
+        """Escalate a manager that keeps continuing without resolving."""
+        current = await self.store.get_node(boundary.id)
+        if current is None:
+            return
+        contract = current.organization_contract
+        if contract is None or contract.escalation is None:
+            return
+        policy = contract.escalation
+        if current.manager_iteration < policy.max_manager_iterations:
+            return
+        reason = (
+            f"manager review exceeded {policy.max_manager_iterations} iterations "
+            f"without resolution: {decision.reason}"
+        )
+        await self._escalate_plan_review(
+            current,
+            reason=reason,
+            required_changes=[],
+        )
+        review = current.organization_review or OrganizationReview()
+        review.phase = OrganizationPhase.BLOCKED
+        review.replan_requested = False
+        review.last_reason = reason
+        review.last_decision = ManagerDecision.BLOCK
+        review.block_count += 1
+        await self.store.set_organization_review(current.id, review)
+        await self.store.set_manager_state(
+            current.id,
+            phase=ManagerPhase.BLOCKED,
+            reasons=[reason],
+        )
+        await self.store.set_status(current.id, NodeStatus.BLOCKED)
 
     async def _expose_boundary_output_commit(self, boundary_id: uuid.UUID) -> None:
         """Expose the accepted nested integrator commit to its parent edge."""
@@ -3537,6 +3829,21 @@ class Runner:
                 return False
         return bool(self.terminal.snapshot(node_id).get("active"))
 
+    async def open_lead_shell(self, owner_id: uuid.UUID) -> bool:
+        """Open an interactive shell in the lead's durable pane."""
+        if self.shell.snapshot(owner_id).get("active"):
+            return True
+        existing = self._shell_tasks.get(owner_id)
+        if existing is not None and not existing.done():
+            return True
+        lead = await self.store.lead_by_terminal_owner(owner_id)
+        if lead is None:
+            return False
+        cwd = await self._project_repo(lead.project_id)
+        if not cwd:
+            return False
+        return await self._start_shell(owner_id, cwd, lead.project_id)
+
     async def open_shell(self, node_id: uuid.UUID) -> bool:
         """Open an ordinary interactive shell in the node's project directory."""
         if self.shell.snapshot(node_id).get("active"):
@@ -3550,6 +3857,9 @@ class Runner:
         cwd = await self._project_repo(node.project_id)
         if not cwd:
             return False
+        return await self._start_shell(node_id, cwd, node.project_id)
+
+    async def _start_shell(self, owner_id: uuid.UUID, cwd: str, project_id: uuid.UUID) -> bool:
         os.makedirs(cwd, exist_ok=True)
         shell = os.environ.get("SHELL") or "/bin/sh"
         if not os.path.exists(shell):
@@ -3561,10 +3871,10 @@ class Runner:
         async def run_shell() -> None:
             try:
                 await self.shell.run(
-                    node_id,
+                    owner_id,
                     [shell, "-i"],
                     cwd=cwd,
-                    environment={"TURN_PROJECT_ID": str(node.project_id)},
+                    environment={"TURN_PROJECT_ID": str(project_id)},
                     stream=None,
                     timeout=None,
                     stall_timeout=None,
@@ -3572,26 +3882,26 @@ class Runner:
                     idle_reap=None,
                 )
             except FileNotFoundError:
-                logger.warning("cannot open shell for %s", node_id)
+                logger.warning("cannot open shell for %s", owner_id)
             except asyncio.CancelledError:
                 raise
             finally:
-                self.shell.release(node_id)
-                self._shell_tasks.pop(node_id, None)
+                self.shell.release(owner_id)
+                self._shell_tasks.pop(owner_id, None)
 
         task = asyncio.create_task(run_shell())
-        self._shell_tasks[node_id] = task
+        self._shell_tasks[owner_id] = task
         # Do not let the websocket take its initial snapshot until the PTY is
         # registered. A Herdr control stream can emit the prompt immediately; if the
         # subscriber snapshots during the small create_subprocess window it
         # receives an empty terminal and misses the persistent scrollback.
         for _ in range(100):
             await asyncio.sleep(0.02)
-            if self.shell.snapshot(node_id).get("active"):
+            if self.shell.snapshot(owner_id).get("active"):
                 return True
             if task.done():
                 return False
-        return bool(self.shell.snapshot(node_id).get("active"))
+        return bool(self.shell.snapshot(owner_id).get("active"))
 
     async def detach_shell(self, node_id: uuid.UUID) -> bool:
         """Detach the browser PTY while retaining the Herdr pane."""

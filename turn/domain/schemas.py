@@ -211,6 +211,7 @@ class AgentType(str, Enum):
     EXECUTOR = "executor"
     INTEGRATOR = "integrator"
     VERIFIER = "verifier"
+    LEAD = "lead"
 
 
 class VerificationDecision(str, Enum):
@@ -344,6 +345,7 @@ class Agent(BaseModel):
             AgentType.INTEGRATOR: Integrator,
             AgentType.VERIFIER: Verifier,
             AgentType.EXECUTOR: Executor,
+            AgentType.LEAD: Lead,
         }[target]
         return agent_model.model_validate(
             {
@@ -356,6 +358,91 @@ class Agent(BaseModel):
 
 class AgentConfig(Agent):
     """Request boundary for creating or updating an :class:`Agent`."""
+
+
+class LeadStatus(str, Enum):
+    """Lifecycle of the project lead agent itself."""
+
+    IDLE = "IDLE"          # created; no provider turn in flight
+    RUNNING = "RUNNING"    # one lead provider turn is in flight
+
+
+class BootstrapStatus(str, Enum):
+    """Project bootstrap progression.
+
+    ``BOOTSTRAPPING`` covers automatic lead/planner organization setup up to
+    root plan acceptance. ``READY`` means normal server-scheduled execution
+    (Step mode by default) is in charge.
+    """
+
+    BOOTSTRAPPING = "BOOTSTRAPPING"
+    READY = "READY"
+
+
+class ReviewKind(str, Enum):
+    PLAN_REVIEW = "PLAN_REVIEW"
+    COMPLETION_REVIEW = "COMPLETION_REVIEW"
+    ESCALATION = "ESCALATION"
+
+
+class ReviewStatus(str, Enum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    SETTLED = "SETTLED"
+
+
+class ReviewDecision(str, Enum):
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+
+
+class ProjectLead(BaseModel):
+    """The single visible oversight agent of one project.
+
+    Persisted per project but never part of workflow sequencing. The provider
+    process may close between turns; continuity lives in ``session_id`` plus
+    the durable terminal owned by ``terminal_owner_id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    project_id: uuid.UUID
+    # Stable terminal/process owner identity. Terminals are keyed by this id
+    # so the lead keeps exactly one durable pane across restarts.
+    terminal_owner_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    agent: Optional[Agent] = None
+    session_id: Optional[str] = None
+    status: LeadStatus = LeadStatus.IDLE
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ReviewRequest(BaseModel):
+    """One durable review or escalation turn inside the agent hierarchy.
+
+    This is not a generic messaging system. It exists only to represent plan
+    reviews, completion/charter reviews, and escalations, and it is the
+    authoritative source for review-flow projection.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    project_id: uuid.UUID
+    # Sender is always a planner node. The receiver is either the parent
+    # planner node or the project lead (receiver_is_lead=True).
+    sender_id: uuid.UUID
+    receiver_id: uuid.UUID
+    receiver_is_lead: bool = False
+    kind: ReviewKind
+    status: ReviewStatus = ReviewStatus.PENDING
+    reason: Optional[str] = None
+    artifact_refs: list[str] = Field(default_factory=list)
+    decision: Optional[ReviewDecision] = None
+    summary: Optional[str] = None
+    required_changes: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_utcnow)
+    settled_at: Optional[datetime] = None
 
 
 class CapabilityStatus(BaseModel):
@@ -390,6 +477,17 @@ class Verifier(Agent):
     """Specialized agent that approves or rejects work in the workgraph."""
 
     type_id: AgentType = AgentType.VERIFIER
+
+
+class Lead(Agent):
+    """Project-level oversight agent; never a sequenced graph node.
+
+    The lead reviews root plans and charter completion, receives escalations,
+    and converses with the user. It shares planner foundations but its prompt
+    contract is review- and escalation-first.
+    """
+
+    type_id: AgentType = AgentType.LEAD
 
 
 class RunPolicy(BaseModel):
@@ -816,6 +914,9 @@ class GraphView(BaseModel):
     """Serialized graph returned to the web client."""
 
     project_id: uuid.UUID
+    bootstrap_status: str = "READY"
+    lead: Optional[ProjectLead] = None
+    review_requests: list[ReviewRequest] = Field(default_factory=list)
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)
     flow_edges: list[FlowEdge] = Field(default_factory=list)

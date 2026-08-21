@@ -183,6 +183,25 @@ class OrganizationBudget(BaseModel):
     max_wall_time_seconds: float | None = Field(default=None, gt=0)
 
 
+class EscalationPolicy(BaseModel):
+    """Local review/escalation limits for one planner boundary.
+
+    Global defaults are these field defaults; each organization charter may
+    override them based on risk, depth, or desired review sensitivity. When a
+    limit is exceeded the boundary escalates to its parent instead of failing
+    silently or looping.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Plan correction attempts before a plan review escalates upward.
+    max_plan_corrections: int = Field(default=2, ge=0, le=20)
+    # Manager review iterations before unresolved progress escalates upward.
+    max_manager_iterations: int = Field(default=5, ge=1, le=100)
+    # A BLOCK decision always escalates when no user input has arrived.
+    escalate_on_block: bool = True
+
+
 class OrganizationContract(BaseModel):
     """The charter that a planner must preserve while shaping a subtree."""
 
@@ -204,6 +223,7 @@ class OrganizationContract(BaseModel):
     min_first_level_production_owners: int = Field(default=1, ge=1)
     require_independent_verification: bool = False
     max_replans: int = Field(default=3, ge=0, le=100)
+    escalation: EscalationPolicy = Field(default_factory=EscalationPolicy)
 
     @field_validator("acceptance_criteria", mode="before")
     @classmethod

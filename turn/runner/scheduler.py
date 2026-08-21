@@ -336,6 +336,10 @@ class Scheduler:
         if project_id in self.deleting_projects:
             return
         root_snapshot = await self.store.get_node(project_id)
+        bootstrap = self.store.bootstrap_status_sync(project_id)
+        if bootstrap == "BOOTSTRAPPING":
+            await self._bootstrap_tick(project_id, root_snapshot)
+            bootstrap = self.store.bootstrap_status_sync(project_id)
         if root_snapshot is not None and root_snapshot.auto_run:
             project_limit = root_snapshot.run_policy.max_parallel_agents if root_snapshot.run_policy else getattr(
                 self.settings, "max_parallel_agents", 4
@@ -416,7 +420,7 @@ class Scheduler:
             if settled and len(nodes) > 1:
                 await self._finalize(root)
 
-        if root is None or not root.auto_run:
+        if root is None or (not root.auto_run and bootstrap != "BOOTSTRAPPING"):
             return
         policy = root.run_policy
         delay_ms = policy.delay_between_jobs_ms if policy else self.settings.delay_between_jobs_ms
@@ -463,6 +467,10 @@ class Scheduler:
                 or candidate.trigger_context is not None
             )
         ], key=lambda node_id: (-priority_by_node.get(node_id, 0), topo_index[node_id]))
+        if bootstrap == "BOOTSTRAPPING":
+            # Bootstrap automation launches only the root planner; everything
+            # below the accepted root plan waits for READY + step/auto mode.
+            runnable_order = [node_id for node_id in runnable_order if node_id == project_id]
         project_active = self._active_count(project_id)
         global_active = self._active_count()
         for node_id in runnable_order:
@@ -497,6 +505,45 @@ class Scheduler:
             self.last_launch_at[project_id] = time.monotonic()
             if delay_ms:
                 break
+
+    async def _bootstrap_tick(self, project_id: uuid.UUID, root: Node | None) -> None:
+        """Drive lead/planner bootstrap until the root plan is accepted.
+
+        The tick launches only the root planner and flips the project to
+        READY when the plan is applied, when bootstrap cannot continue
+        (failure/cancel/pause), or when a user interrupts.
+        """
+        fresh = await self.store.get_node(project_id)
+        if fresh is None:
+            return
+        if await self.store.project_lead(project_id) is None:
+            await self.store.ensure_project_lead(
+                project_id,
+                agent=fresh.agent.model_copy() if fresh.agent else None,
+            )
+        if fresh.status is NodeStatus.EXPANDED or fresh.status is NodeStatus.COMPLETE:
+            # Root plan applied and accepted by the lead: bootstrap done.
+            await self.store.set_bootstrap_status(project_id, "READY")
+            await self._emit("project.bootstrap", project_id, {
+                "project_id": str(project_id),
+                "status": "READY",
+                "reason": "root plan accepted",
+            })
+            return
+        if fresh.paused or fresh.status in (
+            NodeStatus.FAILED,
+            NodeStatus.CANCELLED,
+            NodeStatus.BLOCKED,
+        ):
+            # Bootstrap cannot continue autonomously; stop the automation and
+            # leave the failure or interruption visible. Step mode takes over.
+            await self.store.set_bootstrap_status(project_id, "READY")
+            await self._emit("project.bootstrap", project_id, {
+                "project_id": str(project_id),
+                "status": "READY",
+                "reason": f"interrupted: root {fresh.status.value}"
+                + (" (paused)" if fresh.paused else ""),
+            })
 
     async def step(self, project_id: uuid.UUID) -> list[uuid.UUID]:
         """Launch exactly the current runnable frontier in manual mode."""

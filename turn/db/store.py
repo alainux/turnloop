@@ -69,6 +69,14 @@ from turn.domain.organization import (
 )
 from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
+from turn.domain.lead import (
+    BootstrapStatus,
+    ProjectLead,
+    ReviewDecision,
+    ReviewKind,
+    ReviewRequest,
+    ReviewStatus,
+)
 from turn.contracts.organization import audit_plan
 from turn.contracts.text import sanitize_control_text
 from turn.db.state import ProjectState
@@ -346,6 +354,12 @@ class Store:
         for item in raw.get("budget_requests", []):
             request = BudgetRequest.model_validate(item)
             state.budget_requests[request.id] = request
+        for item in raw.get("review_requests", []):
+            review = ReviewRequest.model_validate(item)
+            state.review_requests[review.id] = review
+        if raw.get("lead") is not None:
+            state.lead = ProjectLead.model_validate(raw["lead"])
+        state.bootstrap_status = raw.get("bootstrap_status", state.bootstrap_status)
         # Give pre-organization projects a durable charter when they are first
         # reopened.  This is an additive projection migration: it does not
         # invent tickets or change the existing graph, but it lets the manager
@@ -473,6 +487,13 @@ class Store:
             payload["budget_requests"] = [
                 self._model_dump(value) for value in state.budget_requests.values()
             ]
+        if state.review_requests:
+            payload["review_requests"] = [
+                self._model_dump(value) for value in state.review_requests.values()
+            ]
+        if state.lead is not None:
+            payload["lead"] = self._model_dump(state.lead)
+        payload["bootstrap_status"] = state.bootstrap_status
         return payload
 
     async def _persist_project(self, project_id: uuid.UUID) -> None:
@@ -967,6 +988,216 @@ class Store:
             )
             return request.model_copy(deep=True)
         return None
+
+    # ------------------------------------------------------------------
+    # Project lead and review requests
+
+    async def project_lead(self, project_id: uuid.UUID) -> ProjectLead | None:
+        """Return the project's single lead, creating nothing implicitly."""
+        state = self._states.get(project_id)
+        if state is None or state.lead is None:
+            return None
+        return state.lead.model_copy(deep=True)
+
+    async def lead_by_terminal_owner(self, owner_id: uuid.UUID) -> ProjectLead | None:
+        """Resolve a lead by its stable terminal owner identity."""
+        for state in self._states.values():
+            if state.lead is not None and state.lead.terminal_owner_id == owner_id:
+                return state.lead.model_copy(deep=True)
+        return None
+
+    async def ensure_project_lead(
+        self,
+        project_id: uuid.UUID,
+        *,
+        agent=None,
+    ) -> ProjectLead:
+        """Return the project lead, creating the single instance on first call.
+
+        The lead is idempotent per project: repeated bootstrap or restart
+        paths must never spawn a second oversight agent.
+        """
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            if state.lead is None:
+                state.lead = ProjectLead(project_id=project_id, agent=agent)
+                await self._persist_project(project_id)
+                await self._log(
+                    project_id,
+                    kind="lead.created",
+                    action="lead.created",
+                    message=f"project lead {state.lead.id} created",
+                    data={"lead_id": str(state.lead.id)},
+                )
+            elif agent is not None and state.lead.agent is None:
+                state.lead.agent = agent
+                await self._persist_project(project_id)
+            return state.lead.model_copy(deep=True)
+
+    async def update_lead(
+        self,
+        project_id: uuid.UUID,
+        *,
+        session_id: str | None = None,
+        status=None,
+        agent=None,
+    ) -> ProjectLead | None:
+        """Persist lead lifecycle/session fields (all updates optional)."""
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            if state.lead is None:
+                return None
+            if session_id is not None:
+                state.lead.session_id = session_id
+            if status is not None:
+                from turn.domain.lead import LeadStatus
+                state.lead.status = LeadStatus(status)
+            if agent is not None:
+                state.lead.agent = agent
+            await self._persist_project(project_id)
+            return state.lead.model_copy(deep=True)
+
+    async def create_review_request(
+        self,
+        *,
+        project_id: uuid.UUID,
+        sender_id: uuid.UUID,
+        receiver_id: uuid.UUID,
+        receiver_is_lead: bool,
+        kind: ReviewKind,
+        reason: str | None = None,
+        artifact_refs: list[str] | None = None,
+        required_changes: list[str] | None = None,
+    ) -> ReviewRequest:
+        """Durably record one pending review/escalation turn."""
+        request = ReviewRequest(
+            project_id=project_id,
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            receiver_is_lead=receiver_is_lead,
+            kind=kind,
+            reason=reason,
+            artifact_refs=list(artifact_refs or []),
+            required_changes=list(required_changes or []),
+        )
+        async with self._project_lock(project_id):
+            self._state(project_id).review_requests[request.id] = request
+            await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="review.requested",
+            action="review.requested",
+            message=f"{kind.value} review requested ({request.status.value})",
+            data={
+                "review_request_id": str(request.id),
+                "sender_id": str(sender_id),
+                "receiver_id": str(receiver_id),
+                "receiver_is_lead": receiver_is_lead,
+                "kind": kind.value,
+                "reason": reason,
+            },
+        )
+        return request.model_copy(deep=True)
+
+    async def update_review_request(
+        self,
+        project_id: uuid.UUID,
+        request_id: uuid.UUID,
+        *,
+        status: ReviewStatus | None = None,
+        decision: ReviewDecision | None = None,
+        summary: str | None = None,
+        required_changes: list[str] | None = None,
+    ) -> ReviewRequest | None:
+        """Advance a review request; SETTLED stamps ``settled_at`` once."""
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            request = state.review_requests.get(request_id)
+            if request is None:
+                return None
+            changed = False
+            if status is not None and status is not request.status:
+                request.status = status
+                changed = True
+            if decision is not None:
+                request.decision = decision
+                changed = True
+            if summary is not None:
+                request.summary = summary
+                changed = True
+            if required_changes is not None:
+                request.required_changes = list(required_changes)
+                changed = True
+            if request.status is ReviewStatus.SETTLED and request.settled_at is None:
+                from datetime import datetime, timezone as _timezone
+                request.settled_at = datetime.now(_timezone.utc)
+                changed = True
+            if changed:
+                await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="review.updated",
+            action="review.updated",
+            message=f"review {request_id} -> {request.status.value}"
+            + (f" ({request.decision.value})" if request.decision else ""),
+            data={
+                "review_request_id": str(request_id),
+                "status": request.status.value,
+                "decision": request.decision.value if request.decision else None,
+                "summary": request.summary,
+            },
+        )
+        return request.model_copy(deep=True)
+
+    async def review_requests(
+        self,
+        project_id: uuid.UUID,
+        *,
+        status: ReviewStatus | None = None,
+        sender_id: uuid.UUID | None = None,
+        receiver_id: uuid.UUID | None = None,
+    ) -> list[ReviewRequest]:
+        """List durable review requests, newest first, optionally filtered."""
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        values = [
+            item
+            for item in state.review_requests.values()
+            if (status is None or item.status is status)
+            and (sender_id is None or item.sender_id == sender_id)
+            and (receiver_id is None or item.receiver_id == receiver_id)
+        ]
+        values.sort(key=lambda item: item.created_at, reverse=True)
+        return [item.model_copy(deep=True) for item in values]
+
+    def bootstrap_status_sync(self, project_id: uuid.UUID) -> str:
+        """Synchronous bootstrap-status read for scheduler hot paths."""
+        state = self._states.get(project_id)
+        return state.bootstrap_status if state else "READY"
+
+    async def bootstrap_status(self, project_id: uuid.UUID) -> str:
+        return self.bootstrap_status_sync(project_id)
+
+    async def set_bootstrap_status(
+        self, project_id: uuid.UUID, status: str
+    ) -> str:
+        if status not in ("BOOTSTRAPPING", "READY"):
+            raise ValueError(f"invalid bootstrap status: {status}")
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            previous = state.bootstrap_status
+            state.bootstrap_status = status
+            await self._persist_project(project_id)
+        if previous != status:
+            await self._log(
+                project_id,
+                kind="project.bootstrap",
+                action="bootstrap.status",
+                message=f"bootstrap {previous} -> {status}",
+                data={"from": previous, "to": status},
+            )
+        return status
 
     async def list_handoffs(
         self,
@@ -2351,10 +2582,17 @@ class Store:
 
     async def get_runs(self, node_id: uuid.UUID) -> list[Run]:
         found = self._project_for_node(node_id)
-        if not found:
-            return []
-        project_id, _ = found
-        return [run.model_copy(deep=True) for run in self._states[project_id].runs.values() if run.node_id == node_id]
+        if found:
+            project_id, _ = found
+            return [run.model_copy(deep=True) for run in self._states[project_id].runs.values() if run.node_id == node_id]
+        # Non-graph owners (e.g. the project lead terminal identity) still own
+        # observable runs; scan every project for them.
+        return [
+            run.model_copy(deep=True)
+            for state in self._states.values()
+            for run in state.runs.values()
+            if run.node_id == node_id
+        ]
 
     async def get_project_runs(self, project_id: uuid.UUID) -> list[Run]:
         state = self._states.get(project_id, self._empty_state())

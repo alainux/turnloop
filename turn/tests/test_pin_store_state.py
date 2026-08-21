@@ -86,7 +86,15 @@ async def test_pin_store_round_trip_preserves_graph_runs_artifacts_and_policy(tm
         item.model_dump(mode="json") for item in artifacts
     ]
     assert await reloaded.get_project_runs(root.id) == await store.get_project_runs(root.id)
-    assert set(persisted_before) == {"version", "project_id", "nodes", "edges", "runs", "artifacts"}
+    assert set(persisted_before) == {
+        "version",
+        "project_id",
+        "nodes",
+        "edges",
+        "runs",
+        "artifacts",
+        "bootstrap_status",
+    }
     assert persisted_before["version"] == 3
 
 
