@@ -671,8 +671,6 @@ export default function App() {
             reviews={graph.review_requests ?? []}
             runs={graph.lead_runs ?? []}
             onClose={() => setLeadOpen(false)}
-            onChanged={loadGraph}
-            notify={notify}
           />
         </>
       )}

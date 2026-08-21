@@ -43,7 +43,7 @@ from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
-from turn.runner.runner import Runner, ControlOperationUnavailable
+from turn.runner.runner import Runner
 from turn.domain.lead import ReviewStatus
 from turn.metrics import BehaviorMetricsStore, evaluate_expectations
 from turn.workers.conversations import (
@@ -241,10 +241,6 @@ class CreateBudgetRequest(BaseModel):
     organization_id: Optional[uuid.UUID] = None
     requested_budget: OrganizationBudget
     reason: str = Field(min_length=1)
-
-
-class LeadMessage(BaseModel):
-    message: str = Field(min_length=1)
 
 
 class DecideBudgetRequest(BaseModel):
@@ -1161,40 +1157,6 @@ async def project_reviews(project_id: str, request: Request, status: str | None 
         "project_id": project_id,
         "review_requests": [item.model_dump(mode="json") for item in requests],
     }
-
-
-@router.post("/api/projects/{project_id}/lead/message")
-async def message_project_lead(project_id: str, body: LeadMessage, request: Request):
-    """Send one user message to the project lead and run one lead turn."""
-    pid = uuid.UUID(project_id)
-    runner: Runner = await _runner(request)
-    if await runner.store.get_node(pid) is None:
-        raise HTTPException(404, "project not found")
-    text = body.message.strip()
-    if not text:
-        raise HTTPException(422, "message must not be empty")
-    try:
-        payload, _usage = await runner._run_lead_turn(
-            pid,
-            purpose="user-message",
-            prompt=(
-                "The project owner sent you the following message. Respond in the "
-                "result envelope; put your plain-language reply in the summary and "
-                "any concrete follow-ups into required_changes.\n\n"
-                f"Owner message:\n{text}\n"
-            ),
-        )
-    except ControlOperationUnavailable as error:
-        raise HTTPException(409, str(error)) from error
-    summary = ""
-    for artifact in payload.get("artifacts", []):
-        if isinstance(artifact, dict) and artifact.get("name") == "plan-audit":
-            content = artifact.get("content") or {}
-            summary = str(content.get("summary") or "")
-            break
-    if not summary:
-        summary = str(payload.get("summary") or "")
-    return {"ok": True, "reply": summary}
 
 
 @router.get("/api/projects/{project_id}/budget-requests")

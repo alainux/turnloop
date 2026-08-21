@@ -1867,6 +1867,10 @@ form.composer:has(.composer-config-panel) {
 .inspector.trigger-inspector {
   grid-template-rows: 38px minmax(0, 1fr);
 }
+/* The lead inspector has no tab strip; its content owns the full body. */
+.inspector.lead-inspector {
+  grid-template-rows: 38px minmax(0, 1fr);
+}
 .inspector-tabs {
   display: flex;
   padding: 0 8px;
@@ -4409,14 +4413,6 @@ img.icon {
 .lead-inspector .terminal-host > * {
   flex: 1;
   min-height: 0;
-}
-.lead-reply {
-  margin-top: 8px;
-  padding: 8px 10px;
-  border-left: 2px solid var(--accent, #6366f1);
-  background: var(--panel-soft, rgb(127 127 127 / 8%));
-  font-size: 12px;
-  white-space: pre-wrap;
 }
 .review-list {
   list-style: none;

@@ -1,6 +1,5 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { GraphNode, ProjectLead, ReviewRequest, Run } from "../domain";
-import { sendLeadMessage } from "../api/lead";
 import { Icon } from "./Icon";
 import { TerminalView } from "./TerminalView";
 
@@ -8,6 +7,7 @@ import { TerminalView } from "./TerminalView";
  * The project lead is oversight identity, not a graph node: exactly one per
  * project, with its own durable terminal and retained session. This surface
  * keeps it visible outside the DAG and exposes the review trail it owns.
+ * Interaction happens through the lead's terminal, like every other agent.
  */
 
 interface OversightProps {
@@ -50,8 +50,6 @@ interface InspectorProps {
   reviews: ReviewRequest[];
   runs: Run[];
   onClose: () => void;
-  onChanged: () => Promise<void>;
-  notify: (text: string) => void;
 }
 
 function reviewTitle(kind: ReviewRequest["kind"]): string {
@@ -69,13 +67,7 @@ export function LeadInspector({
   reviews,
   runs,
   onClose,
-  onChanged,
-  notify,
 }: InspectorProps) {
-  const [message, setMessage] = useState("");
-  const [reply, setReply] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
   // The lead's terminal is keyed by its stable terminal owner id, so the
   // ordinary shell endpoint attaches to the lead's own durable pane.
   const terminalNode = useMemo(
@@ -90,22 +82,6 @@ export function LeadInspector({
       }) as unknown as GraphNode,
     [lead.terminal_owner_id, projectId],
   );
-
-  const send = async () => {
-    const text = message.trim();
-    if (!text) return;
-    setBusy(true);
-    try {
-      const result = await sendLeadMessage(projectId, text);
-      setReply(result.reply || "(no reply content)");
-      setMessage("");
-      await onChanged();
-    } catch (error) {
-      notify(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   return (
     <aside className="inspector lead-inspector" id="inspector">
@@ -138,24 +114,6 @@ export function LeadInspector({
           <div className="terminal-host terminal-tab-panel">
             <TerminalView node={terminalNode} runs={runs} />
           </div>
-        </section>
-        <section className="section">
-          <div className="section-heading"><span>Message</span></div>
-          <label className="field">
-            <span>Send the lead a message</span>
-            <textarea
-              rows={3}
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              placeholder="Direction, constraints, answers to escalations…"
-            />
-          </label>
-          <button className="primary" onClick={() => void send()} disabled={busy || !message.trim()}>
-            {busy ? "Sending…" : "Send"}
-          </button>
-          {reply && (
-            <p className="lead-reply">{reply}</p>
-          )}
         </section>
         <section className="section">
           <div className="section-heading"><span>Review trail</span></div>
