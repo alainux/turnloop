@@ -916,6 +916,9 @@ class GraphView(BaseModel):
     project_id: uuid.UUID
     bootstrap_status: str = "READY"
     lead: Optional[ProjectLead] = None
+    # Run history owned by the lead's stable terminal identity. The lead is
+    # not a graph node, so its runs ride at the project level.
+    lead_runs: list[Run] = Field(default_factory=list)
     review_requests: list[ReviewRequest] = Field(default_factory=list)
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

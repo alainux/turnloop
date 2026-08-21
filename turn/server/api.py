@@ -393,6 +393,14 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
             if (lead := await store.project_lead(project_id)) is not None
             else None
         ),
+        "lead_runs": (
+            [
+                run.model_dump(mode="json")
+                for run in await store.get_runs(lead.terminal_owner_id)
+            ]
+            if (lead := await store.project_lead(project_id)) is not None
+            else []
+        ),
         "review_requests": [
             item.model_dump(mode="json")
             for item in await store.review_requests(project_id)

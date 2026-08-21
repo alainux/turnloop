@@ -213,6 +213,7 @@ export interface GraphView {
   project_id: string;
   bootstrap_status: string;
   lead: ProjectLead | null;
+  lead_runs: Array<Run>;
   review_requests: Array<ReviewRequest>;
   nodes: Array<GraphNodeView>;
   edges: Array<Edge>;

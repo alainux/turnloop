@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { GraphNode, ProjectLead, ReviewRequest } from "../domain";
+import type { GraphNode, ProjectLead, ReviewRequest, Run } from "../domain";
 import { sendLeadMessage } from "../api/lead";
 import { Icon } from "./Icon";
 import { TerminalView } from "./TerminalView";
@@ -48,6 +48,7 @@ interface InspectorProps {
   lead: ProjectLead;
   bootstrapStatus: string;
   reviews: ReviewRequest[];
+  runs: Run[];
   onClose: () => void;
   onChanged: () => Promise<void>;
   notify: (text: string) => void;
@@ -66,6 +67,7 @@ export function LeadInspector({
   lead,
   bootstrapStatus,
   reviews,
+  runs,
   onClose,
   onChanged,
   notify,
@@ -133,8 +135,8 @@ export function LeadInspector({
         </section>
         <section className="section">
           <div className="section-heading"><span>Terminal</span></div>
-          <div className="terminal-host">
-            <TerminalView node={terminalNode} runs={[]} />
+          <div className="terminal-host terminal-tab-panel">
+            <TerminalView node={terminalNode} runs={runs} />
           </div>
         </section>
         <section className="section">
