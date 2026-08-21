@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { coalesce } from "./coalesce";
 import type {
   Agent,
   Capabilities,
@@ -303,6 +304,10 @@ export default function App() {
       });
     };
     refreshGraph();
+    // SSE events arrive in bursts during fan-out execution. Fetching the full
+    // graph once per event saturates the server with duplicate requests, so
+    // bursts coalesce into one trailing refresh (bounded at one second).
+    const scheduleRefresh = coalesce(refreshGraph, { delayMs: 200, maxWaitMs: 1000 });
     const stream = new EventSource(`/api/projects/${projectId}/stream`);
     stream.onopen = () => setConnected(true);
     stream.onerror = () => setConnected(false);
@@ -317,7 +322,7 @@ export default function App() {
           return;
         }
         if (message.type !== "heartbeat" && message.type !== "node.terminal")
-          refreshGraph();
+          scheduleRefresh();
       } catch {
         /* ignore malformed external event */
       }
@@ -328,6 +333,7 @@ export default function App() {
     const reconciliation = window.setInterval(refreshGraph, 2000);
     return () => {
       stream.close();
+      scheduleRefresh().cancel();
       window.clearInterval(reconciliation);
     };
   }, [projectId, loadGraph, loadProjects, notify]);

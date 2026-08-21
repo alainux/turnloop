@@ -128,7 +128,7 @@ export function Inspector({
               <TerminalView
                 node={detail.node}
                 runs={detail.runs}
-                terminalNodeId={detail.node.control_activity?.terminal_node_id}
+                control={detail.node.control_activity}
               />
             </Suspense>
           </div>

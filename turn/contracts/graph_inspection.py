@@ -83,6 +83,10 @@ class GraphInspectionNode(BaseModel):
     document_refs: list[DocumentRef] = Field(default_factory=list)
     subgraph_refs: list[SubgraphRef] = Field(default_factory=list)
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
+    provides: list[str] = Field(default_factory=list)
+    consumes: list[str] = Field(default_factory=list)
+    outputs: dict[str, str] = Field(default_factory=dict)
+    route_taken: Optional[str] = None
     follows: list[uuid.UUID] = Field(default_factory=list)
     children: list[uuid.UUID] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)

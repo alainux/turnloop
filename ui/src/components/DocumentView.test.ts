@@ -37,6 +37,10 @@ const node = (id: string, parent_id: string | null): GraphNode =>
     resource_refs: [],
     document_refs: [],
     artifact_refs: [],
+  provides: [],
+  consumes: [],
+  outputs: {},
+  route_taken: null,
     created_at: "",
     updated_at: "",
     progress: null,
@@ -54,6 +58,7 @@ const edge = (src: string, dst: string): Edge => ({
   src,
   dst,
   type: "FOLLOWS",
+  route: null,
   created_at: "",
 });
 

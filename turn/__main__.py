@@ -123,6 +123,12 @@ def parser() -> argparse.ArgumentParser:
     emit.add_argument("--data", default="{}", help="JSON object containing event data")
     emit.add_argument("--project-id", type=uuid.UUID)
     emit.add_argument("--node-id", type=uuid.UUID)
+    vars_cmd = sub.add_parser("vars", help="show node data-passing variables and routes")
+    vars_cmd.add_argument("project_id", type=uuid.UUID, nargs="?")
+    vars_cmd.add_argument(
+        "--state-file",
+        help="explicit local state path; normally discovered from the current directory",
+    )
     agent = sub.add_parser("agent", help="small local protocol used by a running agent")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     status = agent_sub.add_parser("status", help="publish the agent's current state")
@@ -651,6 +657,39 @@ def discover_project_state(start: Path | None = None) -> Path:
     )
 
 
+async def local_vars_command(args) -> int:
+    """Show published variables, consumptions, and routes for one project."""
+    from turn.tools import graph_explorer
+
+    state_file = args.state_file or str(discover_project_state())
+    if args.project_id is None:
+        raise SystemExit("vars project_id is required")
+    nodes, _children = await graph_explorer._query(
+        state_file, str(args.project_id), None, "json"
+    )
+    rows = 0
+    for item in nodes:
+        provides = item.get("provides") or []
+        consumes = item.get("consumes") or []
+        outputs = item.get("outputs") or {}
+        route = item.get("route_taken")
+        if not (provides or consumes or outputs or route):
+            continue
+        rows += 1
+        print(f"node {item['id']} ({item.get('objective', '')[:60]})")
+        if provides:
+            print(f"  provides: {', '.join(provides)}")
+        if consumes:
+            print(f"  consumes: {', '.join(consumes)}")
+        for key in sorted(outputs):
+            print(f"  output {key} = {outputs[key]}")
+        if route:
+            print(f"  route_taken: {route}")
+    if not rows:
+        print("no declared variables or routes")
+    return 0
+
+
 async def local_graph_command(args) -> int:
     """Read a project-local graph through the installed Turn CLI."""
     from turn.tools import graph_explorer
@@ -987,6 +1026,8 @@ async def async_main(args) -> int:
         return trigger_command(args)
     if args.command == "graph":
         return await local_graph_command(args)
+    if args.command == "vars":
+        return await local_vars_command(args)
     if args.command == "project":
         if args.project_command == "info":
             return local_project_info_command(args)

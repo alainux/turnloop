@@ -39,6 +39,7 @@ export type {
   AcceptanceCriterion,
   AcceptanceEvidence,
   CapabilityStatus,
+  ControlActivity,
   DocumentRef,
   Edge,
   FlowEdge,

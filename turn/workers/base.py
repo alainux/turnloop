@@ -38,6 +38,9 @@ class NodeExecutionContext(BaseModel):
     repo_path: Optional[str] = None
     project_repo_path: Optional[str] = None
     predecessor_artifacts: list[Artifact] = Field(default_factory=list)
+    # General data passing: values resolved from upstream predecessors for
+    # this node's declared ``consumes`` names.
+    variables: dict[str, str] = Field(default_factory=dict)
     purpose: str = "execute"
     review_feedback: str | None = None
     # Optional live stream plus provider-neutral terminal transport. Local
@@ -122,8 +125,25 @@ def _skill_invocation_marker(harness: str, skill_name: str) -> str:
     return f"/{skill_name}"
 
 
+def substitute_prompt_variables(prompt: str, variables: dict[str, str]) -> str:
+    """Replace ``${name}`` references with resolved variable values.
+
+    Only resolved names are substituted; unknown references stay literal so a
+    missing upstream value is visible in the prompt instead of silently
+    disappearing.
+    """
+    import re
+
+    def replace(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        return variables[name] if name in variables else match.group(0)
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}", replace, prompt)
+
+
 def render_context_block(ctx: NodeExecutionContext) -> str:
     """Render the small data envelope sent before the task-specific prompt."""
+    variables_line = f"variables={json.dumps(ctx.variables, sort_keys=True)}" if ctx.variables else "variables={}"
     agent = ctx.node.agent
     if agent is None:
         return "\n".join([
@@ -136,6 +156,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             f"purpose={ctx.purpose}",
             f"review_feedback={ctx.review_feedback or ''}",
             f"predecessor_artifacts={json.dumps([item.model_dump(mode='json') for item in ctx.predecessor_artifacts])}",
+            variables_line,
         ])
 
     skill_names = _capability_skill_names(ctx)
@@ -158,5 +179,6 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         f"model={agent.model or ''}",
         f"reasoning={agent.reasoning.value}",
         f"activate={' '.join(markers)}",
+        variables_line,
         f"trigger_context={ctx.trigger_context.model_dump_json() if ctx.trigger_context else ''}",
     ])

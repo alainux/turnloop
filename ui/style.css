@@ -3397,6 +3397,14 @@ form.composer:has(.composer-config-panel) {
   text-overflow: ellipsis;
 }
 .node-control-activity { color: var(--yellow, #d8a33d); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.control-activity .verification-summary {
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
 .work-view {
   height: 100%;
   overflow: auto;

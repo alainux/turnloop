@@ -21,6 +21,7 @@ from turn.domain.schemas import (
     PlanResult,
     VerificationDecision,
     VerificationResult,
+    parse_follows_reference,
 )
 from turn.domain.organization import ManagerPhase, OrganizationScale
 
@@ -32,6 +33,7 @@ class Indexes:
     parents: dict        # owned node -> anchor
     predecessors: dict   # FOLLOWS: next node -> [previous node]
     successors: dict     # FOLLOWS: previous node -> [next node]
+    follows_routes: dict  # (src, dst) -> route label | None for FOLLOWS edges
 
 
 def workflow_leaves(plan: PlanResult) -> dict[str | None, tuple[str, ...]]:
@@ -48,8 +50,9 @@ def workflow_leaves(plan: PlanResult) -> dict[str | None, tuple[str, ...]]:
     for node in plan.nodes:
         boundaries.setdefault(node.parent_key, []).append(node.key)
         for predecessor in node.follows:
-            if predecessor in keys:
-                successors[predecessor].add(node.key)
+            predecessor_key, _ = parse_follows_reference(predecessor)
+            if predecessor_key in keys:
+                successors[predecessor_key].add(node.key)
     for edge in plan.edges:
         if edge.type is EdgeType.FOLLOWS and edge.src in keys and edge.dst in keys:
             successors[edge.src].add(edge.dst)
@@ -91,6 +94,7 @@ def build_indexes(nodes: list[Node], edges: list[Edge]) -> Indexes:
     parents: dict = {}
     predecessors: dict = {}
     successors: dict = {}
+    follows_routes: dict = {}
     for e in edges:
         if e.type == EdgeType.CONTAINS:
             children.setdefault(e.src, []).append(e.dst)
@@ -98,7 +102,8 @@ def build_indexes(nodes: list[Node], edges: list[Edge]) -> Indexes:
         elif e.type == EdgeType.FOLLOWS:
             predecessors.setdefault(e.dst, []).append(e.src)
             successors.setdefault(e.src, []).append(e.dst)
-    return Indexes(node_by_id, children, parents, predecessors, successors)
+            follows_routes[(e.src, e.dst)] = e.route
+    return Indexes(node_by_id, children, parents, predecessors, successors, follows_routes)
 
 
 def _collect_descendants(idx: Indexes, node_id) -> list[Node]:
@@ -173,6 +178,13 @@ def is_runnable(
         )
         if pn is None or predecessor_status != NodeStatus.COMPLETE:
             return False, "sequence incomplete"
+        # Decision-based routing: a labeled FOLLOWS edge stays active only
+        # when its source selected that route. An unlabeled edge remains
+        # unconditional, and a source that took no route keeps every branch
+        # open (backward-compatible default).
+        route = idx.follows_routes.get((p, node_id))
+        if route is not None and pn.route_taken is not None and pn.route_taken != route:
+            return False, f"route '{route}' not taken (source took '{pn.route_taken}')"
     for inp in node.required_inputs:
         if inp.satisfied_by is None:
             return False, f"missing input: {inp.label}"
@@ -300,6 +312,40 @@ def rejection_target(
     if len(target_ids) != 1:
         return None
     return indexes.node_by_id.get(target_ids[0])
+
+
+def resolve_variables(
+    node_id,
+    idx: Indexes,
+    consumes: list[str],
+) -> dict[str, str]:
+    """Resolve declared ``consumes`` names from upstream predecessor outputs.
+
+    Predecessors are visited nearest-first (BFS over FOLLOWS edges), so the
+    closest producer wins when several upstream nodes publish the same name.
+    Unresolved names are simply absent from the result — callers render them
+    as missing instead of guessing a value.
+    """
+    if not consumes:
+        return {}
+    wanted = set(consumes)
+    resolved: dict[str, str] = {}
+    visited: set = set()
+    queue: list = list(idx.predecessors.get(node_id, []))
+    while queue and wanted:
+        current_id = queue.pop(0)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        producer = idx.node_by_id.get(current_id)
+        if producer is not None and producer.outputs:
+            for name in list(wanted):
+                value = producer.outputs.get(name)
+                if value is not None:
+                    resolved[name] = value
+                    wanted.discard(name)
+        queue.extend(idx.predecessors.get(current_id, []))
+    return resolved
 
 
 def evaluate(nodes: list[Node], edges: list[Edge]) -> Evaluation:

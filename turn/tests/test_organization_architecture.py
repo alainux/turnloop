@@ -921,3 +921,93 @@ async def test_dirty_repo_serializes_worktree_policy_without_touching_user_chang
     await scheduler.wait_for_idle(root.id)
     assert (repo / "README.md").read_text(encoding="utf-8") == "user change\n"
     await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_stops_live_tasks_of_already_cancelled_nodes(tmp_path):
+    """A CANCELLED node's live task must be reaped, not left occupying slots."""
+    store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects")
+    await store.init()
+    root = await store.create_project("Cancel race", repo_path=str(tmp_path / "projects" / "cancel-race"))
+    created = await store.apply_plan(
+        root,
+        PlanResult(nodes=[
+            NodeSpec(key="a", objective="Task A", executor="deterministic"),
+            NodeSpec(key="b", objective="Task B", executor="deterministic"),
+        ]),
+    )
+    node_a, node_b = created
+    cancelled_via_api = await store.set_status(node_a.id, NodeStatus.CANCELLED)
+    assert cancelled_via_api is not None
+
+    started: list[uuid.UUID] = []
+    finished: list[uuid.UUID] = []
+    cancel_calls: list[uuid.UUID] = []
+
+    async def execute(node, _project_id):
+        started.append(node.id)
+        # The provider process is live even though the durable status already
+        # says CANCELLED: the flip won the race against the launch boundary.
+        await asyncio.sleep(5)
+        finished.append(node.id)
+
+    async def cancel_node(node_id):
+        cancel_calls.append(node_id)
+        task = scheduler.running.get(node_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await store.set_status(node_id, NodeStatus.CANCELLED)
+
+    scheduler = Scheduler(
+        store,
+        Settings(max_parallel_agents=2),
+        execute,
+        lambda *_args: asyncio.sleep(0),
+        lambda _root: asyncio.sleep(0),
+        lambda: None,
+        cancel_node=cancel_node,
+    )
+
+    # Simulate the cancel/launch race: the store says CANCELLED but a live
+    # execution task was reserved before the status flip became visible.
+    scheduler.reserve(await store.get_node(node_a.id), root.id)
+    await asyncio.sleep(0.05)
+    assert scheduler.active_node_ids()
+
+    await scheduler.schedule_once(root.id)
+
+    # The live task of the already-CANCELLED node was stopped through the one
+    # cancellation path and no longer occupies a concurrency slot.
+    assert cancel_calls == [node_a.id]
+    assert node_a.id not in scheduler.active_node_ids()
+    assert node_a.id not in finished
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claims_admit_exactly_one_winner(tmp_path):
+    """claim_work_item is the assignment boundary: it must be atomic."""
+    store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects")
+    await store.init()
+    root = await store.create_project("claim race", repo_path=str(tmp_path / "projects" / "claim-race"))
+    item = await store.create_work_item(
+        project_id=root.id,
+        organization_id=root.id,
+        key="contested",
+        title="Contested ticket",
+        objective="Do contested work",
+    )
+
+    results = await asyncio.gather(
+        *(store.claim_work_item(item.id, node_id=root.id) for _ in range(8)),
+        return_exceptions=True,
+    )
+    winners = [result for result in results if not isinstance(result, BaseException)]
+    losers = [result for result in results if isinstance(result, BaseException)]
+    assert len(winners) == 1, "exactly one concurrent claim may win"
+    assert all(isinstance(loser, ValueError) for loser in losers)
+    assert winners[0].status is WorkItemStatus.CLAIMED
+    stored = (await store.list_work_items(root.id))[0]
+    assert stored.status is WorkItemStatus.CLAIMED
+    await store.dispose()

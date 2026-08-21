@@ -243,6 +243,31 @@ transitions, state/configuration changes, agent CLI responses, harness launch
 and return details, decisions, and errors, so external JSONL tooling can read
 the same stream as Turn.
 
+### Data passing between nodes
+
+Nodes can declare `provides` (variable names they publish on successful
+completion) and `consumes` (names resolved from upstream predecessors before
+launch). A worker publishes values through its result's `outputs` map; only
+declared names are accepted. Resolved values are injected into the launch
+context (`variables={...}` in the TURN_CONTEXT envelope) and `${name}`
+references in the node's generated prompt are substituted. Unresolved names
+stay literal so a missing upstream value is visible instead of silently
+dropped. Inspect the current state with:
+
+```bash
+turn vars PROJECT_UUID
+```
+
+### Decision-based routing
+
+A FOLLOWS edge may carry a route label. Planners declare it inline as
+`"key@route"` in `follows` (for example `"review@approve"`) or through an
+explicit `EdgeSpec.route`. A worker selects its route through the result's
+`route` field; the choice is persisted on the node as `route_taken`. While a
+labeled source has taken a different route, its other labeled branches stay
+visibly blocked with reason `route '<name>' not taken`. Unlabeled edges remain
+unconditional, and a completion without a route keeps every branch open.
+
 ## Verification
 
 ```bash
@@ -315,12 +340,14 @@ is the product, architecture, scope, operation, and verification guide.
 - [x] Worktree isolation and explicit merge boundary
 - [x] Organization-fitness metrics
 - [x] Worktrees
+- [ ] Specs and Tickets as first-class objects in a spec.
 - [ ] Multi-graph projects
-- [ ] Variables / General data passing between nodes
-- [ ] Repeatable organizations - Skipped / Locked nodes that can be re-run with new data
-- [ ] Decision-based Routing for nodes 
-- [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management for Running Processes
+- [x] Variables / General data passing between nodes
 - [ ] Loops / Goals / Hill-climbing with visual feedback and metrics
+- [ ] Retries / Recoveries / Timeouts / Exit codes / Better process management for Running Processes
+- [ ] Repeatable organizations - Skipped / Locked nodes that can be re-run with new data
+- [x] Decision-based Routing for nodes 
+
 - [ ] Capability library with Web UI
 - [ ] Architecture / Hygiene & Cleanups
 - [ ] Native app

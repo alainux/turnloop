@@ -101,3 +101,41 @@ async def test_pin_status_compare_and_set_has_one_winner_for_concurrent_calls(tm
     )
 
     assert sum(result is not None for result in results) == 1
+
+
+async def test_save_drops_are_visible_not_silent(tmp_path):
+    """A dropped node write must return None and be logged, never fake success."""
+    from turn.logging import EventLog
+    logs = EventLog(tmp_path / "turn")
+    store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects", logs=logs)
+    await store.init()
+    root = await store.create_project(
+        "drop visibility",
+        repo_path=str(tmp_path / "projects" / "drop-visibility"),
+    )
+    created = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="solo", objective="Solo work", executor="deterministic")]),
+    )
+    node = created[0]
+
+    # A snapshot of a node removed by a plan replacement must not resurrect it
+    # nor claim success.
+    ghost = node.model_copy(deep=True)
+    store._states[root.id].nodes.pop(node.id, None)
+    assert await store._save_node(ghost) is None
+    assert store._states[root.id].nodes.get(node.id) is None
+
+    # The drops are observable in the event log instead of being silent.
+    actions = [record.get("action") for record in logs.read(None) + logs.read(root.id)]
+    assert actions.count("node.save.dropped") >= 1
+
+    # Once the project itself is no longer loaded, writes fail visibly too.
+    store._states.pop(root.id, None)
+    assert await store._save_node(node) is None
+    actions = [
+        record.get("action")
+        for record in logs.read(None)
+    ]
+    assert "node.save.dropped" in actions
+    await store.dispose()

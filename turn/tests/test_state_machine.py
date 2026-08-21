@@ -289,3 +289,42 @@ def test_recovery_classification_and_backoff():
     assert not should_retry("overloaded", False, True)
     assert not should_retry("invalid credentials", False, True)
     assert [backoff_seconds(n, 500) for n in (1, 2, 3)] == [0.5, 1.0, 2.0]
+
+
+def test_correction_required_keeps_cancel_while_process_is_live():
+    """A live provider session flagged for correction stays cancellable."""
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="x",
+        status=NodeStatus.RUNNING,
+        agent_state="correction_required",
+        agent_message="fix the import path",
+    )
+    projected = present_node(node)
+    assert projected.state == UIState.CORRECTION_REQUIRED
+    assert projected.actions == (Action.EDIT, Action.CANCEL)
+
+
+def test_correction_required_after_settlement_has_no_cancel():
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="x",
+        status=NodeStatus.FAILED,
+        agent_state="correction_required",
+    )
+    projected = present_node(node)
+    assert projected.state == UIState.CORRECTION_REQUIRED
+    assert Action.CANCEL not in projected.actions
+
+
+def test_paused_node_stays_paused_during_regeneration():
+    node = Node(
+        project_id="00000000-0000-0000-0000-000000000001",
+        objective="x",
+        status=NodeStatus.EXPANDED,
+        paused=True,
+    )
+    projected = present_node(node, preparing=True)
+    assert projected.state == UIState.PAUSED
+    assert Action.RESUME in projected.actions
+    assert Action.CANCEL not in projected.actions

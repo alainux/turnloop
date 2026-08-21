@@ -576,3 +576,136 @@ async def test_mock_process_looper_restarts_from_cli_and_transition_events(tmp_p
         assert completion_match["data"]["event_data"]["project_id"] == str(project_id)
     finally:
         await runtime.stop()
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher reliability regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_loop_survives_transient_faults(tmp_path):
+    """One failing tick must not kill the dispatcher: triggers stay alive."""
+    store, logs, root, start, _ = await _project(tmp_path)
+    dispatcher = await _dispatcher(store, logs, tmp_path)
+    await store.create_trigger(project_id=root.id, target_node_id=start.id, event_name="reliable.event")
+
+    original_poll = dispatcher.poll_inbox
+    failures = {"count": 0}
+
+    async def flaky_poll():
+        if failures["count"] < 2:
+            failures["count"] += 1
+            raise RuntimeError("transient store hiccup")
+        await original_poll()
+
+    dispatcher.poll_inbox = flaky_poll  # type: ignore[method-assign]
+    # The event waits in the cross-process inbox; it must still be delivered
+    # after two transient failures of the dispatch loop.
+    dispatcher.inbox.append(name="reliable.event", data={})
+    await dispatcher.start()
+    try:
+        for _ in range(200):
+            if failures["count"] >= 2:
+                break
+            await asyncio.sleep(0.01)
+        for _ in range(300):
+            node = await store.get_node(start.id)
+            if node.status is NodeStatus.RUNNABLE:
+                break
+            await asyncio.sleep(0.02)
+        assert node.status is NodeStatus.RUNNABLE
+        assert failures["count"] == 2
+        assert any(
+            record.get("action") == "dispatcher.error"
+            for record in logs.read(None)
+        )
+    finally:
+        await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_schedule_fire_is_retried_not_consumed(tmp_path):
+    """A schedule activation failure must not consume the cron fire."""
+    store, logs, root, start, _ = await _project(tmp_path)
+    dispatcher = await _dispatcher(store, logs, tmp_path)
+    trigger = await store.create_trigger(
+        project_id=root.id,
+        target_node_id=start.id,
+        kind=TriggerKind.SCHEDULE,
+        schedule="* * * * *",
+    )
+
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    calls = {"emit": 0}
+    original_emit = dispatcher.emit
+
+    async def failing_emit(*args, **kwargs):
+        if kwargs.get("source") is EventSource.SCHEDULE or (args and len(args) > 1 and args[1] is EventSource.SCHEDULE):
+            calls["emit"] += 1
+            raise RuntimeError("activation backend down")
+        return await original_emit(*args, **kwargs)
+
+    dispatcher.emit = failing_emit  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        await dispatcher.tick_schedules(now=now)
+    fired = await store.get_trigger(trigger.id)
+    assert fired.last_fired_at is None, "failed fire must not be consumed"
+
+    # Recovery: the same minute fires successfully afterwards.
+    dispatcher.emit = original_emit  # type: ignore[method-assign]
+    await dispatcher.tick_schedules(now=now)
+    fired = await store.get_trigger(trigger.id)
+    assert fired.last_fired_at is not None
+    assert (await store.get_node(start.id)).trigger_context is not None
+
+
+@pytest.mark.asyncio
+async def test_inbox_cursor_advances_per_record_and_dedups_replays(tmp_path):
+    """A crash mid-batch must neither replay processed events nor skip records."""
+    store, logs, root, start, _ = await _project(tmp_path)
+    inbox = EventInbox(tmp_path / "turn")
+    first = inbox.append(name="batch.first", data={"n": 1})
+    second = inbox.append(name="batch.second", data={"n": 2})
+    await store.create_trigger(project_id=root.id, target_node_id=start.id, event_name="batch.first")
+    await store.create_trigger(project_id=root.id, target_node_id=start.id, event_name="batch.second")
+
+    dispatcher = TriggerDispatcher(store, EventBus(logs), logs, tmp_path / "turn")
+    store.set_event_sink(dispatcher.emit)
+    dispatcher._offset = inbox.start_offset()
+
+    # Simulate a crash after the first record was activated but before its
+    # cursor was saved: the durable offset is still 0, so a restart replays
+    # both records. The already-applied event must not double-activate, and
+    # the remaining event must still fire.
+    await dispatcher.emit(
+        "batch.first",
+        data=dict(first["data"]),
+        event_id=uuid.UUID(first["event_id"]),
+        occurred_at=datetime.fromisoformat(first["occurred_at"]),
+    )
+    restarted = TriggerDispatcher(store, EventBus(logs), logs, tmp_path / "turn")
+    store.set_event_sink(restarted.emit)
+    restarted._offset = inbox.start_offset()
+    await restarted.poll_inbox()
+
+    context = (await store.get_node(start.id)).trigger_context
+    assert context is not None
+    assert context.event_name == "batch.second"
+    duplicate = [
+        record for record in logs.read(None) + logs.read(root.id)
+        if record.get("action") in {"event.duplicate", "trigger.replay_skipped"}
+    ]
+    assert duplicate, "replayed event_id must be skipped as a duplicate"
+
+
+@pytest.mark.asyncio
+async def test_inbox_compaction_preserves_unread_records(tmp_path):
+    inbox = EventInbox(tmp_path / "turn")
+    keep = inbox.append(name="compact.keep", data={"n": 3})
+    inbox.save_offset(inbox.path.stat().st_size)
+    size = inbox.compact(inbox.start_offset(), max_bytes=64)
+    assert size == 0
+    assert inbox.start_offset() == 0
+    records, _ = inbox.read_from(0)
+    assert records == []

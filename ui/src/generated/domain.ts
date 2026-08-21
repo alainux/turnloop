@@ -99,6 +99,7 @@ export interface Edge {
   src: string;
   dst: string;
   type: EdgeType;
+  route: string | null;
   created_at: string;
 }
 
@@ -106,6 +107,7 @@ export interface EdgeSpec {
   type: EdgeType;
   src: string;
   dst: string;
+  route: string | null;
 }
 
 export type EdgeType = "CONTAINS" | "FOLLOWS";
@@ -180,6 +182,10 @@ export interface GraphNodeView {
   document_refs: Array<DocumentRef>;
   subgraph_refs: Array<SubgraphRef>;
   artifact_refs: Array<string>;
+  provides: Array<string>;
+  consumes: Array<string>;
+  outputs: Record<string, string>;
+  route_taken: string | null;
   created_at: string;
   updated_at: string;
   progress: number | null;
@@ -303,6 +309,10 @@ export interface Node {
   document_refs: Array<DocumentRef>;
   subgraph_refs: Array<SubgraphRef>;
   artifact_refs: Array<string>;
+  provides: Array<string>;
+  consumes: Array<string>;
+  outputs: Record<string, string>;
+  route_taken: string | null;
   created_at: string;
   updated_at: string;
   progress: number | null;
@@ -331,6 +341,8 @@ export interface NodeSpec {
   subgraph_refs: Array<SubgraphRef>;
   artifacts: Array<ArtifactSpec>;
   capabilities: Array<string>;
+  provides: Array<string>;
+  consumes: Array<string>;
   parent_key: string | null;
   follows: Array<string>;
   plan: boolean;
@@ -659,6 +671,8 @@ export interface WorkerResult {
   session_id: string | null;
   verification: VerificationResult | null;
   run_id: string | null;
+  outputs: Record<string, string>;
+  route: string | null;
 }
 
 export type WorkspaceIsolation = "shared" | "worktree";

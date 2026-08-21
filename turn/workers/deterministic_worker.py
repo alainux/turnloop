@@ -130,6 +130,8 @@ class DeterministicWorker(Worker):
                 AcceptanceEvidence.model_validate(item)
                 for item in data.get("evidence", [])
             ],
+            outputs={str(k): str(v) for k, v in (data.get("outputs") or {}).items()},
+            route=data.get("route"),
         )
 
 

@@ -55,18 +55,24 @@ class EventInbox:
             # remains the durable handoff point across daemon restarts.
             return 0
 
-    def read_from(self, offset: int) -> tuple[list[dict[str, Any]], int]:
+    def read_from(self, offset: int) -> tuple[list[tuple[dict[str, Any], int]], int]:
+        """Return ``(records, eof_offset)`` where each record carries its exact
+        end-of-line byte offset so the durable cursor can advance per record."""
         try:
             with self.path.open("r", encoding="utf-8") as stream:
                 stream.seek(offset)
-                records: list[dict[str, Any]] = []
-                for line in stream:
+                records: list[tuple[dict[str, Any], int]] = []
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        break
+                    end = stream.tell()
                     try:
                         value = json.loads(line)
                     except json.JSONDecodeError:
                         continue
                     if isinstance(value, dict):
-                        records.append(value)
+                        records.append((value, end))
                 return records, stream.tell()
         except OSError:
             return [], offset
@@ -74,6 +80,25 @@ class EventInbox:
     def save_offset(self, offset: int) -> None:
         self.cursor_path.parent.mkdir(parents=True, exist_ok=True)
         self.cursor_path.write_text(str(offset), encoding="utf-8")
+
+    def compact(self, offset: int, *, max_bytes: int = 8 << 20) -> int:
+        """Atomically drop already-consumed prefix bytes once the file grows.
+
+        Only the unconsumed suffix survives, so a crash can never lose an
+        unread record. Returns the new file size.
+        """
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return 0
+        if size <= max_bytes or offset <= 0 or offset > size:
+            return size
+        remaining = self.path.read_bytes()[offset:] if offset < size else b""
+        temp_name = self.path.with_name(f".{self.path.name}.compact")
+        temp_name.write_bytes(remaining)
+        os.replace(temp_name, self.path)
+        self.save_offset(len(remaining))
+        return len(remaining)
 
 
 def _same_minute(left: datetime | None, right: datetime) -> bool:
@@ -140,6 +165,10 @@ class TriggerDispatcher:
         self._task: asyncio.Task | None = None
         self._offset = 0
         self._stop = False
+        # Bounded replay guard: if the process dies after activating an event
+        # but before the inbox cursor is saved, the record is replayed on
+        # restart. The same event_id must never activate triggers twice.
+        self._recent_event_ids: dict[uuid.UUID, None] = {}
 
     def set_wake(self, wake) -> None:
         self._wake = wake
@@ -158,13 +187,26 @@ class TriggerDispatcher:
 
     async def _loop(self) -> None:
         while not self._stop:
-            await self.poll_inbox()
-            await self.tick_schedules()
+            try:
+                await self.poll_inbox()
+                await self.tick_schedules()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # One transient fault (store hiccup, malformed record, log
+                # rotation failure) must never kill the dispatcher: every
+                # event trigger and cron schedule in the workspace would die
+                # silently until daemon restart.
+                try:
+                    await self.logs.emit(None, kind="trigger.activity", action="dispatcher.error", status="error", source="trigger", message=str(error))
+                except Exception:
+                    pass
             await asyncio.sleep(0.1)
 
     async def poll_inbox(self) -> None:
         records, offset = self.inbox.read_from(self._offset)
-        for record in records:
+        consumed = self._offset
+        for record, record_end in records:
             try:
                 source = EventSource(str(record.get("source", EventSource.CLI.value)))
                 occurred_at = datetime.fromisoformat(str(record["occurred_at"]))
@@ -179,8 +221,16 @@ class TriggerDispatcher:
                 )
             except (KeyError, TypeError, ValueError):
                 await self.logs.emit(None, kind="trigger.activity", action="event.rejected", status="error", source="trigger", message="invalid CLI event envelope", data=record)
+            finally:
+                # Advance the durable cursor per record, not per batch. A crash
+                # mid-batch must never replay already-processed events (which
+                # would double-activate triggers) nor skip the failing record
+                # forever.
+                self._offset = record_end
+                self.inbox.save_offset(record_end)
         self._offset = offset
         self.inbox.save_offset(offset)
+        self.inbox.compact(offset)
 
     async def tick_schedules(self, now: datetime | None = None) -> None:
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -194,13 +244,21 @@ class TriggerDispatcher:
                 continue
             if not due:
                 continue
+            previous_fired_at = trigger.last_fired_at
             await self.store.mark_trigger_fired(trigger.id, current)
-            await self.emit(
-                self._schedule_event_name(trigger),
-                data={"scheduled_at": current.isoformat(), "trigger_id": str(trigger.id)},
-                source=EventSource.SCHEDULE,
-                project_id=trigger.project_id,
-            )
+            try:
+                await self.emit(
+                    self._schedule_event_name(trigger),
+                    data={"scheduled_at": current.isoformat(), "trigger_id": str(trigger.id)},
+                    source=EventSource.SCHEDULE,
+                    project_id=trigger.project_id,
+                )
+            except Exception:
+                # The fire was reserved but not delivered. Restore the previous
+                # marker so the same minute is retried instead of silently
+                # consuming the scheduled fire.
+                await self.store.mark_trigger_fired(trigger.id, previous_fired_at)
+                raise
 
     @staticmethod
     def _schedule_event_name(trigger: Trigger) -> str:
@@ -230,6 +288,13 @@ class TriggerDispatcher:
         if not event_name or not event_name.strip():
             raise ValueError("event name cannot be empty")
         event_id = event_id or uuid.uuid4()
+        if event_id in self._recent_event_ids:
+            await self.logs.emit(project_id, kind="trigger.activity", action="event.duplicate", source=source.value if isinstance(source, EventSource) else str(source), message=f"event {event_name} replayed; activations skipped", data={"event_id": str(event_id), "event_name": event_name})
+            return {"event_id": str(event_id), "event_name": event_name, "data": payload, "source": source.value if isinstance(source, EventSource) else str(source), "project_id": str(project_id) if project_id else None, "node_id": str(node_id) if node_id else None, "occurred_at": occurred_at.isoformat(), "matched": 0, "duplicate": True}
+        self._recent_event_ids[event_id] = None
+        if len(self._recent_event_ids) > 4096:
+            for stale_id in list(self._recent_event_ids)[:1024]:
+                self._recent_event_ids.pop(stale_id, None)
         occurred_at = (occurred_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
         payload = dict(data or {})
         envelope = {

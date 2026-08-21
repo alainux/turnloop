@@ -148,8 +148,8 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "await emit_jsonl_telemetry" in worker
     assert "Telemetry {telemetryStatus(telemetry)}" in terminal
     assert "telemetry-unavailable" in css
-    assert "terminalNodeId" in terminal
-    assert 'endpoint = controlTerminal ? "terminal" : "shell"' in terminal
+    assert "terminal_node_id" in terminal
+    assert 'endpoint = showControl ? "terminal" : "shell"' in terminal
     assert "streamNodeId" in terminal
 
 
@@ -254,6 +254,9 @@ def test_only_readme_and_design_are_product_markdown_documents():
         "P0-P1-REVISED.md",
         "P0-P1-FINAL.md",
         "P0-P1-HARDEN.md",
+        "P0-P1-correct.md",
+        "LEAD_ESCALATION.md",
+        "LEAD_ESCALATION_SUGGESTED_ARCH.md",
         "MISTAKES.md",
         "FOUND_BUGS.md",
         "SEEN_ISSUES.md",

@@ -539,11 +539,47 @@ class RuntimeGuard(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+VARIABLE_NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]*"
+
+
+def parse_follows_reference(value: str) -> tuple[str, str | None]:
+    """Split a ``follows`` reference into ``(key, route)``.
+
+    Planners declare decision routing inline with ``"key@route"`` (for example
+    ``"review@approve"``). A plain key keeps ``route=None`` (unconditional).
+    """
+    if "@" in value:
+        key, _, route = value.partition("@")
+        if not key or not route:
+            raise ValueError(f"invalid follows reference {value!r}: expected 'key@route'")
+        return key, route
+    return value, None
+
+
+def _validate_variable_names(names: list[str]) -> list[str]:
+    """Normalize declared data-passing variable names.
+
+    Names are identifiers agents reference in prompts (``${name}``), so they
+    must be compact and unambiguous. Duplicates collapse silently; malformed
+    names are a structural planning error.
+    """
+    import re
+
+    normalized: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not re.fullmatch(VARIABLE_NAME_PATTERN, name):
+            raise ValueError(
+                f"invalid variable name {name!r}: must match {VARIABLE_NAME_PATTERN}"
+            )
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
 class Node(BaseModel):
     """A unit of intent. Persisted; workers are temporary."""
 
     model_config = ConfigDict(validate_assignment=True)
-
     id: uuid.UUID = Field(default_factory=_new_id)
     project_id: uuid.UUID  # root ancestor id
     parent_id: Optional[uuid.UUID] = None  # CONTAINS parent
@@ -603,6 +639,25 @@ class Node(BaseModel):
     )
     artifact_refs: list[uuid.UUID] = Field(default_factory=list)
 
+    # --- general data passing between nodes ---------------------------
+    # Variable names this node publishes on successful completion (values are
+    # taken from the worker result outputs) and names it resolves from
+    # upstream predecessors before launch.
+    provides: list[str] = Field(default_factory=list)
+    consumes: list[str] = Field(default_factory=list)
+    # Published values, keyed by variable name. Persisted so downstream nodes
+    # (and humans) can inspect exactly what flowed through the graph.
+    outputs: dict[str, str] = Field(default_factory=dict)
+    # Decision-based routing: the route this node selected on completion. A
+    # FOLLOWS edge carrying a route label stays active only when its source
+    # took that route; unlabeled edges remain unconditional.
+    route_taken: Optional[str] = None
+
+    @field_validator("provides", "consumes", mode="before")
+    @classmethod
+    def normalize_variable_names(cls, value):
+        return _validate_variable_names(list(value or []))
+
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -634,6 +689,8 @@ class Edge(BaseModel):
     src: uuid.UUID
     dst: uuid.UUID
     type: EdgeType
+    # Decision-routing label for FOLLOWS edges. ``None`` means unconditional.
+    route: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -823,6 +880,14 @@ class NodeSpec(BaseModel):
     artifacts: list["ArtifactSpec"] = Field(default_factory=list)
     # Capability plugin ids loaded by the planner into the project.
     capabilities: list[str] = Field(default_factory=list)
+    # General data passing: variables this node publishes/consumes.
+    provides: list[str] = Field(default_factory=list)
+    consumes: list[str] = Field(default_factory=list)
+
+    @field_validator("provides", "consumes", mode="before")
+    @classmethod
+    def normalize_variable_names(cls, value):
+        return _validate_variable_names(list(value or []))
 
     @field_validator("acceptance_criteria", mode="before")
     @classmethod
@@ -894,6 +959,8 @@ class EdgeSpec(BaseModel):
     type: EdgeType
     src: str  # key
     dst: str  # key
+    # Decision-routing label for FOLLOWS edges (e.g. "approve"/"reject").
+    route: Optional[str] = Field(default=None, max_length=64)
 
 
 class TriggerSpec(BaseModel):
@@ -983,17 +1050,18 @@ class PlanResult(BaseModel):
                 containment[node.parent_key].add(node.key)
                 adjacency[node.parent_key].add(node.key)
             for predecessor in node.follows:
-                if predecessor not in known:
-                    raise ValueError(f"unknown sequence key: {predecessor}")
-                if predecessor == node.key:
+                predecessor_key, _ = parse_follows_reference(predecessor)
+                if predecessor_key not in known:
+                    raise ValueError(f"unknown sequence key: {predecessor_key}")
+                if predecessor_key == node.key:
                     raise ValueError(f"node {node.key} cannot follow itself")
-                if boundaries[predecessor] != boundaries[node.key]:
+                if boundaries[predecessor_key] != boundaries[node.key]:
                     raise ValueError(
-                        f"sequence edge {predecessor}->{node.key} crosses a composition boundary"
+                        f"sequence edge {predecessor_key}->{node.key} crosses a composition boundary"
                     )
-                sequence[predecessor].add(node.key)
-                adjacency[predecessor].add(node.key)
-                sequence_pairs.add((predecessor, node.key))
+                sequence[predecessor_key].add(node.key)
+                adjacency[predecessor_key].add(node.key)
+                sequence_pairs.add((predecessor_key, node.key))
 
         for edge in self.edges:
             if edge.src not in known or edge.dst not in known:
@@ -1135,3 +1203,8 @@ class WorkerResult(BaseModel):
     session_id: Optional[str] = None
     verification: Optional[VerificationResult] = None
     run_id: Optional[uuid.UUID] = None
+    # General data passing: values published by this attempt, keyed by the
+    # node's declared ``provides`` names.
+    outputs: dict[str, str] = Field(default_factory=dict)
+    # Decision-based routing: which outgoing route this attempt selected.
+    route: Optional[str] = Field(default=None, max_length=64)

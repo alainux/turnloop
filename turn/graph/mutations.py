@@ -17,6 +17,7 @@ from turn.domain.schemas import (
     NodeStatus,
     PlanResult,
     SubgraphRef,
+    parse_follows_reference,
 )
 from turn.domain.organization import ManagerPhase, OrganizationContract, OrganizationReview
 
@@ -114,11 +115,11 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
     keys_to_ids = {spec.key: uuid.uuid4() for spec in plan.nodes}
     edge_keys = {(edge.src, edge.dst, edge.type) for edge in state.edges.values()}
 
-    def add_edge(src: uuid.UUID, dst: uuid.UUID, edge_type: EdgeType) -> None:
-        key = (src, dst, edge_type)
+    def add_edge(src: uuid.UUID, dst: uuid.UUID, edge_type: EdgeType, route: str | None = None) -> None:
+        key = (src, dst, edge_type, route)
         if key in edge_keys:
             return
-        edge = Edge(src=src, dst=dst, type=edge_type)
+        edge = Edge(src=src, dst=dst, type=edge_type, route=route)
         state.edges[edge.id] = edge
         edge_keys.add(key)
 
@@ -202,6 +203,8 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
             exported_handoffs=list(spec.exported_handoffs),
             required_handoffs=list(spec.required_handoffs),
             priority=spec.priority,
+            provides=list(spec.provides),
+            consumes=list(spec.consumes),
         )
         state.nodes[node.id] = node
         append_artifacts(state, node.id, spec.artifacts)
@@ -212,9 +215,10 @@ def apply_plan(state: Any, parent: Node, plan: PlanResult) -> list[Node]:
         if spec.parent_key:
             add_edge(keys_to_ids[spec.parent_key], keys_to_ids[spec.key], EdgeType.CONTAINS)
         for predecessor in spec.follows:
-            add_edge(keys_to_ids[predecessor], keys_to_ids[spec.key], EdgeType.FOLLOWS)
+            predecessor_key, route = parse_follows_reference(predecessor)
+            add_edge(keys_to_ids[predecessor_key], keys_to_ids[spec.key], EdgeType.FOLLOWS, route)
     for item in plan.edges:
-        add_edge(keys_to_ids[item.src], keys_to_ids[item.dst], item.type)
+        add_edge(keys_to_ids[item.src], keys_to_ids[item.dst], item.type, item.route)
     parent.status = NodeStatus.EXPANDED
     if parent.executor == PLANNER_EXECUTOR:
         parent.manager_phase = ManagerPhase.EXECUTING

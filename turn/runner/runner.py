@@ -57,7 +57,7 @@ from turn.domain.schemas import (
     VerificationDecision,
     WorkerResult,
 )
-from turn.graph.logic import GraphWalker, rejection_target
+from turn.graph.logic import GraphWalker, rejection_target, resolve_variables
 from turn.runner.events import EventBus
 from turn.runner.execution import NodeExecutor
 from turn.runner.recovery import backoff_seconds, should_retry
@@ -66,7 +66,7 @@ from turn.runner.organization import ManagerReviewDecision, OrganizationManager
 from turn.runner.workspaces import WorkspaceError, WorkspaceManager
 from turn.runner.sessions import SessionController
 from turn.runner.process_supervisor import ProcessSupervisor
-from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block, substitute_prompt_variables
 from turn.workers.herdr import (
     HerdrAdapter,
     HerdrAdapterError,
@@ -103,6 +103,32 @@ def _dump(obj):
     if hasattr(obj, "model_dump"):
         return obj.model_dump(mode="json")
     return obj
+
+
+def render_plan_audit_prompt(context_block: str, contract, plan: PlanResult) -> str:
+    """Build the independent semantic plan-audit prompt.
+
+    Handoff protocol lives in the turn-basics skill, so this prompt must not
+    restate it. It only has to avoid contradicting the skill: earlier wording
+    ("return an envelope") read as a chat reply, and auditors ended their turn
+    without publishing the handoff that settles the audit.
+    """
+    return "\n".join(
+        [
+            context_block,
+            "TURN_INDEPENDENT_PLAN_AUDIT",
+            "You are an independent semantic auditor for the organization charter below.",
+            "Inspect the real project files and the proposed plan. Do not edit files, create graph nodes, or perform the work.",
+            "Approve only a coherent plan that preserves the charter, assigns one cohesive verifiable responsibility per leaf, includes real convergence and independent verification where required, and can complete within the stated budget.",
+            "Reject plans that compress an organization into a flat checklist, duplicate ownership, hide unfinished work in a single vague executor, or claim evidence without an inspectable artifact.",
+            "Mechanical guarantees: Turn injects role capabilities (including turn-basics and role-specific planning/execution skills), normalizes planner roles, inherits organization contracts for omitted nested planner contracts, and canonicalizes equivalent provider payload aliases. Do not reject a plan for omitting any property Turn guarantees mechanically; audit material semantic adequacy only.",
+            "Settle this audit by publishing exactly one normal Turn WorkerResult envelope through the standard result handoff documented in the turn-basics skill. A chat reply does not settle the audit; only an accepted handoff submission does. The envelope carries outcome COMPLETE and one JSON artifact named 'plan-audit' (schema_name 'turn.plan-audit', schema_version 'v1') whose content is: decision APPROVE or REJECT, summary, findings, required_changes.",
+            "ORGANIZATION_CONTRACT_JSON="
+            + json.dumps(contract.model_dump(mode="json"), sort_keys=True),
+            "PROPOSED_PLAN_JSON="
+            + json.dumps(plan.model_dump(mode="json"), sort_keys=True),
+        ]
+    )
 
 
 def _plan_submission_artifact(plan: PlanResult) -> ArtifactSpec:
@@ -1418,21 +1444,10 @@ class Runner:
             purpose="semantic-plan-audit",
             repo_path=base.project_repo_path or base.repo_path,
         )
-        prompt = "\n".join(
-            [
-                render_context_block(review_ctx),
-                "TURN_INDEPENDENT_PLAN_AUDIT",
-                "You are an independent semantic auditor for the organization charter below.",
-                "Inspect the real project files and the proposed plan. Do not edit files, create graph nodes, or perform the work.",
-                "Approve only a coherent plan that preserves the charter, assigns one cohesive verifiable responsibility per leaf, includes real convergence and independent verification where required, and can complete within the stated budget.",
-                "Reject plans that compress an organization into a flat checklist, duplicate ownership, hide unfinished work in a single vague executor, or claim evidence without an inspectable artifact.",
-                "Mechanical guarantees: Turn injects role capabilities (including turn-basics and role-specific planning/execution skills), normalizes planner roles, inherits organization contracts for omitted nested planner contracts, and canonicalizes equivalent provider payload aliases. Do not reject a plan for omitting any property Turn guarantees mechanically; audit material semantic adequacy only.",
-                "Return exactly one normal Turn WorkerResult envelope with outcome COMPLETE and one JSON artifact named 'plan-audit' (schema_name 'turn.plan-audit', schema_version 'v1'). The artifact content must be: decision APPROVE or REJECT, summary, findings, required_changes.",
-                "ORGANIZATION_CONTRACT_JSON="
-                + json.dumps(contract.model_dump(mode="json"), sort_keys=True),
-                "PROPOSED_PLAN_JSON="
-                + json.dumps(plan.model_dump(mode="json"), sort_keys=True),
-            ]
+        prompt = render_plan_audit_prompt(
+            render_context_block(review_ctx),
+            contract,
+            plan,
         )
         runs = await self.store.get_runs(node.id)
         last_error: Exception | None = None
@@ -2410,6 +2425,7 @@ class Runner:
             )
             await self._remember_session(node, result.session_id)
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
+            await self.store.publish_outputs(node.id, outputs=result.outputs, route=result.route)
             await self._accept_consumed_handoffs(node, result)
         elif result.outcome == Outcome.EXPAND:
             plan = result.children or PlanResult(nodes=[])
@@ -2741,6 +2757,8 @@ class Runner:
                 else NodeStatus.RUNNING
             ),
         ) or current
+        if decision.decision is VerificationDecision.APPROVE:
+            await self.store.publish_outputs(current.id, outputs=result.outputs, route=result.route)
         await self._emit("verification.completed", project_id, {
             "node_id": str(current.id),
             "decision": decision.decision.value,
@@ -3937,6 +3955,15 @@ class Runner:
             for artifact in graph_artifacts
             if artifact.node_id in predecessor_ids
         ]
+        # General data passing: resolve this node's declared ``consumes`` from
+        # upstream predecessor outputs, then substitute ${name} references in
+        # the launch prompt. Unresolved names stay literal so the gap is
+        # visible to the agent instead of silently substituted with nothing.
+        variables = resolve_variables(node.id, walker.indexes, node.consumes)
+        if variables and node.generated_prompt:
+            node = node.model_copy(update={
+                "generated_prompt": substitute_prompt_variables(node.generated_prompt, variables),
+            })
 
         # The project's assigned filesystem directory is the canonical control
         # root. A worker may receive a durable Git worktree as its cwd, but all
@@ -4010,6 +4037,7 @@ class Runner:
             node=node,
             ancestry=ancestry,
             resources=resources,
+            variables=variables,
             trigger_context=node.trigger_context,
             repo_path=execution_repo,
             project_repo_path=project_repo,

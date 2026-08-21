@@ -38,6 +38,11 @@ def present_node(
             node.runtime_guard.message,
         )
     if preparing:
+        # A paused node stays paused even while its planner regenerates the
+        # subtree: RESUME remains the honest action instead of a CANCEL that
+        # contradicts the durable pause.
+        if node.paused:
+            return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
         # A planner regeneration can be live while its persisted node remains
         # EXPANDED until the replacement plan is applied. The runner owns the
         # live-task fact, so expose Stop for that state instead of leaving the
@@ -50,9 +55,15 @@ def present_node(
     if node.paused:
         return NodePresentation(UIState.PAUSED, (Action.RESUME, *common))
     if node.agent_state == "correction_required":
+        actions: tuple[Action, ...] = (Action.EDIT,)
+        # The provider session stays alive while a submission needs
+        # correction. A live process must always remain cancellable; dropping
+        # CANCEL here would strand a running harness with no stop action.
+        if node.status == NodeStatus.RUNNING:
+            actions = (Action.EDIT, Action.CANCEL)
         return NodePresentation(
             UIState.CORRECTION_REQUIRED,
-            (Action.EDIT,),
+            actions,
             node.agent_message or "Submission needs correction; the provider session remains available.",
         )
     if node.status == NodeStatus.RUNNING:

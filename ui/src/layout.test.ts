@@ -36,6 +36,10 @@ const node = (id: string, parent_id: string | null): GraphNode => ({
   resource_refs: [],
   document_refs: [],
   artifact_refs: [],
+  provides: [],
+  consumes: [],
+  outputs: {},
+  route_taken: null,
   progress: null,
   created_at: "",
   updated_at: "",
@@ -57,7 +61,7 @@ describe("dendrogram", () => {
   it("places triggers in the rank layout and routes a proper edge into the target", async () => {
     const nodes = [node("root", null), node("target", "root")];
     const edges: Edge[] = [
-      { id: "root-target", src: "root", dst: "target", type: "CONTAINS", created_at: "" },
+      { id: "root-target", src: "root", dst: "target", type: "CONTAINS", route: null, created_at: "" },
     ];
     const configured = [trigger("start", "target")];
     const layout = await layoutDendrogram(nodes, edges, configured);
@@ -93,7 +97,7 @@ describe("dendrogram", () => {
   it("keeps disabled trigger nodes visible without drawing their edges", async () => {
     const layout = await layoutDendrogram(
       [node("root", null), node("target", "root")],
-      [{ id: "root-target", src: "root", dst: "target", type: "CONTAINS", created_at: "" }],
+      [{ id: "root-target", src: "root", dst: "target", type: "CONTAINS", route: null, created_at: "" }],
       [{ ...trigger("disabled", "target"), enabled: false }],
     );
 
@@ -118,11 +122,12 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
-      { id: "left-join", src: "left", dst: "join", type: "FOLLOWS", created_at: "" },
-      { id: "right-join", src: "right", dst: "join", type: "FOLLOWS", created_at: "" },
+      { id: "left-join", src: "left", dst: "join", type: "FOLLOWS", route: null, created_at: "" },
+      { id: "right-join", src: "right", dst: "join", type: "FOLLOWS", route: null, created_at: "" },
     );
 
     expect(workflowLeafIds(nodes, edges).get("root")).toEqual(["join"]);
@@ -136,6 +141,7 @@ describe("dendrogram", () => {
         src: "root",
         dst: id,
         type: "CONTAINS" as const,
+        route: null,
         created_at: "",
       })),
     );
@@ -168,11 +174,12 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
-      { id: "left-final", src: "left", dst: "final", type: "FOLLOWS", created_at: "" },
-      { id: "right-final", src: "right", dst: "final", type: "FOLLOWS", created_at: "" },
+      { id: "left-final", src: "left", dst: "final", type: "FOLLOWS", route: null, created_at: "" },
+      { id: "right-final", src: "right", dst: "final", type: "FOLLOWS", route: null, created_at: "" },
     );
 
     const shown = displayEdges(nodes, edges);
@@ -203,7 +210,7 @@ describe("dendrogram", () => {
   it("keeps edge endpoints aligned with padded node boundaries", async () => {
     const layout = await layoutDendrogram(
       [node("root", null), node("child", "root")],
-      [{ id: "root-child", src: "root", dst: "child", type: "CONTAINS", created_at: "" }],
+      [{ id: "root-child", src: "root", dst: "child", type: "CONTAINS", route: null, created_at: "" }],
     );
     const root = layout.positions.get("root")!,
       child = layout.positions.get("child")!;
@@ -245,6 +252,7 @@ describe("dendrogram", () => {
           src: "prerequisite",
           dst: "dependent",
           type: "FOLLOWS",
+          route: null,
           created_at: "",
         },
       ],
@@ -269,6 +277,7 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
@@ -277,6 +286,7 @@ describe("dendrogram", () => {
         src: "executor",
         dst: "verifier",
         type: "FOLLOWS",
+        route: null,
         created_at: "",
       },
       {
@@ -284,6 +294,7 @@ describe("dendrogram", () => {
         src: "executor",
         dst: "verifier",
         type: "FOLLOWS",
+        route: null,
         created_at: "",
       },
     );
@@ -322,6 +333,7 @@ describe("dendrogram", () => {
       src: "root",
       dst: id,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
@@ -335,6 +347,7 @@ describe("dendrogram", () => {
         src,
         dst,
         type: "FOLLOWS" as const,
+        route: null,
         created_at: "",
       })),
     );
@@ -354,9 +367,9 @@ describe("dendrogram", () => {
   it("uses the sequence handoff into a child instead of the ownership shortcut", () => {
     const nodes = [node("root", null), node("source", "root"), node("target", "root")];
     const edges: Edge[] = [
-      { id: "root-source", src: "root", dst: "source", type: "CONTAINS", created_at: "" },
-      { id: "root-target", src: "root", dst: "target", type: "CONTAINS", created_at: "" },
-      { id: "source-target", src: "source", dst: "target", type: "FOLLOWS", created_at: "" },
+      { id: "root-source", src: "root", dst: "source", type: "CONTAINS", route: null, created_at: "" },
+      { id: "root-target", src: "root", dst: "target", type: "CONTAINS", route: null, created_at: "" },
+      { id: "source-target", src: "source", dst: "target", type: "FOLLOWS", route: null, created_at: "" },
     ];
 
     const shown = displayEdges(nodes, edges);
@@ -391,6 +404,7 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
@@ -399,6 +413,7 @@ describe("dendrogram", () => {
         src: "leaf",
         dst: "branch-end",
         type: "FOLLOWS",
+        route: null,
         created_at: "",
       },
       {
@@ -406,6 +421,7 @@ describe("dendrogram", () => {
         src: "branch",
         dst: "final",
         type: "FOLLOWS",
+        route: null,
         created_at: "",
       },
     );
@@ -445,6 +461,7 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push({
@@ -452,6 +469,7 @@ describe("dendrogram", () => {
       src: "branch",
       dst: "final",
       type: "FOLLOWS",
+      route: null,
       created_at: "",
     });
 
@@ -486,6 +504,7 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
@@ -494,6 +513,7 @@ describe("dendrogram", () => {
         src,
         dst: "integrate",
         type: "FOLLOWS" as const,
+        route: null,
         created_at: "",
       })),
     );
@@ -535,13 +555,14 @@ describe("dendrogram", () => {
       src,
       dst,
       type: "CONTAINS" as const,
+      route: null,
       created_at: "",
     }));
     edges.push(
-      { id: "setup-branch", src: "setup", dst: "branch", type: "FOLLOWS", created_at: "" },
-      { id: "left-join", src: "left", dst: "join", type: "FOLLOWS", created_at: "" },
-      { id: "right-join", src: "right", dst: "join", type: "FOLLOWS", created_at: "" },
-      { id: "branch-final", src: "branch", dst: "final", type: "FOLLOWS", created_at: "" },
+      { id: "setup-branch", src: "setup", dst: "branch", type: "FOLLOWS", route: null, created_at: "" },
+      { id: "left-join", src: "left", dst: "join", type: "FOLLOWS", route: null, created_at: "" },
+      { id: "right-join", src: "right", dst: "join", type: "FOLLOWS", route: null, created_at: "" },
+      { id: "branch-final", src: "branch", dst: "final", type: "FOLLOWS", route: null, created_at: "" },
     );
 
     expect(workflowLeafIds(nodes, edges).get("root")).toEqual(["final"]);

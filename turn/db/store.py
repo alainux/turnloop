@@ -700,10 +700,24 @@ class Store:
         artifact_refs: list[uuid.UUID] | None = None,
         evidence_refs: list[str] | None = None,
     ) -> WorkItem | None:
-        for project_id, state in self._states.items():
-            item = state.work_items.get(item_id)
+        found = next(
+            (
+                (project_id, item)
+                for project_id, state in self._states.items()
+                if (item := state.work_items.get(item_id)) is not None
+            ),
+            None,
+        )
+        if found is None:
+            return None
+        project_id, _ = found
+        # The read-modify-write cycle must hold the project lock: unlocked
+        # field-by-field mutation interleaves with locked graph writers and
+        # can persist a half-updated work item.
+        async with self._project_lock(project_id):
+            item = self._states[project_id].work_items.get(item_id)
             if item is None:
-                continue
+                return None
             if status is not None:
                 item.status = status
             if priority is not None:
@@ -726,14 +740,13 @@ class Store:
                 data={"work_item_id": str(item.id), "status": item.status.value},
             )
             return item.model_copy(deep=True)
-        return None
 
     async def claim_work_item(
         self, item_id: uuid.UUID, node_id: uuid.UUID | None = None
     ) -> WorkItem | None:
         found = next(
             (
-                (project_id, state, state.work_items[item_id])
+                (project_id, item_id)
                 for project_id, state in self._states.items()
                 if item_id in state.work_items
             ),
@@ -741,25 +754,43 @@ class Store:
         )
         if found is None:
             return None
-        _, state, item = found
-        if item.status not in {WorkItemStatus.BACKLOG, WorkItemStatus.READY}:
-            raise ValueError(f"work item is not claimable: {item.status.value}")
-        incomplete = [
-            dependency
-            for dependency in item.depends_on
-            if dependency not in state.work_items
-            or state.work_items[dependency].status is not WorkItemStatus.COMPLETE
-        ]
-        if incomplete:
-            raise ValueError(
-                "work item dependencies are incomplete: "
-                + ", ".join(str(dependency) for dependency in incomplete)
+        project_id, _ = found
+        # Claiming is the assignment boundary of the whole orchestrator. The
+        # claimability check and the status flip must be one atomic step under
+        # the project lock; otherwise two concurrent claims (scheduler tick +
+        # CLI agent) both pass the BACKLOG/READY check and one node's work is
+        # silently stolen.
+        async with self._project_lock(project_id):
+            state = self._states[project_id]
+            item = state.work_items.get(item_id)
+            if item is None:
+                return None
+            if item.status not in {WorkItemStatus.BACKLOG, WorkItemStatus.READY}:
+                raise ValueError(f"work item is not claimable: {item.status.value}")
+            incomplete = [
+                dependency
+                for dependency in item.depends_on
+                if dependency not in state.work_items
+                or state.work_items[dependency].status is not WorkItemStatus.COMPLETE
+            ]
+            if incomplete:
+                raise ValueError(
+                    "work item dependencies are incomplete: "
+                    + ", ".join(str(dependency) for dependency in incomplete)
+                )
+            item.status = WorkItemStatus.CLAIMED
+            if node_id is not None:
+                item.claimed_by = node_id
+            item.updated_at = datetime.now(timezone.utc)
+            await self._persist_project(project_id)
+            await self._log(
+                project_id,
+                kind="work_item.changed",
+                action="work_item.update",
+                message=f"work item {item.id} updated",
+                data={"work_item_id": str(item.id), "status": item.status.value},
             )
-        return await self.update_work_item(
-            item_id,
-            status=WorkItemStatus.CLAIMED,
-            claimed_by=node_id,
-        )
+            return item.model_copy(deep=True)
 
     async def materialize_ready_work_items(
         self, project_id: uuid.UUID, *, limit: int | None = None
@@ -768,6 +799,15 @@ class Store:
         state = self._states.get(project_id)
         if state is None:
             return []
+        # Selection, node creation, and ticket mutation are one atomic
+        # assignment step: two concurrent scheduler ticks must never both
+        # materialize the same backlog entry.
+        async with self._project_lock(project_id):
+            return await self._materialize_ready_work_items_locked(project_id, state, limit=limit)
+
+    async def _materialize_ready_work_items_locked(
+        self, project_id: uuid.UUID, state, *, limit: int | None
+    ) -> list[Node]:
         candidates = sorted(
             (
                 item for item in state.work_items.values()
@@ -1138,16 +1178,38 @@ class Store:
             handoff.rejection_reason = None
             handoff.updated_at = datetime.now(timezone.utc)
 
-    async def _save_node(self, node: Node) -> Node:
+    async def _save_node(self, node: Node) -> Node | None:
+        """Persist one node mutation and return the durable copy.
+
+        Returns ``None`` when the write was intentionally dropped. Callers
+        receive an honest failure signal instead of an unpersisted copy that
+        merely looks saved.
+        """
         if node.project_id not in self._states:
-            return node
+            await self._log(
+                None,
+                kind="state.changed",
+                action="node.save.dropped",
+                status="error",
+                message=f"node {node.id} update dropped: project {node.project_id} is not loaded",
+                data={"node_id": str(node.id), "project_id": str(node.project_id)},
+            )
+            return None
         previous = self._states[node.project_id].nodes.get(node.id)
         if previous is None:
             # A provider/reconnect callback may hold a snapshot while a plan
             # replacement removes its subtree. Never let that stale callback
             # recreate a deleted node; graph creation is owned by apply_plan
             # and create_node, not by state updates.
-            return node.model_copy(deep=True)
+            await self._log(
+                node.project_id,
+                kind="state.changed",
+                action="node.save.dropped",
+                status="error",
+                message=f"node {node.id} update dropped: node no longer exists in project {node.project_id}",
+                data={"node_id": str(node.id), "project_id": str(node.project_id)},
+            )
+            return None
         saved = node.model_copy(update={"updated_at": datetime.now(timezone.utc)}, deep=True)
         self._states[node.project_id].nodes[node.id] = saved
         self._sync_work_item(saved)
@@ -1176,6 +1238,8 @@ class Store:
             if previous != status:
                 await self._log(node.project_id, kind="graph.transition", action="node.status", message=f"{previous.value} -> {status.value}", data={"node_id": str(node_id), "from": previous.value, "to": status.value})
             saved = await self._save_node(node)
+        if saved is None:
+            return None
         if previous != status:
             await self._emit_event(
                 "node.status.changed",
@@ -1226,15 +1290,58 @@ class Store:
             )
         return saved
 
+    async def publish_outputs(
+        self,
+        node_id: uuid.UUID,
+        *,
+        outputs: dict[str, str] | None = None,
+        route: str | None = None,
+    ) -> Optional[Node]:
+        """Persist one completed node's published variables and chosen route.
+
+        Only names the node explicitly declares in ``provides`` are published;
+        undeclared worker output keys are dropped so a node cannot silently
+        widen its data contract.
+        """
+        found = self._project_for_node(node_id)
+        if found is None:
+            return None
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            current = await self.get_node(node_id)
+            if current is None:
+                return None
+            changed = False
+            if outputs:
+                declared = set(current.provides)
+                published = {key: str(value) for key, value in outputs.items() if key in declared}
+                if published:
+                    current.outputs = {**current.outputs, **published}
+                    changed = True
+            if route is not None and route != current.route_taken:
+                current.route_taken = route
+                changed = True
+            if not changed:
+                return current
+            return await self._save_node(current)
+
     async def set_agent_status(
         self, node_id: uuid.UUID, *, state: str | None, message: str | None
     ) -> Optional[Node]:
-        node = await self.get_node(node_id)
-        if node is None:
+        found = self._project_for_node(node_id)
+        if found is None:
             return None
-        node.agent_state = sanitize_control_text(state) if state is not None else None
-        node.agent_message = sanitize_control_text(message) if message is not None else None
-        return await self._save_node(node)
+        project_id, _ = found
+        # Live agent status arrives from CLI submissions racing the scheduler;
+        # the read-modify-write must hold the project lock like every other
+        # node mutator or a locked graph writer can persist a torn update.
+        async with self._project_lock(project_id):
+            current = await self.get_node(node_id)
+            if current is None:
+                return None
+            current.agent_state = sanitize_control_text(state) if state is not None else None
+            current.agent_message = sanitize_control_text(message) if message is not None else None
+            return await self._save_node(current)
 
     async def set_runtime_guard(
         self, project_id: uuid.UUID, *, code: str, message: str
@@ -1254,8 +1361,15 @@ class Store:
         current = node.runtime_guard
         if current is not None and current.code == clean_code and current.message == clean_message:
             return node
-        node.runtime_guard = RuntimeGuard(code=clean_code, message=clean_message)
-        saved = await self._save_node(node)
+        async with self._project_lock(project_id):
+            fresh = await self.get_node(project_id)
+            if fresh is None:
+                return None
+            existing = fresh.runtime_guard
+            if existing is not None and existing.code == clean_code and existing.message == clean_message:
+                return fresh
+            fresh.runtime_guard = RuntimeGuard(code=clean_code, message=clean_message)
+            saved = await self._save_node(fresh)
         await self._log(
             project_id,
             kind="runtime.guard",
@@ -1440,6 +1554,8 @@ class Store:
         # small window between persisting the decision and resetting the flow.
         node.status = status
         saved = await self._save_node(node)
+        if saved is None:
+            return None
         await self._emit_event(
             "verification.completed",
             project_id=saved.project_id,
@@ -1898,7 +2014,7 @@ class Store:
         await self._log(current.project_id, kind="trigger.changed", action="trigger.deleted", message="trigger deleted", data={"trigger_id": str(trigger_id)})
         return True
 
-    async def mark_trigger_fired(self, trigger_id: uuid.UUID, when: datetime) -> Optional[Trigger]:
+    async def mark_trigger_fired(self, trigger_id: uuid.UUID, when: datetime | None) -> Optional[Trigger]:
         current = await self.get_trigger(trigger_id)
         if current is None:
             return None
@@ -1911,6 +2027,21 @@ class Store:
         """Reset the target flow and attach the event envelope to its entry node."""
         target = await self.get_node(trigger.target_node_id)
         if target is None:
+            return []
+        if (
+            target.trigger_context is not None
+            and target.trigger_context.event_id == context.event_id
+        ):
+            # Durable replay guard: this exact event was already applied to the
+            # target (crash between activation and inbox-cursor save). Never
+            # reset the flow twice for one event identity.
+            await self._log(
+                trigger.project_id,
+                kind="trigger.activity",
+                action="trigger.replay_skipped",
+                message="trigger target already carries this event_id",
+                data={"trigger_id": str(trigger.id), "target_node_id": str(target.id), "event_id": str(context.event_id)},
+            )
             return []
         nodes, edges, _ = await self.get_workgraph(trigger.project_id)
         walker = GraphWalker(nodes, edges)

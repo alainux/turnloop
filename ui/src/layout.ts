@@ -277,6 +277,7 @@ export async function layoutDendrogram(
     src: triggerLayoutId(trigger),
     dst: trigger.target_node_id,
     type: "FOLLOWS",
+    route: null,
     created_at: trigger.created_at,
   }));
   const triggerIds = new Set(visibleTriggers.map(triggerLayoutId));
@@ -308,6 +309,7 @@ export async function layoutDendrogram(
       src: node.parent_id,
       dst: node.id,
       type: "CONTAINS",
+      route: null,
       created_at: "",
     });
   }

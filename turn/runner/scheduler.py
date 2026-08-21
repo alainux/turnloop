@@ -287,6 +287,51 @@ class Scheduler:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _reap_cancelled(self, nodes: list[Node]) -> None:
+        """Stop live work for CANCELLED nodes and cancel their descendants.
+
+        Two cases are enforced here on every scheduling pass:
+
+        1. A node whose composition ancestor was CANCELLED inherits the
+           cancellation.
+        2. A node that is itself already CANCELLED but whose execution task
+           is still alive (a cancel/launch race) must have that task stopped.
+           Otherwise the provider process keeps running, occupies project and
+           global concurrency slots, and drains budgets invisibly.
+        """
+        by_id = {node.id: node for node in nodes}
+        for node in nodes:
+            ancestor = by_id.get(node.parent_id)
+            inherited = False
+            seen: set[uuid.UUID] = set()
+            while ancestor is not None and ancestor.id not in seen:
+                seen.add(ancestor.id)
+                if ancestor.status == NodeStatus.CANCELLED:
+                    inherited = True
+                    break
+                ancestor = by_id.get(ancestor.parent_id)
+            already_cancelled = node.status == NodeStatus.CANCELLED
+            if not inherited and not already_cancelled:
+                continue
+            task = self.running.get(node.id)
+            if task is not None and not task.done():
+                if self._cancel_node is not None:
+                    await self._cancel_node(node.id)
+                else:
+                    # Scheduler is composed with Runner in production. Keep
+                    # this branch only for small standalone scheduler tests;
+                    # it still awaits the task before exposing the state.
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            elif not already_cancelled:
+                if self._cancel_node is not None:
+                    await self._cancel_node(node.id)
+                else:
+                    await self.store.set_status(node.id, NodeStatus.CANCELLED)
+                refreshed = await self.store.get_node(node.id)
+                if refreshed is not None and refreshed.status is not NodeStatus.CANCELLED:
+                    await self.store.set_status(node.id, NodeStatus.CANCELLED)
+
     async def schedule_once(self, project_id: uuid.UUID) -> None:
         if project_id in self.deleting_projects:
             return
@@ -318,37 +363,7 @@ class Scheduler:
         active = {node_id for node_id, task in self.running.items() if not task.done()}
         active.update(node.id for node in nodes if self._is_externally_busy(node.id))
         await self.store.cancel_orphaned_runs(project_id, active)
-        by_id = {node.id: node for node in nodes}
-
-        for node in nodes:
-            ancestor = by_id.get(node.parent_id)
-            inactive_ancestor = None
-            seen: set[uuid.UUID] = set()
-            while ancestor is not None and ancestor.id not in seen:
-                seen.add(ancestor.id)
-                if ancestor.status == NodeStatus.CANCELLED:
-                    inactive_ancestor = ancestor
-                    break
-                ancestor = by_id.get(ancestor.parent_id)
-            if inactive_ancestor is None or node.status == NodeStatus.CANCELLED:
-                continue
-            task = self.running.get(node.id)
-            if task is not None and not task.done():
-                if self._cancel_node is not None:
-                    await self._cancel_node(node.id)
-                else:
-                    # Scheduler is composed with Runner in production. Keep
-                    # this branch only for small standalone scheduler tests;
-                    # it still awaits the task before exposing the state.
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-            elif self._cancel_node is not None:
-                await self._cancel_node(node.id)
-            else:
-                await self.store.set_status(node.id, NodeStatus.CANCELLED)
-            refreshed = await self.store.get_node(node.id)
-            if refreshed is not None and refreshed.status is not NodeStatus.CANCELLED:
-                await self.store.set_status(node.id, NodeStatus.CANCELLED)
+        await self._reap_cancelled(nodes)
 
         walker = GraphWalker(nodes, edges)
         evaluation = walker.evaluate()
@@ -490,6 +505,7 @@ class Scheduler:
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if not nodes:
             return []
+        await self._reap_cancelled(nodes)
         root_snapshot = next((node for node in nodes if node.id == project_id), None)
         if root_snapshot is not None:
             project_limit = root_snapshot.run_policy.max_parallel_agents if root_snapshot.run_policy else getattr(

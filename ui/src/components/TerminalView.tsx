@@ -2,34 +2,41 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import xtermCss from "@xterm/xterm/css/xterm.css?inline";
-import type { GraphNode, Run } from "../domain";
+import type { ControlActivity, GraphNode, Run } from "../domain";
 import { getProjectLogs, type LogRecord } from "../api/logs";
 import { Icon } from "./Icon";
 
 interface Props {
   node: GraphNode;
   runs: Run[];
-  terminalNodeId?: string;
+  control?: ControlActivity | null;
 }
 
 const HERDR_OPERATOR_WARNING =
   "CAUTION: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR FROM HERDR ITSELF. " +
   "DO NOT TRY TO LAUNCH HERDR; REQUEST/USE THE ALREADY-RUNNING DAEMON.";
 
-export function TerminalView({ node, terminalNodeId }: Props) {
+export function TerminalView({ node, control }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(false);
   const [idle, setIdle] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
   const [runtimeGuard, setRuntimeGuard] = useState<string | null>(null);
   const [view, setView] = useState<"terminal" | "activity">("terminal");
+  // The organization's own terminal is the primary surface. A control process
+  // (plan audit / manager review) gets an explicitly selectable second
+  // surface; it must never silently replace the agent terminal.
+  const [surface, setSurface] = useState<"agent" | "control">("agent");
+  useEffect(() => {
+    if (!control && surface === "control") setSurface("agent");
+  }, [control, surface]);
   // A project owns one Herdr space. A node gets a durable pane only when an
   // agent runs or a user explicitly opens its terminal; the inspector only
   // attaches to that pane.
   const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "transcript">("connecting");
-  const controlTerminal = Boolean(terminalNodeId && terminalNodeId !== node.id);
-  const endpoint = controlTerminal ? "terminal" : "shell";
-  const streamNodeId = terminalNodeId || node.id;
+  const showControl = Boolean(control) && surface === "control";
+  const endpoint = showControl ? "terminal" : "shell";
+  const streamNodeId = showControl ? control!.terminal_node_id : node.id;
 
   useEffect(() => {
     if (!host.current) return;
@@ -367,10 +374,18 @@ export function TerminalView({ node, terminalNodeId }: Props) {
       <div className="terminal-head">
         <Icon name="terminal" />
         <span className="terminal-title">
-          {controlTerminal
+          {showControl
             ? node.control_activity?.kind === "manager_review" ? "control · manager" : "control · plan audit"
             : "shell"} · {streamNodeId.slice(0, 8)}
         </span>
+        {control && (
+          <span className="terminal-view-switch" role="tablist" aria-label="Terminal surface">
+            <button role="tab" aria-selected={!showControl} className={!showControl ? "active" : ""} onClick={() => setSurface("agent")}>Agent</button>
+            <button role="tab" aria-selected={showControl} className={showControl ? "active" : ""} onClick={() => setSurface("control")}>
+              {node.control_activity?.kind === "manager_review" ? "Manager review" : "Plan audit"}
+            </button>
+          </span>
+        )}
         <span className="terminal-view-switch" role="tablist" aria-label="Node output views">
           <button role="tab" aria-selected={view === "terminal"} className={view === "terminal" ? "active" : ""} onClick={() => setView("terminal")}>Terminal</button>
           <button role="tab" aria-selected={view === "activity"} className={view === "activity" ? "active" : ""} onClick={() => setView("activity")}>Activity</button>
