@@ -4,7 +4,8 @@
       "command": "npx",
       "args": [
         "-y",
-        "chrome-devtools-mcp@1.6.0"
+        "chrome-devtools-mcp@1.6.0",
+        "--allow-unrestricted-paths"
       ]
     }
   }

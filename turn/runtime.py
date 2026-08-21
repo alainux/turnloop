@@ -126,6 +126,18 @@ class TurnRuntime:
                 self.runner.provider_reviews_enabled = True
             self.triggers.set_wake(self.runner.wake)
             await self.runner.start()
+            # Normalize pre-lead projects at the runtime boundary. This keeps
+            # one independent lead and one chat transcript per project without
+            # changing the organization graph or scheduler semantics.
+            from turn.domain.schemas import AgentType
+            for project in await self.store.list_projects():
+                lead_agent = (
+                    project.agent.as_type(AgentType.LEAD)
+                    if project.agent is not None
+                    else None
+                )
+                await self.store.ensure_project_lead(project.id, agent=lead_agent)
+                await self.runner.ensure_lead_terminal(project.id)
             await self.triggers.start()
             if self.test_mode and mock_workflows_enabled():
                 created = await seed_mock_workflows(self.store)

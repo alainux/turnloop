@@ -17,6 +17,7 @@ from turn.capabilities.plugin import CapabilityPluginError, load_capability_plug
 from turn.domain.schemas import (
     Artifact,
     ArtifactSpec,
+    InboundMessage,
     Node,
     PlanResult,
     Resource,
@@ -38,6 +39,9 @@ class NodeExecutionContext(BaseModel):
     repo_path: Optional[str] = None
     project_repo_path: Optional[str] = None
     predecessor_artifacts: list[Artifact] = Field(default_factory=list)
+    # Durable information queued for this node is injected only when a new
+    # Run context is built. It is never written into an active provider pane.
+    inbound_messages: list[InboundMessage] = Field(default_factory=list)
     # General data passing: values resolved from upstream predecessors for
     # this node's declared ``consumes`` names.
     variables: dict[str, str] = Field(default_factory=dict)
@@ -156,6 +160,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             f"purpose={ctx.purpose}",
             f"review_feedback={ctx.review_feedback or ''}",
             f"predecessor_artifacts={json.dumps([item.model_dump(mode='json') for item in ctx.predecessor_artifacts])}",
+            f"inbound_messages={json.dumps([item.model_dump(mode='json') for item in ctx.inbound_messages])}",
             variables_line,
         ])
 
@@ -175,6 +180,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         f"purpose={ctx.purpose}",
         f"review_feedback={ctx.review_feedback or ''}",
         f"predecessor_artifacts={json.dumps([item.model_dump(mode='json') for item in ctx.predecessor_artifacts])}",
+        f"inbound_messages={json.dumps([item.model_dump(mode='json') for item in ctx.inbound_messages])}",
         f"harness={agent.harness.value}",
         f"model={agent.model or ''}",
         f"reasoning={agent.reasoning.value}",

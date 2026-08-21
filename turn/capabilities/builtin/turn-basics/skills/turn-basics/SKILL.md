@@ -26,6 +26,25 @@ artifacts and document references are the durable evidence that downstream
 agents consume. The terminal is a live workspace: the user can inspect it and
 type follow-up direction while your node is active.
 
+The Project Lead is the human-facing control layer for a project. A Lead can
+inspect complete state through the supported Turn surfaces:
+
+```sh
+turn lead show --format json
+turn lead reviews PROJECT_ID --format json
+turn graph PROJECT_ID --format json
+turn work list PROJECT_ID --format json
+turn organization show PROJECT_ID --format json
+```
+
+Use those validated CLI/API operations for coordination. Never edit
+`.turn/state.json`, launch a provider yourself, or make the Lead a scheduler.
+Turn validates, persists, schedules, and executes.
+
+Inbound information is mailbox-delivered at a safe Run boundary. If a node or
+Lead is busy, a new message is durable but must not be typed into its active
+provider terminal. The next turn receives queued messages in order.
+
 ## First turn
 
 1. Invoke every capability marker in the launch message through the harness's

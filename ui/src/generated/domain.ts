@@ -214,6 +214,7 @@ export interface GraphView {
   bootstrap_status: string;
   lead: ProjectLead | null;
   lead_runs: Array<Run>;
+  lead_transcript: Array<LeadTranscriptEntry>;
   review_requests: Array<ReviewRequest>;
   nodes: Array<GraphNodeView>;
   edges: Array<Edge>;
@@ -251,6 +252,19 @@ export type HandoffStatus = "EXPECTED" | "AVAILABLE" | "ACCEPTED" | "REJECTED";
 
 export type HarnessKind = "codex" | "claude" | "opencode" | "pi" | "mock" | "shell";
 
+export interface InboundMessage {
+  id: string;
+  project_id: string;
+  recipient_node_id: string;
+  content: string;
+  source: string;
+  status: InboundMessageStatus;
+  run_id: string | null;
+  created_at: string;
+}
+
+export type InboundMessageStatus = "QUEUED" | "CONSUMED";
+
 export type InputKind = "text" | "file" | "decision" | "credential" | "account" | "approval";
 
 export interface InputSpec {
@@ -272,7 +286,22 @@ export interface Integrator {
   session_id: string | null;
 }
 
-export type LeadStatus = "IDLE" | "RUNNING";
+export type LeadMessageRole = "user" | "lead" | "update";
+
+export type LeadMessageStatus = "QUEUED" | "CONSUMED";
+
+export type LeadStatus = "IDLE" | "RUNNING" | "DORMANT";
+
+export interface LeadTranscriptEntry {
+  id: string;
+  project_id: string;
+  role: LeadMessageRole;
+  content: string;
+  event_name: string | null;
+  status: LeadMessageStatus;
+  run_id: string | null;
+  created_at: string;
+}
 
 export type ManagerDecision = "ACCEPT" | "CONTINUE" | "BLOCK";
 
@@ -508,6 +537,7 @@ export interface ProjectLead {
   agent: Agent | null;
   session_id: string | null;
   status: LeadStatus;
+  wait_events: Array<string>;
   created_at: string;
 }
 

@@ -43,7 +43,7 @@ from turn.workers.capabilities import capability_is_installed
 from turn.domain.state_machine import present_node
 from turn.graph.logic import GraphWalker, derive_flow_edges
 from turn.contracts.schema import public_schema
-from turn.runner.runner import Runner
+from turn.runner.runner import ControlOperationUnavailable, Runner
 from turn.domain.lead import ReviewStatus
 from turn.metrics import BehaviorMetricsStore, evaluate_expectations
 from turn.workers.conversations import (
@@ -188,6 +188,19 @@ class DeleteProjectOptions(BaseModel):
 
     delete_files: bool = False
     delete_conversations: bool = False
+
+
+class LeadChatMessage(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+
+
+class LeadWaitRequest(BaseModel):
+    events: list[str] = Field(default_factory=list, max_length=32)
+
+
+class AgentInboundMessage(BaseModel):
+    content: str = Field(min_length=1, max_length=20_000)
+    source: str = Field(default="user", min_length=1, max_length=80)
 
 
 class CreateTrigger(BaseModel):
@@ -397,6 +410,10 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
             if (lead := await store.project_lead(project_id)) is not None
             else []
         ),
+        "lead_transcript": [
+            item.model_dump(mode="json")
+            for item in await store.lead_transcript(project_id)
+        ],
         "review_requests": [
             item.model_dump(mode="json")
             for item in await store.review_requests(project_id)
@@ -1137,7 +1154,101 @@ async def project_lead(project_id: str, request: Request):
         "project_id": project_id,
         "bootstrap_status": bootstrap,
         "lead": lead.model_dump(mode="json") if lead else None,
+        "transcript": [
+            item.model_dump(mode="json")
+            for item in await store.lead_transcript(pid)
+        ],
     }
+
+
+@router.get("/api/projects/{project_id}/lead/chat")
+async def project_lead_chat(project_id: str, request: Request):
+    """Return the compact durable transcript used by Lead Chat."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    return {
+        "project_id": project_id,
+        "transcript": [
+            item.model_dump(mode="json")
+            for item in await store.lead_transcript(pid)
+        ],
+    }
+
+
+@router.post("/api/projects/{project_id}/lead/chat")
+async def send_project_lead_message(
+    project_id: str,
+    body: LeadChatMessage,
+    request: Request,
+):
+    """Send one user message through the retained Project Lead session."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    lead = await store.project_lead(pid)
+    if lead is None:
+        raise HTTPException(409, "project lead is not initialized")
+    try:
+        entry, _task = await runner.enqueue_lead_message(
+            lead.terminal_owner_id,
+            body.message,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except ControlOperationUnavailable as error:
+        raise HTTPException(409, str(error)) from error
+    return {
+        "project_id": project_id,
+        "message": entry.model_dump(mode="json"),
+        # The endpoint is intentionally asynchronous even for an idle Lead:
+        # the user must be able to queue another message while the provider
+        # turn is live. The transcript/SSE stream carries the later reply.
+        "queued": True,
+        "lead": (
+            refreshed.model_dump(mode="json")
+            if (refreshed := await store.project_lead(pid)) is not None
+            else None
+        ),
+    }
+
+
+@router.post("/api/projects/{project_id}/lead/wait")
+async def wait_project_lead(
+    project_id: str,
+    body: LeadWaitRequest,
+    request: Request,
+):
+    """Put the lead into an inference-free wait state."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    try:
+        lead = await runner.wait_lead(pid, body.events)
+    except ControlOperationUnavailable as error:
+        raise HTTPException(409, str(error)) from error
+    return {"project_id": project_id, "lead": lead.model_dump(mode="json")}
+
+
+@router.post("/api/projects/{project_id}/lead/cancel")
+async def cancel_project_lead(project_id: str, request: Request):
+    """Cancel a Lead Run explicitly before changing its assignment."""
+    pid = uuid.UUID(project_id)
+    store: Store = request.app.state.store
+    runner: Runner = request.app.state.runner
+    if await store.get_node(pid) is None:
+        raise HTTPException(404, "project not found")
+    try:
+        await runner.cancel_lead(pid)
+    except ControlOperationUnavailable as error:
+        raise HTTPException(409, str(error)) from error
+    lead = await store.project_lead(pid)
+    return {"project_id": project_id, "lead": lead.model_dump(mode="json") if lead else None}
 
 
 @router.get("/api/projects/{project_id}/reviews")
@@ -1658,10 +1769,10 @@ async def shell_socket(websocket: WebSocket, node_id: str):
         return
     input_filter = None
     if is_lead:
-        # The Lead pane is never a generic shell: while the lead is idle,
-        # typed lines are assembled locally and submitted as retained-session
-        # conversation turns. While a lead turn runs, keystrokes pass through
-        # so the user steers the live harness like any other agent.
+        # The Lead pane is never a generic shell: typed lines are assembled
+        # locally and submitted as retained-session conversation turns. This
+        # remains true while a Lead turn runs; input is queued and never
+        # written into the active provider.
         async def input_filter(data: bytes | str) -> bytes | None:
             text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
             result = await runner.lead_console_input(nid, text)
@@ -1754,6 +1865,31 @@ async def provide_input(node_id: str, body: ProvideInput, request: Request):
     runner = await _runner(request)
     await runner.provide_input(uuid.UUID(node_id), body.input_id, body.value)
     return {"ok": True}
+
+
+@router.post("/api/nodes/{node_id}/messages")
+async def queue_node_message(
+    node_id: str,
+    body: AgentInboundMessage,
+    request: Request,
+):
+    """Queue information for the node's next turn; never write to a live PTY."""
+    store: Store = request.app.state.store
+    node = await store.get_node(uuid.UUID(node_id))
+    if node is None:
+        raise HTTPException(404, "node not found")
+    item = await store.queue_inbound_message(
+        node.project_id,
+        node.id,
+        body.content,
+        source=body.source,
+    )
+    await request.app.state.events.publish({
+        "type": "agent.inbox.queued",
+        "project_id": str(node.project_id),
+        "data": item.model_dump(mode="json"),
+    })
+    return {"message": item.model_dump(mode="json")}
 
 
 @router.post("/api/nodes/{node_id}/edit")

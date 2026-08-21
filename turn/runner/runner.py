@@ -69,7 +69,14 @@ from turn.runner.workspaces import WorkspaceError, WorkspaceManager
 from turn.runner.sessions import SessionController
 from turn.runner.process_supervisor import ProcessSupervisor
 from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block, substitute_prompt_variables
-from turn.domain.lead import ReviewDecision, ReviewKind, ReviewRequest, ReviewStatus
+from turn.domain.lead import (
+    LeadMessageRole,
+    LeadTranscriptEntry,
+    ReviewDecision,
+    ReviewKind,
+    ReviewRequest,
+    ReviewStatus,
+)
 from turn.workers.herdr import (
     HerdrAdapter,
     HerdrAdapterError,
@@ -271,8 +278,10 @@ class Runner:
         self._cancelling_nodes: set[uuid.UUID] = set()
         self._review_attempts: dict[uuid.UUID, int] = {}
         self._lead_tasks: dict[uuid.UUID, asyncio.Task] = {}
+        self._lead_task_locks: dict[uuid.UUID, asyncio.Lock] = {}
         self._lead_line_buffers: dict[uuid.UUID, str] = {}
         self._lead_input_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self._active_lead_owners: set[uuid.UUID] = set()
         self._reconnect_tasks = self.sessions.reconnect_tasks
         self._forbidden_fresh_sessions = self.sessions.forbidden_fresh_sessions
         self.organization_manager = OrganizationManager()
@@ -393,6 +402,11 @@ class Runner:
                 await self.terminal.detach(node_id)
         for t in running:
             t.cancel()
+        lead_tasks = list(self._lead_tasks.values())
+        for task in lead_tasks:
+            task.cancel()
+        if lead_tasks:
+            await asyncio.gather(*lead_tasks, return_exceptions=True)
         await self.sessions.stop_all()
         for task in self._handoff_watchers.values():
             task.cancel()
@@ -1506,38 +1520,82 @@ class Runner:
     def lead_busy(self, owner_id: uuid.UUID) -> bool:
         """True while a lead provider turn (review or conversation) is live."""
         task = self._lead_tasks.get(owner_id)
-        return self.generation_active(owner_id) or bool(task and not task.done())
+        return (
+            owner_id in self._active_lead_owners
+            or self.generation_active(owner_id)
+            or bool(task and not task.done())
+        )
+
+    async def enqueue_lead_message(
+        self,
+        owner_id: uuid.UUID,
+        message: str,
+    ) -> tuple[LeadTranscriptEntry, asyncio.Task | None]:
+        """Persist a user message and start it only at a safe Lead boundary."""
+        lead = await self.store.lead_by_terminal_owner(owner_id)
+        if lead is None:
+            raise ControlOperationUnavailable("no project lead owns this terminal")
+        if lead.agent is None:
+            raise ControlOperationUnavailable("project lead has no agent configuration")
+        message = message.strip()
+        if not message:
+            raise ValueError("lead messages cannot be empty")
+        if not self.lead_busy(owner_id):
+            await self.store.update_lead(
+                lead.project_id,
+                status="IDLE",
+                wait_events=[],
+            )
+        entry = await self.store.append_lead_message(
+            lead.project_id,
+            role=LeadMessageRole.USER,
+            content=message,
+            status="QUEUED",
+        )
+        await self._emit(
+            "lead.chat.user",
+            lead.project_id,
+            {
+                "message_id": str(entry.id),
+                "status": entry.status.value,
+            },
+        )
+        task = await self._start_lead_task_if_ready(owner_id)
+        return entry, task
+
+    async def _start_lead_task_if_ready(self, owner_id: uuid.UUID) -> asyncio.Task | None:
+        lock = self._lead_task_locks.setdefault(owner_id, asyncio.Lock())
+        async with lock:
+            if self.lead_busy(owner_id):
+                return None
+            pending = await self.store.lead_by_terminal_owner(owner_id)
+            if pending is None or not await self.store.pending_lead_messages(pending.project_id):
+                return None
+            task = asyncio.create_task(self._lead_conversation_task(owner_id))
+            self._lead_tasks[owner_id] = task
+            return task
 
     async def lead_console_input(self, owner_id: uuid.UUID, data: str) -> str | None:
-        """Intercept terminal input addressed to an idle project lead.
+        """Capture Lead input without ever writing it to a busy provider.
 
-        The lead's pane must never behave like a generic shell while it is
-        presented as the Lead (LEAD_ESCALATION_FINISH §1). While the lead is
-        idle this assembles typed lines locally — echoing them into the pane's
-        visible stream without touching stdin — and submits each line as one
-        retained-session lead conversation turn. While a lead turn is running
-        the input passes through untouched so the user steers the live harness
-        exactly like any other agent.
+        Idle and busy input both go through the durable Lead mailbox. A busy
+        provider sees zero of these bytes; queued messages are consumed by the
+        next retained-session turn after the current Run settles.
 
         Returns the bytes to forward to the pane, or ``None`` when consumed.
         """
         if not data:
             return None
-        if self.lead_busy(owner_id):
-            # A turn started mid-line: hand back anything already buffered so
-            # nothing the user typed silently disappears.
-            buffered = self._lead_line_buffers.pop(owner_id, "")
-            return (buffered + data) if (buffered or data) else None
         lock = self._lead_input_locks.setdefault(owner_id, asyncio.Lock())
         async with lock:
             buffer = self._lead_line_buffers.get(owner_id, "")
             echo_parts: list[str] = []
-            submit: str | None = None
+            submits: list[str] = []
             for ch in data:
                 if ch in ("\r", "\n"):
                     echo_parts.append("\r\n")
-                    if buffer.strip() and submit is None:
-                        submit = buffer.strip()
+                    if buffer.strip():
+                        submits.append(buffer.strip())
                     buffer = ""
                 elif ch in ("\x7f", "\b"):
                     if buffer:
@@ -1555,16 +1613,15 @@ class Runner:
             echo = "".join(echo_parts)
             if echo:
                 self.shell.echo(owner_id, echo)
-            if submit is not None:
-                task = asyncio.create_task(
-                    self._lead_conversation_task(owner_id, submit)
-                )
-                self._lead_tasks[owner_id] = task
+            for submit in submits:
+                await self.enqueue_lead_message(owner_id, submit)
             return None
 
-    async def _lead_conversation_task(self, owner_id: uuid.UUID, message: str) -> None:
+    async def _lead_conversation_task(
+        self, owner_id: uuid.UUID
+    ) -> LeadTranscriptEntry | None:
         try:
-            await self.lead_conversation_turn(owner_id, message)
+            return await self._run_lead_chat_turn(owner_id)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -1578,30 +1635,200 @@ class Runner:
                 )
             except Exception:
                 pass
+            return None
         finally:
-            self._lead_tasks.pop(owner_id, None)
+            current = asyncio.current_task()
+            if self._lead_tasks.get(owner_id) is current:
+                self._lead_tasks.pop(owner_id, None)
             self._announce_lead_idle(owner_id)
             self.wake()
+            # Messages typed while the previous turn was active are now at a
+            # safe boundary. Start one follow-up turn, never an in-turn write.
+            await self._start_lead_task_if_ready(owner_id)
 
-    async def lead_conversation_turn(self, owner_id: uuid.UUID, message: str) -> None:
-        """Run one user-typed conversation turn on the retained lead session."""
+    async def _lead_event_task(
+        self,
+        owner_id: uuid.UUID,
+        event_name: str,
+        update: str,
+    ) -> None:
+        """Run one safe-boundary Lead turn for a meaningful project event."""
+        lead = await self.store.lead_by_terminal_owner(owner_id)
+        if lead is None:
+            return
+        try:
+            payload, _usage = await self._run_lead_turn(
+                lead.project_id,
+                purpose="lead-event",
+                prompt="\n".join([
+                    "A meaningful project event occurred after you were waiting.",
+                    f"EVENT={event_name}",
+                    f"UPDATE={update}",
+                    "Inspect Turn state through the supported CLI/API surfaces and publish",
+                    "a concise user-facing response only if the event changes what matters.",
+                ]),
+            )
+            reply = self._lead_reply_text(payload)
+            runs = await self.store.get_runs(owner_id)
+            await self.store.append_lead_message(
+                lead.project_id,
+                role=LeadMessageRole.LEAD,
+                content=reply,
+                event_name=event_name,
+                run_id=runs[-1].id if runs else None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.store.append_lead_message(
+                lead.project_id,
+                role=LeadMessageRole.UPDATE,
+                content="I couldn’t process that project update: " + sanitize_control_text(str(error)),
+                event_name=event_name,
+            )
+        finally:
+            current = asyncio.current_task()
+            if self._lead_tasks.get(owner_id) is current:
+                self._lead_tasks.pop(owner_id, None)
+            self._announce_lead_idle(owner_id)
+            await self._start_lead_task_if_ready(owner_id)
+            self.wake()
+
+    async def lead_conversation_turn(
+        self, owner_id: uuid.UUID, message: str
+    ) -> LeadTranscriptEntry:
+        """Queue a message and await a response when a turn can start now."""
+        entry, task = await self.enqueue_lead_message(owner_id, message)
+        if task is None:
+            return entry
+        response = await task
+        return response or entry
+
+    async def _run_lead_chat_turn(
+        self, owner_id: uuid.UUID
+    ) -> LeadTranscriptEntry | None:
         lead = await self.store.lead_by_terminal_owner(owner_id)
         if lead is None:
             raise ControlOperationUnavailable("no project lead owns this terminal")
-        if lead.agent is None:
-            raise ControlOperationUnavailable("project lead has no agent configuration")
-        prompt = "\n".join([
-            "The project owner typed the following message directly into your terminal.",
-            "Answer it naturally; put your plain-language reply in the summary of the",
-            "result envelope. Concrete follow-ups belong in required_changes.",
-            "",
-            f"Owner message: {message}",
-        ])
-        await self._run_lead_turn(
-            lead.project_id,
-            purpose="lead-conversation",
-            prompt=prompt,
+        pending = await self.store.pending_lead_messages(lead.project_id)
+        if not pending:
+            return None
+        messages = "\n".join(
+            f"{index}. {entry.content}" for index, entry in enumerate(pending, 1)
         )
+        prompt = "\n".join([
+            "The project owner sent these messages in order at the safe turn boundary.",
+            "Answer them naturally in one concise reply; put the plain-language reply",
+            "in the summary of the result envelope. Do not claim queued instructions",
+            "were received during the previous Run.",
+            "",
+            messages,
+        ])
+        try:
+            payload, _usage = await self._run_lead_turn(
+                lead.project_id,
+                purpose="lead-conversation",
+                prompt=prompt,
+                lead_message_ids=[entry.id for entry in pending],
+            )
+        except Exception as error:
+            await self.store.append_lead_message(
+                lead.project_id,
+                role=LeadMessageRole.UPDATE,
+                content="I couldn’t complete that turn: " + sanitize_control_text(str(error)),
+            )
+            raise
+        reply = self._lead_reply_text(payload)
+        runs = await self.store.get_runs(lead.terminal_owner_id)
+        run_id = runs[-1].id if runs else None
+        reply_entry = await self.store.append_lead_message(
+            lead.project_id,
+            role=LeadMessageRole.LEAD,
+            content=reply,
+            run_id=run_id,
+        )
+        await self._emit(
+            "lead.chat.reply",
+            lead.project_id,
+            {"message_id": str(reply_entry.id), "content": reply},
+        )
+        return reply_entry
+
+    @staticmethod
+    def _lead_reply_text(payload: dict) -> str:
+        """Extract the user-facing summary from a structured lead envelope."""
+        for key in ("summary", "message", "response"):
+            value = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "The lead completed the turn without a plain-language summary."
+
+    async def wait_lead(
+        self,
+        project_id: uuid.UUID,
+        events: list[str] | None = None,
+    ):
+        """Put the lead into an inference-free dormant state."""
+        lead = await self.store.project_lead(project_id)
+        if lead is None:
+            raise ControlOperationUnavailable("project has no lead")
+        if self.lead_busy(lead.terminal_owner_id):
+            raise ControlOperationUnavailable("project lead is already responding")
+        requested = list(dict.fromkeys(item.strip() for item in (events or []) if item.strip()))
+        updated = await self.store.update_lead(
+            project_id,
+            status="DORMANT",
+            wait_events=requested,
+        )
+        await self.store.append_lead_message(
+            project_id,
+            role=LeadMessageRole.UPDATE,
+            content=(
+                "I’m waiting for your message"
+                if not requested
+                else "I’m waiting for " + ", ".join(requested)
+            ) + ".",
+        )
+        await self._emit(
+            "lead.waiting",
+            project_id,
+            {"events": requested},
+        )
+        return updated
+
+    async def cancel_lead(self, project_id: uuid.UUID) -> None:
+        """Terminate the active Lead Run at an explicit lifecycle boundary."""
+        lead = await self.store.project_lead(project_id)
+        if lead is None:
+            raise ControlOperationUnavailable("project has no lead")
+        owner_id = lead.terminal_owner_id
+        task = self._lead_tasks.get(owner_id)
+        if task is not None and not task.done():
+            # Stop is the provider/process boundary. Cancelling the Python
+            # task first would otherwise leave a live harness behind.
+            await self.terminal.stop(owner_id)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        elif self.lead_busy(owner_id):
+            await self.terminal.stop(owner_id)
+        self._active_lead_owners.discard(owner_id)
+        await self.terminal.close_persistent_session(owner_id)
+        for run in await self.store.get_runs(owner_id):
+            if run.status is RunStatus.RUNNING:
+                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    error="Lead Run cancelled explicitly",
+                )
+        await self.store.update_lead(project_id, status="IDLE", wait_events=[])
+        await self.store.append_lead_message(
+            project_id,
+            role=LeadMessageRole.UPDATE,
+            content="I stopped the current Lead turn. The next message will start a fresh turn.",
+        )
+        self._announce_lead_idle(owner_id)
+        self.wake()
 
     def _announce_lead_idle(self, owner_id: uuid.UUID) -> None:
         """Mark the idle pane visibly as the Lead, never as a plain shell."""
@@ -1624,11 +1851,23 @@ class Runner:
         purpose: str,
         prompt: str,
         base: NodeExecutionContext | None = None,
+        lead_message_ids: list[uuid.UUID] | None = None,
     ) -> tuple[dict, Usage]:
         """Run exactly one structured provider turn on the project lead."""
-        adapter = self.registry.get_planner("real") or self.registry.planner
+        configured_lead = await self.store.project_lead(project_id)
+        if configured_lead is None:
+            raise ControlOperationUnavailable("project has no lead")
+        planner_key = (
+            "mock"
+            if configured_lead.agent is not None
+            and configured_lead.agent.harness is HarnessKind.MOCK
+            else "real"
+        )
+        adapter = self.registry.get_planner(planner_key) or self.registry.planner
         if adapter is None or not callable(getattr(adapter, "call_structured", None)):
-            raise ControlOperationUnavailable("no real planner adapter is available for the lead turn")
+            raise ControlOperationUnavailable(
+                f"no {planner_key} planner adapter is available for the lead turn"
+            )
         pseudo, lead = await self._lead_pseudo_node(project_id)
         repo_root = await self.store.get_node(project_id)
         repo_path = str(repo_root.repo_path) if repo_root and repo_root.repo_path else None
@@ -1651,6 +1890,21 @@ class Runner:
         )
         ctx.run_id = str(run.id)
         await self.store.update_lead(project_id, status="RUNNING")
+        self._active_lead_owners.add(lead.terminal_owner_id)
+        current_lead_task = asyncio.current_task()
+        registered_lead_task = False
+        if current_lead_task is not None and lead.terminal_owner_id not in self._lead_tasks:
+            self._lead_tasks[lead.terminal_owner_id] = current_lead_task
+            registered_lead_task = True
+        if lead_message_ids:
+            await self.store.mark_lead_messages_consumed(
+                project_id, lead_message_ids, run.id
+            )
+        await self.store.mark_run_process(
+            run.id,
+            ProcessState.RUNNING,
+            pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(lead.terminal_owner_id),
+        )
         # A completed prior turn leaves the durable pane holding a stale
         # interactive writer. Close that exact owner first or providers with
         # single-writer sessions reject the resume.
@@ -1666,10 +1920,25 @@ class Runner:
             except Exception as error:
                 logger.warning("lead session reconciliation failed: %s", error)
         await self.terminal.close_persistent_session(lead.terminal_owner_id)
+        lead_contract = "\n".join([
+            "LEAD_OPERATING_CONTRACT",
+            "You are Turn’s Project Lead, the human-facing control layer.",
+            "Inspect before acting. Use the supported Turn CLI/API surfaces, including:",
+            "  turn lead show --format json",
+            "  turn graph PROJECT_ID --format json",
+            "  turn work list PROJECT_ID --format json",
+            "  turn organization show PROJECT_ID --format json",
+            "  turn lead wait PROJECT_ID --event EVENT_NAME",
+            "Request existing Turn actions through those validated interfaces. Never edit",
+            "Turn state files, invent a scheduler, or claim work that the organization has not done.",
+            "Keep user-facing replies concise and evidence-based. Mention blockers or user decisions",
+            "when they exist, and publish a short summary rather than narrating routine node noise.",
+            "",
+        ])
         try:
             payload, usage, session_id = await adapter.call_structured(
                 ctx,
-                prompt,
+                lead_contract + prompt,
                 handoff_kind="result",
             )
             await self._remember_lead_session(project_id, session_id)
@@ -1684,12 +1953,39 @@ class Runner:
                 session_id=session_id,
             )
             return payload, usage
+        except asyncio.CancelledError:
+            await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="Lead turn cancelled",
+                error="run cancelled by user",
+                retry_recommended=False,
+            )
+            raise
+        except Exception as error:
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=1)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.FAILED,
+                outcome=Outcome.FAIL,
+                summary="Lead turn failed",
+                error=sanitize_control_text(str(error)),
+            )
+            raise
         finally:
+            self._active_lead_owners.discard(lead.terminal_owner_id)
             await self.store.update_lead(project_id, status="IDLE")
             await self.terminal.close_persistent_session(lead.terminal_owner_id)
             # The pane returns to its idle state; mark it visibly as the
             # listening Lead instead of letting it read as a plain shell.
             self._announce_lead_idle(lead.terminal_owner_id)
+            if registered_lead_task and self._lead_tasks.get(lead.terminal_owner_id) is asyncio.current_task():
+                self._lead_tasks.pop(lead.terminal_owner_id, None)
+            active_lead_task = self._lead_tasks.get(lead.terminal_owner_id)
+            if active_lead_task is None or active_lead_task.done():
+                await self._start_lead_task_if_ready(lead.terminal_owner_id)
 
     async def _escalate_plan_review(
         self,
@@ -4690,6 +4986,20 @@ class Runner:
             for artifact in graph_artifacts
             if artifact.node_id in predecessor_ids
         ]
+        inbound_messages = await self.store.pending_inbound_messages(
+            node.project_id, node.id
+        )
+        if inbound_messages and run_id:
+            try:
+                await self.store.mark_inbound_messages_consumed(
+                    node.project_id,
+                    [item.id for item in inbound_messages],
+                    uuid.UUID(run_id),
+                )
+            except ValueError:
+                # A synthetic/control context may use a non-UUID run label;
+                # leave the mailbox queued rather than misattributing it.
+                pass
         # General data passing: resolve this node's declared ``consumes`` from
         # upstream predecessor outputs, then substitute ${name} references in
         # the launch prompt. Unresolved names stay literal so the gap is
@@ -4777,6 +5087,7 @@ class Runner:
             repo_path=execution_repo,
             project_repo_path=project_repo,
             predecessor_artifacts=predecessor_artifacts,
+            inbound_messages=inbound_messages,
             stream=_stream,
             terminal=self.terminal,
             session_callback=None,
@@ -4933,9 +5244,65 @@ class Runner:
             )
 
     async def _emit(self, etype: str, project_id: uuid.UUID, data) -> None:
+        update = self._lead_update_for_event(etype, data)
+        if update is not None:
+            lead = await self.store.project_lead(project_id)
+            if lead is not None:
+                await self.store.append_lead_message(
+                    project_id,
+                    role=LeadMessageRole.UPDATE,
+                    content=update,
+                    event_name=etype,
+                )
+                woke = await self.store.wake_lead_for_event(project_id, etype)
+                if woke is not None and lead.status.value == "DORMANT" and woke.status.value == "IDLE":
+                    await self.events.publish({
+                        "type": "lead.woke",
+                        "project_id": str(project_id),
+                        "data": {"event_name": etype},
+                    })
+                    owner_id = woke.terminal_owner_id
+                    task_lock = self._lead_task_locks.setdefault(owner_id, asyncio.Lock())
+                    async with task_lock:
+                        if not self.lead_busy(owner_id):
+                            event_task = asyncio.create_task(
+                                self._lead_event_task(owner_id, etype, update)
+                            )
+                            self._lead_tasks[owner_id] = event_task
         await self.events.publish(
             {"type": etype, "project_id": str(project_id), "data": data}
         )
+
+    @staticmethod
+    def _lead_update_for_event(etype: str, data) -> str | None:
+        """Map only meaningful lifecycle events into user-facing chat updates."""
+        if etype == "project.bootstrap" and isinstance(data, dict):
+            if data.get("status") == "READY":
+                return "The organization plan is accepted and the project is ready to run."
+        if etype == "organization.budget.exhausted":
+            reason = data.get("reason") if isinstance(data, dict) else None
+            return "The project is blocked by its budget or capacity limit" + (
+                f": {reason}." if reason else "."
+            )
+        if etype == "organization.blocked":
+            reasons = data.get("reasons") if isinstance(data, dict) else None
+            detail = "; ".join(str(item) for item in reasons[:2]) if isinstance(reasons, list) else ""
+            return "The project is blocked" + (f": {detail}." if detail else ".")
+        if etype == "organization.escalation.blocked":
+            reason = data.get("reason") if isinstance(data, dict) else None
+            return "A project escalation needs user input" + (
+                f": {reason}." if reason else "."
+            )
+        if etype == "organization.escalation.settled":
+            decision = data.get("decision") if isinstance(data, dict) else None
+            return "A project escalation was settled" + (
+                f" ({str(decision).lower()})." if decision else "."
+            )
+        if etype in {"organization.review_requested", "review.launched"} and isinstance(data, dict) and data.get("receiver_is_lead"):
+            return "A significant review is ready for the Project Lead."
+        if etype == "project.completed":
+            return "The project reached final acceptance."
+        return None
 
     async def _emit_trigger_event(
         self,

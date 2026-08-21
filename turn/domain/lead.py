@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from turn.domain.schemas import (
     BootstrapStatus,
+    LeadMessageRole,
+    LeadMessageStatus,
+    LeadTranscriptEntry,
     LeadStatus,
     ProjectLead,
     ReviewDecision,
@@ -18,6 +21,9 @@ from turn.domain.schemas import (
 
 __all__ = [
     "BootstrapStatus",
+    "LeadMessageRole",
+    "LeadMessageStatus",
+    "LeadTranscriptEntry",
     "LeadStatus",
     "ProjectLead",
     "ReviewDecision",

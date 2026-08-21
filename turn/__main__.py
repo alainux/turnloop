@@ -19,8 +19,9 @@ from turn.contracts.dag import (
     validate_subgraph_sources,
 )
 from turn.core import TurnCore
-from turn.domain.schemas import AgentConfig, HarnessKind, Node, ReasoningLevel, RunPolicy
+from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, Node, ReasoningLevel, RunPolicy
 from turn.domain.organization import WorkItemStatus
+from turn.domain.lead import ReviewStatus
 from turn.logging import EventLog
 
 
@@ -108,6 +109,20 @@ def parser() -> argparse.ArgumentParser:
     organization_show = organization_sub.add_parser("show", help="show organization metrics and audits")
     organization_show.add_argument("project_id", type=uuid.UUID, nargs="?")
     organization_show.add_argument("--format", choices=["json", "text"], default="json")
+    lead = sub.add_parser("lead", help="inspect and control the project lead")
+    lead_sub = lead.add_subparsers(dest="lead_command", required=True)
+    lead_show = lead_sub.add_parser(
+        "show", aliases=["inspect"], help="show lead chat, project state, work, and reviews"
+    )
+    lead_show.add_argument("project_id", type=uuid.UUID, nargs="?")
+    lead_show.add_argument("--format", choices=["json", "text"], default="json")
+    lead_reviews = lead_sub.add_parser("reviews", help="list pending and settled lead reviews")
+    lead_reviews.add_argument("project_id", type=uuid.UUID, nargs="?")
+    lead_reviews.add_argument("--status", choices=[item.value for item in ReviewStatus])
+    lead_reviews.add_argument("--format", choices=["json", "text"], default="json")
+    lead_wait = lead_sub.add_parser("wait", help="make the lead dormant until a meaningful event")
+    lead_wait.add_argument("project_id", type=uuid.UUID, nargs="?")
+    lead_wait.add_argument("--event", action="append", default=[])
     run = sub.add_parser("run", help="execute a project headlessly until settled")
     run.add_argument("project_id", type=uuid.UUID)
     logs = sub.add_parser("logs", help="read a project's stitched JSONL event history")
@@ -329,6 +344,7 @@ def _cli_action(args: argparse.Namespace) -> str:
         "project_command",
         "work_command",
         "organization_command",
+        "lead_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -356,6 +372,7 @@ def _cli_invocation_data(args: argparse.Namespace) -> dict[str, object]:
         "project_command",
         "work_command",
         "organization_command",
+        "lead_command",
     ):
         value = getattr(args, name, None)
         if value:
@@ -984,6 +1001,95 @@ async def organization_command(args) -> int:
         await store.dispose()
 
 
+async def lead_command(args) -> int:
+    """Expose the same validated Store ports available to the Lead agent."""
+    from turn.contracts.organization import audit_materialized_boundary, organization_metrics
+    from turn.db.store import Store
+    from turn.graph.logic import GraphWalker
+
+    project_id = _required_cli_project_id(args)
+    store = Store(settings.data_dir, projects_dir=settings.projects_dir)
+    await store.init()
+    try:
+        root = await store.get_node(project_id)
+        if root is None:
+            raise SystemExit(f"project not found: {project_id}")
+        lead_agent = (
+            root.agent.as_type(AgentType.LEAD)
+            if root.agent is not None
+            else None
+        )
+        lead = await store.ensure_project_lead(project_id, agent=lead_agent)
+        if args.lead_command in {"show", "inspect"}:
+            nodes, edges, _ = await store.get_workgraph(project_id)
+            walker = GraphWalker(nodes, edges)
+            work_items = await store.list_work_items(project_id)
+            reviews = await store.review_requests(project_id)
+            organizations = []
+            for node in nodes:
+                if node.executor != "planner" or node.organization_contract is None:
+                    continue
+                audit = audit_materialized_boundary(
+                    node.organization_contract, node, nodes, edges
+                )
+                organizations.append({
+                    "node": node.model_dump(mode="json"),
+                    "depth": walker.depth(node.id),
+                    "audit": audit.model_dump(mode="json"),
+                })
+            payload = {
+                "project_id": str(project_id),
+                "lead": lead.model_dump(mode="json"),
+                "transcript": [
+                    item.model_dump(mode="json")
+                    for item in await store.lead_transcript(project_id)
+                ],
+                "root": root.model_dump(mode="json"),
+                "work_items": [item.model_dump(mode="json") for item in work_items],
+                "reviews": [item.model_dump(mode="json") for item in reviews],
+                "organizations": organizations,
+                "metrics": organization_metrics(
+                    nodes,
+                    edges,
+                    work_items=work_items,
+                    handoffs=await store.list_handoffs(project_id),
+                    runs=await store.get_project_runs(project_id),
+                ).model_dump(mode="json"),
+            }
+            if args.format == "text":
+                print(
+                    f"lead {payload['lead']['id']} · {payload['lead']['status']} · "
+                    f"{len(payload['transcript'])} chat entries · "
+                    f"{len(payload['reviews'])} reviews"
+                )
+            else:
+                print(json.dumps(payload, indent=2))
+            return 0
+        if args.lead_command == "reviews":
+            status = ReviewStatus(args.status) if args.status else None
+            reviews = await store.review_requests(project_id, status=status)
+            payload = [item.model_dump(mode="json") for item in reviews]
+            if args.format == "text":
+                for item in payload:
+                    print(f"{item['id']}  {item['status']:>7}  {item['kind']}")
+            else:
+                print(json.dumps(payload, indent=2))
+            return 0
+        if args.lead_command == "wait":
+            updated = await store.update_lead(
+                project_id,
+                status="DORMANT",
+                wait_events=args.event,
+            )
+            if updated is None:
+                raise SystemExit("project lead is not initialized")
+            print(json.dumps(updated.model_dump(mode="json"), indent=2))
+            return 0
+        raise SystemExit(f"unsupported lead command: {args.lead_command}")
+    finally:
+        await store.dispose()
+
+
 def _run_logged_cli(args: argparse.Namespace) -> int:
     """Run a non-protocol CLI command with an outcome event."""
     project_id = _cli_project_id(args)
@@ -1036,6 +1142,8 @@ async def async_main(args) -> int:
         return await work_command(args)
     if args.command in {"organization", "org"}:
         return await organization_command(args)
+    if args.command == "lead":
+        return await lead_command(args)
     if args.command == "doctor":
         from turn.workers.harnesses import harness_capabilities
 

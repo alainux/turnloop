@@ -365,6 +365,7 @@ class LeadStatus(str, Enum):
 
     IDLE = "IDLE"          # created; no provider turn in flight
     RUNNING = "RUNNING"    # one lead provider turn is in flight
+    DORMANT = "DORMANT"    # explicitly waiting for a user or meaningful event
 
 
 class BootstrapStatus(str, Enum):
@@ -414,6 +415,56 @@ class ProjectLead(BaseModel):
     agent: Optional[Agent] = None
     session_id: Optional[str] = None
     status: LeadStatus = LeadStatus.IDLE
+    # Exact event names requested by the lead while dormant. An empty list
+    # means any server-classified meaningful event; routine node noise never
+    # wakes a dormant lead.
+    wait_events: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class LeadMessageRole(str, Enum):
+    USER = "user"
+    LEAD = "lead"
+    UPDATE = "update"
+
+
+class LeadMessageStatus(str, Enum):
+    QUEUED = "QUEUED"
+    CONSUMED = "CONSUMED"
+
+
+class LeadTranscriptEntry(BaseModel):
+    """One durable, project-local item in the human-facing lead chat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    project_id: uuid.UUID
+    role: LeadMessageRole
+    content: str = Field(min_length=1)
+    event_name: Optional[str] = None
+    status: LeadMessageStatus = LeadMessageStatus.CONSUMED
+    run_id: Optional[uuid.UUID] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class InboundMessageStatus(str, Enum):
+    QUEUED = "QUEUED"
+    CONSUMED = "CONSUMED"
+
+
+class InboundMessage(BaseModel):
+    """Small durable mailbox item delivered only at a future turn boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    project_id: uuid.UUID
+    recipient_node_id: uuid.UUID
+    content: str = Field(min_length=1)
+    source: str = Field(default="user", min_length=1, max_length=80)
+    status: InboundMessageStatus = InboundMessageStatus.QUEUED
+    run_id: Optional[uuid.UUID] = None
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -919,6 +970,7 @@ class GraphView(BaseModel):
     # Run history owned by the lead's stable terminal identity. The lead is
     # not a graph node, so its runs ride at the project level.
     lead_runs: list[Run] = Field(default_factory=list)
+    lead_transcript: list[LeadTranscriptEntry] = Field(default_factory=list)
     review_requests: list[ReviewRequest] = Field(default_factory=list)
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

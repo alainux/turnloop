@@ -76,6 +76,23 @@ class CorrectionPlanner(StructuredReviewPlanner):
         return self.plans.pop(0)
 
 
+class BlockingLeadPlanner(StructuredReviewPlanner):
+    """Lead fixture that makes the safe-boundary mailbox observable."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.calls = 0
+
+    async def call_structured(self, ctx, prompt, *, handoff_kind):
+        self.calls += 1
+        self.contexts.append((ctx, handoff_kind, prompt))
+        self.entered.set()
+        await self.release.wait()
+        return self.responses.pop(0), Usage(input_tokens=3, output_tokens=5), "retained-lead-session"
+
+
 class ReconcileTrackingTerminal(MockTerminalTransport):
     def __init__(self):
         super().__init__()
@@ -827,8 +844,8 @@ async def test_idle_lead_terminal_resumes_retained_session_never_shell(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_busy_lead_terminal_passes_keystrokes_through(tmp_path):
-    """While a lead turn is live, typing steers the harness like any agent."""
+async def test_busy_lead_terminal_queues_without_forwarding(tmp_path):
+    """Busy Lead input waits for the next safe retained-session turn."""
     store, runner, _planner, terminal = await make_runner(tmp_path, [])
     root = await make_project(store, tmp_path)
     lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
@@ -850,11 +867,148 @@ async def test_busy_lead_terminal_passes_keystrokes_through(tmp_path):
     runner._lead_tasks[owner] = task
     try:
         forwarded = await runner.lead_console_input(owner, "stop\r")
-        assert forwarded == "stop\r"
+        assert forwarded is None
+        assert all("stop" not in text for _node, text in terminal.written)
+        pending = await store.pending_lead_messages(root.project_id)
+        assert [item.content for item in pending] == ["stop"]
     finally:
         hold.set()
         await task
         runner._lead_tasks.pop(owner, None)
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_busy_lead_message_runs_once_on_next_retained_turn(tmp_path):
+    store, runner, _planner, terminal = await make_runner(tmp_path, [])
+    planner = BlockingLeadPlanner([
+        {"summary": "first turn finished"},
+        {"summary": "queued instruction handled"},
+    ])
+    runner.registry.register_planner(planner, key="real")
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+
+    first, first_task = await runner.enqueue_lead_message(
+        lead.terminal_owner_id, "Start the project"
+    )
+    assert first.status.value == "QUEUED"
+    assert first_task is not None
+    await planner.entered.wait()
+
+    forwarded = await runner.lead_console_input(
+        lead.terminal_owner_id, "Make mobile quality a priority.\r"
+    )
+    assert forwarded is None
+    assert all("mobile quality" not in text for _node, text in terminal.written)
+    pending = await store.pending_lead_messages(root.project_id)
+    assert [item.content for item in pending] == ["Make mobile quality a priority."]
+
+    planner.release.set()
+    await first_task
+    follow_up = runner._lead_tasks.get(lead.terminal_owner_id)
+    assert follow_up is not None and follow_up is not first_task
+    await follow_up
+
+    transcript = await store.lead_transcript(root.project_id)
+    assert [item.content for item in transcript if item.role.value == "user"][-2:] == [
+        "Start the project",
+        "Make mobile quality a priority.",
+    ]
+    assert [item.content for item in transcript if item.role.value == "lead"][-2:] == [
+        "first turn finished",
+        "queued instruction handled",
+    ]
+    assert await store.pending_lead_messages(root.project_id) == []
+    assert len(await store.get_runs(lead.terminal_owner_id)) == 2
+    assert {run.session_id for run in await store.get_runs(lead.terminal_owner_id)} == {
+        "retained-lead-session"
+    }
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_mailbox_waits_for_next_context_boundary(tmp_path):
+    store, runner, _planner, terminal = await make_runner(tmp_path, [])
+    root = await make_project(store, tmp_path)
+    (worker,) = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="worker", objective="Do the work", executor="deterministic")]),
+    )
+    terminal._node(worker.id)["active"] = True
+    item = await store.queue_inbound_message(
+        root.project_id,
+        worker.id,
+        "Finding from the active reviewer",
+        source="reviewer",
+    )
+    assert item.status.value == "QUEUED"
+    assert terminal.written == []
+
+    context = await runner._build_context(worker, run_id=str(uuid.uuid4()))
+    assert [message.content for message in context.inbound_messages] == [
+        "Finding from the active reviewer"
+    ]
+    assert await store.pending_inbound_messages(root.project_id, worker.id) == []
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_lead_wait_is_inference_free_and_wakes_once_for_escalation(tmp_path):
+    store, runner, _planner, _terminal = await make_runner(tmp_path, [])
+    planner = StructuredReviewPlanner([{"summary": "I reviewed the escalation."}])
+    runner.registry.register_planner(planner, key="real")
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    await runner.wait_lead(root.project_id, ["organization.escalation.blocked"])
+    assert (await store.project_lead(root.project_id)).status.value == "DORMANT"
+    assert runner._lead_tasks == {}
+
+    for index in range(50):
+        await runner._emit("node.updated", root.project_id, {"node_id": str(index)})
+    assert runner._lead_tasks == {}
+    assert await store.get_runs(lead.terminal_owner_id) == []
+
+    await runner._emit(
+        "organization.escalation.blocked",
+        root.project_id,
+        {"reason": "needs a decision"},
+    )
+    tasks = [task for task in runner._lead_tasks.values() if not task.done()]
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+    assert len(await store.get_runs(lead.terminal_owner_id)) == 1
+    assert (await store.project_lead(root.project_id)).status.value == "IDLE"
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_lead_cancel_ends_old_run_before_fresh_message(tmp_path):
+    store, runner, _planner, terminal = await make_runner(tmp_path, [])
+    planner = BlockingLeadPlanner([{"summary": "fresh turn completed"}])
+    runner.registry.register_planner(planner, key="real")
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    _entry, task = await runner.enqueue_lead_message(lead.terminal_owner_id, "Old assignment")
+    assert task is not None
+    await planner.entered.wait()
+    await runner.cancel_lead(root.project_id)
+    assert task.done()
+    old_run = (await store.get_runs(lead.terminal_owner_id))[0]
+    assert old_run.status is RunStatus.CANCELLED
+    assert old_run.process_state.value == "CANCELLED"
+    assert not terminal.snapshot(lead.terminal_owner_id)["active"]
+
+    planner.release.set()
+    _entry, fresh_task = await runner.enqueue_lead_message(
+        lead.terminal_owner_id, "Fresh assignment"
+    )
+    assert fresh_task is not None
+    await fresh_task
+    runs = await store.get_runs(lead.terminal_owner_id)
+    assert [run.status for run in runs] == [RunStatus.CANCELLED, RunStatus.COMPLETE]
+    transcript = await store.lead_transcript(root.project_id)
+    assert "fresh turn completed" in [item.content for item in transcript]
     await store.dispose()
 
 

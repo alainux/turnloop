@@ -44,6 +44,7 @@ import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
 import { LeadInspector, LeadOversight } from "./components/LeadOversight";
+import { LeadChat } from "./components/LeadChat";
 import { LogsPanel } from "./components/LogsPanel";
 import { QualityPanel } from "./components/QualityPanel";
 import { WorkView } from "./components/WorkView";
@@ -212,7 +213,7 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
   const [leadOpen, setLeadOpen] = useState(false);
-  const [viewMode, setViewMode] = useState<"graph" | "document" | "work">("graph");
+  const [viewMode, setViewMode] = useState<"lead" | "graph" | "document" | "work">("lead");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
@@ -278,7 +279,7 @@ export default function App() {
   useEffect(() => {
     setSelected(null);
     setSelectedTrigger(null);
-    setViewMode("graph");
+    setViewMode("lead");
     clearDocumentNavigation();
     setPolicyOpen(false);
     if (!projectId) {
@@ -473,6 +474,19 @@ export default function App() {
                 <div className="segmented view-toggle" role="tablist" aria-label="Project view">
                   <button
                     role="tab"
+                    aria-selected={viewMode === "lead"}
+                    className={viewMode === "lead" ? "selected" : ""}
+                    onClick={() => {
+                      clearDocumentNavigation();
+                      setSelected(null);
+                      setSelectedTrigger(null);
+                      setViewMode("lead");
+                    }}
+                  >
+                    Lead Chat
+                  </button>
+                  <button
+                    role="tab"
                     aria-selected={viewMode === "graph"}
                     className={viewMode === "graph" ? "selected" : ""}
                     onClick={() => {
@@ -507,6 +521,9 @@ export default function App() {
                     Work
                   </button>
                 </div>
+                <button className="button quiet toolbar-activity" onClick={() => setLogsOpen(true)}>
+                  <Icon name="activity" /> Activity
+                </button>
                 <div className="segmented">
                   <button
                     className={root?.run_policy?.auto_run ? "selected" : ""}
@@ -544,7 +561,16 @@ export default function App() {
               </div>
             </div>
             {graphReady && root ? (
-              viewMode === "document" ? (
+              viewMode === "lead" ? (
+                <LeadChat
+                  projectId={projectId!}
+                  lead={graph!.lead ?? null}
+                  transcript={graph!.lead_transcript ?? []}
+                  bootstrapStatus={graph!.bootstrap_status ?? "READY"}
+                  onOpenTerminal={() => setLeadOpen(true)}
+                  onChanged={loadGraph}
+                />
+              ) : viewMode === "document" ? (
                 <DocumentView
                   nodes={graph!.nodes}
                   edges={graph!.edges}

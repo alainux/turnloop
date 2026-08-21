@@ -16,7 +16,7 @@ from typing import Any
 
 from turn.config import Settings, settings
 from turn.contracts.dag import parse_result, parse_verification
-from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, PlanResult, WorkerResult
+from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, PlanResult, Usage, WorkerResult
 from turn.workers.base import InvalidSubmission, NodeExecutionContext, Planner, Worker, render_context_block
 from turn.workers.interactive import (
     agent_environment,
@@ -207,6 +207,30 @@ class MockHarnessPlanner(Planner):
             raise InvalidSubmission(f"mock planner returned an invalid plan: {error}") from error
         plan.session_id = session_id
         return plan
+
+    async def call_structured(
+        self,
+        ctx: NodeExecutionContext,
+        prompt: str,
+        *,
+        handoff_kind: str = "result",
+    ) -> tuple[dict[str, Any], Usage, str | None]:
+        """Run a structured control-plane turn through the mock process.
+
+        Lead Chat and other test-mode control turns must use the same
+        process-backed mock harness as ordinary mock nodes. Keeping this on
+        the planner adapter preserves the normal terminal/session/run path;
+        it does not create an in-process chat shortcut.
+        """
+        session_id = _session_for(ctx)
+        await _remember_session(ctx, session_id)
+        payload = await _launch(
+            ctx,
+            kind=handoff_kind,
+            prompt=prompt,
+            runtime=self.runtime,
+        )
+        return payload, Usage(), session_id
 
 
 class MockHarnessWorker(Worker):

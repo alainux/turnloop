@@ -33,6 +33,8 @@ from turn.domain.schemas import (
     EdgeType,
     Graph,
     InputSpec,
+    InboundMessage,
+    InboundMessageStatus,
     Node,
     NodeSpec,
     NodeStatus,
@@ -71,6 +73,10 @@ from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
 from turn.domain.lead import (
     BootstrapStatus,
+    LeadMessageRole,
+    LeadMessageStatus,
+    LeadTranscriptEntry,
+    LeadStatus,
     ProjectLead,
     ReviewDecision,
     ReviewKind,
@@ -357,6 +363,12 @@ class Store:
         for item in raw.get("review_requests", []):
             review = ReviewRequest.model_validate(item)
             state.review_requests[review.id] = review
+        for item in raw.get("lead_transcript", raw.get("lead_messages", [])):
+            transcript_item = LeadTranscriptEntry.model_validate(item)
+            state.lead_transcript.append(transcript_item)
+        for item in raw.get("inbound_messages", []):
+            inbox_item = InboundMessage.model_validate(item)
+            state.inbound_messages[inbox_item.id] = inbox_item
         if raw.get("lead") is not None:
             state.lead = ProjectLead.model_validate(raw["lead"])
         state.bootstrap_status = raw.get("bootstrap_status", state.bootstrap_status)
@@ -493,6 +505,14 @@ class Store:
             ]
         if state.lead is not None:
             payload["lead"] = self._model_dump(state.lead)
+        if state.lead_transcript:
+            payload["lead_transcript"] = [
+                self._model_dump(value) for value in state.lead_transcript
+            ]
+        if state.inbound_messages:
+            payload["inbound_messages"] = [
+                self._model_dump(value) for value in state.inbound_messages.values()
+            ]
         payload["bootstrap_status"] = state.bootstrap_status
         return payload
 
@@ -1019,9 +1039,10 @@ class Store:
         """
         async with self._project_lock(project_id):
             state = self._state(project_id)
+            changed = False
             if state.lead is None:
                 state.lead = ProjectLead(project_id=project_id, agent=agent)
-                await self._persist_project(project_id)
+                changed = True
                 await self._log(
                     project_id,
                     kind="lead.created",
@@ -1031,6 +1052,33 @@ class Store:
                 )
             elif agent is not None and state.lead.agent is None:
                 state.lead.agent = agent
+                changed = True
+            if not state.lead_transcript:
+                root = state.nodes.get(project_id)
+                objective = (
+                    root.generated_prompt
+                    if root is not None and root.generated_prompt
+                    else root.objective
+                    if root is not None
+                    else "Project objective received."
+                )
+                state.lead_transcript.extend([
+                    LeadTranscriptEntry(
+                        project_id=project_id,
+                        role=LeadMessageRole.USER,
+                        content=objective,
+                    ),
+                    LeadTranscriptEntry(
+                        project_id=project_id,
+                        role=LeadMessageRole.UPDATE,
+                        content=(
+                            "I’ve got it. I’m framing the work with the organization "
+                            "while the team starts behind the scenes."
+                        ),
+                    ),
+                ])
+                changed = True
+            if changed:
                 await self._persist_project(project_id)
             return state.lead.model_copy(deep=True)
 
@@ -1041,6 +1089,7 @@ class Store:
         session_id: str | None = None,
         status=None,
         agent=None,
+        wait_events: list[str] | None = None,
     ) -> ProjectLead | None:
         """Persist lead lifecycle/session fields (all updates optional)."""
         async with self._project_lock(project_id):
@@ -1054,8 +1103,178 @@ class Store:
                 state.lead.status = LeadStatus(status)
             if agent is not None:
                 state.lead.agent = agent
+            if wait_events is not None:
+                state.lead.wait_events = list(dict.fromkeys(wait_events))
             await self._persist_project(project_id)
             return state.lead.model_copy(deep=True)
+
+    async def append_lead_message(
+        self,
+        project_id: uuid.UUID,
+        *,
+        role: LeadMessageRole | str,
+        content: str,
+        event_name: str | None = None,
+        status: LeadMessageStatus | str = LeadMessageStatus.CONSUMED,
+        run_id: uuid.UUID | None = None,
+    ) -> LeadTranscriptEntry:
+        """Append one validated item to the project's durable lead chat."""
+        entry = LeadTranscriptEntry(
+            project_id=project_id,
+            role=LeadMessageRole(role),
+            content=content.strip(),
+            event_name=event_name,
+            status=LeadMessageStatus(status),
+            run_id=run_id,
+        )
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            state.lead_transcript.append(entry)
+            await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="lead.message",
+            action=f"lead.{entry.role.value}",
+            message=entry.content,
+            data={
+                "message_id": str(entry.id),
+                "role": entry.role.value,
+                "event_name": entry.event_name,
+            },
+        )
+        return entry.model_copy(deep=True)
+
+    async def lead_transcript(self, project_id: uuid.UUID) -> list[LeadTranscriptEntry]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        return [entry.model_copy(deep=True) for entry in state.lead_transcript]
+
+    async def pending_lead_messages(
+        self, project_id: uuid.UUID
+    ) -> list[LeadTranscriptEntry]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        return [
+            entry.model_copy(deep=True)
+            for entry in state.lead_transcript
+            if entry.role is LeadMessageRole.USER
+            and entry.status is LeadMessageStatus.QUEUED
+        ]
+
+    async def mark_lead_messages_consumed(
+        self,
+        project_id: uuid.UUID,
+        message_ids: list[uuid.UUID],
+        run_id: uuid.UUID,
+    ) -> None:
+        if not message_ids:
+            return
+        wanted = set(message_ids)
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            changed = False
+            for entry in state.lead_transcript:
+                if entry.id in wanted and entry.status is LeadMessageStatus.QUEUED:
+                    entry.status = LeadMessageStatus.CONSUMED
+                    entry.run_id = run_id
+                    changed = True
+            if changed:
+                await self._persist_project(project_id)
+
+    async def queue_inbound_message(
+        self,
+        project_id: uuid.UUID,
+        recipient_node_id: uuid.UUID,
+        content: str,
+        *,
+        source: str = "user",
+    ) -> InboundMessage:
+        """Queue information for the recipient's next safe Run boundary."""
+        node = await self.get_node(recipient_node_id)
+        if node is None or node.project_id != project_id:
+            raise ValueError("recipient_node_id must identify a node in this project")
+        item = InboundMessage(
+            project_id=project_id,
+            recipient_node_id=recipient_node_id,
+            content=content.strip(),
+            source=source,
+        )
+        async with self._project_lock(project_id):
+            self._state(project_id).inbound_messages[item.id] = item
+            await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="agent.inbox",
+            action="message.queued",
+            message=f"message queued for node {recipient_node_id}",
+            data={"message_id": str(item.id), "node_id": str(recipient_node_id)},
+        )
+        return item.model_copy(deep=True)
+
+    async def pending_inbound_messages(
+        self,
+        project_id: uuid.UUID,
+        recipient_node_id: uuid.UUID,
+    ) -> list[InboundMessage]:
+        state = self._states.get(project_id)
+        if state is None:
+            return []
+        return [
+            item.model_copy(deep=True)
+            for item in sorted(state.inbound_messages.values(), key=lambda value: value.created_at)
+            if item.recipient_node_id == recipient_node_id
+            and item.status is InboundMessageStatus.QUEUED
+        ]
+
+    async def mark_inbound_messages_consumed(
+        self,
+        project_id: uuid.UUID,
+        message_ids: list[uuid.UUID],
+        run_id: uuid.UUID,
+    ) -> None:
+        wanted = set(message_ids)
+        if not wanted:
+            return
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            changed = False
+            for item_id in wanted:
+                item = state.inbound_messages.get(item_id)
+                if item is not None and item.status is InboundMessageStatus.QUEUED:
+                    item.status = InboundMessageStatus.CONSUMED
+                    item.run_id = run_id
+                    changed = True
+            if changed:
+                await self._persist_project(project_id)
+
+    async def wake_lead_for_event(
+        self,
+        project_id: uuid.UUID,
+        event_name: str,
+    ) -> ProjectLead | None:
+        """Wake a dormant lead only for an explicitly requested event."""
+        async with self._project_lock(project_id):
+            state = self._state(project_id)
+            lead = state.lead
+            if (
+                lead is None
+                or lead.status.value != "DORMANT"
+                or (lead.wait_events and event_name not in lead.wait_events)
+            ):
+                return lead.model_copy(deep=True) if lead is not None else None
+            lead.status = LeadStatus.IDLE
+            lead.wait_events = []
+            await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="lead.wake",
+            action="lead.wake.event",
+            message=f"lead woke for {event_name}",
+            data={"event_name": event_name},
+        )
+        return lead.model_copy(deep=True)
 
     async def create_review_request(
         self,
