@@ -9,19 +9,27 @@ import { Icon } from "./Icon";
 interface Props {
   node: GraphNode;
   runs: Run[];
+  terminalNodeId?: string;
 }
 
-export function TerminalView({ node }: Props) {
+const HERDR_OPERATOR_WARNING =
+  "CAUTION: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR FROM HERDR ITSELF. " +
+  "DO NOT TRY TO LAUNCH HERDR; REQUEST/USE THE ALREADY-RUNNING DAEMON.";
+
+export function TerminalView({ node, terminalNodeId }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(false);
   const [idle, setIdle] = useState(false);
   const [reconnectKey, setReconnectKey] = useState(0);
+  const [runtimeGuard, setRuntimeGuard] = useState<string | null>(null);
   const [view, setView] = useState<"terminal" | "activity">("terminal");
   // A project owns one Herdr space. A node gets a durable pane only when an
   // agent runs or a user explicitly opens its terminal; the inspector only
   // attaches to that pane.
-  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected">("connecting");
-  const endpoint = "shell";
+  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "transcript">("connecting");
+  const controlTerminal = Boolean(terminalNodeId && terminalNodeId !== node.id);
+  const endpoint = controlTerminal ? "terminal" : "shell";
+  const streamNodeId = terminalNodeId || node.id;
 
   useEffect(() => {
     if (!host.current) return;
@@ -100,6 +108,11 @@ export function TerminalView({ node }: Props) {
     let sessionActive = false;
     let replaying = false;
     let socket: WebSocket | null = null;
+    let guarded = false;
+    // A clean inactive status is a terminal lifecycle event, not a transport
+    // failure. Keep the transcript rendered and suppress the reconnect path
+    // when the backend has explicitly told us the session ended.
+    let sessionEnded = false;
     let terminalWriteQueue = Promise.resolve();
     const queueTerminalWrite = (data: string) => {
       // Do not wait for xterm's optional completion callback here. A native
@@ -188,12 +201,14 @@ export function TerminalView({ node }: Props) {
     };
 
     setConnection("connecting");
+    setRuntimeGuard(null);
     if (endpoint) {
       const protocol = location.protocol === "https:" ? "wss" : "ws";
       socket = new WebSocket(
-        `${protocol}://${location.host}/api/nodes/${node.id}/${endpoint}`,
+        `${protocol}://${location.host}/api/nodes/${streamNodeId}/${endpoint}`,
       );
       socket.onopen = () => {
+        sessionEnded = false;
         setConnection("connected");
         syncSize();
       };
@@ -204,8 +219,16 @@ export function TerminalView({ node }: Props) {
         } catch {
           return;
         }
-        if (message.type === "snapshot") {
-          activate(Boolean(message.active), Boolean(message.idle));
+        if (message.type === "runtime_guard") {
+          guarded = true;
+          setRuntimeGuard(String(message.message ?? "Runtime guard is active."));
+          activate(false);
+          setConnection("disconnected");
+        } else if (message.type === "snapshot") {
+          const snapshotActive = Boolean(message.active);
+          sessionEnded = !snapshotActive;
+          setConnection(snapshotActive ? "connected" : "transcript");
+          activate(snapshotActive, Boolean(message.idle));
           terminal.reset();
           if (message.output) {
             const fitted = { cols: terminal.cols, rows: terminal.rows };
@@ -227,6 +250,10 @@ export function TerminalView({ node }: Props) {
           await queueTerminalWrite(String(message.data ?? ""));
         } else if (message.type === "status") {
           const statusActive = Boolean(message.active);
+          if (!statusActive) {
+            sessionEnded = true;
+            setConnection("transcript");
+          }
           activate(statusActive, Boolean(message.idle));
           if (!statusActive && socket?.readyState === WebSocket.OPEN) {
             // The outer attach client ended (for example after a cancelled
@@ -239,13 +266,17 @@ export function TerminalView({ node }: Props) {
       };
       socket.onclose = () => {
         activate(false);
-        if (!disposed) {
+        if (!disposed && sessionEnded) {
+          setConnection("transcript");
+        } else if (!disposed) {
           setConnection("disconnected");
-          // The Herdr pane is durable. A dropped websocket should be visibly
-          // retried, not briefly presented as a manual reconnect failure.
-          window.setTimeout(() => {
-            if (!disposed) setReconnectKey((value) => value + 1);
-          }, 500);
+          if (!guarded && !node.runtime_guard) {
+            // The Herdr pane is durable. A dropped websocket should be visibly
+            // retried, not briefly presented as a manual reconnect failure.
+            window.setTimeout(() => {
+              if (!disposed) setReconnectKey((value) => value + 1);
+            }, 500);
+          }
         }
       };
     } else {
@@ -327,7 +358,7 @@ export function TerminalView({ node }: Props) {
       socket?.close();
       terminal.dispose();
     };
-  }, [endpoint, node.id, reconnectKey]);
+  }, [endpoint, node.id, reconnectKey, streamNodeId]);
 
   return (
     <div
@@ -336,28 +367,40 @@ export function TerminalView({ node }: Props) {
       <div className="terminal-head">
         <Icon name="terminal" />
         <span className="terminal-title">
-          {endpoint === "shell" ? "shell" : node.agent?.harness ?? node.executor} · {node.id.slice(0, 8)}
+          {controlTerminal
+            ? node.control_activity?.kind === "manager_review" ? "control · manager" : "control · plan audit"
+            : "shell"} · {streamNodeId.slice(0, 8)}
         </span>
         <span className="terminal-view-switch" role="tablist" aria-label="Node output views">
           <button role="tab" aria-selected={view === "terminal"} className={view === "terminal" ? "active" : ""} onClick={() => setView("terminal")}>Terminal</button>
           <button role="tab" aria-selected={view === "activity"} className={view === "activity" ? "active" : ""} onClick={() => setView("activity")}>Activity</button>
         </span>
         <span className="terminal-mode">
-          {active ? (idle ? "LIVE · waiting" : "LIVE") : connection === "connecting" ? "CONNECTING" : "RECONNECTING"}
+          {active
+            ? (idle ? "LIVE · waiting" : "LIVE")
+            : connection === "connecting"
+            ? "CONNECTING"
+            : connection === "transcript"
+            ? "TRANSCRIPT"
+            : "RECONNECTING"}
         </span>
       </div>
       {!active && (
         <div className="terminal-disconnected">
           <span>
-            {connection === "connecting"
+            {runtimeGuard
+              ? `${runtimeGuard} ${HERDR_OPERATOR_WARNING}`
+            : connection === "connecting"
               ? "Connecting to this node’s persistent Herdr shell…"
+              : connection === "transcript"
+              ? "Session finished; transcript retained."
               : "Connection interrupted; reconnecting to the persistent Herdr shell…"}
           </span>
         </div>
       )}
       <div
         ref={host}
-        className={`terminal-shadow-host ${!active || view !== "terminal" ? "is-collapsed" : ""}`}
+        className={`terminal-shadow-host ${(!active && connection !== "transcript") || view !== "terminal" ? "is-collapsed" : ""}`}
         aria-label="Agent terminal"
       />
       {view === "activity" && <HarnessActivity node={node} />}

@@ -57,6 +57,9 @@ class NodeExecutionContext(BaseModel):
     # One-based durable run number, used by deterministic fixtures to model
     # first-pass/retry behavior without inspecting persistence internals.
     attempt: int = 1
+    # Stable execution-attempt identity propagated to the CLI submission
+    # protocol.  A node id alone is insufficient once a retry exists.
+    run_id: str | None = None
     trigger_context: TriggerContext | None = None
     interactive_terminal: bool = False
     timeout_seconds: float | None = None
@@ -75,6 +78,15 @@ class Worker(ABC):
 
     def render_artifacts(self, specs: list[ArtifactSpec]) -> list[ArtifactSpec]:
         return specs
+
+
+class InvalidSubmission(RuntimeError):
+    """A provider produced a handoff that needs correction on this Run.
+
+    This is intentionally not a ``WorkerResult(FAIL)``.  The provider may be
+    alive and able to correct the same attempt, so turning protocol feedback
+    into an infrastructure failure would create a needless retry race.
+    """
 
 
 class Planner(ABC):
@@ -118,6 +130,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
             "TURN_CONTEXT",
             f"project_id={ctx.node.project_id}",
             f"node_id={ctx.node.id}",
+            f"run_id={ctx.run_id or ''}",
             f"repo={ctx.repo_path or ''}",
             f"project_repo={ctx.project_repo_path or ctx.repo_path or ''}",
             f"purpose={ctx.purpose}",
@@ -134,6 +147,7 @@ def render_context_block(ctx: NodeExecutionContext) -> str:
         "TURN_CONTEXT",
         f"project_id={ctx.node.project_id}",
         f"node_id={ctx.node.id}",
+        f"run_id={ctx.run_id or ''}",
         f"role={agent.type_id.value}",
         f"repo={ctx.repo_path or ''}",
         f"project_repo={ctx.project_repo_path or ctx.repo_path or ''}",

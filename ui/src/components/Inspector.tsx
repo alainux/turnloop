@@ -125,7 +125,11 @@ export function Inspector({
         {detail && terminalVisited && (
           <div hidden={tab !== "terminal"} className="terminal-tab-panel">
             <Suspense fallback={<p className="detail-loading">Loading terminal…</p>}>
-              <TerminalView node={detail.node} runs={detail.runs} />
+              <TerminalView
+                node={detail.node}
+                runs={detail.runs}
+                terminalNodeId={detail.node.control_activity?.terminal_node_id}
+              />
             </Suspense>
           </div>
         )}
@@ -337,7 +341,28 @@ function Overview({
               ? "generating"
               : node.ui_state.replaceAll("_", " ")}
         </span>
+        {node.process_state && (
+          <span className="badge neutral" title="Provider process state; this does not determine work outcome">
+            process {node.process_state.toLowerCase().replaceAll("_", " ")}
+            {node.process_exit_code !== null && ` (${node.process_exit_code})`}
+          </span>
+        )}
       </div>
+      {node.runtime_guard && (
+        <section className="section runtime-guard" role="alert" aria-label="Runtime guard">
+          <div className="section-heading">
+            <span>Execution blocked</span>
+            <span className="badge failed">Guarded</span>
+          </div>
+          <p className="verification-summary">{node.runtime_guard.message}</p>
+          <code className="runtime-guard-code">{node.runtime_guard.code}</code>
+          <p className="runtime-guard-caution">
+            Herdr is an existing daemon. It cannot be launched inside a subprocess or from Herdr itself.
+            Do not try to launch Herdr; request/use the already-running daemon, then restart Turn from a normal host shell.
+            Retries are suppressed until that boundary is corrected.
+          </p>
+        </section>
+      )}
       <OrganizationDetails node={node} />
       {node.control_activity && (
         <section className="section control-activity" aria-label="Control activity">

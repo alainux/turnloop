@@ -81,7 +81,7 @@ Everything else is a capability plugin or a harness/runtime concern.
 - DRY. Don't repeat yourself. If you find yourself repeating code or adding things in multiple places, flag it.
 - Clean up when done. Don't wait the human to say it. Don't end your work leaving experiments, temp files, or strange artifacts unless they need to be there for a reason.
 - The CLI is the only communication resource of agents with the system. No observing for completion or status. No shortcuts. Only observing for a crash or a system failure is allowed. 
-- Your code must be correct and verifiable via tests only. If tests are passing, but you found a bug, discover where is the verifiability gap and close it. Everything is testable when properly designed.
+- Your code must be correct and verifiable via tests only. If tests are passing, but you found a bug, add a line to MISTAKES.md, then discover where is the verifiability gap and close it. Everything is testable when properly designed. 
 
 ## Success criteria
 
@@ -145,4 +145,6 @@ Everything else is a capability plugin or a harness/runtime concern.
 - Use the `./projects/my-project` repo dir for demo projects, so we can inspect the state and artifacts. Not `/tmp` or `/.demo-x`. 
 - This document and the real implementation may diverge. When that happens, steer it back to match this document.
 - Herdr is a daemon. It runs constantly, _it doesn't need to be launched or restarted_. The CLI can be used to access it and control it.
+- CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR. REQUEST/USE THE ALREADY-RUNNING HERDR DAEMON. If it is unavailable, fail visibly and stop; do not run `herdr server`.
 - When launching a node, immediately observe the terminal, either in herdr or in the UI. Most problems appear instantly.
+- Try to always use the UI and use visual mode for inspection. This is what a human sees and interacts with. The CLI is only for agents and automation, not for humans.

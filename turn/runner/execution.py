@@ -16,6 +16,8 @@ from turn.config import Settings
 from turn.db.store import PLANNER_EXECUTOR, Store
 from turn.domain.schemas import Node, NodeStatus
 from turn.runner.scheduler import Scheduler
+from turn.workers.base import InvalidSubmission
+from turn.workers.herdr import HerdrAdapterError
 from turn.workers.terminal import GenerationStalled
 
 logger = logging.getLogger("turn.runner.execution")
@@ -50,6 +52,7 @@ class NodeExecutor:
         run_worker: Callable[..., Awaitable[None]],
         mark_cancelled: Callable[[Node], Awaitable[None]],
         mark_failed: Callable[[Node, str], Awaitable[None]],
+        reject_submission: Callable[[Node, str], Awaitable[None]],
     ) -> None:
         self.store = store
         self.settings = settings
@@ -69,6 +72,7 @@ class NodeExecutor:
         self.run_worker = run_worker
         self.mark_cancelled = mark_cancelled
         self.mark_failed = mark_failed
+        self.reject_submission = reject_submission
 
     async def execute(self, node: Node, project_id: uuid.UUID) -> None:
         watcher: asyncio.Task | None = None
@@ -116,6 +120,8 @@ class NodeExecutor:
         except asyncio.CancelledError:
             await self.mark_cancelled(node)
             raise
+        except InvalidSubmission as error:
+            await self.reject_submission(node, str(error))
         except GenerationStalled as error:
             root = await self.store.get_node(project_id)
             policy = root.run_policy if root else None
@@ -135,6 +141,25 @@ class NodeExecutor:
                 project_id,
                 _dump(await self.store.get_node(node.id)),
             )
+        except HerdrAdapterError as error:
+            # Herdr boundary/availability failures are infrastructure circuit
+            # breakers, not ordinary provider failures. Persisting the guard
+            # on the project root stops auto-run and makes the exact operator
+            # action visible instead of allowing retry churn.
+            code = getattr(error, "code", None)
+            if code in {"herdr_nested_invocation", "herdr_unavailable"}:
+                await self.store.set_runtime_guard(
+                    project_id,
+                    code=code,
+                    message=str(error),
+                )
+                await self.emit(
+                    "node.updated",
+                    project_id,
+                    _dump(await self.store.get_node(node.id)),
+                )
+            else:
+                await self.mark_failed(node, f"runner error: {error}")
         except Exception as error:
             logger.exception("node %s failed", node.id)
             await self.mark_failed(node, f"runner error: {error}")
@@ -143,12 +168,14 @@ class NodeExecutor:
                 watcher.cancel()
                 await asyncio.gather(watcher, return_exceptions=True)
                 self.status_watchers.pop(node.id, None)
-            cleared = await self.store.set_agent_status(
-                node.id,
-                state=None,
-                message=None,
-            )
-            if cleared is not None:
-                await self.emit("node.updated", project_id, _dump(cleared))
+            current = await self.store.get_node(node.id)
+            if current is not None and current.agent_state != "correction_required":
+                cleared = await self.store.set_agent_status(
+                    node.id,
+                    state=None,
+                    message=None,
+                )
+                if cleared is not None:
+                    await self.emit("node.updated", project_id, _dump(cleared))
             self.scheduler.release(node.id)
             self.wake()

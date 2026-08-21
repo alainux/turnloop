@@ -52,6 +52,7 @@ from turn.domain.schemas import (
     Resource,
     Run,
     RunStatus,
+    ProcessState,
     SubgraphRef,
     VerificationDecision,
     WorkerResult,
@@ -64,12 +65,17 @@ from turn.runner.scheduler import Scheduler
 from turn.runner.organization import ManagerReviewDecision, OrganizationManager
 from turn.runner.workspaces import WorkspaceError, WorkspaceManager
 from turn.runner.sessions import SessionController
-from turn.workers.base import NodeExecutionContext, Worker, render_context_block
-from turn.workers.herdr import HerdrAdapter, HerdrAdapterError, HerdrResourceNotFound
+from turn.runner.process_supervisor import ProcessSupervisor
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block
+from turn.workers.herdr import (
+    HerdrAdapter,
+    HerdrAdapterError,
+    HerdrResourceNotFound,
+)
 from turn.workers import parsing
 from turn.workers.harness_catalog import HarnessCommandFactory
 from turn.metrics import HarnessEvent
-from turn.workers.interactive import read_result_file
+from turn.workers.interactive import read_result_file, read_submission_file
 from turn.workers.capabilities import CapabilityLaunch, harness_capability_adapter
 from turn.workers.terminal import GenerationStalled, HerdrPtyTransport, TerminalTransport
 from turn.workers.registry import WorkerRegistry, build_registry
@@ -196,6 +202,7 @@ class Runner:
         )
         self.sessions = SessionController(terminal)
         self.terminal = self.sessions.terminal
+        self.processes = ProcessSupervisor(self.store, self.terminal)
         # Shell access and harness access use the same per-node Herdr pane; the
         # UI's terminal endpoint still decides whether the node is generating,
         # so shell activity does not make a node appear active.
@@ -203,12 +210,23 @@ class Runner:
         self._shell_tasks: dict[uuid.UUID, asyncio.Task] = self.sessions.shell_tasks
         self._status_watchers: dict[uuid.UUID, asyncio.Task] = {}
         self._handoff_watchers: dict[uuid.UUID, asyncio.Task] = {}
+        # Scheduler wakeups and provider callbacks can request the same
+        # settled organization review concurrently. Serialize the control
+        # operation per project so a failed attempt cannot be multiplied by
+        # already-queued scheduler passes.
+        self._organization_review_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self._organization_review_tasks: dict[uuid.UUID, asyncio.Task] = {}
         # A production daemon restart can detach from a provider while Herdr
         # keeps that provider's pane alive. These maps let the next Runner
         # generation preserve the in-flight run and settle that same Run when
         # the provider writes its handoff.
         self._recovered_active_node_ids: set[uuid.UUID] = set()
         self._recovered_run_ids: dict[uuid.UUID, uuid.UUID] = {}
+        # In-memory cancellation intent fences a provider result while its
+        # external process is being stopped. The persisted node remains
+        # RUNNING until the terminal boundary is closed, so the UI never
+        # claims cancellation while a provider is still live.
+        self._cancelling_nodes: set[uuid.UUID] = set()
         self._reconnect_tasks = self.sessions.reconnect_tasks
         self._forbidden_fresh_sessions = self.sessions.forbidden_fresh_sessions
         self.organization_manager = OrganizationManager()
@@ -226,6 +244,7 @@ class Runner:
             ) or node_id in self._recovered_active_node_ids,
             isolation_available=self._workspace_isolation_available,
             request_review=self._request_organization_review,
+            cancel_node=self._cancel_node_by_id,
         )
         self.node_executor = NodeExecutor(
             store=self.store,
@@ -246,6 +265,7 @@ class Runner:
             run_worker=self._run_worker,
             mark_cancelled=self._mark_cancelled,
             mark_failed=self._mark_failed,
+            reject_submission=self._reject_submission,
         )
         self.scheduler.set_executor(self.node_executor.execute)
         # Keep the existing Runner-level aliases for compatibility with
@@ -261,7 +281,9 @@ class Runner:
     # -- lifecycle -------------------------------------------------------
 
     async def start(self) -> None:
-        await self._recover_external_runs()
+        nested_herdr = await self._apply_runtime_boundary_guard()
+        if not nested_herdr:
+            await self._recover_external_runs()
         self._task = asyncio.create_task(self._loop())
         # Restore editability for retained provider sessions after a daemon
         # restart. The CLI writes the same handoff files during an agent's
@@ -273,6 +295,35 @@ class Runner:
                     await self._ensure_handoff_watcher(
                         node.id, project.id, project.repo_path,
                     )
+
+    async def _apply_runtime_boundary_guard(self) -> bool:
+        """Install or clear the Herdr circuit breaker once per start/tick."""
+        startup_error = getattr(self.terminal, "startup_error", None)
+        projects = await self.store.list_projects()
+        if isinstance(startup_error, HerdrAdapterError):
+            code = getattr(startup_error, "code", "herdr_unavailable")
+            for project in projects:
+                await self.store.set_runtime_guard(
+                    project.id,
+                    code=code,
+                    message=str(startup_error),
+                )
+            return True
+        # A prior bad launch leaves an intentional durable explanation. Once
+        # Turn is restarted from a normal host process, clear only this
+        # specific stale boundary guard; unrelated runtime guards remain.
+        for project in projects:
+            if project.runtime_guard is not None and project.runtime_guard.code in {
+                "herdr_nested_invocation",
+                "herdr_unavailable",
+            }:
+                await self.store.clear_runtime_guard(project.id)
+        return False
+
+    async def _guarded_project(self, project_id: uuid.UUID) -> bool:
+        """Return whether this project is behind a durable runtime circuit breaker."""
+        root = await self.store.get_node(project_id)
+        return bool(root is not None and root.runtime_guard is not None)
 
     async def stop(self, *, close_workspaces: bool = False) -> None:
         self._stop = True
@@ -403,6 +454,8 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return False
+        if await self._guarded_project(node.project_id):
+            return False
         cwd = await self._project_repo(node.project_id)
         if not cwd:
             return False
@@ -427,6 +480,8 @@ class Runner:
     # -- scheduling ------------------------------------------------------
 
     async def tick(self) -> None:
+        if await self._apply_runtime_boundary_guard():
+            return
         projects = await self.store.list_projects()
         now = time.monotonic()
         if now - self._last_workspace_reconcile_at >= 5.0:
@@ -442,6 +497,8 @@ class Runner:
         for p in projects:
             if p.id in self._deleting_projects:
                 continue
+            if p.runtime_guard is not None:
+                continue
             try:
                 await self._schedule_project(p.id)
             except Exception as e:  # pragma: no cover
@@ -449,6 +506,8 @@ class Runner:
 
     async def schedule_once(self, project_id: uuid.UUID) -> None:
         """Run one scheduler pass for a project through the public contract."""
+        if await self._guarded_project(project_id):
+            return
         await self._review_safe_organizations(project_id)
         await self.scheduler.schedule_once(project_id)
 
@@ -502,13 +561,13 @@ class Runner:
             )
 
     async def close_project_workspace(self, project_id: uuid.UUID) -> bool:
-        """Close a project's Herdr space without touching unrelated workspaces."""
-        nodes, _, _ = await self.store.get_workgraph(project_id)
-        for node in nodes:
-            # Close each node pane first so no provider, shell, or control
-            # process survives while the project workspace is being removed.
-            await self.terminal.close_persistent_session(node.id)
-        return await self.terminal.close_project_workspace(str(project_id))
+        """Close every node process before its project's provider workspace."""
+        # The supervisor's inventory is the sole cleanup surface. It includes
+        # graph nodes, retained reconnects, and control-plane owners, while
+        # filtering out unrelated Herdr workspaces.
+        closed = await self.processes.close_all(project_id)
+        workspace_closed = await self.terminal.close_project_workspace(str(project_id))
+        return closed or workspace_closed
 
     async def _project_repo(self, project_id: uuid.UUID) -> str | None:
         """Resolve the filesystem directory assigned to a project."""
@@ -533,6 +592,8 @@ class Runner:
     async def _schedule_project(self, project_id: uuid.UUID) -> None:
         # Compatibility shim for older in-process callers. Scheduling
         # decisions and task reservation live in Scheduler.
+        if await self._guarded_project(project_id):
+            return
         await self._review_safe_organizations(project_id)
         await self.scheduler.schedule_once(project_id)
 
@@ -561,6 +622,10 @@ class Runner:
                 ManagerPhase.EXECUTING,
                 ManagerPhase.REVIEW_PENDING,
             }
+            and not (
+                node.organization_review is not None
+                and node.organization_review.control_retry_required
+            )
             and node.status in {NodeStatus.EXPANDED, NodeStatus.COMPLETE}
         ]
         material.sort(key=lambda item: walker.depth(item.id), reverse=True)
@@ -713,7 +778,19 @@ class Runner:
                     continue
                 submission: tuple[str, Path, dict, bool] | None = None
                 for path in paths:
-                    payload = read_result_file(path)
+                    present, payload = read_submission_file(path)
+                    if present and payload is None:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        current = await self.store.get_node(node_id)
+                        if current is not None:
+                            await self._reject_submission(
+                                current,
+                                f"{self._handoff_kind(path)} submission is not a valid JSON object; correct and resubmit in the live provider session",
+                            )
+                        break
                     if payload is not None:
                         force = bool(payload.pop("__turn_force", False))
                         submission = (self._handoff_kind(path), path, payload, force)
@@ -819,6 +896,20 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return []
+        run = (
+            await self._resolve_submission_run(node, plan.run_id, PLANNER_EXECUTOR)
+            if plan.run_id is not None
+            else await self.store.active_run(node.id)
+        )
+        direct_revision = run is None and plan.run_id is None
+        if run is None:
+            if not direct_revision:
+                await self._emit(
+                    "harness.submission.stale",
+                    project_id,
+                    {"node_id": str(node_id), "run_id": str(plan.run_id) if plan.run_id else None},
+                )
+                return []
         contract = self._organization_contract_for_plan(node, plan)
         structural_audit = None
         semantic_audit = None
@@ -893,10 +984,6 @@ class Runner:
         node = await self.store.get_node(node_id)
         if node is None:
             return []
-        prior_runs = await self.store.get_runs(node.id)
-        run = self._take_recovered_run(node.id, prior_runs)
-        if run is None:
-            run = await self.store.create_run(node, PLANNER_EXECUTOR, len(prior_runs) + 1)
         # A successful user-directed revision supersedes any error/status
         # message left by an earlier failed submission.
         node.agent_state = None
@@ -917,21 +1004,31 @@ class Runner:
             # An explicit empty replacement is a valid focused no-op handoff;
             # its boundary has no remaining executable frontier.
             await self.store.set_status(node.id, NodeStatus.COMPLETE)
+        if run is not None:
+            accepted = await self.store.accept_run_submission(
+                run.id,
+                outcome=Outcome.COMPLETE,
+                node_status=NodeStatus.EXPANDED if created else NodeStatus.COMPLETE,
+            )
+            if accepted is None:
+                await self._emit("harness.submission.stale", project_id, {"node_id": str(node_id), "run_id": str(run.id)})
+                return []
         artifacts = await self.store.add_artifacts(
             node.id,
             [_plan_submission_artifact(plan)],
         )
         for artifact in artifacts:
             await self._emit("artifact.created", project_id, _dump(artifact))
-        await self.store.update_run(
-            run.id,
-            status=RunStatus.COMPLETE,
-            outcome=Outcome.COMPLETE,
-            summary=f"revised plan with {len(created)} node(s)",
-            logs=f"replaced {len(removed)} descendant node(s)",
-            usage=plan.usage,
-            session_id=plan.session_id or (node.agent.session_id if node.agent else None),
-        )
+        if run is not None:
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.COMPLETE,
+                outcome=Outcome.COMPLETE,
+                summary=f"revised plan with {len(created)} node(s)",
+                logs=f"replaced {len(removed)} descendant node(s)",
+                usage=plan.usage,
+                session_id=plan.session_id or (node.agent.session_id if node.agent else None),
+            )
         if plan.session_id:
             await self._remember_session(node, plan.session_id)
         await self._emit(
@@ -947,45 +1044,71 @@ class Runner:
         self.wake()
         return created
 
+    async def _resolve_submission_run(
+        self, node: Node, submitted_run_id: uuid.UUID | None, worker: str
+    ) -> Run | None:
+        """Resolve a handoff to the one current attempt, never by node alone.
+
+        Legacy in-process tests and retained sessions created before the
+        attempt id was introduced may omit the field; they can bind to an
+        already-running current Run. An explicit id is always strict, which
+        is what prevents a late Run A payload from settling Run B.
+        """
+        if submitted_run_id is not None:
+            run = await self.store.get_run(submitted_run_id)
+            if (
+                run is None
+                or run.node_id != node.id
+                or run.status is not RunStatus.RUNNING
+                or run.accepted_submission
+            ):
+                return None
+            return run
+        active = await self.store.active_run(node.id)
+        if active is not None and not active.accepted_submission:
+            return active
+        runs = await self.store.get_runs(node.id)
+        return await self.store.create_run(node, worker, len(runs) + 1)
+
     async def _apply_result_revision(
         self, node_id: uuid.UUID, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
-        await self._settle_reconnect_after_handoff(node_id)
         node = await self.store.get_node(node_id)
         if node is None:
             return
-        prior_runs = await self.store.get_runs(node.id)
-        run = self._take_recovered_run(node.id, prior_runs)
+        run = await self._resolve_submission_run(
+            node,
+            result.run_id,
+            node.agent.harness.value if node.agent else node.executor or "agent",
+        )
         if run is None:
-            run = await self.store.create_run(
-                node,
-                node.agent.harness.value if node.agent else node.executor or "agent",
-                len(prior_runs) + 1,
-            )
+            await self._emit("harness.submission.stale", project_id, {"node_id": str(node_id), "run_id": str(result.run_id) if result.run_id else None})
+            return
+        await self._settle_reconnect_after_handoff(node_id)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._handle_outcome(node, run, project_id, result)
 
     async def _apply_verification_revision(
         self, node_id: uuid.UUID, project_id: uuid.UUID, decision: VerificationResult
     ) -> None:
-        await self._settle_reconnect_after_handoff(node_id)
         node = await self.store.get_node(node_id)
         if node is None:
             return
-        prior_runs = await self.store.get_runs(node.id)
-        run = self._take_recovered_run(node.id, prior_runs)
+        run = await self._resolve_submission_run(
+            node,
+            decision.run_id,
+            node.agent.harness.value if node.agent else node.executor or "agent",
+        )
         if run is None:
-            run = await self.store.create_run(
-                node,
-                node.agent.harness.value if node.agent else node.executor or "agent",
-                len(prior_runs) + 1,
-            )
+            await self._emit("harness.submission.stale", project_id, {"node_id": str(node_id), "run_id": str(decision.run_id) if decision.run_id else None})
+            return
+        await self._settle_reconnect_after_handoff(node_id)
         await self.store.set_status(node.id, NodeStatus.RUNNING)
         await self._handle_outcome(
             node,
             run,
             project_id,
-            WorkerResult(outcome=Outcome.COMPLETE, verification=decision),
+            WorkerResult(outcome=Outcome.COMPLETE, verification=decision, run_id=decision.run_id),
         )
 
     async def _settle_reconnect_after_handoff(self, node_id: uuid.UUID) -> None:
@@ -1072,6 +1195,18 @@ class Runner:
         process and resumes the saved provider session by id; Run again is the
         explicit path that clears that id and starts a new conversation.
         """
+        # A local/process transport has no durable provider pane to retain.
+        # If an injected command published its handoff while the attachment
+        # task was still unwinding, release() alone would leave that PTY live
+        # after the Run became semantically settled. Herdr is the one backend
+        # whose pane intentionally survives a completed provider turn.
+        # Custom durable test/provider ports may omit the optional backend
+        # label; treat an unlabeled injected transport as durable, matching
+        # the Herdr contract, rather than destroying its retained session.
+        if getattr(self.terminal, "backend_name", "herdr") != "herdr":
+            snapshot = self.terminal.snapshot(node_id)
+            if snapshot.get("active"):
+                await self.terminal.stop(node_id)
         self.terminal.release(node_id)
         node = await self.store.get_node(node_id)
         if node is not None:
@@ -1079,6 +1214,21 @@ class Runner:
             # This second event is intentionally after PTY release so the
             # browser cannot leave a completed/cancelled node spinning.
             await self._emit("node.updated", project_id, _dump(node))
+
+    async def _reconcile_run_process(self, run: Run, node_id: uuid.UUID) -> None:
+        """Record liveness from the process supervisor without semantic writes."""
+        if getattr(self.terminal, "backend_name", "local") != "herdr":
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=0)
+            return
+        try:
+            names = await self.terminal.foreground_process_names(node_id)
+        except (HerdrAdapterError, HerdrResourceNotFound, OSError, RuntimeError):
+            await self.store.mark_run_process(run.id, ProcessState.UNKNOWN)
+            return
+        if names:
+            await self.store.mark_run_process(run.id, ProcessState.RUNNING)
+        else:
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=0)
 
     def _review_planner_for(self, node: Node):
         """Return the real planner adapter used for provider review turns.
@@ -1162,6 +1312,10 @@ class Runner:
         """Build an isolated provider context for a non-graph review turn."""
         if node.agent is None:
             raise RuntimeError("provider review requires a planner agent")
+        if base.terminal is None:
+            raise ControlOperationUnavailable(
+                "provider review requires the registered Turn terminal transport"
+            )
         review_node = node.model_copy(
             update={
                 # A review writes the ordinary result handoff protocol, but it
@@ -1174,11 +1328,10 @@ class Runner:
                 "node": review_node,
                 "repo_path": repo_path or base.repo_path,
                 "project_repo_path": base.project_repo_path or repo_path,
-                # A review is deliberately a bounded one-shot provider turn.
-                # LocalPtyTransport is selected by AgentPlanner when terminal
-                # is None, while the retained session remains on the copied
-                # planner agent when the manager invokes this context.
-                "terminal": None,
+                # Control-plane reviews use the same Herdr transport as graph
+                # work. They are bounded Runs, but never invisible local PTY
+                # subprocesses.
+                "terminal": base.terminal,
                 "session_callback": None,
                 "forbidden_session_id": None,
                 "purpose": purpose,
@@ -1200,10 +1353,29 @@ class Runner:
             last_error: Exception | None = None
             for attempt in range(1, 4):
                 run = await self.store.create_run(
-                    node, "semantic-plan-auditor", len(runs) + attempt
+                    node,
+                    "semantic-plan-auditor",
+                    len(runs) + attempt,
+                    # Injected auditors have no provider pane; the semantic
+                    # node remains the operational owner for their attempt.
+                    process_owner_id=node.id,
+                )
+                await self.store.mark_run_process(
+                    run.id,
+                    ProcessState.RUNNING,
+                    pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(node.id),
                 )
                 try:
                     audit = await self.semantic_plan_auditor(contract, plan)
+                    accepted = await self.store.accept_run_submission(
+                        run.id,
+                        outcome=Outcome.COMPLETE,
+                    )
+                    if accepted is None:
+                        raise InvalidSubmission("semantic audit Run became stale")
+                    await self.store.mark_run_process(
+                        run.id, ProcessState.EXITED, exit_code=0
+                    )
                     await self.store.update_run(
                         run.id,
                         status=RunStatus.COMPLETE,
@@ -1213,6 +1385,9 @@ class Runner:
                     return audit
                 except Exception as error:
                     last_error = error
+                    await self.store.mark_run_process(
+                        run.id, ProcessState.EXITED, exit_code=1
+                    )
                     await self.store.update_run(
                         run.id,
                         status=RunStatus.FAILED,
@@ -1262,14 +1437,36 @@ class Runner:
         runs = await self.store.get_runs(node.id)
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            # A control attempt is a real provider process with a short-lived
+            # Herdr pane. Give every attempt its own synthetic owner so the
+            # persisted Run identifies the exact pane used by this call.
+            attempt_ctx = review_ctx.model_copy(
+                update={
+                    "node": review_ctx.node.model_copy(update={"id": uuid.uuid4()}),
+                }
+            )
             run = await self.store.create_run(
-                node, "semantic-plan-auditor", len(runs) + attempt
+                node,
+                "semantic-plan-auditor",
+                len(runs) + attempt,
+                process_owner_id=attempt_ctx.node.id,
+            )
+            attempt_ctx.run_id = str(run.id)
+            await self.store.mark_run_process(
+                run.id,
+                ProcessState.RUNNING,
+                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
             )
             try:
                 payload, usage, session_id = await planner.call_structured(
-                    review_ctx,
+                    attempt_ctx,
                     prompt,
                     handoff_kind="result",
+                )
+                await self.store.mark_run_process(
+                    run.id,
+                    ProcessState.RUNNING,
+                    pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
                 )
                 content = self._structured_artifact_payload(
                     payload,
@@ -1277,6 +1474,20 @@ class Runner:
                     artifact_name="plan-audit",
                 )
                 audit = parse_plan_audit(content)
+                # The result is already in memory; the provider/control
+                # process must be gone before this Run becomes observable as
+                # settled. This is deliberately the exact synthetic owner
+                # passed to the provider context, not the graph boundary.
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                accepted = await self.store.accept_run_submission(
+                    run.id,
+                    outcome=Outcome.COMPLETE,
+                )
+                if accepted is None:
+                    raise InvalidSubmission("semantic audit Run became stale")
+                await self.store.mark_run_process(
+                    run.id, ProcessState.EXITED, exit_code=0
+                )
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.COMPLETE,
@@ -1286,8 +1497,24 @@ class Runner:
                     session_id=session_id,
                 )
                 return audit
+            except asyncio.CancelledError:
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    outcome=Outcome.FAIL,
+                    summary="semantic organization plan audit cancelled",
+                    error="run cancelled by user",
+                    retry_recommended=False,
+                )
+                raise
             except Exception as error:
                 last_error = error
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.mark_run_process(
+                    run.id, ProcessState.EXITED, exit_code=1
+                )
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.FAILED,
@@ -1366,8 +1593,22 @@ class Runner:
         # structured call; close that stale writer first or Codex rejects the
         # resume with an "active writer" error. A live Turn-owned generation
         # is never touched here.
-        if not self.generation_active(boundary_id):
-            await self.terminal.close_persistent_session(boundary_id)
+        if self.generation_active(boundary_id):
+            raise ControlOperationUnavailable(
+                "organization manager review cannot start while the boundary provider is active"
+            )
+        reconcile = getattr(self.terminal, "reconcile_provider_session", None)
+        if callable(reconcile) and manager_agent.session_id:
+            await reconcile(
+                boundary.id,
+                project_key=str(boundary.project_id),
+                session_id=manager_agent.session_id,
+                provider=manager_agent.harness.value,
+            )
+        # The retained planner pane may have been detached from Turn's map by
+        # a daemon restart. Reconcile it by provider session before closing it
+        # so Codex cannot reject the manager resume with an active-writer error.
+        await self.terminal.close_persistent_session(boundary_id)
         prompt = "\n".join(
             [
                 render_context_block(review_ctx),
@@ -1383,16 +1624,52 @@ class Runner:
             ]
         )
         runs = await self.store.get_runs(boundary.id)
+        # A failed control attempt owns a synthetic pane, not the graph
+        # boundary. Close those exact owners before retrying so a previous
+        # review cannot leak a provider writer or a Herdr tab into the next
+        # attempt.
+        for previous in runs:
+            if (
+                previous.worker == "organization-manager"
+                and previous.status is not RunStatus.RUNNING
+                and previous.process_owner_id is not None
+            ):
+                await self.terminal.close_persistent_session(
+                    previous.process_owner_id
+                )
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            # Each manager attempt owns a fresh synthetic pane. Reusing the
+            # graph boundary as the process owner makes the UI attach to the
+            # wrong terminal and allows a failed control writer to survive a
+            # retry.
+            attempt_ctx = review_ctx.model_copy(
+                update={
+                    "node": review_ctx.node.model_copy(update={"id": uuid.uuid4()}),
+                }
+            )
             run = await self.store.create_run(
-                boundary, "organization-manager", len(runs) + attempt
+                boundary,
+                "organization-manager",
+                len(runs) + attempt,
+                process_owner_id=attempt_ctx.node.id,
+            )
+            attempt_ctx.run_id = str(run.id)
+            await self.store.mark_run_process(
+                run.id,
+                ProcessState.RUNNING,
+                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
             )
             try:
                 payload, usage, session_id = await planner.call_structured(
-                    review_ctx,
+                    attempt_ctx,
                     prompt,
                     handoff_kind="result",
+                )
+                await self.store.mark_run_process(
+                    run.id,
+                    ProcessState.RUNNING,
+                    pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(attempt_ctx.node.id),
                 )
                 content = self._structured_artifact_payload(
                     payload,
@@ -1400,6 +1677,16 @@ class Runner:
                     artifact_name="manager-result",
                 )
                 result = parse_manager_result(content)
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                accepted = await self.store.accept_run_submission(
+                    run.id,
+                    outcome=Outcome.COMPLETE,
+                )
+                if accepted is None:
+                    raise InvalidSubmission("manager review Run became stale")
+                await self.store.mark_run_process(
+                    run.id, ProcessState.EXITED, exit_code=0
+                )
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.COMPLETE,
@@ -1411,8 +1698,24 @@ class Runner:
                 if session_id:
                     await self._remember_session(boundary, session_id)
                 return result
+            except asyncio.CancelledError:
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+                await self.store.update_run(
+                    run.id,
+                    status=RunStatus.CANCELLED,
+                    outcome=Outcome.FAIL,
+                    summary="organization manager review cancelled",
+                    error="run cancelled by user",
+                    retry_recommended=False,
+                )
+                raise
             except Exception as error:
                 last_error = error
+                await self.terminal.close_persistent_session(attempt_ctx.node.id)
+                await self.store.mark_run_process(
+                    run.id, ProcessState.EXITED, exit_code=1
+                )
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.FAILED,
@@ -1444,13 +1747,18 @@ class Runner:
         ctx = await self._build_context(node, run_id=str(run.id))
         ctx.forbidden_session_id = forbidden_session_id
         await self.store.set_status(node.id, NodeStatus.RUNNING)
+        await self.store.mark_run_process(
+            run.id,
+            ProcessState.RUNNING,
+            pane_id=getattr(self.terminal, "pane_id", lambda _node_id: None)(node.id),
+        )
         await self._emit("run.created", project_id, _dump(run))
 
         # Stop can arrive immediately after the run record makes the node
         # visible as RUNNING, before this coroutine reaches the harness call.
         # Do not launch a process for a run that has already been cancelled.
         current = await self.store.get_node(node.id)
-        if current is None or current.status is NodeStatus.CANCELLED:
+        if current is None or current.status is NodeStatus.CANCELLED or node.id in self._cancelling_nodes:
             await self.store.update_run(
                 run.id,
                 status=RunStatus.CANCELLED,
@@ -1503,8 +1811,16 @@ class Runner:
             for correction_attempt in range(3):
                 corrections_used = correction_attempt
                 plan = await planner.plan(ctx)
+                await self._reconcile_run_process(run, node.id)
+                if plan.run_id is not None and plan.run_id != run.id:
+                    raise InvalidSubmission(
+                        f"planner submission belongs to stale Run {plan.run_id}"
+                    )
                 current = await self.store.get_node(node.id)
-                if current is not None and current.status is NodeStatus.CANCELLED:
+                if current is not None and (
+                    current.status is NodeStatus.CANCELLED
+                    or node.id in self._cancelling_nodes
+                ):
                     await self.store.update_run(
                         run.id,
                         status=RunStatus.CANCELLED,
@@ -1512,6 +1828,9 @@ class Runner:
                         summary="run cancelled",
                         error="run cancelled by user",
                         retry_recommended=False,
+                    )
+                    await self.store.mark_run_process(
+                        run.id, ProcessState.CANCELLED
                     )
                     return []
                 await self._emit("harness.return", project_id, {"run_id": str(run.id), "node_id": str(node.id), "status": "returned", "outcome": "plan", "session_id": plan.session_id, "created": len(plan.nodes)})
@@ -1642,6 +1961,18 @@ class Runner:
             )
             for artifact in submitted:
                 await self._emit("artifact.created", project_id, _dump(artifact))
+            accepted = await self.store.accept_run_submission(
+                run.id,
+                outcome=Outcome.COMPLETE,
+                node_status=NodeStatus.EXPANDED if created else NodeStatus.COMPLETE,
+            )
+            if accepted is None:
+                await self._emit(
+                    "harness.submission.stale",
+                    project_id,
+                    {"node_id": str(node.id), "run_id": str(run.id), "reason": "planner attempt is no longer authoritative"},
+                )
+                return []
             session_note = f"session_id={plan.session_id}" if plan.session_id else "session_id=unavailable"
             await self.store.update_run(
                 run.id,
@@ -1662,6 +1993,7 @@ class Runner:
             )
             return created
         except asyncio.CancelledError:
+            await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
             await self.store.update_run(
                 run.id,
                 status=RunStatus.CANCELLED,
@@ -1683,6 +2015,7 @@ class Runner:
                 error=sanitize_control_text(error),
                 retry_recommended=True,
             )
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=0)
             await self.store.set_status(node.id, NodeStatus.RUNNABLE)
             await self._emit(
                 "organization.audit_control_failed",
@@ -1690,9 +2023,22 @@ class Runner:
                 {"node_id": str(node.id), "reason": sanitize_control_text(error), "retryable": True},
             )
             return []
+        except InvalidSubmission as error:
+            await self.store.mark_submission_rejected(
+                node.id,
+                run_id=run.id,
+                message=f"planner submission rejected: {sanitize_control_text(error)}. Correct and resubmit on the same Run.",
+            )
+            await self._ensure_handoff_watcher(
+                node.id, project_id, await self._project_repo(project_id)
+            )
+            return []
         except Exception as error:
             current = await self.store.get_node(node.id)
-            if current is not None and current.status is NodeStatus.CANCELLED:
+            if current is not None and (
+                current.status is NodeStatus.CANCELLED
+                or node.id in self._cancelling_nodes
+            ):
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.CANCELLED,
@@ -1701,6 +2047,7 @@ class Runner:
                     error="run cancelled by user",
                     retry_recommended=False,
                 )
+                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
                 return []
             await self._emit("application.error", project_id, {"run_id": str(run.id), "node_id": str(node.id), "phase": "planner", "error": str(error)})
             await self.store.update_run(
@@ -1712,6 +2059,7 @@ class Runner:
                 error=str(error),
                 retry_recommended=isinstance(error, GenerationStalled),
             )
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=1)
             raise
         finally:
             await self._finish_provider_terminal(node.id, project_id)
@@ -1729,7 +2077,18 @@ class Runner:
         if agent is not None:
             harness = agent.harness.value
             if harness == HarnessKind.MOCK.value:
-                return self.registry.get_planner("mock") or self.registry.planner
+                # A mock execution harness is also useful with the heuristic
+                # planner in test-mode UI runs. The process-level mock planner
+                # is selected explicitly by the mock workspace mode or by a
+                # seeded lab plan, never merely because the leaf harness is
+                # mock.
+                is_mock_plan = any(
+                    Path(ref).name == "mock-plan.json"
+                    for ref in node.resource_refs
+                )
+                if self.s.planner == "mock" or is_mock_plan:
+                    return self.registry.get_planner("mock") or self.registry.planner
+                return self.registry.get_planner(self.s.planner) or self.registry.planner
             if harness in REAL_HARNESSES:
                 return self.registry.get_planner("real") or self.registry.planner
         return self.registry.planner
@@ -1766,13 +2125,18 @@ class Runner:
         ctx.forbidden_session_id = forbidden_session_id
         ctx.attempt = run.attempt
         await self.store.set_status(node.id, NodeStatus.RUNNING)
+        await self.store.mark_run_process(
+            run.id,
+            ProcessState.RUNNING,
+            pane_id=getattr(self.terminal, "pane_id", lambda _node_id: None)(node.id),
+        )
         await self._emit("run.created", project_id, _dump(run))
 
         # Stop can arrive immediately after the run record makes the node
         # visible as RUNNING, before this coroutine reaches the harness call.
         # Do not launch a process for a run that has already been cancelled.
         current = await self.store.get_node(node.id)
-        if current is None or current.status is NodeStatus.CANCELLED:
+        if current is None or current.status is NodeStatus.CANCELLED or node.id in self._cancelling_nodes:
             await self.store.update_run(
                 run.id,
                 status=RunStatus.CANCELLED,
@@ -1821,6 +2185,7 @@ class Runner:
                 if root and root.run_policy else self.s.stall_timeout_seconds
             )
             result: WorkerResult = await self.exec_adapter.run(worker, ctx, timeout=timeout)
+            await self._reconcile_run_process(run, node.id)
             # Short-lived process transports detach before returning from the
             # worker, but their completed PTY remains in the transport until
             # release(). Publish the attempt outcome only after that release
@@ -1843,6 +2208,7 @@ class Runner:
                 },
             )
         except asyncio.TimeoutError:
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=-1)
             await self._handle_outcome(
                 node, run, project_id,
                 WorkerResult(outcome=Outcome.FAIL, summary="timed out", error="timeout",
@@ -1852,12 +2218,20 @@ class Runner:
             return
         except asyncio.CancelledError:
             await self._mark_cancelled(node)
+            await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
             await self.store.update_run(run.id, status=RunStatus.CANCELLED, outcome=Outcome.FAIL)
             await self._finish_provider_terminal(node.id, project_id)
             raise
+        except InvalidSubmission as error:
+            await self._reject_submission(node, str(error))
+            await self._finish_provider_terminal(node.id, project_id)
+            return
         except Exception as e:
             current = await self.store.get_node(node.id)
-            if current is not None and current.status is NodeStatus.CANCELLED:
+            if current is not None and (
+                current.status is NodeStatus.CANCELLED
+                or node.id in self._cancelling_nodes
+            ):
                 await self.store.update_run(
                     run.id,
                     status=RunStatus.CANCELLED,
@@ -1866,6 +2240,7 @@ class Runner:
                     error="run cancelled by user",
                     retry_recommended=False,
                 )
+                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
                 await self._finish_provider_terminal(node.id, project_id)
                 return
             logger.exception("worker failed for node %s", node.id)
@@ -1873,6 +2248,7 @@ class Runner:
             await self.store.update_run(
                 run.id, status=RunStatus.FAILED, outcome=Outcome.FAIL, error=str(e)
             )
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=1)
             await self._mark_failed(node, f"worker error: {e}")
             await self._finish_provider_terminal(node.id, project_id)
             return
@@ -1888,7 +2264,10 @@ class Runner:
         self, node: Node, run: Run, project_id: uuid.UUID, result: WorkerResult
     ) -> None:
         current = await self.store.get_node(node.id)
-        if current is not None and current.status is NodeStatus.CANCELLED:
+        if current is not None and (
+            current.status is NodeStatus.CANCELLED
+            or node.id in self._cancelling_nodes
+        ):
             # Stop is a terminal user decision. A provider can return a result
             # while its terminal is shutting down, but it must not mutate the
             # graph, artifacts, or final run outcome after that decision.
@@ -1902,26 +2281,18 @@ class Runner:
             )
             await self._emit("node.updated", project_id, _dump(current))
             return
-        if result.outcome in {Outcome.COMPLETE, Outcome.EXPAND}:
-            try:
-                await self._commit_workspace_result(node)
-            except WorkspaceError as error:
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.FAILED,
-                    outcome=Outcome.FAIL,
-                    summary="workspace merge failed",
-                    error=str(error),
-                    retry_recommended=False,
-                )
-                await self.store.set_status(node.id, NodeStatus.FAILED)
-                await self._request_reviews_for_node(node.id, "workspace_merge_failed")
-                await self._emit("organization.workspace_failed", project_id, {
+        if result.run_id is not None and result.run_id != run.id:
+            await self._emit(
+                "harness.submission.stale",
+                project_id,
+                {
                     "node_id": str(node.id),
-                    "error": str(error),
-                })
-                return
-        await self._persist_result_materials(node.id, project_id, result)
+                    "run_id": str(result.run_id),
+                    "current_run_id": str(run.id),
+                    "reason": "submission belongs to a different execution attempt",
+                },
+            )
+            return
         if result.outcome is Outcome.COMPLETE and node.acceptance_criteria:
             evidence_items = [
                 *result.evidence,
@@ -1937,50 +2308,91 @@ class Runner:
                 for criterion in node.acceptance_criteria
                 if criterion.id not in evidence_by_id
             ]
-            failed = [
-                item.criterion_id
-                for item in evidence_items
-                if item.status is EvidenceStatus.FAIL
-            ]
-            unverified = [
-                item.criterion_id
-                for item in evidence_items
-                if item.status is EvidenceStatus.UNVERIFIED
-            ]
-            unreferenced = [
-                item.criterion_id
-                for item in evidence_items
-                if not item.refs
-            ]
+            failed = [item.criterion_id for item in evidence_items if item.status is EvidenceStatus.FAIL]
+            unverified = [item.criterion_id for item in evidence_items if item.status is EvidenceStatus.UNVERIFIED]
+            unreferenced = [item.criterion_id for item in evidence_items if not item.refs]
             if missing or failed or unverified or unreferenced:
-                reason_parts = []
-                if missing:
-                    reason_parts.append("missing evidence for " + ", ".join(missing))
-                if failed:
-                    reason_parts.append("failed criteria: " + ", ".join(failed))
-                if unverified:
-                    reason_parts.append(
-                        "unverified criteria: " + ", ".join(unverified)
+                problems = [
+                    *( ["missing evidence for " + ", ".join(missing)] if missing else []),
+                    *( ["failed criteria: " + ", ".join(failed)] if failed else []),
+                    *( ["unverified criteria: " + ", ".join(unverified)] if unverified else []),
+                    *( ["evidence has no inspectable refs for " + ", ".join(unreferenced)] if unreferenced else []),
+                ]
+                detail = "; ".join(problems)
+                await self._reject_submission(
+                    node,
+                    "acceptance evidence rejected: " + detail,
+                )
+                return
+        if result.outcome is Outcome.EXPAND:
+            # Deterministic graph/schema validation is part of submission
+            # acceptance. An invalid expansion is correction-required on the
+            # live attempt, never an accepted EXPAND followed by a fake
+            # evaluator/process failure.
+            expansion = result.children or PlanResult(nodes=[])
+            validation_repo = await self._project_repo(project_id)
+            try:
+                if validation_repo:
+                    catalog = CapabilityCatalog(Path(self.s.data_dir) / "capabilities")
+                    expansion_payload = expansion.model_dump(mode="json")
+                    catalog.load_plan_role_capabilities(expansion_payload, validation_repo)
+                    catalog.validate_plan(
+                        expansion_payload,
+                        validation_repo,
+                        planner_capabilities=node.agent.capabilities if node.agent else None,
                     )
-                if unreferenced:
-                    reason_parts.append(
-                        "evidence has no inspectable refs for "
-                        + ", ".join(unreferenced)
-                    )
+                    validate_subgraph_sources(expansion, validation_repo)
+                contract = self._organization_contract_for_plan(node, expansion)
+                if contract is not None:
+                    structural = audit_plan(contract, expansion)
+                    if not structural.accepted:
+                        raise InvalidSubmission(
+                            "organization plan rejected: " + "; ".join(structural.errors)
+                        )
+            except InvalidSubmission as error:
+                await self._reject_submission(node, str(error))
+                return
+            except Exception as error:
+                await self._reject_submission(
+                    node, f"invalid expansion submission: {sanitize_control_text(error)}"
+                )
+                return
+        accepted = await self.store.accept_run_submission(
+            run.id,
+            outcome=result.outcome,
+            node_status={
+                Outcome.COMPLETE: NodeStatus.COMPLETE,
+                Outcome.EXPAND: NodeStatus.EXPANDED,
+                Outcome.BLOCK: NodeStatus.BLOCKED,
+                Outcome.FAIL: NodeStatus.FAILED,
+            }[result.outcome],
+        )
+        if accepted is None:
+            await self._emit(
+                "harness.submission.stale",
+                project_id,
+                {
+                    "node_id": str(node.id),
+                    "run_id": str(run.id),
+                    "reason": "execution attempt is no longer authoritative",
+                },
+            )
+            return
+        if result.outcome in {Outcome.COMPLETE, Outcome.EXPAND}:
+            try:
+                await self._commit_workspace_result(node)
+            except WorkspaceError as error:
                 await self.store.update_run(
                     run.id,
-                    status=RunStatus.FAILED,
-                    outcome=Outcome.FAIL,
-                    summary="acceptance evidence rejected",
-                    error="; ".join(reason_parts),
+                    summary="workspace merge failed",
+                    error=str(error),
                     retry_recommended=False,
                 )
-                await self.store.set_status(node.id, NodeStatus.FAILED)
-                await self._request_reviews_for_node(
-                    node.id, "acceptance_evidence_failed"
-                )
-                await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
-                return
+                await self._emit("organization.workspace_failed", project_id, {
+                    "node_id": str(node.id),
+                    "error": str(error),
+                })
+        await self._persist_result_materials(node.id, project_id, result)
         if result.verification is not None:
             if (
                 result.outcome is Outcome.COMPLETE
@@ -2029,16 +2441,11 @@ class Runner:
                     )
                     await self.store.update_run(
                         run.id,
-                        status=RunStatus.FAILED,
-                        outcome=Outcome.FAIL,
                         summary="organization plan rejected",
                         error="; ".join(structural_audit.errors),
                         retry_recommended=False,
                     )
-                    await self.store.set_status(node.id, NodeStatus.FAILED)
-                    await self._request_reviews_for_node(
-                        node.id, "organization_plan_rejected"
-                    )
+                    await self.store.set_status(node.id, NodeStatus.RUNNABLE)
                     await self._emit("node.updated", project_id, _dump(await self.store.get_node(node.id)))
                     return
                 if node.id == project_id or contract.scale.value != "focused":
@@ -2071,18 +2478,13 @@ class Runner:
                     if semantic_audit is not None and semantic_audit.decision is PlanAuditDecision.REJECT:
                         await self.store.update_run(
                             run.id,
-                            status=RunStatus.FAILED,
-                            outcome=Outcome.FAIL,
                             summary="semantic organization plan rejected",
                             error="; ".join(
                                 semantic_audit.required_changes or semantic_audit.findings
                             ),
                             retry_recommended=False,
                         )
-                        await self.store.set_status(node.id, NodeStatus.FAILED)
-                        await self._request_reviews_for_node(
-                            node.id, "semantic_plan_rejected"
-                        )
+                        await self.store.set_status(node.id, NodeStatus.RUNNABLE)
                         await self._emit(
                             "node.updated",
                             project_id,
@@ -2423,7 +2825,7 @@ class Runner:
                     updated = await self.store.reset_node_after_rejection(
                         item.id,
                         item.status,
-                        agent_state="correction_requested" if item.id == target.id else None,
+                        agent_state="correction_required" if item.id == target.id else None,
                         agent_message=correction if item.id == target.id else None,
                     )
                     await self._emit("node.updated", project_id, _dump(updated or item))
@@ -2610,6 +3012,30 @@ class Runner:
         *,
         boundaries: list[Node] | None = None,
     ):
+        lock = self._organization_review_locks.setdefault(
+            project_id, asyncio.Lock()
+        )
+        if lock.locked():
+            return []
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("organization review requires an asyncio task")
+        self._organization_review_tasks[project_id] = task
+        try:
+            async with lock:
+                return await self._review_organizations_locked(
+                    project_id, boundaries=boundaries
+                )
+        finally:
+            if self._organization_review_tasks.get(project_id) is task:
+                self._organization_review_tasks.pop(project_id, None)
+
+    async def _review_organizations_locked(
+        self,
+        project_id: uuid.UUID,
+        *,
+        boundaries: list[Node] | None = None,
+    ):
         """Run the durable manager review before a project is accepted."""
         nodes, edges, _ = await self.store.get_workgraph(project_id)
         if boundaries is None:
@@ -2620,6 +3046,10 @@ class Runner:
                 and node.organization_contract.scale.value != "focused"
                 and node.status in {NodeStatus.EXPANDED, NodeStatus.COMPLETE}
                 and node.manager_phase not in {ManagerPhase.ACCEPTED, ManagerPhase.BLOCKED}
+                and not (
+                    node.organization_review is not None
+                    and node.organization_review.control_retry_required
+                )
             ]
         else:
             current = {node.id: node for node in nodes}
@@ -2627,6 +3057,10 @@ class Runner:
                 current[node.id]
                 for node in boundaries
                 if node.id in current
+                and not (
+                    current[node.id].organization_review is not None
+                    and current[node.id].organization_review.control_retry_required
+                )
             ]
         boundaries.sort(
             key=lambda node: len(GraphWalker(nodes, edges).ancestors(node.id)),
@@ -2634,6 +3068,8 @@ class Runner:
         )
         decisions = []
         for boundary in boundaries:
+            if boundary.id in self._cancelling_nodes:
+                continue
             if boundary.manager_phase not in {
                 ManagerPhase.ACCEPTED,
                 ManagerPhase.BLOCKED,
@@ -2656,6 +3092,8 @@ class Runner:
                 )
                 try:
                     manager_result = await reviewer(snapshot)
+                    if boundary.id in self._cancelling_nodes:
+                        continue
                     if manager_result.plan is not None:
                         contract = boundary.organization_contract
                         if contract is not None:
@@ -2686,12 +3124,20 @@ class Runner:
                         self.store, boundary.id, manager_result
                     )
                 except Exception as error:
+                    if boundary.id in self._cancelling_nodes:
+                        continue
                     reason = "manager review unavailable: " + sanitize_control_text(error)
                     await self.organization_manager.request_review(
                         self.store,
                         boundary.id,
                         reason,
                     )
+                    current = await self.store.get_node(boundary.id)
+                    review = current.organization_review if current else None
+                    if review is not None:
+                        review.control_retry_required = True
+                        review.control_failure_reason = reason
+                        await self.store.set_organization_review(boundary.id, review)
                     await self.store.set_manager_state(
                         boundary.id,
                         phase=ManagerPhase.REVIEW_PENDING,
@@ -2927,6 +3373,9 @@ class Runner:
             raise ValueError("node is not a material organization boundary")
         if self.generation_active(node_id):
             raise RuntimeError("organization provider is still active")
+        review_lock = self._organization_review_locks.get(node.project_id)
+        if review_lock is not None and review_lock.locked():
+            raise RuntimeError("organization review is still active")
         descendants = await self.store.descendants(node_id)
         work_items = await self.store.list_work_items(
             node.project_id, organization_id=node_id
@@ -2942,6 +3391,8 @@ class Runner:
         review.phase = OrganizationPhase.EXECUTE_FRONTIER
         review.replan_requested = False
         review.last_reason = "organization review resumed after provider failure"
+        review.control_retry_required = False
+        review.control_failure_reason = None
         await self.store.set_organization_review(node_id, review)
         await self.store.set_manager_state(
             node_id,
@@ -3013,12 +3464,25 @@ class Runner:
         if existing is not None and not existing.done():
             return True
         cwd = await self._project_repo(node.project_id)
+        follow_up_run: Run | None = None
         if prompt is not None:
             # A follow-up is a new provider process with the same conversation
             # id. Close any existing provider/pane first so the prompt is
             # delivered through the provider's launch command, never into a
             # stale composer.
             await self.terminal.close_persistent_session(node_id)
+            prior_runs = await self.store.get_runs(node.id)
+            follow_up_run = await self.store.create_run(
+                node,
+                node.agent.harness.value if node.agent else node.executor or "agent",
+                len(prior_runs) + 1,
+            )
+            await self.store.set_status(node.id, NodeStatus.RUNNING)
+            await self.store.mark_run_process(
+                follow_up_run.id,
+                ProcessState.RUNNING,
+                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(node.id),
+            )
         persistent_exists = await self.terminal.has_persistent_session(node_id)
         command: list[str] | None = None
         if prompt is not None or not persistent_exists:
@@ -3039,7 +3503,10 @@ class Runner:
             )
 
         task = asyncio.create_task(
-            self._run_reconnect(node, command or ["true"], cwd, stream)
+            self._run_reconnect(
+                node, command or ["true"], cwd, stream,
+                run_id=follow_up_run.id if follow_up_run else None,
+            )
         )
         self._reconnect_tasks[node_id] = task
         # Let the Herdr control stream create and register the PTY before the API
@@ -3148,9 +3615,39 @@ class Runner:
             return True
         return await self.terminal.close_persistent_session(node_id)
 
-    async def _run_reconnect(self, node: Node, command: list[str], cwd: str, stream) -> None:
+    async def _run_reconnect(
+        self,
+        node: Node,
+        command: list[str],
+        cwd: str,
+        stream,
+        *,
+        run_id: uuid.UUID | None = None,
+    ) -> None:
         launch = self._prepare_capabilities(node.agent, cwd, node.id) if node.agent else CapabilityLaunch()
-        environment = {"TURN_PROJECT_ID": str(node.project_id)}
+        handoff_kind = (
+            "plan"
+            if node.executor == PLANNER_EXECUTOR
+            else "verification"
+            if node.agent and node.agent.type_id is AgentType.VERIFIER
+            else "result"
+        )
+        handoff_root = Path(cwd) / ".turn" / "interactive"
+        handoff_root.mkdir(parents=True, exist_ok=True)
+        handoff_path = handoff_root / f"{node.id}.{handoff_kind}.json"
+        handoff_path.unlink(missing_ok=True)
+        runs = await self.store.get_runs(node.id)
+        environment = {
+            "TURN_PROJECT_ID": str(node.project_id),
+            "TURN_RUN_ID": str(run_id or ""),
+            "TURN_NODE_ID": str(node.id),
+            "TURN_REPO": str(Path(cwd).resolve()),
+            "TURN_HANDOFF_KIND": handoff_kind,
+            "TURN_HANDOFF_FILE": str(handoff_path),
+            "TURN_STATUS_FILE": str(handoff_root / f"{node.id}.status.json"),
+            "TURN_MOCK_ATTEMPT": str(len(runs) + 1),
+            "TURN_MOCK_GENERATED_PROMPT": node.generated_prompt or node.objective,
+        }
         if launch.claude_config or launch.pi_mcp_config:
             environment["TURN_AGENT_MCP_CONFIG"] = launch.claude_config or launch.pi_mcp_config or ""
         if launch.opencode_config:
@@ -3212,6 +3709,13 @@ class Runner:
             raise
         finally:
             await self._finish_provider_terminal(node.id, node.project_id)
+            if run_id is not None:
+                try:
+                    saved_run = await self.store.get_run(run_id)
+                    if saved_run is not None:
+                        await self._reconcile_run_process(saved_run, node.id)
+                except Exception:
+                    await self.store.mark_run_process(run_id, ProcessState.UNKNOWN)
             self._reconnect_tasks.pop(node.id, None)
 
     async def pause(self, node_id: uuid.UUID) -> None:
@@ -3227,41 +3731,77 @@ class Runner:
         self.wake()
 
     async def cancel(self, node_id: uuid.UUID) -> None:
+        await self._cancel_node_by_id(node_id)
+
+    async def _cancel_node_by_id(self, node_id: uuid.UUID) -> None:
         node = await self.store.get_node(node_id)
         if node is None:
             return
+        self._cancelling_nodes.add(node_id)
+        try:
+            await self._cancel_node(node)
+        finally:
+            self._cancelling_nodes.discard(node_id)
+
+    async def _cancel_node(self, node: Node) -> None:
+        node_id = node.id
         self._recovered_active_node_ids.discard(node_id)
         self._recovered_run_ids.pop(node_id, None)
         await self._stop_handoff_watcher(node_id)
-        reconnect = self._reconnect_tasks.get(node_id)
-        if reconnect is not None and not reconnect.done():
-            # A follow-up runs in a separate reconnect task, but Stop has the
-            # same lifecycle meaning as it does for a normal worker: terminate
-            # the provider and make the next user action an explicit fresh run.
+        # A control Run may own a synthetic Herdr pane rather than the graph
+        # node's pane. Stop every exact active owner before settling any Run;
+        # stopping only node_id is how control writers leaked across retries.
+        active_runs = [
+            run
+            for run in await self.store.get_runs(node_id)
+            if run.status is RunStatus.RUNNING
+        ]
+        process_owners = {
+            run.process_owner_id or node_id
+            for run in active_runs
+        }
+        process_owners.add(node_id)
+        for owner_id in process_owners:
+            await self.terminal.stop(owner_id)
+            # ``stop`` is the provider-termination boundary. The transport
+            # contract requires it to await the provider's cleanup (Herdr
+            # closes the pane as part of stop); calling the broader close
+            # operation here would duplicate termination for transports that
+            # implement close as stop + release.
+        tasks = [
+            task
+            for task in (
+                self._reconnect_tasks.get(node_id),
+                self._running.get(node_id),
+                self._shell_tasks.get(node_id),
+            )
+            if task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ]
+        should_settle = bool(active_runs) or node.status not in {
+            NodeStatus.COMPLETE,
+            NodeStatus.CANCELLED,
+        }
+        # The provider boundary is closed before publishing the terminal node
+        # decision. This keeps CANCELLED truthful while fencing late results.
+        await self._cancel_active_runs(node_id)
+        if should_settle:
             await self._mark_cancelled(node)
-            await self.terminal.stop(node_id)
-            reconnect.cancel()
-            await asyncio.gather(reconnect, return_exceptions=True)
-            self.wake()
-            return
-        task = self._running.get(node_id)
-        if task is not None and not task.done():
-            # Stop the provider before cancelling Turn's awaiter. This makes
-            # Stop effective even when the task is inside a native harness
-            # call rather than inside the runner's Python bookkeeping.
-            await self._mark_cancelled(node)
-            await self.terminal.stop(node_id)
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            current = await self.store.get_node(node_id)
-            if current is not None and current.status is NodeStatus.RUNNING:
-                await self.store.set_status(node_id, NodeStatus.CANCELLED)
-                await self._emit(
-                    "node.updated", node.project_id, _dump(await self.store.get_node(node_id))
-                )
-        else:
-            await self.terminal.stop(node_id)
-            await self._mark_cancelled(node)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        review_task = self._organization_review_tasks.get(node.project_id)
+        if (
+            review_task is not None
+            and review_task is not asyncio.current_task()
+            and not review_task.done()
+        ):
+            # A provider review is scheduler-driven rather than stored in the
+            # node task map. Keep the cancellation fence installed until that
+            # operation has observed the stopped provider and unwound.
+            await asyncio.gather(review_task, return_exceptions=True)
         self.wake()
 
     async def branch_action(self, node_id: uuid.UUID, action: str) -> None:
@@ -3278,19 +3818,9 @@ class Runner:
             for target in targets:
                 await self.store.set_paused(target.id, False)
         elif action == "cancel":
-            cancelling: list[asyncio.Task] = []
             for target in targets:
-                await self._stop_handoff_watcher(target.id)
-                task = self._running.get(target.id)
-                if task:
-                    await self.terminal.stop(target.id)
-                    task.cancel()
-                    cancelling.append(task)
-                elif target.status not in (NodeStatus.COMPLETE, NodeStatus.CANCELLED):
-                    await self.terminal.stop(target.id)
-                    await self.store.set_status(target.id, NodeStatus.CANCELLED)
-            if cancelling:
-                await asyncio.gather(*cancelling, return_exceptions=True)
+                if target.status not in (NodeStatus.COMPLETE, NodeStatus.CANCELLED):
+                    await self._cancel_node_by_id(target.id)
         else:
             raise ValueError(f"unsupported branch action: {action}")
         await self._emit("graph.branch_updated", node.project_id, {"root": str(node_id), "action": action})
@@ -3301,22 +3831,26 @@ class Runner:
         self._manual_stages.pop(project_id, None)
         nodes, _, _ = await self.store.get_workgraph(project_id)
         for node in nodes:
-            await self._stop_handoff_watcher(node.id)
-        tasks = [self._running[node.id] for node in nodes if node.id in self._running]
-        tasks.extend(
-            task for node in nodes
-            for task in [self._reconnect_tasks.get(node.id)]
-            if task is not None and not task.done()
-        )
-        tasks.extend(
-            task for node in nodes
-            for task in [self._shell_tasks.get(node.id)]
-            if task is not None and not task.done()
-        )
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            runs = await self.store.get_runs(node.id)
+            active = any(run.status is RunStatus.RUNNING for run in runs)
+            has_task = any(
+                task is not None and not task.done()
+                for task in (
+                    self._running.get(node.id),
+                    self._reconnect_tasks.get(node.id),
+                    self._shell_tasks.get(node.id),
+                )
+            )
+            if active or has_task or node.status not in {
+                NodeStatus.COMPLETE,
+                NodeStatus.CANCELLED,
+            }:
+                await self._cancel_node_by_id(node.id)
+            else:
+                # Completed nodes can still have a retained inspection pane;
+                # release it through the same provider boundary rather than
+                # leaving project deletion to race a live shell.
+                await self.terminal.close_persistent_session(node.id)
 
     # -- manual stepping --------------------------------------------------
 
@@ -3333,6 +3867,8 @@ class Runner:
         """Manually execute a specific node regardless of auto-run mode."""
         node = await self.store.get_node(node_id)
         if node is None:
+            return None
+        if node.runtime_guard is not None:
             return None
         if node.project_id in self._deleting_projects:
             return None
@@ -3490,6 +4026,7 @@ class Runner:
             ),
             timeout_seconds=policy.timeout_seconds if policy else self.s.default_run_timeout_seconds,
             stall_timeout_seconds=policy.stall_timeout_seconds if policy else self.s.stall_timeout_seconds,
+            run_id=run_id,
             telemetry=_telemetry,
         )
 
@@ -3532,6 +4069,21 @@ class Runner:
         await self.store.set_status(node.id, NodeStatus.CANCELLED)
         updated = await self.store.get_node(node.id)
         await self._emit("node.updated", n.project_id, _dump(updated or n))
+
+    async def _cancel_active_runs(self, node_id: uuid.UUID) -> None:
+        """Settle attempts only after the provider terminal is stopped."""
+        for run in await self.store.get_runs(node_id):
+            if run.status is not RunStatus.RUNNING:
+                continue
+            await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="run cancelled",
+                error="run cancelled by user",
+                retry_recommended=False,
+            )
 
     async def _reset_provider_session(self, node_id: uuid.UUID) -> str | None:
         """Clear the provider session and return the identity being retired."""
@@ -3579,6 +4131,28 @@ class Runner:
         if n is not None:
             await self._request_reviews_for_node(node.id, "child_failed")
             await self._emit("node.updated", n.project_id, _dump(n))
+
+    async def _reject_submission(self, node: Node, detail: str) -> None:
+        """Keep the current attempt alive while a provider corrects its handoff."""
+        run = await self.store.active_run(node.id)
+        if run is None:
+            return
+        accepted = await self.store.mark_submission_rejected(
+            node.id,
+            run_id=run.id,
+            message=f"submission rejected: {sanitize_control_text(detail)}. Correct and resubmit on the same Run.",
+        )
+        if not accepted:
+            return
+        await self._emit(
+            "harness.submission.rejected",
+            node.project_id,
+            {"node_id": str(node.id), "run_id": str(run.id), "reason": detail},
+        )
+        await self._ensure_handoff_watcher(
+            node.id, node.project_id, await self._project_repo(node.project_id)
+        )
+        self.wake()
 
     async def _request_reviews_for_node(
         self, node_id: uuid.UUID, reason: str

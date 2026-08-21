@@ -44,7 +44,7 @@ from turn.domain.organization import (
     HandoffContract,
     OrganizationContract,
 )
-from turn.workers.base import NodeExecutionContext, Planner, render_context_block
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Planner, render_context_block
 from turn.workers.harnesses import recover_session_id
 from turn.workers.harness_catalog import HarnessCommandFactory, codex_project_root_flags
 from turn.workers.interactive import (
@@ -53,6 +53,7 @@ from turn.workers.interactive import (
     prepare_result_file,
     read_codex_session_usage,
     read_result_file,
+    read_submission_file,
     run_until_result,
 )
 from turn.workers.terminal import GenerationStalled, LocalPtyTransport
@@ -194,6 +195,7 @@ class CodexPlanner(Planner):
             session_callback=ctx.session_callback,
             telemetry=ctx.telemetry,
             forbidden_session_id=ctx.forbidden_session_id,
+            run_id=ctx.run_id,
         )
         plan = AgentPlanner._parse_plan(text, ctx.node.objective)
         if plan is not None:
@@ -205,6 +207,8 @@ class CodexPlanner(Planner):
             plan.usage = usage
             plan.session_id = session_id
             return plan
+        if text:
+            raise InvalidSubmission("planner returned an invalid Turn plan")
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
 
     @staticmethod
@@ -235,6 +239,7 @@ class CodexPlanner(Planner):
         forbidden_session_id: str | None = None,
         project_repo_path: str | None = None,
         handoff_kind: str = "plan",
+        run_id: str | None = None,
     ) -> tuple[str, Usage, str | None]:
         if shutil.which(self.s.codex_binary) is None:
             return "", Usage(), None
@@ -254,6 +259,7 @@ class CodexPlanner(Planner):
             agent,
             data_dir=self.s.data_dir,
             project_repo_path=project_repo_path,
+            run_id=run_id,
         )
         if project_id is not None:
             environment["TURN_PROJECT_ID"] = str(project_id)
@@ -362,7 +368,10 @@ class CodexPlanner(Planner):
                 machine_output_handler=emit_machine_event if (sidecar or live_machine_events) else None,
                 capture_machine_output=machine_output_path is not None,
             )
-            if result.returncode != 0:
+            submitted_present, submitted = read_submission_file(result_path)
+            if submitted_present and submitted is None:
+                raise InvalidSubmission("Codex planner returned an invalid JSON submission")
+            if submitted is None and result.returncode != 0:
                 detail = result.output.decode(errors="replace").strip()
                 if len(detail) > 2000:
                     detail = detail[-2000:]
@@ -386,9 +395,8 @@ class CodexPlanner(Planner):
                     harness="codex",
                     unavailable_detail="Codex completed without a notify rollout; lifecycle evidence remains available but tool metrics are unavailable for this run.",
                 )
-            if result.stalled:
+            if submitted is None and result.stalled:
                 raise GenerationStalled(f"planner produced no output for {stall_timeout:g} seconds")
-            submitted = read_result_file(result_path)
             if submitted is not None:
                 structured = json.dumps(submitted)
             usage = read_codex_session_usage(observed_session or session_id)
@@ -444,6 +452,8 @@ class AgentPlanner(Planner):
         if plan is not None:
             plan.session_id = agent.session_id
             return plan
+        if text:
+            raise InvalidSubmission("planner returned an invalid Turn plan")
         raise RuntimeError("planner returned no valid turn-plan; no heuristic fallback is enabled")
 
     async def call_structured(
@@ -480,6 +490,7 @@ class AgentPlanner(Planner):
                 forbidden_session_id=ctx.forbidden_session_id,
                 project_repo_path=ctx.project_repo_path,
                 handoff_kind=handoff_kind,
+                run_id=ctx.run_id,
             )
         else:
             raw = await self._call_harness(
@@ -582,6 +593,7 @@ class AgentPlanner(Planner):
                 agent,
                 data_dir=self.s.data_dir,
                 project_repo_path=ctx.project_repo_path,
+                run_id=ctx.run_id,
             )
             telemetry_sidecar: NativeTelemetrySidecar | None = None
             claude_settings = None
@@ -684,7 +696,10 @@ class AgentPlanner(Planner):
                     idle_warning=self.s.terminal_idle_warning_seconds,
                     idle_reap=self.s.terminal_idle_reap_seconds,
                 )
-            if result.returncode != 0:
+            submitted_present, submitted = read_submission_file(result_path)
+            if submitted_present and submitted is None:
+                raise InvalidSubmission(f"{agent.harness.value} planner returned an invalid JSON submission")
+            if submitted is None and result.returncode != 0:
                 detail = result.output.decode(errors="replace").strip()
                 if len(detail) > 2000:
                     detail = detail[-2000:]
@@ -692,7 +707,7 @@ class AgentPlanner(Planner):
                     f"{agent.harness.value} planner harness exited {result.returncode}"
                     + (f": {detail}" if detail else "")
                 )
-            if result.stalled:
+            if submitted is None and result.stalled:
                 raise GenerationStalled(f"planner produced no output for {ctx.stall_timeout_seconds:g} seconds")
             raw_output = result.output.decode(errors="replace")
             if not native:
@@ -700,7 +715,6 @@ class AgentPlanner(Planner):
             if telemetry_sidecar is not None and telemetry_records == 0:
                 await emit_telemetry_status(ctx.telemetry, harness=agent.harness.value, source=telemetry_sidecar.source,
                                             status="degraded", detail=f"{agent.harness.value} completed without structured hook events; lifecycle evidence remains available but tool metrics are unavailable for this run.")
-            submitted = read_result_file(result_path)
             text = json.dumps(submitted) if submitted is not None else ""
             if agent.harness == HarnessKind.OPENCODE and not agent.session_id:
                 agent.session_id = recover_session_id(text)

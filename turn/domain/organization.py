@@ -311,6 +311,11 @@ class OrganizationReview(BaseModel):
     audit_required_changes: list[str] = Field(default_factory=list)
     audit_correction_count: int = Field(default=0, ge=0)
     audit_updated_at: datetime | None = None
+    # A provider/control failure is retryable, but must require an explicit
+    # resume. Otherwise an auto-run heartbeat immediately re-enters the same
+    # failed review and can launch an unbounded stream of control attempts.
+    control_retry_required: bool = False
+    control_failure_reason: str | None = None
 
 
 class PlanAudit(BaseModel):

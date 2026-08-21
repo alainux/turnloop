@@ -15,8 +15,10 @@ from turn.domain.schemas import (
     InputSpec,
     NodeStatus,
     Outcome,
+    ProcessState,
     RunPolicy,
     RunStatus,
+    RuntimeGuard,
     SubgraphRef,
     VerificationResult,
 )
@@ -37,6 +39,11 @@ class GraphInspectionRun(BaseModel):
     started_at: datetime
     ended_at: Optional[datetime] = None
     session_id: Optional[str] = None
+    process_state: ProcessState = ProcessState.LAUNCH_REQUESTED
+    process_exit_code: Optional[int] = None
+    pane_id: Optional[str] = None
+    provider: Optional[str] = None
+    accepted_submission: bool = False
 
 
 class GraphInspectionArtifact(BaseModel):
@@ -66,6 +73,7 @@ class GraphInspectionNode(BaseModel):
     session_id: Optional[str] = None
     agent_state: Optional[str] = None
     agent_message: Optional[str] = None
+    runtime_guard: Optional[RuntimeGuard] = None
     verification: Optional[VerificationResult] = None
     paused: bool = False
     auto_run: bool = True

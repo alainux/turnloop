@@ -245,6 +245,7 @@ def mock_workflow_definitions() -> tuple[MockWorkflowDefinition, ...]:
 async def seed_mock_workflows(store: Store) -> list[str]:
     """Create the process-harness lab projects once."""
     projects = await store.list_projects()
+    catalog = CapabilityCatalog(store.data_dir / "capabilities")
     existing = {project.project_name or project.objective for project in projects}
     existing_by_title = {
         project.project_name or project.objective: project for project in projects
@@ -260,6 +261,13 @@ async def seed_mock_workflows(store: Store) -> list[str]:
             existing_by_title.pop(title, None)
         elif project.agent is not None and project.agent.harness is HarnessKind.MOCK:
             await _migrate_persisted_mock_project(store, project)
+            if project.repo_path:
+                # The mock lab is a server-owned fixture. Reconcile its
+                # project-local capability packages on every startup so a
+                # persisted project behaves like a freshly seeded project
+                # after the capability catalog or fixture code changes.
+                for entry in catalog.list():
+                    catalog.load_into_project(entry.id, project.repo_path)
 
     # Keep already-seeded test-lab projects aligned with the professional
     # Mock naming without creating duplicate projects on a server restart.
@@ -305,7 +313,6 @@ async def seed_mock_workflows(store: Store) -> list[str]:
             ),
             run_policy=RunPolicy(auto_run=definition.auto_run),
         )
-        catalog = CapabilityCatalog(store.data_dir / "capabilities")
         for entry in catalog.list():
             catalog.load_into_project(entry.id, repo_path)
         plan_path = Path(repo_path) / ".turn" / "mock-plan.json"

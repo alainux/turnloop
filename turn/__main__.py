@@ -460,6 +460,13 @@ def agent_command(args) -> int:
     except SystemExit as error:
         logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=str(error), data={"response_status": "error", "node_id": os.getenv("TURN_NODE_ID")})
         raise
+    # The launch environment is the trusted binding between a provider turn
+    # and its persisted execution attempt.  Adding it at the protocol edge
+    # keeps every harness adapter on the same wire contract while allowing
+    # agents to omit boilerplate from their JSON.
+    raw_run_id = os.getenv("TURN_RUN_ID", "").strip()
+    if raw_run_id and "run_id" not in value:
+        value = {**value, "run_id": raw_run_id}
     try:
         if getattr(args, "graph_file", None) and kind != "plan":
             raise ValueError("--graph-file is only valid for plan submissions")
@@ -495,6 +502,16 @@ def agent_command(args) -> int:
             if isinstance(error, ValidationError)
             else str(error)
         )
+        status_path = os.getenv("TURN_STATUS_FILE")
+        if status_path:
+            _write_agent_json(
+                Path(status_path),
+                {
+                    "node_id": os.getenv("TURN_NODE_ID"),
+                    "state": "correction_required",
+                    "message": f"submission rejected: {detail}; correct and resubmit on the same Run",
+                },
+            )
         logger.emit_sync(project_id, kind="agent.action", action=action, status="error", source="cli", message=detail, data={"node_id": os.getenv("TURN_NODE_ID"), "kind": kind, "response_status": "rejected"})
         raise SystemExit(f"invalid {kind} submission: {detail}") from error
     try:
@@ -510,7 +527,10 @@ def agent_command(args) -> int:
     if status_path:
         _write_agent_json(Path(status_path), {
             "node_id": os.getenv("TURN_NODE_ID"),
-            "state": "complete" if kind in {"result", "verification"} else "working",
+            # Submission is an informational handoff marker. The accepted
+            # structured outcome is the only authority allowed to settle the
+            # Run/Node lifecycle in the server.
+            "state": "submitted",
             "message": "submission received",
         })
     logger.emit_sync(project_id, kind="agent.action", action=action, status="ok", source="cli", message="agent submission published", data={**_cli_invocation_data(args), "kind": kind, "response_status": "accepted"})

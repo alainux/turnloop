@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# CAUTION FOR AI OPERATORS: Herdr is an existing daemon. It cannot be launched
+# inside subprocesses or from Herdr itself. Do not launch Herdr here; this
+# script launches Turn only and requests the already-running Herdr client.
+# Do not try to launch Herdr here.
 # Start the Turn UI server.
 #
 # The served app uses real harnesses only. Deterministic test modes are loaded

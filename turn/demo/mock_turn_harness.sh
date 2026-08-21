@@ -10,6 +10,32 @@ if [[ "${1:-}" == "--reconnect" ]]; then
   prompt="${*:3}"
   printf 'mock-turn: resumed session %s\n' "$session_id"
   printf 'mock-turn: follow-up prompt received (%s bytes)\n' "${#prompt}"
+  handoff_kind="${TURN_HANDOFF_KIND:-result}"
+  handoff_file="${TURN_HANDOFF_FILE:?TURN_HANDOFF_FILE is required for reconnect}"
+  generated_prompt="${TURN_MOCK_GENERATED_PROMPT:-}"
+  case "$handoff_kind" in
+    verification)
+      payload='{"decision":"APPROVE","summary":"The follow-up review accepts the corrected work.","findings":[],"required_changes":[],"evidence_refs":[]}'
+      printf '%s\n' "$payload" | turn agent verify --stdin
+      ;;
+    result)
+      if [[ "$generated_prompt" == *"MOCK_RERUN"* ]]; then
+        payload='{"outcome":"COMPLETE","summary":"Fresh follow-up pass complete.","artifacts":[{"name":"second-pass","content":"new output"}]}'
+      else
+        payload='{"outcome":"COMPLETE","summary":"The requested correction is complete.","artifacts":[{"name":"corrected","content":"corrected output"}]}'
+      fi
+      printf '%s\n' "$payload" | turn agent submit --kind result --stdin
+      ;;
+    plan)
+      printf '%s\n' '{"nodes":[]}' | turn agent submit --kind plan --stdin
+      ;;
+    *)
+      printf 'mock-turn: unsupported reconnect handoff kind: %s\n' "$handoff_kind" >&2
+      exit 2
+      ;;
+  esac
+  printf 'mock-turn: cli submission accepted (kind=%s)\n' "$handoff_kind"
+  printf 'mock-turn: process exiting 0\n'
   exit 0
 fi
 

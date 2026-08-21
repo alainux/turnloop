@@ -69,6 +69,7 @@ def test_graph_motion_is_truthful_and_manual_run_is_first_class():
     assert "error instanceof ApiError" in app
     assert "error.status === 404" in app
     assert "clearDeletedProject" in app
+    assert '"terminal_node_id"' in api
 
 
 def test_work_view_exposes_independent_backlog_detail():
@@ -147,6 +148,39 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "await emit_jsonl_telemetry" in worker
     assert "Telemetry {telemetryStatus(telemetry)}" in terminal
     assert "telemetry-unavailable" in css
+    assert "terminalNodeId" in terminal
+    assert 'endpoint = controlTerminal ? "terminal" : "shell"' in terminal
+    assert "streamNodeId" in terminal
+
+
+def test_terminal_finish_is_a_transcript_and_status_heartbeats_do_not_replay_backlog():
+    terminal = source("components", "TerminalView.tsx")
+    api = (ROOT / "turn" / "server" / "api.py").read_text()
+    assert '"TRANSCRIPT"' in terminal
+    assert "sessionEnded" in terminal
+    assert 'connection !== "transcript"' in terminal
+    assert "if chunk is None:" in api
+    assert 'if chunk == "":' in api
+    status_block = api[api.index("async def send_status"):api.index("status_sender =", api.index("async def send_status"))]
+    assert '"output"' not in status_block
+
+
+def test_herdr_boundary_warning_is_visible_on_every_operator_surface():
+    herdr = (ROOT / "turn" / "workers" / "herdr.py").read_text()
+    terminal = source("components", "TerminalView.tsx")
+    inspector = source("components", "Inspector.tsx")
+    api = (ROOT / "turn" / "server" / "api.py").read_text()
+    explorer = (ROOT / "turn" / "tools" / "graph_explorer.py").read_text()
+    agents = (ROOT / "AGENTS.md").read_text()
+    readme = (ROOT / "README.md").read_text()
+    run_script = (ROOT / "scripts" / "run.sh").read_text()
+    for content in (herdr, terminal, inspector, api, explorer, agents, readme, run_script):
+        assert "CANNOT BE LAUNCHED" in content or "cannot be launched" in content
+        assert "DO NOT TRY TO LAUNCH HERDR" in content.upper() or "do not launch Herdr" in content
+    assert "HerdrBoundaryError" in herdr and "retry_suppressed" in api
+    assert 'message.type === "runtime_guard"' in terminal
+    assert 'aria-label="Runtime guard"' in inspector
+    assert "RUNTIME GUARD" in explorer
 
 
 def test_quality_panel_reuses_the_logs_panel_shell_and_record_layout():
@@ -217,10 +251,13 @@ def test_only_readme_and_design_are_product_markdown_documents():
     implementation_docs = {
         "TURN_ORCHESTRATION_REVIEW.md",
         "Turn P0–P1 Implementation Brief.md",
-            "P0-P1-REVISED.md",
-            "P0-P1-FINAL.md",
-            "MISTAKES.md",
+        "P0-P1-REVISED.md",
+        "P0-P1-FINAL.md",
+        "P0-P1-HARDEN.md",
+        "MISTAKES.md",
+        "FOUND_BUGS.md",
         "SEEN_ISSUES.md",
+        "GOAL.md",
     }
     product_docs = sorted(
         path.name

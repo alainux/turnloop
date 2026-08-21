@@ -555,8 +555,8 @@ async def test_injected_crash_after_process_start_returns_failure_without_exit_m
     assert result.returncode == 17
 
 
-async def test_codex_worker_rejects_a_valid_handoff_with_a_nonzero_exit(tmp_path, monkeypatch):
-    """A crash after writing a result is still a failed harness attempt."""
+async def test_codex_worker_accepts_a_valid_handoff_with_a_nonzero_exit(tmp_path, monkeypatch):
+    """A valid handoff remains authoritative after a diagnostic crash exit."""
     from turn.domain.schemas import AgentConfig, HarnessKind, Node
     from turn.workers.base import NodeExecutionContext
     from turn.workers.codex_worker import CodexWorker
@@ -590,8 +590,8 @@ async def test_codex_worker_rejects_a_valid_handoff_with_a_nonzero_exit(tmp_path
         NodeExecutionContext(node=node, repo_path=str(tmp_path), terminal=CrashedTransport())
     )
 
-    assert result.outcome.value == "FAIL"
-    assert "exited 9" in result.summary
+    assert result.outcome.value == "COMPLETE"
+    assert result.summary == "reported before crashing"
 
 
 async def test_injected_process_waits_for_handoff_after_control_task_ends(tmp_path):

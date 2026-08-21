@@ -17,10 +17,11 @@ from typing import Any
 from turn.config import Settings, settings
 from turn.contracts.dag import parse_result, parse_verification
 from turn.domain.schemas import AgentConfig, AgentType, HarnessKind, PlanResult, WorkerResult
-from turn.workers.base import NodeExecutionContext, Planner, Worker, render_context_block
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Planner, Worker, render_context_block
 from turn.workers.interactive import (
     agent_environment,
     read_result_file,
+    read_submission_file,
     run_until_result,
 )
 from turn.capabilities.catalog import CapabilityCatalog
@@ -92,6 +93,7 @@ async def _launch(
         ctx.node.agent,
         data_dir=runtime.data_dir,
         project_repo_path=ctx.project_repo_path,
+        run_id=ctx.run_id,
     )
     session_id = _session_for(ctx)
     # This fixture deliberately keeps the injected shell command short. The
@@ -141,9 +143,11 @@ async def _launch(
             process_exit_path=process_exit_path,
             keep_attached=False,
         )
-        if terminal.returncode != 0:
+        submitted_present, submitted = read_submission_file(result_path)
+        if submitted_present and submitted is None:
+            raise InvalidSubmission("mock harness returned an invalid JSON submission")
+        if submitted is None and terminal.returncode != 0:
             raise RuntimeError(f"mock harness exited with status {terminal.returncode}")
-        submitted = read_result_file(result_path)
         if submitted is None:
             raise RuntimeError("mock harness exited without a handoff")
         return submitted
@@ -197,7 +201,10 @@ class MockHarnessPlanner(Planner):
             prompt=f"{ctx.node.generated_prompt or ctx.node.objective}\n{render_context_block(ctx)}",
             runtime=self.runtime,
         )
-        plan = PlanResult.model_validate(payload)
+        try:
+            plan = PlanResult.model_validate(payload)
+        except (TypeError, ValueError) as error:
+            raise InvalidSubmission(f"mock planner returned an invalid plan: {error}") from error
         plan.session_id = session_id
         return plan
 
@@ -222,13 +229,19 @@ class MockHarnessWorker(Worker):
             runtime=self.runtime,
         )
         if verification:
-            decision = parse_verification(payload)
+            try:
+                decision = parse_verification(payload)
+            except (TypeError, ValueError) as error:
+                raise InvalidSubmission(f"mock verifier returned an invalid verification: {error}") from error
             return WorkerResult(
                 outcome="COMPLETE",
                 summary=decision.summary,
                 verification=decision,
                 session_id=session_id,
             )
-        result = parse_result(json.dumps(payload))
+        try:
+            result = parse_result(json.dumps(payload))
+        except (TypeError, ValueError) as error:
+            raise InvalidSubmission(f"mock worker returned an invalid result: {error}") from error
         result.session_id = session_id
         return result

@@ -35,6 +35,9 @@ interface Props {
   onTriggerSelect: (trigger: Trigger) => void;
 }
 export const nodeStatusLabel = (node: GraphNode) => {
+  if (node.runtime_guard) {
+    return `${node.runtime_guard.code} — ${node.runtime_guard.message}`;
+  }
   const machineState =
     node.status === "RUNNING" || node.generation_active
       ? node.agent_state ?? (node.generation_active ? "generating" : "starting")

@@ -9,6 +9,10 @@ Herdr is an external, user-owned daemon. Turn is a client of that daemon: it
 must never start, stop, or otherwise own the Herdr server lifecycle. Every
 command in this adapter is a client operation sent through Herdr's existing
 socket service.
+
+CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR
+FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR. REQUEST/USE THE ALREADY-RUNNING
+HERDR DAEMON.
 """
 from __future__ import annotations
 
@@ -20,8 +24,63 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+HERDR_OPERATOR_WARNING = (
+    "CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES "
+    "OR FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR. "
+    "REQUEST/USE THE ALREADY-RUNNING HERDR DAEMON."
+)
+
+
 class HerdrAdapterError(RuntimeError):
     """A Herdr command failed or returned an invalid response."""
+
+
+class HerdrBoundaryError(HerdrAdapterError):
+    """Turn was launched from a Herdr-owned process boundary.
+
+    Herdr is a user-owned daemon.  A Turn process may be its client, but a
+    process already running inside Herdr must not invoke the Herdr client
+    again.  Treat this as a permanent launch-boundary error so the runner can
+    persist a visible guard instead of retrying a request that can never work.
+    """
+
+    code = "herdr_nested_invocation"
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"{HERDR_OPERATOR_WARNING} Turn is running inside a Herdr-owned process "
+            "and cannot invoke the Herdr client. Stop this nested launch, start Turn once "
+            "from a normal host shell (for example scripts/run.sh), and do not run `herdr server`. "
+            "No provider was launched and retries are disabled."
+        )
+
+
+class HerdrUnavailableError(HerdrAdapterError):
+    """Herdr client/daemon access is unavailable and must not be retried."""
+
+    code = "herdr_unavailable"
+
+    def __init__(self, detail: str | None = None) -> None:
+        suffix = f" Detail: {detail}" if detail else ""
+        super().__init__(
+            f"{HERDR_OPERATOR_WARNING} Herdr is required for Turn terminal management, but the existing Herdr "
+            "client/daemon is unavailable. Turn does not launch, restart, or replace "
+            "Herdr; make the already-running daemon available, then restart Turn. "
+            "No provider was launched and retries are disabled."
+            + suffix
+        )
+
+
+def herdr_boundary_error() -> HerdrBoundaryError | None:
+    """Return the fail-closed boundary error for a nested Herdr process."""
+    return HerdrBoundaryError() if os.getenv("HERDR_ENV") == "1" else None
+
+
+def require_external_turn_process() -> None:
+    """Reject Herdr client use from a process Herdr itself owns."""
+    error = herdr_boundary_error()
+    if error is not None:
+        raise error
 
 
 class HerdrResourceNotFound(HerdrAdapterError):
@@ -144,14 +203,28 @@ class HerdrCliAdapter:
     """
 
     def __init__(self, herdr_binary: str | None = None, session: str | None = None):
+        self._boundary_error = herdr_boundary_error()
         self._herdr = herdr_binary or shutil.which("herdr")
         self._session = session if session is not None else os.getenv("HERDR_SESSION")
+
+    @property
+    def boundary_error(self) -> HerdrBoundaryError | None:
+        return self._boundary_error
+
+    @property
+    def startup_error(self) -> HerdrAdapterError | None:
+        if self._boundary_error is not None:
+            return self._boundary_error
+        if not self.available:
+            return HerdrUnavailableError("herdr executable was not found on PATH")
+        return None
 
     @property
     def available(self) -> bool:
         return bool(self._herdr)
 
     def command(self, *args: str) -> list[str]:
+        require_external_turn_process()
         if not self._herdr:
             raise HerdrAdapterError("Herdr is required for project terminal management")
         command = [self._herdr]
@@ -162,15 +235,17 @@ class HerdrCliAdapter:
 
     @staticmethod
     def _client_environment() -> dict[str, str]:
-        """Give each CLI child the context required by the Herdr client."""
-        environment = os.environ.copy()
-        # Herdr's installed client contract requires this marker for commands
-        # sent to the user-owned daemon. It is scoped to Turn's child process;
-        # Turn still does not own or launch the daemon lifecycle.
-        environment["HERDR_ENV"] = "1"
-        return environment
+        """Pass the host context without marking the client as Herdr-owned.
+
+        ``HERDR_ENV=1`` is an ownership marker used by Herdr for processes it
+        launched.  Setting it on Turn's client subprocess makes the client
+        reject itself as a nested invocation, which is exactly the boundary
+        this adapter must protect.
+        """
+        return os.environ.copy()
 
     async def _run(self, *args: str) -> dict[str, object]:
+        require_external_turn_process()
         if not self.available:
             raise HerdrAdapterError("Herdr is required for project terminal management")
         process = await asyncio.create_subprocess_exec(
@@ -197,6 +272,7 @@ class HerdrCliAdapter:
 
     async def _run_without_result(self, *args: str) -> None:
         """Run a successful side-effect command whose CLI response is empty."""
+        require_external_turn_process()
         if not self.available:
             raise HerdrAdapterError("Herdr is required for terminal commands")
         process = await asyncio.create_subprocess_exec(
@@ -219,6 +295,18 @@ class HerdrCliAdapter:
                     args[-1] if args else "unknown",
                 )
                 raise HerdrResourceNotFound(resource, resource_id)
+        lowered = detail.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "operation not permitted",
+                "connection refused",
+                "connection reset",
+                "daemon is not running",
+                "failed to connect",
+            )
+        ):
+            raise HerdrUnavailableError(detail)
         raise HerdrAdapterError(detail or f"herdr {' '.join(args)} failed")
 
     @staticmethod

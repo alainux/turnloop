@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 import sys
 import uuid
 from types import SimpleNamespace
@@ -31,6 +33,26 @@ async def test_local_pty_forwards_machine_bytes_without_transform(tmp_path):
     assert raw in transport.snapshot(node_id)["output"]
 
 
+async def test_local_pty_attaches_subscribers_created_before_process_start(tmp_path):
+    transport = LocalPtyTransport()
+    node_id = uuid.uuid4()
+    queue = transport.subscribe(node_id)
+    task = asyncio.create_task(
+        transport.run(
+            node_id,
+            [sys.executable, "-c", "print('control-ready', flush=True)"],
+            cwd=str(tmp_path),
+            timeout=5,
+        )
+    )
+    chunks: list[str] = []
+    while "control-ready" not in "".join(chunks):
+        chunks.append(await asyncio.wait_for(queue.get(), timeout=5))
+    result = await task
+    transport.unsubscribe(node_id, queue)
+    assert result.returncode == 0
+
+
 async def test_local_pty_does_not_replace_utf8_split_across_reads(tmp_path):
     transport = LocalPtyTransport()
     node_id = uuid.uuid4()
@@ -53,6 +75,76 @@ async def test_local_pty_does_not_replace_utf8_split_across_reads(tmp_path):
     assert result.returncode == 0
     assert "".join(pieces) == "─"
     assert "�" not in "".join(pieces)
+
+
+async def test_local_pty_does_not_treat_partial_utf8_decode_as_eof(tmp_path):
+    transport = LocalPtyTransport()
+    node_id = uuid.uuid4()
+    queue = transport.subscribe(node_id)
+    result = await transport.run(
+        node_id,
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,time; data='😀'.encode(); "
+                "[os.write(1, bytes([byte])) or time.sleep(.04) for byte in data]"
+            ),
+        ],
+        cwd=str(tmp_path),
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert await asyncio.wait_for(queue.get(), timeout=1) == "😀"
+    assert await asyncio.wait_for(queue.get(), timeout=1) is None
+    transport.unsubscribe(node_id, queue)
+
+
+async def test_local_pty_eagain_keeps_the_reader_alive(tmp_path, monkeypatch):
+    transport = LocalPtyTransport()
+    master_fd: int | None = None
+    injected = False
+    real_openpty = os.openpty
+    real_read = os.read
+
+    def openpty():
+        nonlocal master_fd
+        master, slave = real_openpty()
+        master_fd = master
+        return master, slave
+
+    def read(fd: int, size: int):
+        nonlocal injected
+        if fd == master_fd and not injected:
+            injected = True
+            raise BlockingIOError(errno.EAGAIN, "try again")
+        return real_read(fd, size)
+
+    monkeypatch.setattr(os, "openpty", openpty)
+    monkeypatch.setattr(os, "read", read)
+    result = await transport.run(
+        uuid.uuid4(),
+        [sys.executable, "-c", "print('after-eagain', flush=True)"],
+        cwd=str(tmp_path),
+        timeout=5,
+    )
+    assert injected
+    assert result.returncode == 0
+    assert b"after-eagain" in result.output
+
+
+async def test_local_pty_flushes_decoder_at_explicit_eof(tmp_path):
+    transport = LocalPtyTransport()
+    pieces: list[str] = []
+    result = await transport.run(
+        uuid.uuid4(),
+        [sys.executable, "-c", "import os; os.write(1, b'\\xf0')"],
+        cwd=str(tmp_path),
+        timeout=5,
+        stream=lambda _node_id, chunk: _record_terminal_chunk(pieces, chunk),
+    )
+    assert result.returncode == 0
+    assert "�" in "".join(pieces)
 
 
 async def _record_terminal_chunk(pieces: list[str], chunk: str) -> None:
@@ -283,6 +375,20 @@ async def test_herdr_retry_forces_new_command_when_pane_close_is_denied(tmp_path
     assert node_id in transport._fresh_launch_nodes
     assert transport.pane_id(node_id) is not None
     assert not await transport.has_persistent_session(node_id)
+
+
+async def test_herdr_stop_interrupts_and_closes_the_provider_pane(tmp_path):
+    adapter = MockHerdrAdapter()
+    transport = HerdrPtyTransport(str(tmp_path), adapter=adapter)
+    node_id = uuid.uuid4()
+    await transport.ensure_persistent_shell(node_id, cwd=str(tmp_path))
+    pane_id = transport.pane_id(node_id)
+
+    assert pane_id is not None
+    assert await transport.stop(node_id)
+    assert adapter.sent_keys == [(pane_id, ("esc",))]
+    assert pane_id not in adapter.panes
+    assert transport.pane_id(node_id) is None
 
 
 def test_herdr_cli_keeps_permission_errors_visible_for_lookup_commands():

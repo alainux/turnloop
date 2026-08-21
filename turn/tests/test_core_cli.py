@@ -177,7 +177,7 @@ def test_agent_cli_writes_atomic_status_and_result_handoffs(tmp_path, monkeypatc
     assert json.loads(handoff.read_text()) == {
         "outcome": "COMPLETE", "summary": "done", "artifacts": ["src"]
     }
-    assert json.loads(status.read_text())["state"] == "complete"
+    assert json.loads(status.read_text())["state"] == "submitted"
 
 
 def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch):
@@ -210,7 +210,7 @@ def test_agent_cli_replaces_prior_plan_handoff_atomically(tmp_path, monkeypatch)
     assert agent_command(args) == 0
 
     assert json.loads(handoff.read_text()) == second
-    assert json.loads(status.read_text())["state"] == "working"
+    assert json.loads(status.read_text())["state"] == "submitted"
 
 
 def test_agent_cli_does_not_clobber_a_handoff_on_malformed_stdin(tmp_path, monkeypatch):
@@ -250,7 +250,7 @@ def test_agent_cli_accepts_verification_stdin_and_completes_status(tmp_path, mon
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     assert agent_command(args) == 0
     assert json.loads(handoff.read_text()) == payload
-    assert json.loads(status.read_text())["state"] == "complete"
+    assert json.loads(status.read_text())["state"] == "submitted"
 
 
 def test_verification_parser_promotes_structured_evidence_refs():

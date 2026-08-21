@@ -114,6 +114,8 @@ describe("graph node controls", () => {
             audit_required_changes: [],
             audit_correction_count: 0,
             audit_updated_at: null,
+            control_retry_required: false,
+            control_failure_reason: null,
           },
         }),
       ),

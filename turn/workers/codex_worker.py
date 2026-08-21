@@ -26,13 +26,14 @@ from turn.domain.schemas import (
     VerificationResult,
     WorkerResult,
 )
-from turn.workers.base import NodeExecutionContext, Worker, render_context_block
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block
 from turn.workers.interactive import (
     agent_environment,
     format_verification_result,
     prepare_result_file,
     read_codex_session_usage,
     read_result_file,
+    read_submission_file,
     run_until_result,
 )
 from turn.workers import parsing
@@ -85,6 +86,7 @@ class CodexWorker(Worker):
             agent,
             data_dir=self.s.data_dir,
             project_repo_path=ctx.project_repo_path,
+            run_id=ctx.run_id,
         )
         environment["TURN_PROJECT_ID"] = str(ctx.node.project_id)
         sidecar = prepare_codex_notify_telemetry(cwd, ctx.node.id) if native else None
@@ -261,7 +263,16 @@ class CodexWorker(Worker):
                     harness="codex",
                     unavailable_detail="Codex completed without a notify rollout; lifecycle evidence remains available but tool metrics are unavailable for this run.",
                 )
-            if terminal.idle_reaped:
+            # The accepted Turn handoff is semantic authority. Read it before
+            # interpreting a provider exit, stall, or detached-idle marker;
+            # native harnesses can submit and then exit non-zero while
+            # flushing their UI/process.
+            submitted_present, submitted = read_submission_file(result_path)
+            if submitted_present and submitted is None:
+                raise InvalidSubmission("Codex returned an invalid JSON submission")
+            if submitted is not None:
+                structured_text = json.dumps(submitted)
+            elif terminal.idle_reaped:
                 return WorkerResult(
                     outcome=Outcome.FAIL,
                     summary="Codex terminal was reaped after being idle while detached",
@@ -269,14 +280,14 @@ class CodexWorker(Worker):
                     retry_recommended=False,
                     session_id=discovered_session,
                 )
-            if terminal.stalled:
+            if submitted is None and terminal.stalled:
                 return WorkerResult(
                     outcome=Outcome.FAIL,
                     summary=f"Codex stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                     error="stalled terminal output",
                     retry_recommended=False,
                 )
-            if terminal.returncode != 0:
+            if submitted is None and terminal.returncode != 0:
                 return WorkerResult(
                     outcome=Outcome.FAIL,
                     summary=f"Codex exited {terminal.returncode}",
@@ -284,9 +295,6 @@ class CodexWorker(Worker):
                     retry_recommended=False,
                     session_id=discovered_session or session_id,
                 )
-            submitted = read_result_file(result_path)
-            if submitted is not None:
-                structured_text = json.dumps(submitted)
             usage = read_codex_session_usage(discovered_session or session_id)
         except asyncio.CancelledError:
             raise
@@ -329,13 +337,7 @@ class CodexWorker(Worker):
             try:
                 decision = parse_verification(json.loads(structured_text))
             except (TypeError, ValueError, json.JSONDecodeError) as error:
-                return WorkerResult(
-                    outcome=Outcome.FAIL,
-                    summary="Codex verifier returned an invalid verification",
-                    error=str(error),
-                    retry_recommended=False,
-                    session_id=discovered_session or session_id,
-                )
+                raise InvalidSubmission(f"Codex verifier returned an invalid verification: {error}") from error
             return WorkerResult(
                 outcome=Outcome.COMPLETE,
                 summary=decision.summary,
@@ -406,7 +408,7 @@ class CodexWorker(Worker):
             gp = gp.replace(repo, cwd)
         correction = (
             ctx.node.agent_message
-            if ctx.node.agent_state == "correction_requested"
+            if ctx.node.agent_state == "correction_required"
             else None
         )
         acceptance_contract = self._acceptance_evidence_prompt(ctx)
@@ -468,12 +470,7 @@ class CodexWorker(Worker):
         try:
             result = parse_result(data)
         except (TypeError, ValueError) as error:
-            return WorkerResult(
-                outcome=Outcome.FAIL,
-                summary="codex returned an invalid Turn result",
-                error=str(error),
-                retry_recommended=False,
-            )
+            raise InvalidSubmission(f"codex returned an invalid Turn result: {error}") from error
         result.summary = parsing.clean_summary(result.summary)
         return result
 

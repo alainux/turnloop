@@ -58,6 +58,11 @@ def build_registry(
     if test_mode:
         reg.register(DeterministicWorker())
         reg.register(MockHarnessWorker(settings))
+        # Test mode may host the process-backed mock lab alongside projects
+        # configured for a real harness. Register the mock planner by its
+        # explicit node-harness key even when the workspace default planner
+        # is Codex; Runner._planner_for selects the adapter from the node.
+        reg.register_planner(MockHarnessPlanner(settings), key="mock")
     elif settings.planner != "codex":
         raise RuntimeError(
             "non-Codex planners are test-only; construct the registry with test_mode=True"

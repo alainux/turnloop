@@ -83,6 +83,8 @@ export interface ControlActivity {
   status: "running";
   started_at: string;
   attempt: number;
+  run_id: string;
+  terminal_node_id: string;
 }
 
 export interface DocumentRef {
@@ -183,12 +185,16 @@ export interface GraphNodeView {
   progress: number | null;
   agent_state: string | null;
   agent_message: string | null;
+  runtime_guard: RuntimeGuard | null;
   ui_state: NodeUIState;
   allowed_actions: Array<NodeAction>;
   state_reason: string | null;
   generation_active: boolean;
   capability_status: Array<CapabilityStatus>;
   control_activity: ControlActivity | null;
+  process_state: ProcessState | null;
+  process_exit_code: number | null;
+  process_provider: string | null;
 }
 
 export interface GraphView {
@@ -302,6 +308,7 @@ export interface Node {
   progress: number | null;
   agent_state: string | null;
   agent_message: string | null;
+  runtime_guard: RuntimeGuard | null;
 }
 
 export type NodeAction = "run" | "pause" | "resume" | "cancel" | "retry" | "edit" | "regenerate" | "provide_input";
@@ -331,7 +338,7 @@ export interface NodeSpec {
 
 export type NodeStatus = "PENDING" | "BLOCKED" | "RUNNABLE" | "RUNNING" | "EXPANDED" | "COMPLETE" | "FAILED" | "CANCELLED";
 
-export type NodeUIState = "queued" | "ready" | "running" | "preparing" | "paused" | "waiting_input" | "correction_required" | "waiting_sequence" | "complete" | "container" | "failed" | "cancelled";
+export type NodeUIState = "queued" | "ready" | "running" | "preparing" | "paused" | "waiting_input" | "correction_required" | "waiting_sequence" | "complete" | "container" | "failed" | "cancelled" | "runtime_guarded";
 
 export interface OrganizationBudget {
   max_active_workers: number | null;
@@ -408,6 +415,8 @@ export interface OrganizationReview {
   audit_required_changes: Array<string>;
   audit_correction_count: number;
   audit_updated_at: string | null;
+  control_retry_required: boolean;
+  control_failure_reason: string | null;
 }
 
 export type OrganizationScale = "focused" | "delivery" | "organization";
@@ -451,6 +460,7 @@ export interface PlanResult {
   organization_contract: OrganizationContract | null;
   usage: Usage;
   session_id: string | null;
+  run_id: string | null;
 }
 
 export interface Planner {
@@ -463,6 +473,8 @@ export interface Planner {
   capabilities: Array<string>;
   session_id: string | null;
 }
+
+export type ProcessState = "LAUNCH_REQUESTED" | "RUNNING" | "EXITED" | "UNKNOWN" | "CANCELLED";
 
 export type ReasoningLevel = "default" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -481,6 +493,16 @@ export interface Run {
   attempt: number;
   usage: Usage;
   session_id: string | null;
+  process_state: ProcessState;
+  process_pid: number | null;
+  process_exit_code: number | null;
+  process_started_at: string | null;
+  process_exited_at: string | null;
+  pane_id: string | null;
+  process_owner_id: string | null;
+  provider: string | null;
+  accepted_submission: boolean;
+  submission_id: string | null;
 }
 
 export interface RunPolicy {
@@ -503,6 +525,12 @@ export interface RunPolicy {
 }
 
 export type RunStatus = "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";
+
+export interface RuntimeGuard {
+  code: string;
+  message: string;
+  created_at: string;
+}
 
 export interface SubgraphRef {
   ref: string;
@@ -564,6 +592,7 @@ export interface VerificationResult {
   evidence_refs: Array<string>;
   evidence: Array<AcceptanceEvidence>;
   target_node_id: string | null;
+  run_id: string | null;
 }
 
 export interface Verifier {
@@ -629,6 +658,7 @@ export interface WorkerResult {
   usage: Usage;
   session_id: string | null;
   verification: VerificationResult | null;
+  run_id: string | null;
 }
 
 export type WorkspaceIsolation = "shared" | "worktree";

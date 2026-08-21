@@ -116,6 +116,7 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                 session_id=node.agent.session_id if node.agent else None,
                 agent_state=node.agent_state,
                 agent_message=node.agent_message,
+                runtime_guard=node.runtime_guard,
                 verification=node.verification,
                 paused=node.paused,
                 auto_run=node.auto_run,
@@ -152,6 +153,11 @@ async def _query(state_file: str, project_id: str, requester: str | None = None,
                         started_at=run.started_at,
                         ended_at=run.ended_at,
                         session_id=run.session_id,
+                        process_state=run.process_state,
+                        process_exit_code=run.process_exit_code,
+                        pane_id=run.pane_id,
+                        provider=run.provider,
+                        accepted_submission=run.accepted_submission,
                     )
                     for run in node_runs
                 ],
@@ -180,6 +186,8 @@ def _files_for(rows) -> list[str]:
 
 
 def _summary(item: dict) -> str:
+    # CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES
+    # OR FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR; REQUEST THE DAEMON.
     line = f"[{item['id']}] [{item['status']}|{item['executor']}] {item['objective']}"
     if item.get("parent_id"):
         line += f"  parent={item['parent_id']}"
@@ -191,6 +199,10 @@ def _summary(item: dict) -> str:
     line += f"\n  execution: paused={item['paused']}, auto_run={item['auto_run']}"
     if item.get("run_policy"):
         line += "\n  run_policy: " + json.dumps(item["run_policy"], sort_keys=True)
+    if item.get("runtime_guard"):
+        guard = item["runtime_guard"]
+        line += "\n  RUNTIME GUARD: " + str(guard.get("code", "unknown"))
+        line += " — " + str(guard.get("message", "execution blocked"))
     if item.get("required_inputs"):
         line += "\n  required_inputs: " + ", ".join(
             input_spec["id"] for input_spec in item["required_inputs"]

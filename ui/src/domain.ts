@@ -19,9 +19,11 @@ import type {
   OrganizationReview,
   PlanAudit,
   PlanAuditResult,
+  ProcessState,
   ReasoningLevel,
   Run,
   RunPolicy as GeneratedRunPolicy,
+  RuntimeGuard,
   SubgraphRef,
   Trigger,
   TriggerContext,
@@ -52,8 +54,10 @@ export type {
   OrganizationReview,
   PlanAudit,
   PlanAuditResult,
+  ProcessState,
   ReasoningLevel,
   Run,
+  RuntimeGuard,
   SubgraphRef,
   Usage,
   Trigger,
@@ -99,7 +103,11 @@ export type GraphNodeView = OptionalGenerated<
   | "exported_handoffs"
   | "required_handoffs"
   | "priority"
+  | "process_state"
+  | "process_exit_code"
+  | "process_provider"
   | "control_activity"
+  | "runtime_guard"
 >;
 export type GraphView = OptionalGenerated<
   GeneratedGraphView,
@@ -128,6 +136,7 @@ export type Project = OptionalGenerated<
   | "exported_handoffs"
   | "required_handoffs"
   | "priority"
+  | "runtime_guard"
 > & {
   subgraph_refs?: SubgraphRef[];
   trigger_context?: TriggerContext | null;

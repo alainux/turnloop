@@ -54,6 +54,17 @@ def test_test_registry_keeps_real_planner_separate_from_mock_planner():
     assert registry.get_planner("real").name == "agent-planner"
 
 
+def test_codex_test_registry_also_serves_explicit_mock_nodes():
+    registry = build_registry(
+        Settings(planner="codex", default_executor="codex"),
+        test_mode=True,
+    )
+
+    assert registry.get_planner("mock") is not None
+    assert registry.get_planner("mock").name == "mock-planner"
+    assert registry.get_planner("real") is not None
+
+
 def test_runner_selects_planner_from_the_node_harness(tmp_path):
     settings = Settings(
         data_dir=str(tmp_path / "turn"),

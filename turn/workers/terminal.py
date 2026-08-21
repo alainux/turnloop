@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import codecs
+import errno
 import json
 import os
 import pty
@@ -27,9 +28,13 @@ from typing import Awaitable, Callable, Literal, Protocol, runtime_checkable
 from turn.workers.herdr import (
     HerdrAdapter,
     HerdrAdapterError,
+    HerdrBoundaryError,
     HerdrCliAdapter,
     HerdrResourceNotFound,
+    HerdrUnavailableError,
+    herdr_boundary_error,
     is_stale_resource_error,
+    require_external_turn_process,
 )
 
 StreamCallback = Callable[[uuid.UUID, str], Awaitable[None]]
@@ -116,6 +121,9 @@ class TerminalTransport(Protocol):
     async def detach(self, node_id: uuid.UUID) -> bool: ...
     def release(self, node_id: uuid.UUID) -> bool: ...
     def snapshot(self, node_id: uuid.UUID) -> dict: ...
+    def owned_node_ids(self) -> set[uuid.UUID]: ...
+
+    def owned_node_ids_for_project(self, project_key: str) -> set[uuid.UUID]: ...
 
 
 @dataclass
@@ -124,7 +132,7 @@ class _Session:
     master_fd: int
     process: asyncio.subprocess.Process
     output: bytearray = field(default_factory=bytearray)
-    subscribers: set[asyncio.Queue[str]] = field(default_factory=set)
+    subscribers: set[asyncio.Queue[str | None]] = field(default_factory=set)
     started_at: float = field(default_factory=time.monotonic)
     last_output_at: float = field(default_factory=time.monotonic)
     last_input_at: float = field(default_factory=time.monotonic)
@@ -178,6 +186,10 @@ class LocalPtyTransport:
 
     def __init__(self, backlog_limit: int = 2_000_000, completed_session_limit: int = 32):
         self.sessions: dict[uuid.UUID, _Session] = {}
+        # A browser can subscribe just before a control stream is created.
+        # Carry that subscription into the session so the control terminal
+        # becomes live instead of staying blank after the initial snapshot.
+        self._pending_subscribers: dict[uuid.UUID, set[asyncio.Queue[str | None]]] = {}
         self.backlog_limit = backlog_limit
         self.completed_session_limit = completed_session_limit
 
@@ -254,6 +266,7 @@ class LocalPtyTransport:
             process=process,
             idle_warning_seconds=idle_warning or 300.0,
         )
+        session.subscribers.update(self._pending_subscribers.pop(node_id, set()))
         self.sessions[node_id] = session
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -261,7 +274,17 @@ class LocalPtyTransport:
         def readable() -> None:
             try:
                 chunk = os.read(master, 65536)
-            except OSError:
+            except BlockingIOError:
+                # Readiness is level-triggered and a PTY can lose the race
+                # between the readiness notification and os.read(). EAGAIN
+                # means "try again", never EOF.
+                return
+            except OSError as error:
+                if error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    return
+                # Linux PTY masters report EIO when the slave closes. That is
+                # the real EOF boundary; other errors are also terminal for
+                # this reader and must not leave the consumer waiting forever.
                 chunk = b""
             if chunk:
                 queue.put_nowait(chunk)
@@ -275,7 +298,7 @@ class LocalPtyTransport:
             while True:
                 chunk = await queue.get()
                 if chunk is None:
-                    return
+                    break
                 now = time.monotonic()
                 session.last_output_at = now
                 session.last_activity_at = now
@@ -285,11 +308,18 @@ class LocalPtyTransport:
                 # The PTY is the source of truth. Decode only at the transport
                 # boundary; never parse or rewrite a harness stream here.
                 raw_text = session.decoder.decode(chunk, final=False)
-                for subscriber in list(session.subscribers):
-                    subscriber.put_nowait(raw_text)
-                if stream is not None:
+                # A partial UTF-8 sequence legitimately decodes to an empty
+                # string. Empty text is not an event and must not be confused
+                # with the explicit EOF sentinel below.
+                if raw_text:
+                    for subscriber in list(session.subscribers):
+                        subscriber.put_nowait(raw_text)
+                if stream is not None and raw_text:
                     await stream(node_id, raw_text)
 
+                # The loop only exits on the typed EOF sentinel. The final
+                # decoder flush is therefore reachable and occurs exactly
+                # once after all bytes have been consumed.
             # Flush a partial code point when the PTY closes. This is the only
             # place where replacement is appropriate: the process has ended,
             # so there can be no later byte that completes the sequence.
@@ -348,7 +378,7 @@ class LocalPtyTransport:
                 consumer.cancel()
                 await asyncio.gather(consumer, return_exceptions=True)
             for subscriber in list(session.subscribers):
-                subscriber.put_nowait("")
+                subscriber.put_nowait(None)
             self._evict_completed()
 
     def _evict_completed(self) -> None:
@@ -445,8 +475,24 @@ class LocalPtyTransport:
         return False
 
     async def close_orphaned_project_workspaces(self, project_keys: set[str]) -> int:
-        """No-op counterpart to the Herdr workspace reconciliation port."""
-        return 0
+        """Close local PTYs when the owning runtime has no projects left.
+
+        Local PTYs do not have a project-workspace mapping, so the normal
+        reconciliation pass cannot identify an orphan by project key. The
+        runtime shutdown path deliberately calls this port with an empty set
+        after cancelling runner work; at that boundary every remaining local
+        session is an orphan and must be closed as well. Keeping this scoped
+        to the empty-set shutdown signal preserves active sessions during
+        ordinary scheduling reconciliation.
+        """
+        if project_keys:
+            return 0
+        node_ids = list(self.sessions)
+        closed = 0
+        for node_id in node_ids:
+            if await self.close_persistent_session(node_id):
+                closed += 1
+        return closed
 
     async def detach(self, node_id: uuid.UUID) -> bool:
         """End the attaching PTY client without killing the harness.
@@ -507,18 +553,35 @@ class LocalPtyTransport:
             "output": bytes(session.output).decode(errors="replace"),
         }
 
-    def subscribe(self, node_id: uuid.UUID) -> asyncio.Queue[str]:
-        queue: asyncio.Queue[str] = asyncio.Queue()
+    def owned_node_ids(self) -> set[uuid.UUID]:
+        """Return the exact local session inventory used by cleanup."""
+        return set(self.sessions)
+
+    def owned_node_ids_for_project(self, project_key: str) -> set[uuid.UUID]:
+        # Local transport instances are test/in-process adapters. They do not
+        # maintain a durable project map, so only the caller's persisted Runs
+        # can safely associate a session with a project.
+        return set()
+
+    def subscribe(self, node_id: uuid.UUID) -> asyncio.Queue[str | None]:
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
         session = self.sessions.get(node_id)
         if session is not None:
             session.subscribers.add(queue)
             session.last_activity_at = time.monotonic()
+        else:
+            self._pending_subscribers.setdefault(node_id, set()).add(queue)
         return queue
 
-    def unsubscribe(self, node_id: uuid.UUID, queue: asyncio.Queue[str]) -> None:
+    def unsubscribe(self, node_id: uuid.UUID, queue: asyncio.Queue[str | None]) -> None:
         session = self.sessions.get(node_id)
         if session is not None:
             session.subscribers.discard(queue)
+        pending = self._pending_subscribers.get(node_id)
+        if pending is not None:
+            pending.discard(queue)
+            if not pending:
+                self._pending_subscribers.pop(node_id, None)
 
 
 class HerdrPtyTransport(LocalPtyTransport):
@@ -564,6 +627,30 @@ class HerdrPtyTransport(LocalPtyTransport):
         # but force the next launch to inject its new command into that pane
         # instead of mistaking the retained shell for a completed provider.
         self._fresh_launch_nodes: set[uuid.UUID] = set()
+
+    @property
+    def boundary_error(self) -> HerdrBoundaryError | None:
+        """Expose a permanent nested-launch error to the runner at startup."""
+        context_error = herdr_boundary_error()
+        if context_error is not None:
+            return context_error
+        error = getattr(self.adapter, "boundary_error", None)
+        if isinstance(error, HerdrBoundaryError):
+            return error
+        return None
+
+    @property
+    def startup_error(self) -> HerdrAdapterError | None:
+        """Return a fail-closed startup error without launching Herdr."""
+        context_error = herdr_boundary_error()
+        if context_error is not None:
+            return context_error
+        error = getattr(self.adapter, "startup_error", None)
+        if isinstance(error, HerdrAdapterError):
+            return error
+        if not self.adapter.available:
+            return HerdrUnavailableError("Herdr client is not available")
+        return None
 
     @staticmethod
     def _is_interactive_shell(command: list[str]) -> bool:
@@ -874,6 +961,34 @@ class HerdrPtyTransport(LocalPtyTransport):
         value = (self._projects.get(project_key, {}).get("panes") or {}).get(str(node_id))
         return value if isinstance(value, str) else None
 
+    def owned_node_ids(self) -> set[uuid.UUID]:
+        """Return every node mapped to a Turn-owned Herdr pane."""
+        node_ids = set(self._node_projects)
+        for record in self._projects.values():
+            for raw in (record.get("panes") or {}):
+                try:
+                    node_ids.add(uuid.UUID(str(raw)))
+                except (TypeError, ValueError):
+                    continue
+        node_ids.update(self.sessions)
+        node_ids.update(self._pending_subscribers)
+        return node_ids
+
+    def owned_node_ids_for_project(self, project_key: str) -> set[uuid.UUID]:
+        """Return Turn-owned pane owners in one durable Herdr workspace."""
+        node_ids = {
+            node_id
+            for node_id, owner in self._node_projects.items()
+            if owner == project_key
+        }
+        record = self._projects.get(project_key)
+        for raw in (record.get("panes") or {}) if isinstance(record, dict) else {}:
+            try:
+                node_ids.add(uuid.UUID(str(raw)))
+            except (TypeError, ValueError):
+                continue
+        return node_ids
+
     async def foreground_process_names(self, node_id: uuid.UUID) -> tuple[str, ...]:
         pane_id = self.pane_id(node_id)
         if pane_id is None:
@@ -914,6 +1029,7 @@ class HerdrPtyTransport(LocalPtyTransport):
         idle_warning: float | None,
         idle_reap: float | None,
     ) -> asyncio.Task:
+        require_external_turn_process()
         pane_id = await self._ensure_pane(node_id, cwd=cwd, environment=environment)
         process = await asyncio.create_subprocess_exec(
             *self._control_command(pane_id),
@@ -922,7 +1038,10 @@ class HerdrPtyTransport(LocalPtyTransport):
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
             limit=self.backlog_limit,
-            env={**os.environ, "HERDR_ENV": "1"},
+            # This is a client control process launched by Turn, not a
+            # Herdr-owned child.  Propagating HERDR_ENV=1 would make Herdr
+            # reject the client as a nested invocation.
+            env=os.environ.copy(),
         )
         session = _Session(
             node_id=node_id,
@@ -930,6 +1049,7 @@ class HerdrPtyTransport(LocalPtyTransport):
             process=process,
             idle_warning_seconds=idle_warning or 300.0,
         )
+        session.subscribers.update(self._pending_subscribers.pop(node_id, set()))
         self.sessions[node_id] = session
         self._control_locks[node_id] = asyncio.Lock()
         closed = asyncio.Event()
@@ -970,8 +1090,9 @@ class HerdrPtyTransport(LocalPtyTransport):
                 if len(session.output) > self.backlog_limit:
                     del session.output[: len(session.output) - self.backlog_limit]
                 text = session.decoder.decode(chunk, final=False)
-                for subscriber in list(session.subscribers):
-                    subscriber.put_nowait(text)
+                if text:
+                    for subscriber in list(session.subscribers):
+                        subscriber.put_nowait(text)
                 if stream is not None and text:
                     await stream(node_id, text)
 
@@ -1010,7 +1131,7 @@ class HerdrPtyTransport(LocalPtyTransport):
                 self._control_locks.pop(node_id, None)
                 self._control_closed.pop(node_id, None)
                 for subscriber in list(session.subscribers):
-                    subscriber.put_nowait("")
+                    subscriber.put_nowait(None)
                 self._evict_completed()
 
         task = asyncio.create_task(supervise())
@@ -1215,11 +1336,25 @@ class HerdrPtyTransport(LocalPtyTransport):
         return sent
 
     async def stop(self, node_id: uuid.UUID) -> bool:
-        # Interrupt the foreground harness, then release only Turn's control
-        # stream. The Herdr pane and its shell remain available to the user.
-        interrupted = await self.write(node_id, b"\x03")
-        released = await self._close_control(node_id)
-        return interrupted or released
+        # An explicit stop owns the provider process, not just Turn's control
+        # attachment. Herdr's pane API exposes Escape as the portable
+        # interrupt key (the CLI does not accept ``ctrl-c`` as a logical key),
+        # then closing the node pane is the authoritative process boundary.
+        # ``detach`` remains the non-destructive operation used by daemon
+        # restarts and browser disconnects.
+        pane_id = self.pane_id(node_id)
+        interrupted = False
+        if pane_id is not None:
+            try:
+                interrupted = await self.adapter.send_keys(pane_id, ("esc",))
+            except HerdrResourceNotFound:
+                # Herdr may have removed the whole project workspace between
+                # reconciliation and this cleanup call. A missing pane is
+                # already stopped; close_persistent_session below also drops
+                # Turn's stale mapping.
+                interrupted = False
+        closed = await self.close_persistent_session(node_id)
+        return interrupted or closed
 
     async def detach(self, node_id: uuid.UUID) -> bool:
         return await self._close_control(node_id)

@@ -38,6 +38,7 @@ class Scheduler:
         is_externally_busy: Callable[[uuid.UUID], bool] | None = None,
         isolation_available: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
         request_review: Callable[[uuid.UUID, str], Awaitable[None]] | None = None,
+        cancel_node: Callable[[uuid.UUID], Awaitable[None]] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -52,6 +53,7 @@ class Scheduler:
         self._is_externally_busy = is_externally_busy or (lambda _node_id: False)
         self._isolation_available = isolation_available
         self._request_review = request_review
+        self._cancel_node = cancel_node
         self.running: dict[uuid.UUID, asyncio.Task] = {}
         self.running_projects: dict[uuid.UUID, uuid.UUID] = {}
         self.retries: dict[uuid.UUID, int] = {}
@@ -332,10 +334,21 @@ class Scheduler:
                 continue
             task = self.running.get(node.id)
             if task is not None and not task.done():
-                task.cancel()
-            node.status = NodeStatus.CANCELLED
-            await self.store.set_status(node.id, NodeStatus.CANCELLED)
-            await self._emit("node.updated", project_id, _dump(node))
+                if self._cancel_node is not None:
+                    await self._cancel_node(node.id)
+                else:
+                    # Scheduler is composed with Runner in production. Keep
+                    # this branch only for small standalone scheduler tests;
+                    # it still awaits the task before exposing the state.
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            elif self._cancel_node is not None:
+                await self._cancel_node(node.id)
+            else:
+                await self.store.set_status(node.id, NodeStatus.CANCELLED)
+            refreshed = await self.store.get_node(node.id)
+            if refreshed is not None and refreshed.status is not NodeStatus.CANCELLED:
+                await self.store.set_status(node.id, NodeStatus.CANCELLED)
 
         walker = GraphWalker(nodes, edges)
         evaluation = walker.evaluate()

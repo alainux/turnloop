@@ -661,7 +661,15 @@ async def test_retained_verifier_can_change_a_rejection_after_submission(tmp_pat
     assert agent_command(args) == 0
     for _ in range(100):
         current = await store.get_node(verifier.id)
-        if current and current.verification and current.verification.decision is VerificationDecision.APPROVE:
+        settled_runs = await store.get_runs(verifier.id)
+        if (
+            current
+            and current.verification
+            and current.verification.decision is VerificationDecision.APPROVE
+            and settled_runs
+            and settled_runs[-1].status is RunStatus.COMPLETE
+            and settled_runs[-1].accepted_submission
+        ):
             break
         await asyncio.sleep(0.01)
     assert current is not None
@@ -689,7 +697,7 @@ def test_verification_cli_writes_the_verification_handoff(tmp_path, monkeypatch)
     )
     assert agent_command(args) == 0
     assert json.loads(handoff.read_text())["decision"] == "REJECT"
-    assert json.loads(status.read_text())["state"] == "complete"
+    assert json.loads(status.read_text())["state"] == "submitted"
 
 
 def test_any_node_can_submit_a_review_through_the_result_handoff(tmp_path, monkeypatch):

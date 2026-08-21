@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Trigger } from "../domain";
-import { deleteTrigger, updateTrigger } from "../api/triggers";
+import { deleteTrigger, emitTrigger, updateTrigger } from "../api/triggers";
 import { Icon } from "./Icon";
 
 function formatTriggerData(data: Record<string, unknown> | undefined): string {
@@ -60,6 +60,19 @@ export function TriggerInspector({ trigger, onClose, onChanged, notify }: Props)
       await deleteTrigger(trigger.id);
       onClose();
       await onChanged();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fire = async () => {
+    setBusy(true);
+    try {
+      await emitTrigger(trigger);
+      await onChanged();
+      notify(`Event emitted: ${trigger.event_name}`);
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error));
     } finally {
@@ -127,6 +140,11 @@ export function TriggerInspector({ trigger, onClose, onChanged, notify }: Props)
           </button>
         </section>
         <section className="section trigger-actions">
+          {trigger.kind === "event" && (
+            <button className="button compact accent" disabled={busy || !trigger.enabled} onClick={() => void fire()}>
+              Emit event now
+            </button>
+          )}
           <button className="button compact danger" disabled={busy} onClick={() => void remove()}>Delete trigger</button>
         </section>
       </div>

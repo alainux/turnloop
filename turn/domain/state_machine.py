@@ -31,6 +31,12 @@ def present_node(
 ) -> NodePresentation:
     """Project one node into a stable UI state and guarded action set."""
     common = (Action.EDIT, Action.REGENERATE)
+    if node.runtime_guard is not None:
+        return NodePresentation(
+            UIState.RUNTIME_GUARDED,
+            (Action.EDIT,),
+            node.runtime_guard.message,
+        )
     if preparing:
         # A planner regeneration can be live while its persisted node remains
         # EXPANDED until the replacement plan is applied. The runner owns the

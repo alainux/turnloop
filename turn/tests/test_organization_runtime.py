@@ -53,6 +53,25 @@ class StructuredReviewPlanner:
         return self.responses.pop(0), Usage(input_tokens=3, output_tokens=5), "review-session"
 
 
+class ReconcileTrackingTerminal(MockTerminalTransport):
+    """Mock the provider inventory repair required before a manager resume."""
+
+    def __init__(self):
+        super().__init__()
+        self.reconciled_sessions: list[tuple[uuid.UUID, str, str, str]] = []
+
+    async def reconcile_provider_session(
+        self,
+        node_id: uuid.UUID,
+        *,
+        project_key: str,
+        session_id: str,
+        provider: str,
+    ) -> bool:
+        self.reconciled_sessions.append((node_id, project_key, session_id, provider))
+        return True
+
+
 @pytest.mark.asyncio
 async def test_invalid_live_handoff_enters_correction_without_false_failure_or_duplicate_run(tmp_path):
     store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects")
@@ -127,7 +146,7 @@ async def test_invalid_live_handoff_enters_correction_without_false_failure_or_d
 
 
 @pytest.mark.asyncio
-async def test_worker_evidence_is_persisted_and_missing_criteria_fail_runs(tmp_path):
+async def test_worker_evidence_is_persisted_and_missing_criteria_requires_correction(tmp_path):
     store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects")
     await store.init()
     root = await store.create_project(
@@ -207,13 +226,17 @@ async def test_worker_evidence_is_persisted_and_missing_criteria_fail_runs(tmp_p
         WorkerResult(outcome=Outcome.COMPLETE, summary="claimed complete"),
     )
     bad_after = await store.get_node(bad.id)
-    assert bad_after.status is NodeStatus.FAILED
-    assert (await store.get_runs(bad.id))[0].status is RunStatus.FAILED
+    assert bad_after.status is NodeStatus.RUNNING
+    assert bad_after.agent_state == "correction_required"
+    bad_saved_run = (await store.get_runs(bad.id))[0]
+    assert bad_saved_run.status is RunStatus.RUNNING
+    assert bad_saved_run.outcome is None
+    assert bad_saved_run.accepted_submission is False
     await store.dispose()
 
 
 @pytest.mark.asyncio
-async def test_worker_evidence_must_be_passing_and_referenced(tmp_path):
+async def test_worker_evidence_must_be_passing_and_referenced_before_acceptance(tmp_path):
     store = Store(tmp_path / "turn", projects_dir=tmp_path / "projects")
     await store.init()
     root = await store.create_project(
@@ -267,8 +290,13 @@ async def test_worker_evidence_must_be_passing_and_referenced(tmp_path):
             root.id,
             WorkerResult(outcome=Outcome.COMPLETE, summary="claimed complete", evidence=[evidence]),
         )
-        assert (await store.get_runs(node.id))[-1].status is RunStatus.FAILED
-        await store.set_status(node.id, NodeStatus.RUNNABLE)
+        saved_run = (await store.get_runs(node.id))[-1]
+        assert saved_run.status is RunStatus.RUNNING
+        assert saved_run.outcome is None
+        saved_node = await store.get_node(node.id)
+        assert saved_node.status is NodeStatus.RUNNING
+        assert saved_node.agent_state == "correction_required"
+        await store.set_status(node.id, NodeStatus.RUNNING)
 
     await store.dispose()
 
@@ -394,6 +422,7 @@ async def test_manager_control_failure_stays_review_pending_and_exposes_reviewin
 
     async def reviewer(_snapshot):
         observed.append((await store.get_node(root.id)).manager_phase)
+        await asyncio.sleep(0.01)
         raise RuntimeError("\x1b[31mprovider unavailable\x1b[0m")
 
     runner = Runner(
@@ -404,13 +433,23 @@ async def test_manager_control_failure_stays_review_pending_and_exposes_reviewin
         terminal_transport=MockTerminalTransport(),
         manager_reviewer=reviewer,
     )
-    decisions = await runner._review_organizations(root.id, boundaries=[root])
+    decisions = await asyncio.gather(
+        *(runner._review_organizations(root.id, boundaries=[root]) for _ in range(3))
+    )
     current = await store.get_node(root.id)
-    assert decisions == []
+    assert decisions == [[], [], []]
     assert observed == [ManagerPhase.REVIEWING]
     assert current.manager_phase is ManagerPhase.REVIEW_PENDING
     assert current.manager_phase is not ManagerPhase.BLOCKED
     assert "\x1b" not in " ".join(current.manager_review_reasons)
+    assert current.organization_review is not None
+    assert current.organization_review.control_retry_required is True
+    # A failed control operation is resumable, not an auto-run trigger. A
+    # scheduler heartbeat must not launch another provider attempt by itself.
+    await runner._review_safe_organizations(root.id)
+    assert observed == [ManagerPhase.REVIEWING]
+    await runner._review_organizations(root.id, boundaries=[root])
+    assert observed == [ManagerPhase.REVIEWING]
     await store.dispose()
 
 
@@ -466,6 +505,7 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
         ),
     )
     root = await store.set_agent_session(root.id, "retained-planner-session")
+    terminal = ReconcileTrackingTerminal()
     runner = Runner(
         store,
         registry=registry,
@@ -473,7 +513,7 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
             data_dir=str(tmp_path / "turn"),
             projects_dir=str(tmp_path / "projects"),
         ),
-        terminal_transport=MockTerminalTransport(),
+        terminal_transport=terminal,
     )
     runner.provider_reviews_enabled = True
     contract = root.organization_contract
@@ -486,15 +526,44 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
     assert audit.decision.value == "APPROVE"
     assert planner.contexts[0][0].node.agent.session_id is None
     manager_snapshot = await runner.organization_manager.snapshot(store, root.id)
+    stale_owner = uuid.uuid4()
+    stale_run = await store.create_run(
+        root,
+        "organization-manager",
+        1,
+        process_owner_id=stale_owner,
+    )
+    await store.update_run(
+        stale_run.id,
+        status=RunStatus.FAILED,
+        outcome=Outcome.FAIL,
+        error="prior control attempt failed",
+    )
     manager_result = await runner._provider_manager_review(manager_snapshot)
     assert manager_result.decision is ManagerDecision.BLOCK
     assert root.id in runner.terminal.close_requests
+    assert stale_owner in runner.terminal.close_requests
+    assert terminal.reconciled_sessions == [
+        (root.id, str(root.project_id), "retained-planner-session", "codex")
+    ]
     assert planner.contexts[1][0].node.agent.session_id == "retained-planner-session"
     runs = await store.get_runs(root.id)
     assert {run.worker for run in runs} == {
         "semantic-plan-auditor",
         "organization-manager",
     }
+    audit_run = next(run for run in runs if run.worker == "semantic-plan-auditor")
+    manager_run = next(
+        run
+        for run in reversed(runs)
+        if run.worker == "organization-manager" and run.process_owner_id != stale_owner
+    )
+    assert audit_run.process_owner_id is not None and audit_run.process_owner_id != root.id
+    assert manager_run.process_owner_id is not None and manager_run.process_owner_id != root.id
+    assert audit_run.process_state.value == "EXITED"
+    assert manager_run.process_state.value == "EXITED"
+    assert audit_run.process_owner_id in terminal.close_requests
+    assert manager_run.process_owner_id in terminal.close_requests
     refreshed = await store.get_node(root.id)
     assert refreshed.agent.session_id == "review-session"
     await store.dispose()

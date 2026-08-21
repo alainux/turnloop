@@ -165,6 +165,11 @@ Herdr is an external, user-owned daemon. Turn connects to it through the
 existing service with `herdr status server` before starting Turn; do not run
 `herdr server` as part of the Turn launch procedure.
 
+**CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR
+FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR. REQUEST/USE THE ALREADY-RUNNING
+HERDR DAEMON.** If it is unavailable, Turn fails visibly and stops; it does
+not launch, restart, or replace Herdr.
+
 ### Install and start
 
 ```bash

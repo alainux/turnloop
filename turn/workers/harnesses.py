@@ -35,7 +35,7 @@ from turn.domain.schemas import (
 from turn.contracts.dag import parse_result, parse_verification
 from turn.config import settings
 from turn.workers import parsing
-from turn.workers.base import NodeExecutionContext, Worker, render_context_block
+from turn.workers.base import InvalidSubmission, NodeExecutionContext, Worker, render_context_block
 from turn.workers.terminal import LocalPtyTransport
 from turn.metrics import emit_jsonl_telemetry
 from turn.workers.harness_catalog import (
@@ -48,6 +48,7 @@ from turn.workers.interactive import (
     opencode_session_ids,
     prepare_result_file,
     read_result_file,
+    read_submission_file,
     format_verification_result,
     run_until_result,
 )
@@ -508,6 +509,7 @@ class CLIHarnessWorker(Worker):
             agent,
             data_dir=self.s.data_dir,
             project_repo_path=ctx.project_repo_path,
+            run_id=ctx.run_id,
         )
         telemetry_sidecar: NativeTelemetrySidecar | None = None
         claude_settings = None
@@ -687,7 +689,13 @@ class CLIHarnessWorker(Worker):
                 status="degraded",
                 detail=f"{self.harness.value} completed without structured hook events; lifecycle evidence remains available but tool metrics are unavailable for this run.",
             )
-        if terminal.idle_reaped:
+        submitted_present, submitted = read_submission_file(result_path)
+        if submitted_present and submitted is None:
+            raise InvalidSubmission(f"{self.name} returned an invalid JSON submission")
+        if submitted is not None:
+            # A valid semantic handoff wins over all later process diagnostics.
+            pass
+        elif terminal.idle_reaped:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} terminal was reaped after being idle while detached",
@@ -695,14 +703,14 @@ class CLIHarnessWorker(Worker):
                 retry_recommended=False,
                 session_id=observed_session or agent.session_id,
             )
-        if terminal.stalled:
+        if submitted is None and terminal.stalled:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} stopped producing output for {ctx.stall_timeout_seconds:g} seconds",
                 error="stalled terminal output",
                 retry_recommended=False,
             )
-        if terminal.returncode != 0:
+        if submitted is None and terminal.returncode != 0:
             return WorkerResult(
                 outcome=Outcome.FAIL,
                 summary=f"{self.name} exited {terminal.returncode}",
@@ -710,7 +718,6 @@ class CLIHarnessWorker(Worker):
                 retry_recommended=False,
                 session_id=observed_session or agent.session_id,
             )
-        submitted = read_result_file(result_path)
         session = observed_session or agent.session_id
         if verification:
             if submitted is None:
@@ -723,12 +730,7 @@ class CLIHarnessWorker(Worker):
             try:
                 decision = parse_verification(submitted)
             except (TypeError, ValueError) as error:
-                return WorkerResult(
-                    outcome=Outcome.FAIL,
-                    summary=f"{self.name} returned an invalid verification",
-                    error=str(error),
-                    session_id=session or agent.session_id,
-                )
+                raise InvalidSubmission(f"{self.name} returned an invalid verification: {error}") from error
             return WorkerResult(
                 outcome=Outcome.COMPLETE,
                 summary=decision.summary,
@@ -772,14 +774,7 @@ class CLIHarnessWorker(Worker):
         try:
             result = parse_result(data)
         except (TypeError, ValueError) as error:
-            return WorkerResult(
-                outcome=Outcome.FAIL,
-                summary=f"{self.name} returned an invalid Turn result",
-                error=str(error),
-                retry_recommended=False,
-                session_id=session or agent.session_id,
-                usage=usage,
-            )
+            raise InvalidSubmission(f"{self.name} returned an invalid Turn result: {error}") from error
         result.summary = parsing.clean_summary(result.summary)
         result.session_id = session or agent.session_id
         result.usage = usage

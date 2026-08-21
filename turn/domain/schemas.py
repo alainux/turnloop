@@ -101,6 +101,7 @@ class NodeUIState(str, Enum):
     CONTAINER = "container"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    RUNTIME_GUARDED = "runtime_guarded"
 
 
 class NodeAction(str, Enum):
@@ -163,6 +164,21 @@ class RunStatus(str, Enum):
     RUNNING = "RUNNING"
     COMPLETE = "COMPLETE"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class ProcessState(str, Enum):
+    """Operational state of the process assigned to a semantic Run.
+
+    This is deliberately separate from :class:`RunStatus`.  A provider may
+    exit after a valid submission, and a launch may be uncertain while Herdr
+    reconciles its durable pane; neither fact is a semantic outcome.
+    """
+
+    LAUNCH_REQUESTED = "LAUNCH_REQUESTED"
+    RUNNING = "RUNNING"
+    EXITED = "EXITED"
+    UNKNOWN = "UNKNOWN"
     CANCELLED = "CANCELLED"
 
 
@@ -282,6 +298,7 @@ class VerificationResult(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     evidence: list[AcceptanceEvidence] = Field(default_factory=list)
     target_node_id: Optional[uuid.UUID] = None
+    run_id: Optional[uuid.UUID] = None
 
 
 class Agent(BaseModel):
@@ -512,6 +529,16 @@ def flatten_document_refs(refs: list[DocumentRef]) -> list[DocumentRef]:
     return flattened
 
 
+class RuntimeGuard(BaseModel):
+    """A durable, non-retryable infrastructure boundary failure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=2000)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class Node(BaseModel):
     """A unit of intent. Persisted; workers are temporary."""
 
@@ -588,6 +615,9 @@ class Node(BaseModel):
     # output.
     agent_state: Optional[str] = None
     agent_message: Optional[str] = None
+    # A runtime guard is intentionally separate from semantic BLOCKED/FAILED:
+    # it prevents scheduling and retries until the launch boundary is fixed.
+    runtime_guard: RuntimeGuard | None = None
 
 
 # --------------------------------------------------------------------------
@@ -641,6 +671,22 @@ class Run(BaseModel):
     attempt: int = 1
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
+    # Process supervision facts. These never infer or overwrite ``status``.
+    process_state: ProcessState = ProcessState.LAUNCH_REQUESTED
+    process_pid: Optional[int] = None
+    process_exit_code: Optional[int] = None
+    process_started_at: Optional[datetime] = None
+    process_exited_at: Optional[datetime] = None
+    pane_id: Optional[str] = None
+    # Control-plane Runs may use a synthetic terminal owner so their Herdr
+    # pane can be exposed without pretending that the operation is a graph
+    # node. Semantic ownership remains ``node_id``.
+    process_owner_id: Optional[uuid.UUID] = None
+    provider: Optional[str] = None
+    # Exactly one accepted submission can settle an attempt. The identity is
+    # persisted so a late handoff from an older Run cannot settle its retry.
+    accepted_submission: bool = False
+    submission_id: Optional[uuid.UUID] = None
 
 
 # --------------------------------------------------------------------------
@@ -691,6 +737,8 @@ class ControlActivity(BaseModel):
     status: Literal["running"] = "running"
     started_at: datetime
     attempt: int = 1
+    run_id: uuid.UUID
+    terminal_node_id: uuid.UUID
 
 
 class GraphNodeView(Node):
@@ -702,6 +750,9 @@ class GraphNodeView(Node):
     generation_active: bool = False
     capability_status: list[CapabilityStatus] = Field(default_factory=list)
     control_activity: Optional[ControlActivity] = None
+    process_state: Optional[ProcessState] = None
+    process_exit_code: Optional[int] = None
+    process_provider: Optional[str] = None
 
 
 class GraphView(BaseModel):
@@ -898,6 +949,7 @@ class PlanResult(BaseModel):
     organization_contract: OrganizationContract | None = None
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
+    run_id: Optional[uuid.UUID] = None
 
     @model_validator(mode="after")
     def validate_references_and_cycles(self) -> "PlanResult":
@@ -1082,3 +1134,4 @@ class WorkerResult(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
     verification: Optional[VerificationResult] = None
+    run_id: Optional[uuid.UUID] = None

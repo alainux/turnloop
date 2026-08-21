@@ -2018,18 +2018,24 @@ async def test_stop_remains_cancelled_when_provider_returns_during_shutdown(tmp_
             return WorkerResult(outcome=Outcome.COMPLETE, summary="finished during stop")
 
     class CompletionOnStopTerminal(MockTerminalTransport):
-        def __init__(self, worker: LateCompletionWorker):
+        def __init__(self, worker: LateCompletionWorker, store: Store):
             super().__init__()
             self.worker = worker
+            self.store = store
+            self.status_at_stop: list[NodeStatus] = []
 
         async def stop(self, node_id):
+            current = await self.store.get_node(node_id)
+            assert current is not None
+            self.status_at_stop.append(current.status)
             self.worker.release.set()
             await asyncio.wait_for(self.worker.returned.wait(), timeout=1)
             return True
 
     worker = LateCompletionWorker()
     _, store, runner = await _runtime(tmp_path, worker)
-    runner.terminal = CompletionOnStopTerminal(worker)
+    terminal = CompletionOnStopTerminal(worker, store)
+    runner.terminal = terminal
     root = await store.create_project("root", run_policy=RunPolicy(auto_run=False))
     await store.set_status(root.id, NodeStatus.EXPANDED)
     child = await store.create_node(
@@ -2048,6 +2054,7 @@ async def test_stop_remains_cancelled_when_provider_returns_during_shutdown(tmp_
 
     cancelled = await store.get_node(child.id)
     runs = await store.get_runs(child.id)
+    assert terminal.status_at_stop == [NodeStatus.RUNNING]
     assert cancelled.status == NodeStatus.CANCELLED
     assert runs[-1].status == RunStatus.CANCELLED
     await store.dispose()

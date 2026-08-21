@@ -38,10 +38,12 @@ from turn.domain.schemas import (
     NodeStatus,
     Outcome,
     PlanResult,
+    ProcessState,
     VerificationResult,
     Run,
     RunPolicy,
     RunStatus,
+    RuntimeGuard,
     SubgraphRef,
     Trigger,
     TriggerContext,
@@ -1234,6 +1236,44 @@ class Store:
         node.agent_message = sanitize_control_text(message) if message is not None else None
         return await self._save_node(node)
 
+    async def set_runtime_guard(
+        self, project_id: uuid.UUID, *, code: str, message: str
+    ) -> Optional[Node]:
+        """Persist one infrastructure guard on the project root.
+
+        The root is the durable project-wide circuit breaker.  Repeated
+        scheduler ticks update neither the timestamp nor the log once the
+        same guard is already present, so a boundary failure cannot become a
+        self-amplifying retry loop.
+        """
+        node = await self.get_node(project_id)
+        if node is None:
+            return None
+        clean_code = sanitize_control_text(code)
+        clean_message = sanitize_control_text(message)
+        current = node.runtime_guard
+        if current is not None and current.code == clean_code and current.message == clean_message:
+            return node
+        node.runtime_guard = RuntimeGuard(code=clean_code, message=clean_message)
+        saved = await self._save_node(node)
+        await self._log(
+            project_id,
+            kind="runtime.guard",
+            action="runtime.guard.raised",
+            message=clean_message,
+            status="error",
+            data={"code": clean_code, "retry_suppressed": True},
+        )
+        return saved
+
+    async def clear_runtime_guard(self, project_id: uuid.UUID) -> Optional[Node]:
+        """Clear a guard only through an explicit user/operator mutation."""
+        node = await self.get_node(project_id)
+        if node is None or node.runtime_guard is None:
+            return node
+        node.runtime_guard = None
+        return await self._save_node(node)
+
     async def set_organization_review(
         self, node_id: uuid.UUID, review: OrganizationReview
     ) -> Optional[Node]:
@@ -1914,7 +1954,14 @@ class Store:
 
     # -- runs -------------------------------------------------------------
 
-    async def create_run(self, node: Node, worker: str, attempt: int = 1) -> Run:
+    async def create_run(
+        self,
+        node: Node,
+        worker: str,
+        attempt: int = 1,
+        *,
+        process_owner_id: uuid.UUID | None = None,
+    ) -> Run:
         # A new attempt inherits the current harness conversation; an explicit
         # fresh re-run clears node.agent.session_id before this method is called.
         run = Run(
@@ -1924,11 +1971,170 @@ class Store:
             status=RunStatus.RUNNING,
             attempt=attempt,
             session_id=node.agent.session_id if node.agent else None,
+            process_owner_id=process_owner_id or node.id,
+            provider=(node.agent.harness.value if node.agent else worker),
         )
-        self._state(node.project_id).runs[run.id] = run
-        await self._persist_project(node.project_id)
+        async with self._project_lock(node.project_id):
+            self._state(node.project_id).runs[run.id] = run
+            await self._persist_project(node.project_id)
         await self._log(node.project_id, kind="harness.run", action="run.created", message="harness run created", data={"run_id": str(run.id), "node_id": str(node.id), "worker": worker, "attempt": attempt, "session_id": run.session_id})
         return run.model_copy(deep=True)
+
+    async def get_run(self, run_id: uuid.UUID) -> Run | None:
+        """Return one attempt without exposing mutable store state."""
+        found = self._project_for_run(run_id)
+        return found[1].model_copy(deep=True) if found else None
+
+    async def active_run(self, node_id: uuid.UUID) -> Run | None:
+        """Return the newest still-semantic-active attempt for a node."""
+        runs = await self.get_runs(node_id)
+        for run in reversed(runs):
+            if run.status is RunStatus.RUNNING:
+                return run
+        return None
+
+    async def mark_run_process(
+        self,
+        run_id: uuid.UUID,
+        state: ProcessState,
+        *,
+        pid: int | None = None,
+        pane_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> Run:
+        """Record supervision facts without changing semantic Run status."""
+        found = self._project_for_run(run_id)
+        if not found:
+            raise KeyError(run_id)
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            current = self._states[project_id].runs.get(run_id)
+            if current is None:
+                raise KeyError(run_id)
+            current.process_state = state
+            if pid is not None:
+                current.process_pid = pid
+            if pane_id is not None:
+                current.pane_id = pane_id
+            now = datetime.now(timezone.utc)
+            if state is ProcessState.RUNNING and current.process_started_at is None:
+                current.process_started_at = now
+            if state is ProcessState.EXITED:
+                current.process_exited_at = now
+                current.process_exit_code = exit_code
+            await self._persist_project(project_id)
+            saved = current.model_copy(deep=True)
+        await self._log(
+            project_id,
+            kind="harness.process",
+            action="process.state",
+            message=f"process {state.value.lower()}",
+            status="error" if state is ProcessState.EXITED and exit_code not in (None, 0) else "info",
+            data={
+                "run_id": str(run_id),
+                "node_id": str(saved.node_id),
+                "process_state": saved.process_state.value,
+                "process_pid": saved.process_pid,
+                "process_exit_code": saved.process_exit_code,
+                "pane_id": saved.pane_id,
+            },
+        )
+        return saved
+
+    async def accept_run_submission(
+        self,
+        run_id: uuid.UUID,
+        *,
+        outcome: Outcome,
+        node_status: NodeStatus | None = None,
+        submission_id: uuid.UUID | None = None,
+    ) -> Run | None:
+        """Atomically accept the sole semantic submission for an attempt.
+
+        This claims and settles the semantic handoff in one project-locked
+        write. The runner may persist result materials and graph effects
+        afterward, but competing watchers can no longer reinterpret the
+        attempt. ``None`` means the attempt is stale, already settled, or cancelled. Process exit
+        watchers must use :meth:`mark_run_process` instead and therefore
+        cannot overwrite this decision.
+        """
+        found = self._project_for_run(run_id)
+        if not found:
+            return None
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            current = self._states[project_id].runs.get(run_id)
+            node = self._states[project_id].nodes.get(current.node_id) if current else None
+            if (
+                current is None
+                or node is None
+                or current.status is not RunStatus.RUNNING
+                or current.accepted_submission
+                or node.status is NodeStatus.CANCELLED
+            ):
+                return None
+            current.accepted_submission = True
+            current.submission_id = submission_id or uuid.uuid4()
+            current.outcome = outcome
+            current.status = (
+                RunStatus.FAILED if outcome is Outcome.FAIL else RunStatus.COMPLETE
+            )
+            current.ended_at = datetime.now(timezone.utc)
+            # Graph materialization (artifacts, children, required inputs)
+            # must finish before the scheduler sees the node's terminal graph
+            # status. The Run claim and semantic outcome are atomic here;
+            # callers apply ``node_status`` in the existing graph mutation
+            # path immediately afterward so a scheduler tick cannot finalize
+            # a half-materialized submission.
+            node.agent_state = None
+            node.agent_message = None
+            await self._persist_project(project_id)
+            saved = current.model_copy(deep=True)
+        await self._log(
+            project_id,
+            kind="harness.submission",
+            action="submission.accepted",
+            message=f"accepted {outcome.value} submission",
+            status="error" if outcome is Outcome.FAIL else "ok",
+            data={
+                "run_id": str(run_id),
+                "node_id": str(saved.node_id),
+                "outcome": outcome.value,
+                "submission_id": str(saved.submission_id),
+            },
+        )
+        return saved
+
+    async def mark_submission_rejected(
+        self, node_id: uuid.UUID, *, run_id: uuid.UUID | None, message: str
+    ) -> bool:
+        """Record correction-required feedback without failing a live Run."""
+        found = self._project_for_node(node_id)
+        if not found:
+            return False
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            node = self._states[project_id].nodes.get(node_id)
+            run = self._states[project_id].runs.get(run_id) if run_id else None
+            if node is None or node.status is NodeStatus.CANCELLED:
+                return False
+            if run_id is not None and (
+                run is None or run.node_id != node_id or run.status is not RunStatus.RUNNING
+            ):
+                return False
+            node.agent_state = "correction_required"
+            node.agent_message = sanitize_control_text(message)
+            node.updated_at = datetime.now(timezone.utc)
+            await self._persist_project(project_id)
+        await self._log(
+            project_id,
+            kind="harness.submission",
+            action="submission.rejected",
+            message=sanitize_control_text(message),
+            status="error",
+            data={"node_id": str(node_id), "run_id": str(run_id) if run_id else None},
+        )
+        return True
 
     def _project_for_run(self, run_id: uuid.UUID) -> tuple[uuid.UUID, Run] | None:
         for project_id, state in self._states.items():
@@ -1946,34 +2152,54 @@ class Store:
         found = self._project_for_run(run_id)
         if not found:
             raise KeyError(run_id)
-        project_id, run = found
-        if status is not None:
-            run.status = status
-        if outcome is not None:
-            run.outcome = outcome
-        if summary is not None:
-            run.summary = sanitize_control_text(summary)
-        if logs is not None:
-            run.logs = sanitize_control_text(logs)
-        if error is not None:
-            run.error = sanitize_control_text(error)
-        elif status == RunStatus.COMPLETE:
-            # A run may have been marked orphaned while its owner was being
-            # registered. Completing that same run must remove the transient
-            # interruption marker instead of presenting a contradictory
-            # COMPLETE + error record.
-            run.error = None
-        if retry_recommended is not None:
-            run.retry_recommended = retry_recommended
-        elif status == RunStatus.COMPLETE:
-            run.retry_recommended = False
-        if usage is not None:
-            run.usage = usage
-        if session_id is not None:
-            run.session_id = session_id
-        if status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED):
-            run.ended_at = datetime.now(timezone.utc)
-        await self._persist_project(project_id)
+        project_id, _ = found
+        async with self._project_lock(project_id):
+            run = self._states[project_id].runs.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            # Semantic settlement is single-assignment. A late process watcher
+            # or cancellation path may still report diagnostics, but it cannot
+            # turn an accepted COMPLETE/BLOCK/EXPAND/FAIL submission into a
+            # different semantic status.
+            if (
+                run.accepted_submission
+                and run.status in {
+                    RunStatus.COMPLETE,
+                    RunStatus.FAILED,
+                    RunStatus.CANCELLED,
+                }
+                and status in {RunStatus.FAILED, RunStatus.CANCELLED}
+                and status is not run.status
+            ):
+                status = None
+                outcome = None
+            if status is not None:
+                run.status = status
+            if outcome is not None:
+                run.outcome = outcome
+            if summary is not None:
+                run.summary = sanitize_control_text(summary)
+            if logs is not None:
+                run.logs = sanitize_control_text(logs)
+            if error is not None:
+                run.error = sanitize_control_text(error)
+            elif status == RunStatus.COMPLETE:
+                # A run may have been marked orphaned while its owner was
+                # being registered. Completing that same run removes the
+                # transient interruption marker.
+                run.error = None
+            if retry_recommended is not None:
+                run.retry_recommended = retry_recommended
+            elif status == RunStatus.COMPLETE:
+                run.retry_recommended = False
+            if usage is not None:
+                run.usage = usage
+            if session_id is not None:
+                run.session_id = session_id
+            if status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED):
+                run.ended_at = datetime.now(timezone.utc)
+            await self._persist_project(project_id)
+            saved = run.model_copy(deep=True)
         terminal_update = status in (RunStatus.COMPLETE, RunStatus.FAILED, RunStatus.CANCELLED)
         await self._log(
             project_id,
@@ -1985,12 +2211,12 @@ class Store:
             message=(
                 summary
                 or error
-                or ("harness session updated" if session_id is not None else f"run {run.status.value} updated")
+                or ("harness session updated" if session_id is not None else f"run {saved.status.value} updated")
             ),
-            status="error" if run.status is RunStatus.FAILED else "ok" if run.status is RunStatus.COMPLETE else "info",
-            data={"run_id": str(run.id), "node_id": str(run.node_id), "status": run.status.value, "outcome": _jsonable(run.outcome), "error": run.error, "summary": run.summary, "session_id": run.session_id, "usage": _jsonable(run.usage)},
+            status="error" if saved.status is RunStatus.FAILED else "ok" if saved.status is RunStatus.COMPLETE else "info",
+            data={"run_id": str(saved.id), "node_id": str(saved.node_id), "status": saved.status.value, "outcome": _jsonable(saved.outcome), "error": saved.error, "summary": saved.summary, "session_id": saved.session_id, "usage": _jsonable(saved.usage)},
         )
-        return run.model_copy(deep=True)
+        return saved
 
     async def get_runs(self, node_id: uuid.UUID) -> list[Run]:
         found = self._project_for_node(node_id)
@@ -2013,6 +2239,7 @@ class Store:
         for run in state.runs.values():
             if run.node_id in node_ids and run.status == RunStatus.RUNNING and run.node_id not in active_node_ids:
                 run.status = RunStatus.CANCELLED
+                run.process_state = ProcessState.CANCELLED
                 run.outcome = Outcome.FAIL
                 run.ended_at = datetime.now(timezone.utc)
                 run.error = "Run interrupted before this runner process started"

@@ -161,6 +161,7 @@ def agent_environment(
     *,
     data_dir: str | Path | None = None,
     project_repo_path: str | Path | None = None,
+    run_id: str | None = None,
 ) -> dict[str, str]:
     """Install loaded capabilities and prepare one native harness launch."""
     capability_ids = list(dict.fromkeys(getattr(agent, "capabilities", None) or []))
@@ -187,6 +188,7 @@ def agent_environment(
     status = handoff.parent / f"{node_id}.status.json"
     environment = {
         "TURN_NODE_ID": str(node_id),
+        "TURN_RUN_ID": str(run_id or ""),
         "TURN_PROJECT_ID": os.getenv("TURN_PROJECT_ID", ""),
         "TURN_REPO": str(Path(project_repo_path or cwd).resolve()),
         "TURN_DATA_DIR": str(Path(data_dir or settings.data_dir).expanduser().resolve()),
@@ -220,6 +222,25 @@ def read_result_file(path: Path) -> dict[str, Any] | None:
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def read_submission_file(path: Path) -> tuple[bool, dict[str, Any] | None]:
+    """Return ``(present, payload)`` so invalid handoffs are distinguishable.
+
+    ``read_result_file`` intentionally remains a tolerant polling helper.
+    Provider completion paths need the stronger distinction: a present but
+    malformed handoff is correction-required while a missing handoff after a
+    dead process is an infrastructure failure.
+    """
+    try:
+        raw = path.read_text()
+    except (FileNotFoundError, OSError):
+        return False, None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return True, None
+    return True, value if isinstance(value, dict) else None
 
 
 def opencode_session_ids(binary: str = "opencode") -> list[str]:

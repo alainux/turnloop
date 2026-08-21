@@ -1987,6 +1987,10 @@ form.composer:has(.composer-config-panel) {
 .badge.cancelled {
   color: var(--red);
 }
+.badge.runtime_guarded {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 45%, var(--border));
+}
 .section {
   padding: 13px 0;
   border-top: 1px solid var(--border);
@@ -3357,6 +3361,20 @@ form.composer:has(.composer-config-panel) {
   gap: 10px;
   color: var(--text-2);
   text-align: center;
+}
+.runtime-guard {
+  border-top-color: color-mix(in srgb, var(--red) 55%, var(--border));
+  background: color-mix(in srgb, var(--red) 6%, transparent);
+}
+.runtime-guard-code {
+  color: var(--red);
+  font-size: 10px;
+}
+.runtime-guard-caution {
+  margin: 0;
+  color: var(--amber);
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 @keyframes breathe {

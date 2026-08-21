@@ -278,6 +278,19 @@ def _dump(n: Node):
     return n.model_dump(mode="json")
 
 
+async def _reject_runtime_guard(request: Request, node_id: uuid.UUID) -> None:
+    """Reject launch-like actions with the persisted operator explanation."""
+    store: Store = request.app.state.store
+    node = await store.get_node(node_id)
+    root = await store.get_node(node.project_id) if node is not None else None
+    guard = root.runtime_guard if root is not None else None
+    if guard is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"runtime guard {guard.code}: {guard.message}",
+        )
+
+
 async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner | None = None) -> dict:
     nodes, edges, artifacts = await store.get_workgraph(project_id)
     triggers = await store.list_triggers(project_id)
@@ -320,6 +333,13 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
         # Only a runner-owned provider task is generation; an open user shell
         # must not animate a completed node as if the agent were still working.
         item["generation_active"] = generation_active
+        latest_run = next(
+            iter(reversed(await store.get_runs(n.id))),
+            None,
+        )
+        item["process_state"] = latest_run.process_state.value if latest_run else None
+        item["process_exit_code"] = latest_run.process_exit_code if latest_run else None
+        item["process_provider"] = latest_run.provider if latest_run else None
         control_run = next(
             (
                 run for run in reversed(await store.get_runs(n.id))
@@ -336,6 +356,8 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
                 "status": "running",
                 "started_at": control_run.started_at.isoformat(),
                 "attempt": control_run.attempt,
+                "run_id": str(control_run.id),
+                "terminal_node_id": str(control_run.process_owner_id or n.id),
             }
         statuses = []
         if n.agent is not None and project_root is not None:
@@ -1467,9 +1489,14 @@ async def _pty_socket(
         async def send_output():
             while True:
                 chunk = await queue.get()
-                if not chunk:
+                if chunk is None:
                     await websocket.send_json({"type": "status", "active": False})
                     return
+                # Incremental UTF-8 decoding may produce an empty text chunk
+                # while it waits for the rest of a code point. It is not EOF
+                # and it is not a websocket event.
+                if chunk == "":
+                    continue
                 await websocket.send_json({"type": "output", "data": chunk})
 
         sender = asyncio.create_task(send_output())
@@ -1478,7 +1505,18 @@ async def _pty_socket(
             try:
                 while True:
                     await asyncio.sleep(5)
-                    await websocket.send_json({"type": "status", **transport.snapshot(nid)})
+                    snapshot = transport.snapshot(nid)
+                    # Heartbeats describe liveness only. The initial snapshot
+                    # carries the transcript; resending it here turns a
+                    # five-second status tick into an unbounded backlog
+                    # download for every attached browser.
+                    await websocket.send_json({
+                        "type": "status",
+                        "active": bool(snapshot.get("active")),
+                        "idle": bool(snapshot.get("idle")),
+                        "stalled": bool(snapshot.get("stalled")),
+                        "idle_reaped": bool(snapshot.get("idle_reaped")),
+                    })
             except (WebSocketDisconnect, RuntimeError):
                 return
 
@@ -1518,6 +1556,8 @@ async def _pty_socket(
 async def terminal_socket(websocket: WebSocket, node_id: str):
     """Expose the provider's raw PTY stream."""
     runner: Runner = websocket.scope["app"].state.runner
+    if await _send_runtime_guard(websocket, runner, uuid.UUID(node_id)):
+        return
     await _pty_socket(websocket, node_id, runner.terminal)
 
 
@@ -1526,6 +1566,8 @@ async def shell_socket(websocket: WebSocket, node_id: str):
     """Open a standalone interactive shell in the assigned project directory."""
     runner: Runner = websocket.scope["app"].state.runner
     nid = uuid.UUID(node_id)
+    if await _send_runtime_guard(websocket, runner, nid):
+        return
     if not await runner.open_shell(nid):
         await websocket.close(code=1011, reason="project directory unavailable")
         return
@@ -1541,6 +1583,28 @@ async def shell_socket(websocket: WebSocket, node_id: str):
         return await runner.detach_shell(nid)
 
     await _pty_socket(websocket, node_id, runner.shell, cleanup_shell)
+
+
+async def _send_runtime_guard(websocket: WebSocket, runner: Runner, node_id: uuid.UUID) -> bool:
+    """Fail a terminal attach once with the durable project guard.
+
+    CAUTION FOR AI OPERATORS: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR
+    FROM HERDR ITSELF. DO NOT TRY TO LAUNCH HERDR; REQUEST THE EXISTING DAEMON.
+    """
+    node = await runner.store.get_node(node_id)
+    root = await runner.store.get_node(node.project_id) if node is not None else None
+    guard = root.runtime_guard if root is not None else None
+    if guard is None:
+        return False
+    await websocket.accept()
+    await websocket.send_json({
+        "type": "runtime_guard",
+        "code": guard.code,
+        "message": guard.message,
+        "retry_suppressed": True,
+    })
+    await websocket.close(code=1011, reason="runtime guard")
+    return True
 
 
 @router.post("/api/nodes/{node_id}/shell/close")
@@ -1623,6 +1687,7 @@ async def regenerate(node_id: str, request: Request, force: bool = False):
 async def retry(node_id: str, request: Request):
     runner = await _runner(request)
     nid = uuid.UUID(node_id)
+    await _reject_runtime_guard(request, nid)
     await runner.retry(nid)
     # retry() wakes the scheduler. In auto-run mode it owns the next launch;
     # starting one here as well races that wake-up and can launch the same
@@ -1639,6 +1704,7 @@ async def retry(node_id: str, request: Request):
 async def resume_organization_review(node_id: str, request: Request):
     """Resume an already-materialized organization after review failure."""
     runner = await _runner(request)
+    await _reject_runtime_guard(request, uuid.UUID(node_id))
     try:
         node = await runner.resume_organization_review(uuid.UUID(node_id))
     except ValueError as error:
@@ -1651,6 +1717,7 @@ async def resume_organization_review(node_id: str, request: Request):
 @router.post("/api/nodes/{node_id}/reconnect")
 async def reconnect(node_id: str, request: Request):
     runner = await _runner(request)
+    await _reject_runtime_guard(request, uuid.UUID(node_id))
     return {"ok": await runner.reconnect(uuid.UUID(node_id))}
 
 
@@ -1694,5 +1761,7 @@ async def branch_action(node_id: str, body: BranchAction, request: Request):
 async def run_node(node_id: str, request: Request):
     """Manually execute a specific node (works in any mode)."""
     runner = await _runner(request)
-    nid = await runner.run_node(uuid.UUID(node_id))
+    parsed_id = uuid.UUID(node_id)
+    await _reject_runtime_guard(request, parsed_id)
+    nid = await runner.run_node(parsed_id)
     return {"ok": nid is not None, "ran": str(nid) if nid else None}
