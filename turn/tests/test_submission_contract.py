@@ -34,3 +34,15 @@ def test_plan_audit_prompt_demands_a_published_handoff() -> None:
 def test_plan_audit_prompt_drops_ambiguous_return_wording() -> None:
     prompt = render_plan_audit_prompt("CONTEXT", _Contract(), _Plan())
     assert "Return exactly one normal Turn WorkerResult envelope" not in prompt
+
+
+def test_plan_audit_prompt_explains_transitive_sequence_ordering() -> None:
+    """Real runs burned all plan corrections on a catch-22: the auditor
+    demanded a direct `follows` edge that the mechanical validator rejects as
+    a transitive shortcut. The prompt must state the ordering semantics so an
+    auditor never asks for a forbidden edge again.
+    """
+    prompt = render_plan_audit_prompt("CONTEXT", _Contract(), _Plan())
+    assert "ordering is transitive" in prompt
+    assert "rejected as a shortcut" in prompt
+    assert "never demand a direct follows edge" in prompt

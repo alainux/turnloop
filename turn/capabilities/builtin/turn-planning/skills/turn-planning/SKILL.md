@@ -428,6 +428,12 @@ express immediate prerequisites in `follows`; use a composition owner only
 when multiple outputs must be reconciled. Do not create long-range links or
 serialize unrelated work merely to make a checklist look orderly.
 
+Sequence edges connect adjacent stages only, and ordering is transitive: if
+backend → client → integrate already guarantees integrate runs after backend,
+adding backend → integrate is a rejected shortcut, not extra safety. A node
+that consumes an earlier stage's artifacts but runs after an intermediate
+stage needs no direct edge to that earlier stage.
+
 Keep the first specification visible at the current planning boundary. Prefer
 direct concrete executors only for leaf-fit contracts. Prefer a nested planner
 when the named boundary is itself a program, feature family, collection,
