@@ -141,6 +141,7 @@ class MockTerminalTransport:
         self._stops: dict[uuid.UUID, asyncio.Event] = {}
         self.closed_nodes: set[uuid.UUID] = set()
         self.close_requests: list[uuid.UUID] = []
+        self.written: list[tuple[uuid.UUID, str]] = []
 
     @property
     def available(self) -> bool:
@@ -173,7 +174,17 @@ class MockTerminalTransport:
         state = self._node(node_id)
         if not state["active"]:
             return False
-        state["output"] = str(state["output"]) + (data.decode() if isinstance(data, bytes) else data)
+        text = data.decode() if isinstance(data, bytes) else data
+        self.written.append((node_id, text))
+        state["output"] = str(state["output"]) + text
+        return True
+
+    def echo(self, node_id: uuid.UUID, text: str) -> bool:
+        """Output-only write: visible in the pane stream, never sent to stdin."""
+        state = self._node(node_id)
+        if not state["active"]:
+            return False
+        state["output"] = str(state["output"]) + text
         return True
 
     async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool:

@@ -1476,6 +1476,7 @@ async def _pty_socket(
     node_id: str,
     transport,
     cleanup: Callable[[], Awaitable[object]] | None = None,
+    input_filter: Callable[[bytes | str], Awaitable[bytes | None]] | None = None,
 ) -> None:
     """Serve a raw PTY without interpreting or reformatting its bytes."""
 
@@ -1500,6 +1501,16 @@ async def _pty_socket(
 
     await websocket.accept()
     nid = uuid.UUID(node_id)
+
+    async def deliver(message: dict) -> None:
+        payload = input_bytes(message)
+        if input_filter is not None:
+            filtered = await input_filter(payload)
+            if not filtered:
+                return
+            payload = filtered
+        await transport.write(nid, payload)
+
     queue = transport.subscribe(nid)
     sender = None
     status_sender = None
@@ -1521,7 +1532,7 @@ async def _pty_socket(
                     max(8, min(200, int(first_message.get("rows") or 24))),
                 )
             elif message_type == "input":
-                await transport.write(nid, input_bytes(first_message))
+                await deliver(first_message)
             elif message_type == "scroll":
                 await transport.scroll(
                     nid,
@@ -1589,7 +1600,7 @@ async def _pty_socket(
         while True:
             message = await websocket.receive_json()
             if message.get("type") == "input":
-                await transport.write(nid, input_bytes(message))
+                await deliver(message)
             elif message.get("type") == "scroll":
                 await transport.scroll(
                     nid,
@@ -1645,6 +1656,21 @@ async def shell_socket(websocket: WebSocket, node_id: str):
     if not opened:
         await websocket.close(code=1011, reason="project directory unavailable")
         return
+    input_filter = None
+    if is_lead:
+        # The Lead pane is never a generic shell: while the lead is idle,
+        # typed lines are assembled locally and submitted as retained-session
+        # conversation turns. While a lead turn runs, keystrokes pass through
+        # so the user steers the live harness like any other agent.
+        async def input_filter(data: bytes | str) -> bytes | None:
+            text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+            result = await runner.lead_console_input(nid, text)
+            if result is None:
+                return None
+            return result.encode()
+
+        if not runner.lead_busy(nid):
+            runner._announce_lead_idle(nid)
     async def cleanup_shell() -> bool:
         # A websocket disappearing is a detach, not an explicit close. This
         # keeps the Herdr-backed shell available for reconnects and server
@@ -1656,7 +1682,7 @@ async def shell_socket(websocket: WebSocket, node_id: str):
             return False
         return await runner.detach_shell(nid)
 
-    await _pty_socket(websocket, node_id, runner.shell, cleanup_shell)
+    await _pty_socket(websocket, node_id, runner.shell, cleanup_shell, input_filter=input_filter)
 
 
 async def _send_runtime_guard(websocket: WebSocket, runner: Runner, node_id: uuid.UUID) -> bool:

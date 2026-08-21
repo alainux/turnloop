@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from turn.config import Settings
 from turn.db.store import Store
+from turn.domain.lead import ReviewKind, ReviewStatus
 from turn.domain.schemas import Node, NodeStatus
 from turn.graph.logic import GraphWalker
 
@@ -39,6 +40,8 @@ class Scheduler:
         isolation_available: Callable[[uuid.UUID], Awaitable[bool]] | None = None,
         request_review: Callable[[uuid.UUID, str], Awaitable[None]] | None = None,
         cancel_node: Callable[[uuid.UUID], Awaitable[None]] | None = None,
+        execute_review: Callable[[uuid.UUID, uuid.UUID], Awaitable[None]] | None = None,
+        lead_busy: Callable[[uuid.UUID], bool] | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -54,6 +57,14 @@ class Scheduler:
         self._isolation_available = isolation_available
         self._request_review = request_review
         self._cancel_node = cancel_node
+        # Actionable ReviewRequests are executable units in the same frontier
+        # machinery as nodes: auto mode reserves them on a scheduling pass,
+        # step mode launches them with the current stage (LEAD_ESCALATION_FINISH §4–§5).
+        self._execute_review = execute_review
+        self._lead_busy = lead_busy or (lambda _owner_id: False)
+        self.running_reviews: dict[uuid.UUID, asyncio.Task] = {}
+        self.running_review_projects: dict[uuid.UUID, uuid.UUID] = {}
+        self.manual_review_stages: dict[uuid.UUID, set[uuid.UUID]] = {}
         self.running: dict[uuid.UUID, asyncio.Task] = {}
         self.running_projects: dict[uuid.UUID, uuid.UUID] = {}
         self.retries: dict[uuid.UUID, int] = {}
@@ -97,6 +108,24 @@ class Scheduler:
         self.running.pop(node_id, None)
         self.running_projects.pop(node_id, None)
 
+    def reserve_review(self, request_id: uuid.UUID, project_id: uuid.UUID) -> asyncio.Task:
+        """Reserve one review-request settlement; idempotent like reserve."""
+        existing = self.running_reviews.get(request_id)
+        if existing is not None and not existing.done():
+            return existing
+
+        async def run() -> None:
+            try:
+                await self._execute_review(request_id, project_id)
+            finally:
+                self.running_reviews.pop(request_id, None)
+                self.running_review_projects.pop(request_id, None)
+
+        task = asyncio.create_task(run())
+        self.running_reviews[request_id] = task
+        self.running_review_projects[request_id] = project_id
+        return task
+
     def active_node_ids(self, project_id: uuid.UUID | None = None) -> frozenset[uuid.UUID]:
         return frozenset(
             node_id
@@ -105,8 +134,64 @@ class Scheduler:
             and (project_id is None or self.running_projects.get(node_id) == project_id)
         )
 
+    def _active_review_ids(self, project_id: uuid.UUID | None = None) -> set[uuid.UUID]:
+        return {
+            request_id
+            for request_id, task in self.running_reviews.items()
+            if not task.done()
+            and (
+                project_id is None
+                or self.running_review_projects.get(request_id) == project_id
+            )
+        }
+
+    def _review_capacity_used(self, project_id: uuid.UUID | None = None) -> int:
+        return len(self._active_review_ids(project_id))
+
     def _active_count(self, project_id: uuid.UUID | None = None) -> int:
-        return len(self.active_node_ids(project_id))
+        # Review turns consume the same project/global concurrency budget as
+        # node executions: they are one execution authority, not a side lane.
+        return len(self.active_node_ids(project_id)) + self._review_capacity_used(project_id)
+
+    async def _pending_review_actions(
+        self, project_id: uuid.UUID, nodes: list[Node]
+    ) -> list:
+        """Actionable PENDING review requests whose receiver can run now."""
+        bootstrap = self.store.bootstrap_status_sync(project_id)
+        if bootstrap == "BOOTSTRAPPING":
+            # Bootstrap automation owns plan-review turns itself; nothing here
+            # may launch a second model call during it.
+            return []
+        pending = await self.store.review_requests(
+            project_id, status=ReviewStatus.PENDING
+        )
+        node_by_id = {node.id: node for node in nodes}
+        receivers_running: set[uuid.UUID] = set()
+        ready = []
+        for request in pending:
+            if request.kind not in (ReviewKind.COMPLETION_REVIEW, ReviewKind.ESCALATION):
+                continue
+            if request.id in self.running_reviews:
+                continue
+            if request.receiver_id in receivers_running:
+                continue
+            if self._is_externally_busy(request.receiver_id):
+                continue
+            if request.receiver_is_lead:
+                if self._lead_busy(request.receiver_id):
+                    continue
+            else:
+                receiver = node_by_id.get(request.receiver_id)
+                if (
+                    receiver is None
+                    or receiver.status is NodeStatus.RUNNING
+                    or receiver.paused
+                    or request.receiver_id in self.running
+                ):
+                    continue
+            receivers_running.add(request.receiver_id)
+            ready.append(request)
+        return ready
 
     @staticmethod
     def _apply_organization_limit(
@@ -283,6 +368,15 @@ class Scheduler:
                 if not task.done()
                 and (project_id is None or self.running_projects.get(node_id) == project_id)
             ]
+            tasks.extend(
+                task
+                for request_id, task in self.running_reviews.items()
+                if not task.done()
+                and (
+                    project_id is None
+                    or self.running_review_projects.get(request_id) == project_id
+                )
+            )
             if not tasks:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -505,6 +599,25 @@ class Scheduler:
             self.last_launch_at[project_id] = time.monotonic()
             if delay_ms:
                 break
+        # Auto mode: ready review turns launch through this same pass, under
+        # the same concurrency budget. Step mode never reaches this branch.
+        if root.auto_run:
+            for request in await self._pending_review_actions(project_id, nodes):
+                if project_id in self.deleting_projects:
+                    return
+                if self._active_count(project_id) >= project_limit or self._active_count() >= global_limit:
+                    break
+                self.reserve_review(request.id, project_id)
+                self.last_launch_at[project_id] = time.monotonic()
+                await self._emit("review.launched", project_id, {
+                    "project_id": str(project_id),
+                    "review_request_id": str(request.id),
+                    "kind": request.kind.value,
+                    "receiver_id": str(request.receiver_id),
+                    "receiver_is_lead": request.receiver_is_lead,
+                })
+                if delay_ms:
+                    break
 
     async def _bootstrap_tick(self, project_id: uuid.UUID, root: Node | None) -> None:
         """Drive lead/planner bootstrap until the root plan is accepted.
@@ -577,24 +690,42 @@ class Scheduler:
                 nodes, edges, _ = await self.store.get_workgraph(project_id)
 
         stage = self.manual_stages.get(project_id)
-        if stage:
+        stage_reviews = self.manual_review_stages.get(project_id, set())
+        if stage or stage_reviews:
             current = {node.id: node for node in nodes}
-            settled = all(
-                node_id not in self.running
-                and current.get(node_id) is not None
-                and current[node_id].status
-                in (
-                    NodeStatus.COMPLETE,
-                    NodeStatus.FAILED,
-                    NodeStatus.BLOCKED,
-                    NodeStatus.CANCELLED,
-                    NodeStatus.EXPANDED,
+            settled = (
+                not stage
+                or all(
+                    node_id not in self.running
+                    and current.get(node_id) is not None
+                    and current[node_id].status
+                    in (
+                        NodeStatus.COMPLETE,
+                        NodeStatus.FAILED,
+                        NodeStatus.BLOCKED,
+                        NodeStatus.CANCELLED,
+                        NodeStatus.EXPANDED,
+                    )
+                    for node_id in stage
                 )
-                for node_id in stage
             )
-            if not settled:
+            reviews_settled = True
+            for request_id in stage_reviews:
+                task = self.running_reviews.get(request_id)
+                if task is not None and not task.done():
+                    reviews_settled = False
+                    break
+                requests = await self.store.review_requests(
+                    project_id, status=None
+                )
+                request = next((item for item in requests if item.id == request_id), None)
+                if request is None or request.status is ReviewStatus.PENDING:
+                    reviews_settled = False
+                    break
+            if not (settled and reviews_settled):
                 return []
             self.manual_stages.pop(project_id, None)
+            self.manual_review_stages.pop(project_id, None)
 
         walker = GraphWalker(nodes, edges)
         evaluation = walker.evaluate()
@@ -641,12 +772,12 @@ class Scheduler:
                 or node.trigger_context is not None
             )
         ]
-        if not stage_nodes:
+        if not stage_nodes and not (
+            await self._pending_review_actions(project_id, nodes)
+        ):
             return []
 
         stage_nodes = stage_nodes[:available]
-        if not stage_nodes:
-            return []
 
         stage_active = set(self.active_node_ids())
         selected: list[Node] = []
@@ -660,7 +791,7 @@ class Scheduler:
             selected.append(node)
             stage_active.add(node.id)
         stage_nodes = selected
-        if not stage_nodes:
+        if not stage_nodes and not (await self._pending_review_actions(project_id, nodes)):
             return []
         self.manual_stages[project_id] = {node.id for node in stage_nodes}
         for node in stage_nodes:
@@ -670,4 +801,22 @@ class Scheduler:
             self.reserve(node, project_id)
             stage_active.add(node.id)
             await self._emit("node.updated", project_id, _dump(node))
+        # Review turns are part of the same stage: Next Stage launches them,
+        # never a hidden scheduler.
+        review_capacity = max(0, available - len(stage_nodes))
+        stage_review_ids: set[uuid.UUID] = set()
+        for request in await self._pending_review_actions(project_id, nodes):
+            if len(stage_review_ids) >= max(review_capacity, 1) or project_id in self.deleting_projects:
+                break
+            self.reserve_review(request.id, project_id)
+            stage_review_ids.add(request.id)
+            await self._emit("review.launched", project_id, {
+                "project_id": str(project_id),
+                "review_request_id": str(request.id),
+                "kind": request.kind.value,
+                "receiver_id": str(request.receiver_id),
+                "receiver_is_lead": request.receiver_is_lead,
+            })
+        if stage_review_ids:
+            self.manual_review_stages[project_id] = stage_review_ids
         return [node.id for node in stage_nodes]

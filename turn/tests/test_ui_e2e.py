@@ -204,6 +204,9 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             page.locator("#inspector").get_by_role(
                 "heading", name=runnable["objective"]
             ).wait_for()
+            # The terminal is the default surface; authoring lives in Overview.
+            page.locator("#inspector .terminal-shadow-host").wait_for(state="visible")
+            page.get_by_role("tab", name="Overview").click()
             page.locator(".instructions-section").wait_for()
             assert page.locator(".instructions-section").count() == 1
             assert page.get_by_role("button", name="Save agent").is_disabled()

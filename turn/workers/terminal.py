@@ -1290,6 +1290,24 @@ class HerdrPtyTransport(LocalPtyTransport):
             {"type": "terminal.input", "bytes": base64.b64encode(payload).decode()},
         )
 
+    def echo(self, node_id: uuid.UUID, text: str) -> bool:
+        """Write text into the visible output stream without touching stdin.
+
+        Used for UI affordances such as the lead-conversation local echo and
+        the idle banner. Subscribers and the replay backlog see it exactly
+        like process output, but no process receives it as input, so an idle
+        pane's shell can never execute anything a UI affordance prints.
+        """
+        session = self.sessions.get(node_id)
+        if session is None or session.ended:
+            return False
+        session.output.extend(text.encode())
+        if len(session.output) > self.backlog_limit:
+            del session.output[: len(session.output) - self.backlog_limit]
+        for subscriber in list(session.subscribers):
+            subscriber.put_nowait(text)
+        return True
+
     async def scroll(self, node_id: uuid.UUID, direction: str, amount: int = 1) -> bool:
         if direction not in {"up", "down"}:
             return False

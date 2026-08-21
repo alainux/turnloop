@@ -33,6 +33,7 @@ from turn.domain.organization import (
     OrganizationScale,
     PlanAuditDecision,
     PlanAuditResult,
+    WorkItemSpec,
     WorkItemStatus,
 )
 from turn.domain.schemas import (
@@ -44,6 +45,7 @@ from turn.domain.schemas import (
     EdgeType,
     EventSource,
     HarnessKind,
+    InputSpec,
     ManagerResult,
     Node,
     NodeStatus,
@@ -266,6 +268,10 @@ class Runner:
         # RUNNING until the terminal boundary is closed, so the UI never
         # claims cancellation while a provider is still live.
         self._cancelling_nodes: set[uuid.UUID] = set()
+        self._review_attempts: dict[uuid.UUID, int] = {}
+        self._lead_tasks: dict[uuid.UUID, asyncio.Task] = {}
+        self._lead_line_buffers: dict[uuid.UUID, str] = {}
+        self._lead_input_locks: dict[uuid.UUID, asyncio.Lock] = {}
         self._reconnect_tasks = self.sessions.reconnect_tasks
         self._forbidden_fresh_sessions = self.sessions.forbidden_fresh_sessions
         self.organization_manager = OrganizationManager()
@@ -284,6 +290,11 @@ class Runner:
             isolation_available=self._workspace_isolation_available,
             request_review=self._request_organization_review,
             cancel_node=self._cancel_node_by_id,
+            execute_review=self._execute_review_action,
+            lead_busy=lambda owner_id: (
+                self.generation_active(owner_id)
+                or bool((task := self._lead_tasks.get(owner_id)) and not task.done())
+            ),
         )
         self.node_executor = NodeExecutor(
             store=self.store,
@@ -1491,6 +1502,120 @@ class Runner:
         if session_id:
             await self.store.update_lead(project_id, session_id=session_id)
 
+    def lead_busy(self, owner_id: uuid.UUID) -> bool:
+        """True while a lead provider turn (review or conversation) is live."""
+        task = self._lead_tasks.get(owner_id)
+        return self.generation_active(owner_id) or bool(task and not task.done())
+
+    async def lead_console_input(self, owner_id: uuid.UUID, data: str) -> str | None:
+        """Intercept terminal input addressed to an idle project lead.
+
+        The lead's pane must never behave like a generic shell while it is
+        presented as the Lead (LEAD_ESCALATION_FINISH §1). While the lead is
+        idle this assembles typed lines locally — echoing them into the pane's
+        visible stream without touching stdin — and submits each line as one
+        retained-session lead conversation turn. While a lead turn is running
+        the input passes through untouched so the user steers the live harness
+        exactly like any other agent.
+
+        Returns the bytes to forward to the pane, or ``None`` when consumed.
+        """
+        if not data:
+            return None
+        if self.lead_busy(owner_id):
+            # A turn started mid-line: hand back anything already buffered so
+            # nothing the user typed silently disappears.
+            buffered = self._lead_line_buffers.pop(owner_id, "")
+            return (buffered + data) if (buffered or data) else None
+        lock = self._lead_input_locks.setdefault(owner_id, asyncio.Lock())
+        async with lock:
+            buffer = self._lead_line_buffers.get(owner_id, "")
+            echo_parts: list[str] = []
+            submit: str | None = None
+            for ch in data:
+                if ch in ("\r", "\n"):
+                    echo_parts.append("\r\n")
+                    if buffer.strip() and submit is None:
+                        submit = buffer.strip()
+                    buffer = ""
+                elif ch in ("\x7f", "\b"):
+                    if buffer:
+                        buffer = buffer[:-1]
+                        echo_parts.append("\b \b")
+                elif ch == "\x03":
+                    buffer = ""
+                    echo_parts.append("^C\r\n")
+                elif ch >= " " or ch == "\t":
+                    buffer += ch
+                    echo_parts.append(ch)
+                # Remaining control characters are swallowed: they must never
+                # reach an idle shell.
+            self._lead_line_buffers[owner_id] = buffer
+            echo = "".join(echo_parts)
+            if echo:
+                self.shell.echo(owner_id, echo)
+            if submit is not None:
+                task = asyncio.create_task(
+                    self._lead_conversation_task(owner_id, submit)
+                )
+                self._lead_tasks[owner_id] = task
+            return None
+
+    async def _lead_conversation_task(self, owner_id: uuid.UUID, message: str) -> None:
+        try:
+            await self.lead_conversation_turn(owner_id, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("lead conversation turn failed: %s", error)
+            try:
+                self.shell.echo(
+                    owner_id,
+                    "\r\n\x1b[31mlead turn failed: "
+                    + sanitize_control_text(str(error))
+                    + "\x1b[0m\r\n",
+                )
+            except Exception:
+                pass
+        finally:
+            self._lead_tasks.pop(owner_id, None)
+            self._announce_lead_idle(owner_id)
+            self.wake()
+
+    async def lead_conversation_turn(self, owner_id: uuid.UUID, message: str) -> None:
+        """Run one user-typed conversation turn on the retained lead session."""
+        lead = await self.store.lead_by_terminal_owner(owner_id)
+        if lead is None:
+            raise ControlOperationUnavailable("no project lead owns this terminal")
+        if lead.agent is None:
+            raise ControlOperationUnavailable("project lead has no agent configuration")
+        prompt = "\n".join([
+            "The project owner typed the following message directly into your terminal.",
+            "Answer it naturally; put your plain-language reply in the summary of the",
+            "result envelope. Concrete follow-ups belong in required_changes.",
+            "",
+            f"Owner message: {message}",
+        ])
+        await self._run_lead_turn(
+            lead.project_id,
+            purpose="lead-conversation",
+            prompt=prompt,
+        )
+
+    def _announce_lead_idle(self, owner_id: uuid.UUID) -> None:
+        """Mark the idle pane visibly as the Lead, never as a plain shell."""
+        try:
+            self.shell.echo(
+                owner_id,
+                "\r\n\x1b[2m—— Project lead is listening — type a message and press Enter —\x1b[0m\r\n",
+            )
+        except Exception:
+            # Purely cosmetic affordance; never break control flow on it.
+            pass
+
+    async def _execute_review_action(self, request_id: uuid.UUID, project_id: uuid.UUID) -> None:
+        await self.settle_review_request(project_id, request_id)
+
     async def _run_lead_turn(
         self,
         project_id: uuid.UUID,
@@ -1561,6 +1686,9 @@ class Runner:
         finally:
             await self.store.update_lead(project_id, status="IDLE")
             await self.terminal.close_persistent_session(lead.terminal_owner_id)
+            # The pane returns to its idle state; mark it visibly as the
+            # listening Lead instead of letting it read as a plain shell.
+            self._announce_lead_idle(lead.terminal_owner_id)
 
     async def _escalate_plan_review(
         self,
@@ -1807,182 +1935,472 @@ class Runner:
             review.audit_updated_at = datetime.now(timezone.utc)
         await self.store.set_organization_review(node_id, review)
 
-    async def _provider_manager_review(self, snapshot: dict) -> ManagerResult:
-        """Ask the retained planner session for a typed management decision."""
-        boundary_data = snapshot.get("boundary") or {}
+    async def _review_authority_for(self, boundary: Node) -> tuple[uuid.UUID, bool]:
+        """Resolve the hierarchical acceptance authority for a boundary.
+
+        Nested boundaries are accepted by their parent planner; the root
+        boundary (or a boundary without a planner ancestor) is accepted by
+        the project lead. Returns (receiver_id, receiver_is_lead).
+        """
+        if boundary.id != boundary.project_id:
+            parent = await self._parent_planner_for(boundary)
+            if parent is not None:
+                return parent.id, False
+        lead = await self.store.project_lead(boundary.project_id)
+        if lead is None:
+            raise ControlOperationUnavailable(
+                "boundary acceptance requires a project lead and none exists"
+            )
+        return lead.terminal_owner_id, True
+
+    async def _request_authority_completion_review(self, boundary: Node) -> None:
+        """Record one durable completion-review request for a settled frontier.
+
+        Storage only: no model call happens here. The scheduler (auto mode)
+        or the user's Next Stage (step mode) launches the receiver's bounded
+        review turn through ``settle_review_request``.
+        """
+        project_id = boundary.project_id
+        open_requests = [
+            item
+            for item in await self.store.review_requests(
+                project_id, sender_id=boundary.id, status=ReviewStatus.PENDING
+            )
+            if item.kind is ReviewKind.COMPLETION_REVIEW
+        ]
+        if open_requests:
+            return
+        receiver_id, receiver_is_lead = await self._review_authority_for(boundary)
+        request = await self.store.create_review_request(
+            project_id=project_id,
+            sender_id=boundary.id,
+            receiver_id=receiver_id,
+            receiver_is_lead=receiver_is_lead,
+            kind=ReviewKind.COMPLETION_REVIEW,
+            reason="frontier settled; hierarchical acceptance requested",
+        )
+        await self._emit("organization.review_requested", project_id, {
+            "project_id": str(project_id),
+            "node_id": str(boundary.id),
+            "review_request_id": str(request.id),
+            "kind": request.kind.value,
+            "receiver_id": str(receiver_id),
+            "receiver_is_lead": receiver_is_lead,
+        })
+
+    async def settle_review_request(self, project_id: uuid.UUID, request_id: uuid.UUID) -> None:
+        """Execute one bounded receiver turn that settles a review request.
+
+        This is the single execution path for actionable ReviewRequests: the
+        scheduler reserves it in auto mode and Next Stage launches it in step
+        mode. The receiver — parent planner or project lead — runs one
+        structured turn in its own durable pane and returns an APPROVE,
+        REJECT, or ESCALATE decision.
+        """
+        requests = await self.store.review_requests(project_id)
+        request = next((item for item in requests if item.id == request_id), None)
+        if request is None or request.status is not ReviewStatus.PENDING:
+            return
+        await self.store.update_review_request(
+            project_id, request_id, status=ReviewStatus.ACTIVE
+        )
         try:
-            boundary_id = uuid.UUID(str(boundary_data["id"]))
-        except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("manager snapshot has no valid boundary id") from error
-        boundary = await self.store.get_node(boundary_id)
-        if boundary is None:
-            raise RuntimeError(f"manager boundary disappeared: {boundary_id}")
-        planner = self._review_planner_for(boundary)
-        if planner is None:
-            raise RuntimeError("no real planner adapter is available for manager review")
-        if boundary.agent is None:
-            raise RuntimeError("manager review requires the retained planner agent")
-        base = await self._build_context(boundary)
-        manager_agent = boundary.agent.as_type(AgentType.PLANNER)
-        manager_node = boundary.model_copy(update={"agent": manager_agent})
-        review_ctx = self._review_context(
+            payload = await self._execute_review_turn(project_id, request)
+        except Exception as error:
+            attempts = self._review_attempts.get(request_id, 0) + 1
+            self._review_attempts[request_id] = attempts
+            reason = sanitize_control_text(error)
+            if attempts >= 3:
+                # Fail visibly instead of looping model calls forever.
+                await self.store.update_review_request(
+                    project_id,
+                    request_id,
+                    status=ReviewStatus.SETTLED,
+                    decision=ReviewDecision.REJECT,
+                    summary=f"review turn failed repeatedly: {reason}",
+                )
+                self._review_attempts.pop(request_id, None)
+                await self._emit("organization.review_failed", project_id, {
+                    "review_request_id": str(request_id),
+                    "error": reason,
+                })
+                self.wake()
+                return
+            await self.store.update_review_request(
+                project_id, request_id, status=ReviewStatus.PENDING
+            )
+            logger.warning(
+                "review turn attempt %d failed for request %s: %s",
+                attempts, request_id, reason,
+            )
+            return
+        self._review_attempts.pop(request_id, None)
+        try:
+            await self._apply_review_decision(project_id, request, payload)
+        finally:
+            self.wake()
+
+    def _review_decision_payload(self, payload: dict) -> dict:
+        content = self._structured_artifact_payload(
+            payload,
+            schema_name="turn.review-decision",
+            artifact_name="review-decision",
+        )
+        raw = str(content.get("decision") or "").strip().upper()
+        if raw not in {"APPROVE", "REJECT", "ESCALATE"}:
+            raise InvalidSubmission(
+                f"review-decision must be APPROVE, REJECT, or ESCALATE; got {raw!r}"
+            )
+        return {
+            "decision": raw,
+            "summary": sanitize_control_text(str(content.get("summary") or "")),
+            "required_changes": [
+                sanitize_control_text(str(item))
+                for item in (content.get("required_changes") or [])
+            ],
+            "missing_inputs": [
+                sanitize_control_text(str(item))
+                for item in (content.get("missing_inputs") or [])
+            ],
+            "work_items": list(content.get("work_items") or []),
+        }
+
+    def _review_work_items(self, content: dict) -> list[WorkItemSpec]:
+        from turn.domain.organization import WorkItemSpec as _Spec
+        specs: list[_Spec] = []
+        for item in content["work_items"]:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key:
+                continue
+            specs.append(_Spec(
+                key=key,
+                title=str(item.get("title") or key)[:200],
+                instructions=(
+                    str(item.get("instructions") or item.get("objective") or key).strip()
+                    or key
+                ),
+                depends_on=[str(d) for d in (item.get("depends_on") or [])],
+            ))
+        return specs
+
+    async def _escalate_completion_review(self, request: ReviewRequest, summary: str) -> None:
+        """Pass a completion decision one level up the hierarchy."""
+        # Escalating advances from the CURRENT receiver's position upward, so
+        # a parent that cannot decide hands the decision to the lead instead
+        # of bouncing it back to the original sender.
+        receiver_node = await self.store.get_node(request.receiver_id)
+        if receiver_node is None:
+            raise ControlOperationUnavailable("review receiver disappeared")
+        await self._escalate_plan_review(
+            receiver_node,
+            reason=f"completion acceptance escalated: {summary}",
+            required_changes=[],
+        )
+
+    async def _apply_review_decision(
+        self, project_id: uuid.UUID, request: ReviewRequest, payload: dict
+    ) -> None:
+        content = self._review_decision_payload(payload)
+        raw_decision = content["decision"]
+        summary = content["summary"]
+        sender = await self.store.get_node(request.sender_id)
+        if sender is None:
+            raise ControlOperationUnavailable("review sender disappeared")
+
+        if request.kind is ReviewKind.COMPLETION_REVIEW:
+            if raw_decision == "ESCALATE":
+                if request.receiver_is_lead:
+                    # The lead is the top of the hierarchy; ESCALATE there can
+                    # only mean the decision needs something Turn cannot get.
+                    missing = content["missing_inputs"] or [summary or "user input required"]
+                    result = ManagerResult(
+                        decision=ManagerDecision.BLOCK,
+                        summary=summary or "lead escalation requires user input",
+                        missing_inputs=[
+                            InputSpec(id=f"lead-input-{index}", label=text[:120])
+                            for index, text in enumerate(missing, start=1)
+                        ],
+                    )
+                    await self.organization_manager.apply_result(
+                        self.store, sender.id, result
+                    )
+                    await self.store.update_review_request(
+                        project_id, request.id,
+                        status=ReviewStatus.SETTLED,
+                        decision=ReviewDecision.REJECT,
+                        summary="blocked on user input: " + summary,
+                    )
+                    await self._emit("organization.escalation.blocked", project_id, {
+                        "node_id": str(sender.id),
+                        "review_request_id": str(request.id),
+                        "reason": summary,
+                    })
+                    return
+                await self.store.update_review_request(
+                    project_id, request.id,
+                    status=ReviewStatus.SETTLED,
+                    decision=ReviewDecision.REJECT,
+                    summary=f"escalated upward: {summary}",
+                )
+                await self._escalate_completion_review(request, summary)
+                return
+            if raw_decision == "APPROVE":
+                accept = ManagerResult(decision=ManagerDecision.ACCEPT, summary=summary)
+                await self.organization_manager.apply_result(self.store, sender.id, accept)
+                await self._expose_boundary_output_commit(sender.id)
+                await self.store.update_review_request(
+                    project_id, request.id,
+                    status=ReviewStatus.SETTLED,
+                    decision=ReviewDecision.APPROVE,
+                    summary=summary,
+                )
+                await self._emit("organization.reviewed", project_id, {
+                    "node_id": str(sender.id),
+                    "phase": ManagerPhase.ACCEPTED.value,
+                    "replan": False,
+                    "reason": summary,
+                    "authority": "lead" if request.receiver_is_lead else "parent",
+                })
+                return
+            # REJECT: corrective work flows through the ordinary CONTINUE
+            # machinery so the retained planner appends a bounded wave.
+            contract = sender.organization_contract
+            settled_rejects = [
+                item for item in await self.store.review_requests(
+                    project_id, sender_id=sender.id,
+                )
+                if item.kind is ReviewKind.COMPLETION_REVIEW
+                and item.status is ReviewStatus.SETTLED
+                and item.decision is ReviewDecision.REJECT
+            ]
+            max_iterations = (
+                contract.escalation.max_manager_iterations
+                if contract is not None and contract.escalation is not None
+                else 5
+            )
+            if len(settled_rejects) >= max_iterations:
+                await self.store.update_review_request(
+                    project_id, request.id,
+                    status=ReviewStatus.SETTLED,
+                    decision=ReviewDecision.REJECT,
+                    summary=f"escalated after {len(settled_rejects)} corrections: {summary}",
+                )
+                await self._escalate_completion_review(request, summary)
+                return
+            specs = self._review_work_items(content)
+            if not specs:
+                specs = [WorkItemSpec(
+                    key=f"correction-{len(settled_rejects) + 1}",
+                    title="Address review corrections",
+                    instructions="\n".join(content["required_changes"] or [summary])[:4000],
+                )]
+            result = ManagerResult(
+                decision=ManagerDecision.CONTINUE,
+                work_items=specs,
+                summary=summary,
+            )
+            review_decision = await self.organization_manager.apply_result(
+                self.store, sender.id, result
+            )
+            await self.store.update_review_request(
+                project_id, request.id,
+                status=ReviewStatus.SETTLED,
+                decision=ReviewDecision.REJECT,
+                summary=summary,
+            )
+            if review_decision.decision is ManagerDecision.CONTINUE:
+                await self._maybe_escalate_manager_loop(sender, review_decision)
+            await self._emit("organization.reviewed", project_id, {
+                "node_id": str(sender.id),
+                "phase": OrganizationPhase.EXECUTE_FRONTIER.value,
+                "replan": False,
+                "reason": summary,
+                "authority": "lead" if request.receiver_is_lead else "parent",
+            })
+            return
+
+        # ESCALATION requests: the receiver either corrects the situation and
+        # lets the sender retry fresh, or passes the decision further up.
+        if raw_decision == "ESCALATE":
+            if request.receiver_is_lead:
+                await self.store.update_review_request(
+                    project_id, request.id,
+                    status=ReviewStatus.SETTLED,
+                    decision=ReviewDecision.REJECT,
+                    summary="blocked on user input: " + (summary or "lead cannot resolve alone"),
+                )
+                await self._emit("organization.escalation.blocked", project_id, {
+                    "node_id": str(sender.id),
+                    "review_request_id": str(request.id),
+                    "reason": summary,
+                })
+                return
+            await self.store.update_review_request(
+                project_id, request.id,
+                status=ReviewStatus.SETTLED,
+                decision=ReviewDecision.REJECT,
+                summary=f"escalated upward: {summary}",
+            )
+            receiver_node = await self.store.get_node(request.receiver_id)
+            if receiver_node is None:
+                raise ControlOperationUnavailable("review receiver disappeared")
+            await self._escalate_plan_review(
+                receiver_node,
+                reason=f"escalation advanced to the lead by the parent planner: {summary}",
+                required_changes=list(request.required_changes),
+            )
+            return
+        # APPROVE (receiver corrected the organization or endorses a retry)
+        # and REJECT (corrective directives recorded) both revive the sender
+        # with a fresh planning run; the durable trail records which.
+        await self.store.update_review_request(
+            project_id, request.id,
+            status=ReviewStatus.SETTLED,
+            decision=ReviewDecision.APPROVE if raw_decision == "APPROVE" else ReviewDecision.REJECT,
+            summary=summary,
+        )
+        await self.retry(request.sender_id)
+        await self._emit("organization.escalation.settled", project_id, {
+            "node_id": str(sender.id),
+            "review_request_id": str(request.id),
+            "decision": raw_decision,
+            "reason": summary,
+        })
+
+    async def _execute_review_turn(self, project_id: uuid.UUID, request: ReviewRequest) -> dict:
+        """Run the receiver's single bounded structured review turn."""
+        sender = await self.store.get_node(request.sender_id)
+        if sender is None:
+            raise ControlOperationUnavailable("review sender disappeared")
+        snapshot = await self.organization_manager.snapshot(self.store, request.sender_id)
+        kind_line = (
+            "KIND: COMPLETION_REVIEW — decide whether the boundary charter is"
+            if request.kind is ReviewKind.COMPLETION_REVIEW
+            else "KIND: ESCALATION — the sender exhausted its correction budget"
+        )
+        role_line = (
+            "the project lead"
+            if request.receiver_is_lead
+            else "the parent planner"
+        )
+        prompt = "\n".join([
+            "TURN_REVIEW_REQUEST",
+            f"You are {role_line}: the hierarchical authority for this decision.",
+            kind_line,
+            "Inspect the persisted snapshot below and the real project files before deciding.",
+            "When corrective work is needed you may use Turn CLI tools to fix organization wiring, prompts, or contracts yourself before deciding.",
+            "Return exactly one normal Turn WorkerResult envelope with outcome COMPLETE and one JSON artifact named 'review-decision' (schema_name 'turn.review-decision', schema_version 'v1') whose content has:",
+            '- decision: "APPROVE" (accept, or corrected and proceed), "REJECT" (return corrective work), or "ESCALATE" (pass the decision one level up)',
+            "- summary: short rationale",
+            "- required_changes: concrete corrections when REJECTing",
+            "- work_items: bounded follow-up items when REJECTing a completion review",
+            "- missing_inputs: what only the user can provide, when blocked",
+            f"REASON={request.reason}",
+            "REQUIRED_CHANGES=" + json.dumps(request.required_changes),
+            "ORGANIZATION_SNAPSHOT_JSON=" + json.dumps(snapshot, sort_keys=True),
+        ])
+        if request.receiver_is_lead:
+            payload, _usage = await self._run_lead_turn(
+                project_id,
+                purpose="authority-review",
+                prompt=prompt,
+            )
+            return payload
+        receiver = await self.store.get_node(request.receiver_id)
+        if receiver is None:
+            raise ControlOperationUnavailable("review receiver node disappeared")
+        return await self._node_structured_turn(
+            receiver,
+            purpose="authority-review",
+            worker="authority-review",
+            prompt=prompt,
+        )
+
+    async def _node_structured_turn(
+        self,
+        node: Node,
+        *,
+        purpose: str,
+        worker: str,
+        prompt: str,
+    ) -> dict:
+        """One bounded structured provider turn on a node's retained session."""
+        planner = self._review_planner_for(node)
+        if planner is None or not callable(getattr(planner, "call_structured", None)):
+            raise ControlOperationUnavailable(
+                "no real planner adapter is available for the review turn"
+            )
+        if node.agent is None:
+            raise ControlOperationUnavailable("review receiver has no agent")
+        base = await self._build_context(node)
+        agent = node.agent.as_type(AgentType.PLANNER)
+        ctx = self._review_context(
             base,
-            manager_node,
-            purpose="organization-manager-review",
+            node.model_copy(update={"agent": agent}),
+            purpose=purpose,
             repo_path=base.project_repo_path or base.repo_path,
         )
-        # A completed native planner handoff leaves its Codex TUI in the
-        # durable pane so the user can inspect or reconnect it. Manager
-        # review resumes the same provider session in a separate, bounded
-        # structured call; close that stale writer first or Codex rejects the
-        # resume with an "active writer" error. A live Turn-owned generation
-        # is never touched here.
-        if self.generation_active(boundary_id):
-            raise ControlOperationUnavailable(
-                "organization manager review cannot start while the boundary provider is active"
-            )
         reconcile = getattr(self.terminal, "reconcile_provider_session", None)
-        if callable(reconcile) and manager_agent.session_id:
+        if callable(reconcile) and agent.session_id:
             await reconcile(
-                boundary.id,
-                project_key=str(boundary.project_id),
-                session_id=manager_agent.session_id,
-                provider=manager_agent.harness.value,
+                node.id,
+                project_key=str(node.project_id),
+                session_id=agent.session_id,
+                provider=agent.harness.value,
             )
-        # The retained planner pane may have been detached from Turn's map by
-        # a daemon restart. Reconcile it by provider session before closing it
-        # so Codex cannot reject the manager resume with an active-writer error.
-        await self.terminal.close_persistent_session(boundary_id)
-        prompt = "\n".join(
-            [
-                render_context_block(review_ctx),
-                "TURN_ORGANIZATION_MANAGER_REVIEW",
-                "You are the retained planner acting as the organization manager at a safe point.",
-                "Observe the current persisted snapshot and real project files. Do not directly edit files or mutate Turn state.",
-                "Choose ACCEPT only when the charter, deliverables, every acceptance criterion, independent verification, required handoffs, and the backlog are actually complete with inspectable evidence.",
-                "Choose CONTINUE when more bounded work is required. Return work_items only; graph changes belong to a retained planner turn, not the manager result. Every work item must have a unique key, precise instructions, explicit acceptance criteria when needed, and dependencies that refer to existing or same-response keys.",
-                "Choose BLOCK when missing user input, an impossible constraint, or a hard budget/workspace failure prevents safe progress. Include missing_inputs when user action is required.",
-                "Return exactly one normal Turn WorkerResult envelope with outcome COMPLETE and one JSON artifact named 'manager-result' (schema_name 'turn.manager-result', schema_version 'v1'). The artifact content must be a ManagerResult object with decision ACCEPT, CONTINUE, or BLOCK, summary, and the relevant work_items or missing_inputs. ACCEPT has no work_items; CONTINUE returns work_items only; BLOCK may return missing_inputs.",
-                "ORGANIZATION_SNAPSHOT_JSON="
-                + json.dumps(snapshot, sort_keys=True),
-            ]
+        await self.terminal.close_persistent_session(node.id)
+        runs = await self.store.get_runs(node.id)
+        run = await self.store.create_run(node, worker, len(runs) + 1)
+        ctx.run_id = str(run.id)
+        await self.store.mark_run_process(
+            run.id,
+            ProcessState.RUNNING,
+            pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(node.id),
         )
-        # Manager review resumes the boundary's own retained session in its
-        # own durable pane. There is no synthetic reviewer process and no
-        # synthetic process owner: the planner's terminal visibly becomes
-        # active again for the review turn.
-        runs = await self.store.get_runs(boundary.id)
-        completion_request = await self.store.create_review_request(
-            project_id=boundary.project_id,
-            sender_id=boundary.id,
-            receiver_id=boundary.id,
-            receiver_is_lead=False,
-            kind=ReviewKind.COMPLETION_REVIEW,
-            reason="boundary frontier settled; manager review requested",
-        )
-        await self.store.update_review_request(
-            boundary.project_id,
-            completion_request.id,
-            status=ReviewStatus.ACTIVE,
-        )
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            run = await self.store.create_run(
-                boundary,
-                "organization-manager",
-                len(runs) + attempt,
+        try:
+            payload, usage, session_id = await planner.call_structured(
+                ctx,
+                prompt,
+                handoff_kind="result",
             )
-            review_ctx.run_id = str(run.id)
-            await self.store.mark_run_process(
+            accepted = await self.store.accept_run_submission(run.id, outcome=Outcome.COMPLETE)
+            if accepted is None:
+                raise InvalidSubmission("review Run became stale")
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=0)
+            await self.store.update_run(
                 run.id,
-                ProcessState.RUNNING,
-                pane_id=getattr(self.terminal, "pane_id", lambda _id: None)(boundary.id),
+                status=RunStatus.COMPLETE,
+                outcome=Outcome.COMPLETE,
+                usage=usage,
+                session_id=session_id,
             )
-            try:
-                payload, usage, session_id = await planner.call_structured(
-                    review_ctx,
-                    prompt,
-                    handoff_kind="result",
-                )
-                content = self._structured_artifact_payload(
-                    payload,
-                    schema_name="turn.manager-result",
-                    artifact_name="manager-result",
-                )
-                result = parse_manager_result(content)
-                await self.store.update_review_request(
-                    boundary.project_id,
-                    completion_request.id,
-                    status=ReviewStatus.SETTLED,
-                    decision=(
-                        ReviewDecision.APPROVE
-                        if result.decision is ManagerDecision.ACCEPT
-                        else ReviewDecision.REJECT
-                    ),
-                    summary=result.summary,
-                )
-                accepted = await self.store.accept_run_submission(
-                    run.id,
-                    outcome=Outcome.COMPLETE,
-                )
-                if accepted is None:
-                    raise InvalidSubmission("manager review Run became stale")
-                await self.store.mark_run_process(
-                    run.id, ProcessState.EXITED, exit_code=0
-                )
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.COMPLETE,
-                    outcome=Outcome.COMPLETE,
-                    summary=result.summary,
-                    usage=usage,
-                    session_id=session_id,
-                )
-                if session_id:
-                    await self._remember_session(boundary, session_id)
-                return result
-            except asyncio.CancelledError:
-                await self.store.update_review_request(
-                    boundary.project_id,
-                    completion_request.id,
-                    status=ReviewStatus.SETTLED,
-                    summary="manager review cancelled",
-                )
-                await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.CANCELLED,
-                    outcome=Outcome.FAIL,
-                    summary="organization manager review cancelled",
-                    error="run cancelled by user",
-                    retry_recommended=False,
-                )
-                raise
-            except Exception as error:
-                last_error = error
-                await self.store.update_review_request(
-                    boundary.project_id,
-                    completion_request.id,
-                    status=ReviewStatus.SETTLED,
-                    summary=f"manager review failed: {sanitize_control_text(error)}",
-                )
-                await self.store.mark_run_process(
-                    run.id, ProcessState.EXITED, exit_code=1
-                )
-                await self.store.update_run(
-                    run.id,
-                    status=RunStatus.FAILED,
-                    outcome=Outcome.FAIL,
-                    summary="organization manager review failed",
-                    error=sanitize_control_text(error),
-                    retry_recommended=attempt < 3,
-                )
-                if attempt < 3:
-                    await asyncio.sleep(0.05 * attempt)
-        raise ControlOperationUnavailable(
-            "organization manager review unavailable after 3 attempts: "
-            + sanitize_control_text(last_error)
-        ) from last_error
+            if session_id:
+                await self._remember_session(node, session_id)
+            return payload
+        except asyncio.CancelledError:
+            await self.store.mark_run_process(run.id, ProcessState.CANCELLED)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.CANCELLED,
+                outcome=Outcome.FAIL,
+                summary="review turn cancelled",
+                error="run cancelled by user",
+                retry_recommended=False,
+            )
+            raise
+        except Exception as error:
+            await self.store.mark_run_process(run.id, ProcessState.EXITED, exit_code=1)
+            await self.store.update_run(
+                run.id,
+                status=RunStatus.FAILED,
+                outcome=Outcome.FAIL,
+                summary="review turn failed",
+                error=sanitize_control_text(error),
+                retry_recommended=True,
+            )
+            raise
 
     async def _plan_node(
         self,
@@ -3351,9 +3769,15 @@ class Runner:
                 await self.organization_manager.request_review(
                     self.store, boundary.id, "frontier_settled"
                 )
+            if self.provider_reviews_enabled and self.manager_reviewer is None:
+                # Final boundary acceptance belongs to the receiver named by
+                # the hierarchy: the parent planner for nested boundaries, the
+                # project lead for the root. The tick only records the durable
+                # request; the scheduler/step machinery owns launching that
+                # one bounded review turn (LEAD_ESCALATION_FINISH §3–§5).
+                await self._request_authority_completion_review(boundary)
+                continue
             reviewer = self.manager_reviewer
-            if reviewer is None and self.provider_reviews_enabled:
-                reviewer = self._provider_manager_review
             if reviewer is not None:
                 await self.store.set_manager_state(
                     boundary.id,

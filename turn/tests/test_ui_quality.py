@@ -256,6 +256,7 @@ def test_only_readme_and_design_are_product_markdown_documents():
         "P0-P1-HARDEN.md",
         "P0-P1-correct.md",
         "LEAD_ESCALATION.md",
+        "LEAD_ESCALATION_FINISH.md",
         "LEAD_ESCALATION_SUGGESTED_ARCH.md",
         "MISTAKES.md",
         "FOUND_BUGS.md",

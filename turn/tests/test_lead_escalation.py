@@ -26,6 +26,7 @@ from turn.domain.organization import (
     ManagerPhase,
     OrganizationContract,
     OrganizationScale,
+    WorkItemStatus,
 )
 from turn.domain.schemas import (
     AgentConfig,
@@ -128,6 +129,35 @@ def manager_payload(decision: str, summary: str, work_items: list[dict] | None =
                     "summary": summary,
                     "work_items": work_items or [],
                     "missing_inputs": [],
+                },
+            }
+        ],
+    }
+
+
+def review_decision_payload(
+    decision: str,
+    summary: str,
+    *,
+    work_items: list[dict] | None = None,
+    required_changes: list[str] | None = None,
+    missing_inputs: list[str] | None = None,
+) -> dict:
+    return {
+        "outcome": "COMPLETE",
+        "summary": "review returned",
+        "artifacts": [
+            {
+                "kind": ArtifactKind.JSON.value,
+                "name": "review-decision",
+                "schema_name": "turn.review-decision",
+                "schema_version": "v1",
+                "content": {
+                    "decision": decision,
+                    "summary": summary,
+                    "required_changes": required_changes or [],
+                    "work_items": work_items or [],
+                    "missing_inputs": missing_inputs or [],
                 },
             }
         ],
@@ -301,13 +331,13 @@ async def test_nested_review_resumes_parent_planner_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_manager_review_uses_boundary_terminal_and_increments_iteration(tmp_path):
+async def test_completion_authority_reviews_on_receiver_terminal_and_session(tmp_path):
     store, runner, planner, terminal = await make_runner(
         tmp_path,
         [
-            manager_payload(
-                "CONTINUE",
-                "keep going",
+            review_decision_payload(
+                "REJECT",
+                "needs follow-up",
                 work_items=[
                     {
                         "key": "follow-up",
@@ -316,55 +346,96 @@ async def test_manager_review_uses_boundary_terminal_and_increments_iteration(tm
                     }
                 ],
             ),
-            manager_payload("ACCEPT", "done"),
+            review_decision_payload("APPROVE", "done"),
         ],
     )
     root = await make_project(store, tmp_path)
-    await store.apply_plan(
+    await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    children = await store.apply_plan(
         root,
-        PlanResult(nodes=[NodeSpec(key="leaf", objective="Leaf", executor="codex")]),
+        PlanResult(nodes=[NodeSpec(key="dept", objective="Department", executor="planner", plan=True)]),
     )
-    await store.set_status(root.id, NodeStatus.EXPANDED)
-    await store.set_manager_state(
-        root.id, phase=ManagerPhase.EXECUTING, reasons=["frontier settled"]
+    nested = await store.set_agent_session(children[0].id, "nested-planner-session")
+    # A completed leaf makes the deterministic acceptance gate evaluable;
+    # drop auto-generated evidence criteria so no verifier fixture is needed.
+    nested_contract = nested.organization_contract.model_copy(deep=True)
+    nested_contract.acceptance_criteria = []
+    nested.organization_contract = nested_contract
+    await store._save_node(nested)
+    # A completed leaf makes the deterministic acceptance gate evaluable.
+    leaves = await store.apply_plan(
+        nested,
+        PlanResult(nodes=[NodeSpec(key="unit", objective="Unit work", executor="codex")]),
     )
-    manager = OrganizationManager()
+    await store.set_status(leaves[0].id, NodeStatus.COMPLETE)
 
-    snapshot = await manager.snapshot(store, root.id)
-    first = await runner._provider_manager_review(snapshot)
-    assert first.decision is ManagerDecision.CONTINUE
-    await manager.apply_result(store, root.id, first)
-    iteration_after_continue = (await store.get_node(root.id)).manager_iteration
-    assert iteration_after_continue >= 1
+    # The settled frontier only records a durable request — zero model calls.
+    await runner._request_authority_completion_review(nested)
+    assert planner.contexts == [], "request creation must not launch a model turn"
+    requests = await store.review_requests(root.project_id)
+    completion = [
+        item for item in sorted(requests, key=lambda r: r.created_at)
+        if item.kind.value == "COMPLETION_REVIEW"
+    ]
+    assert len(completion) == 1
+    request = completion[0]
+    assert request.status.value == "PENDING"
+    # Nested acceptance belongs to the parent planner, not the boundary itself.
+    assert request.receiver_is_lead is False
+    assert request.receiver_id == root.id
 
-    snapshot = await manager.snapshot(store, root.id)
-    second = await runner._provider_manager_review(snapshot)
-    assert second.decision is ManagerDecision.ACCEPT
-    await manager.apply_result(store, root.id, second)
-    final = await store.get_node(root.id)
-    assert final.manager_iteration > iteration_after_continue or final.manager_phase is ManagerPhase.ACCEPTED
-
-    # Same boundary terminal performed both reviews; no synthetic process.
-    # Session continuity: the second review resumes the session the first
-    # review persisted ("review-session" is the fixture's scripted id).
+    # The scheduler-owned settlement resumes the parent's retained session.
+    await runner.settle_review_request(root.project_id, request.id)
     contexts = [ctx for ctx, _ in planner.contexts]
-    assert all(ctx.node.id == root.id for ctx in contexts)
-    assert [ctx.node.agent.session_id for ctx in contexts] == [
+    assert contexts and contexts[0].node.id == root.id
+    assert contexts[0].node.agent.session_id == "retained-planner-session"
+    assert (
+        root.id,
+        str(root.project_id),
+        "retained-planner-session",
+        "codex",
+    ) in terminal.reconciled_sessions
+    settled = next(
+        item for item in await store.review_requests(
+            root.project_id, sender_id=nested.id
+        )
+        if item.id == request.id
+    )
+    assert settled.status.value == "SETTLED"
+    assert settled.decision.value == "REJECT"
+    # The rejection appended a bounded wave through ordinary machinery.
+    wave_root = await store.get_node(nested.id)
+    assert wave_root.manager_iteration >= 1
+    follow_up = next(
+        item for item in await store.list_work_items(root.project_id, organization_id=nested.id)
+        if item.key == "follow-up"
+    )
+    await store.update_work_item(follow_up.id, status=WorkItemStatus.COMPLETE)
+
+    # Second frontier settlement: the same receiver approves on the session
+    # the first review persisted.
+    await runner._request_authority_completion_review(nested)
+    pending = [
+        item for item in await store.review_requests(
+            root.project_id, sender_id=nested.id, status=None
+        )
+        if item.kind.value == "COMPLETION_REVIEW" and item.status.value == "PENDING"
+    ]
+    assert len(pending) == 1
+    await runner.settle_review_request(root.project_id, pending[0].id)
+    assert [ctx.node.agent.session_id for ctx, _ in planner.contexts] == [
         "retained-planner-session",
         "review-session",
     ]
-    runs = await store.get_runs(root.id)
-    manager_runs = [run for run in runs if run.worker == "organization-manager"]
-    assert len(manager_runs) == 2
-    assert all(run.process_owner_id == root.id for run in manager_runs)
-    assert all(run.status is RunStatus.COMPLETE for run in manager_runs)
-    completion = [
-        item for item in sorted(
-            await store.review_requests(root.project_id), key=lambda r: r.created_at
+    approved = next(
+        item for item in await store.review_requests(
+            root.project_id, sender_id=nested.id
         )
-        if item.kind.value == "COMPLETION_REVIEW"
-    ]
-    assert [item.decision.value for item in completion] == ["REJECT", "APPROVE"]
+        if item.id == pending[0].id
+    )
+    assert approved.decision.value == "APPROVE"
+    final = await store.get_node(nested.id)
+    assert final.manager_phase is ManagerPhase.ACCEPTED
     await store.dispose()
 
 
@@ -705,4 +776,353 @@ async def test_projects_have_independent_leads_sessions_and_review_queues(tmp_pa
     # Resolving a lead by terminal owner returns exactly the owning project.
     assert (await store.lead_by_terminal_owner(lead_one.terminal_owner_id)).project_id == first.project_id
     assert (await store.lead_by_terminal_owner(lead_two.terminal_owner_id)).project_id == second.project_id
+    await store.dispose()
+
+
+# ---------------------------------------------------------------------------
+# LEAD_ESCALATION_FINISH.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_idle_lead_terminal_resumes_retained_session_never_shell(tmp_path):
+    """Typing into an idle Lead terminal runs a real retained-session turn.
+
+    The typed text must never reach the durable shell's stdin: it is consumed
+    by the conversation line editor and submitted as one lead model turn that
+    streams in the same pane and preserves ProjectLead.session_id.
+    """
+    store, runner, planner, terminal = await make_runner(
+        tmp_path,
+        [audit_payload("APPROVE")],  # scripted review envelope for the lead turn
+    )
+    root = await make_project(store, tmp_path)
+    await store.set_agent_session(root.id, "retained-planner-session")
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    owner = lead.terminal_owner_id
+
+    # Simulate the post-bootstrap idle pane: an active shell session exists.
+    terminal._node(owner)["active"] = True
+    terminal._node(owner)["persistent"] = True
+
+    # Idle: every keystroke is consumed — nothing reaches the shell's stdin.
+    forwarded = await runner.lead_console_input(owner, "What is blocking this project?\r")
+    assert forwarded is None
+    assert all("What is blocking" not in text for _node, text in terminal.written)
+
+    # The conversation turn ran on the lead's identity with the retained
+    # session and created a normal Run.
+    await asyncio.gather(*runner._lead_tasks.values(), return_exceptions=True)
+    assert all(task.done() for task in runner._lead_tasks.values())
+    contexts = [ctx for ctx, _kind in planner.contexts]
+    lead_ctx = [ctx for ctx, _kind in planner.contexts if ctx.node.id == owner]
+    assert lead_ctx, "the lead turn must execute on the lead's terminal identity"
+    assert lead_ctx[0].node.agent.session_id == lead.session_id
+    runs = await store.get_runs(owner)
+    assert any(run.worker == "project-lead" for run in runs)
+    refreshed = await store.lead_by_terminal_owner(owner)
+    assert refreshed.session_id == "review-session"
+    assert refreshed.status.value == "IDLE"
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_busy_lead_terminal_passes_keystrokes_through(tmp_path):
+    """While a lead turn is live, typing steers the harness like any agent."""
+    store, runner, _planner, terminal = await make_runner(tmp_path, [])
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    owner = lead.terminal_owner_id
+
+    class Blocker:
+        def __init__(self):
+            self.done_flag = asyncio.Event()
+
+        def __call__(self):
+            return self.done_flag.is_set()
+
+    hold = asyncio.Event()
+
+    async def long_turn():
+        await hold.wait()
+
+    task = asyncio.create_task(long_turn())
+    runner._lead_tasks[owner] = task
+    try:
+        forwarded = await runner.lead_console_input(owner, "stop\r")
+        assert forwarded == "stop\r"
+    finally:
+        hold.set()
+        await task
+        runner._lead_tasks.pop(owner, None)
+    await store.dispose()
+
+
+def test_setup_is_a_capability_not_an_agent():
+    """No standalone setup authority exists; bootstrap is Lead + Root Planner."""
+    import asyncio
+    from turn.domain.schemas import AgentType
+    from turn.domain.capability_contracts import SETUP_CAPABILITY_ID
+    assert not [member for member in AgentType if "setup" in member.value]
+    assert SETUP_CAPABILITY_ID != "lead" and SETUP_CAPABILITY_ID.startswith("turn-")
+
+
+@pytest.mark.asyncio
+async def test_setup_capability_belongs_to_root_planner_only(tmp_path):
+    """Setup behavior attaches to the initial Root Planner, never an agent."""
+    from turn.domain.capability_contracts import SETUP_CAPABILITY_ID
+    store, _runner, _planner, _terminal = await make_runner(tmp_path, [])
+    root = await make_project(store, tmp_path)
+    assert SETUP_CAPABILITY_ID in root.agent.capabilities
+    children = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="dept", objective="Department", executor="planner", plan=True)]),
+    )
+    assert SETUP_CAPABILITY_ID not in children[0].agent.capabilities
+
+
+@pytest.mark.asyncio
+async def test_nested_completion_requires_parent_acceptance(tmp_path):
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path, [review_decision_payload("APPROVE", "parent accepts")]
+    )
+    root = await make_project(store, tmp_path)
+    await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    children = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="dept", objective="Department", executor="planner", plan=True)]),
+    )
+    nested = children[0]
+    # Drop auto-generated evidence criteria so the deterministic acceptance
+    # gate evaluates only frontier/backlog state in this fixture.
+    nested_contract = nested.organization_contract.model_copy(deep=True)
+    nested_contract.acceptance_criteria = []
+    nested.organization_contract = nested_contract
+    await store._save_node(nested)
+    leaves = await store.apply_plan(
+        nested,
+        PlanResult(nodes=[NodeSpec(key="unit", objective="Unit work", executor="codex")]),
+    )
+    await store.set_status(leaves[0].id, NodeStatus.COMPLETE)
+
+    # The settled frontier produces exactly one durable request to the parent.
+    await runner._request_authority_completion_review(nested)
+    request = next(
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "COMPLETION_REVIEW" and item.sender_id == nested.id
+    )
+    assert request.receiver_id == root.id
+    assert request.receiver_is_lead is False
+
+    await runner.settle_review_request(root.project_id, request.id)
+    final = await store.get_node(nested.id)
+    assert final.manager_phase is ManagerPhase.ACCEPTED
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_root_completion_requires_lead_acceptance(tmp_path):
+    """The project cannot become COMPLETE until the Lead accepts completion."""
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path,
+        [
+            review_decision_payload("REJECT", "not done yet"),
+            review_decision_payload("APPROVE", "lead accepts completion"),
+        ],
+    )
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    # Drop auto-generated evidence criteria: this test exercises hierarchical
+    # gating, not the deterministic evidence audit.
+    root_contract = root.organization_contract.model_copy(deep=True)
+    root_contract.acceptance_criteria = []
+    root.organization_contract = root_contract
+    await store._save_node(root)
+    leaves = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="leaf", objective="Leaf", executor="codex")]),
+    )
+    await store.set_status(leaves[0].id, NodeStatus.COMPLETE)
+
+    await runner._request_authority_completion_review(root)
+    request = next(
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "COMPLETION_REVIEW"
+    )
+    assert request.receiver_is_lead is True
+    assert request.receiver_id == lead.terminal_owner_id
+
+    # Lead rejects: no acceptance, project stays incomplete.
+    await runner.settle_review_request(root.project_id, request.id)
+    after_reject = await store.get_node(root.id)
+    assert after_reject.manager_phase is ManagerPhase.EXECUTING
+    # The corrective wave completes before the frontier settles again.
+    corrections = [
+        item for item in await store.list_work_items(root.project_id, organization_id=root.id)
+        if item.status is not WorkItemStatus.COMPLETE
+    ]
+    for item in corrections:
+        await store.update_work_item(item.id, status=WorkItemStatus.COMPLETE)
+
+    # Second frontier settlement; this time the lead approves.
+    await runner._request_authority_completion_review(root)
+    pending = next(
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "COMPLETION_REVIEW" and item.status.value == "PENDING"
+    )
+    await runner.settle_review_request(root.project_id, pending.id)
+    after_accept = await store.get_node(root.id)
+    assert after_accept.manager_phase is ManagerPhase.ACCEPTED
+    decisions = [
+        item.decision.value
+        for item in sorted(
+            (r for r in await store.review_requests(root.project_id) if r.kind.value == "COMPLETION_REVIEW"),
+            key=lambda r: r.created_at,
+        )
+    ]
+    assert decisions == ["REJECT", "APPROVE"]
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_escalation_is_processed_by_parent_and_propagates_to_lead(tmp_path):
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path,
+        [review_decision_payload("ESCALATE", "beyond my authority")],
+    )
+    root = await make_project(store, tmp_path)
+    lead = await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    children = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="dept", objective="Department", executor="planner", plan=True)]),
+    )
+    nested = await store.set_agent_session(children[0].id, "nested-planner-session")
+
+    escalation = await store.create_review_request(
+        project_id=root.project_id,
+        sender_id=nested.id,
+        receiver_id=root.id,
+        receiver_is_lead=False,
+        kind=ReviewKind.ESCALATION,
+        reason="plan rejected twice",
+    )
+
+    # Step/auto machinery executes the parent's escalation turn...
+    await runner.settle_review_request(root.project_id, escalation.id)
+    settled = next(
+        item for item in await store.review_requests(root.project_id) if item.id == escalation.id
+    )
+    assert settled.status.value == "SETTLED"
+    ctx = planner.contexts[0][0]
+    assert ctx.node.id == root.id
+    # ...and the parent's ESCALATE climbs to the lead as a new PENDING request.
+    propagated = [
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "ESCALATION" and item.status.value == "PENDING"
+    ]
+    assert len(propagated) == 1
+    # The request advances from the current receiver's position upward.
+    assert propagated[0].sender_id == root.id
+    assert propagated[0].receiver_is_lead is True
+    assert propagated[0].receiver_id == lead.terminal_owner_id
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_escalation_settlement_revives_sender_for_fresh_planning(tmp_path):
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path, [review_decision_payload("REJECT", "fixed the wiring; retry")]
+    )
+    root = await make_project(store, tmp_path)
+    await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    root = await store.set_status(root.id, NodeStatus.FAILED)
+    lead = await store.project_lead(root.project_id)
+
+    escalation = await store.create_review_request(
+        project_id=root.project_id,
+        sender_id=root.id,
+        receiver_id=lead.terminal_owner_id,
+        receiver_is_lead=True,
+        kind=ReviewKind.ESCALATION,
+        reason="root planning exhausted corrections",
+    )
+    await runner.settle_review_request(root.project_id, escalation.id)
+    revived = await store.get_node(root.id)
+    # Fresh-run preparation makes the sender immediately schedulable again.
+    assert revived.status is NodeStatus.RUNNABLE
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_step_mode_produces_zero_model_calls_until_stepped(tmp_path):
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path, [review_decision_payload("APPROVE", "accepted")]
+    )
+    root = await make_project(store, tmp_path)  # auto_run=False
+    await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    leaves = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="leaf", objective="Leaf", executor="codex")]),
+    )
+    await store.set_status(leaves[0].id, NodeStatus.COMPLETE)
+    contract = root.organization_contract.model_copy(deep=True)
+    contract.scale = OrganizationScale.DELIVERY
+    root.organization_contract = contract
+    await store._save_node(root)
+    await store.set_manager_state(root.id, phase=ManagerPhase.EXECUTING, reasons=["frontier settled"])
+    await store.set_status(root.id, NodeStatus.EXPANDED)
+
+    # Background ticks discover the ready review but launch nothing.
+    for _ in range(3):
+        await runner.scheduler.schedule_once(root.project_id)
+    await asyncio.gather(*runner.scheduler.running.values(), return_exceptions=True)
+    assert len(planner.contexts) == 0, "step mode must not call the model before Step"
+
+    # Next Stage launches the ready review frontier.
+    launched = await runner.scheduler.step(root.project_id)
+    await asyncio.gather(
+        *runner.scheduler.running.values(),
+        *runner.scheduler.running_reviews.values(),
+        return_exceptions=True,
+    )
+    assert len(planner.contexts) == 1
+    request = next(
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "COMPLETION_REVIEW"
+    )
+    assert request.status.value == "SETTLED"
+    await store.dispose()
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_runs_ready_reviews_automatically(tmp_path):
+    store, runner, planner, _terminal = await make_runner(
+        tmp_path, [review_decision_payload("APPROVE", "accepted")]
+    )
+    root = await make_project(store, tmp_path)
+    root = await store.set_auto_run(root.id, True) if hasattr(store, "set_auto_run") else root
+    policy = root.run_policy.model_copy(update={"auto_run": True})
+    root = await store.update_run_policy(root.id, policy) if hasattr(store, "update_run_policy") else root
+    await store._save_node(root)
+    await store.ensure_project_lead(root.project_id, agent=root.agent.model_copy())
+    leaves = await store.apply_plan(
+        root,
+        PlanResult(nodes=[NodeSpec(key="leaf", objective="Leaf", executor="codex")]),
+    )
+    await store.set_status(leaves[0].id, NodeStatus.COMPLETE)
+    contract = root.organization_contract.model_copy(deep=True)
+    contract.scale = OrganizationScale.DELIVERY
+    root.organization_contract = contract
+    await store._save_node(root)
+    await store.set_manager_state(root.id, phase=ManagerPhase.EXECUTING, reasons=["frontier settled"])
+    await runner._request_authority_completion_review(root)
+
+    await runner.scheduler.schedule_once(root.project_id)
+    await asyncio.gather(*runner.scheduler.running_reviews.values(), return_exceptions=True)
+    assert len(planner.contexts) == 1
+    request = next(
+        item for item in await store.review_requests(root.project_id)
+        if item.kind.value == "COMPLETION_REVIEW"
+    )
+    assert request.status.value == "SETTLED"
     await store.dispose()

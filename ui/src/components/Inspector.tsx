@@ -110,16 +110,23 @@ export function Inspector({
           <p className="detail-error">{error}</p>
         ) : !detail ? (
           <p className="detail-loading">Loading node…</p>
-        ) : tab === "overview" ? (
-          <Overview
-            detail={detail}
-            capabilities={capabilities}
-            mutate={mutate}
-            onDirtyChange={(value) => {
-              dirty.current = value;
-            }}
-          />
-        ) : null}
+        ) : (
+          <>
+            {/* The node identity stays visible on every surface: selection
+                must always answer "which agent am I looking at". */}
+            <NodeIdentity node={detail.node} />
+            {tab === "overview" && (
+              <Overview
+                detail={detail}
+                capabilities={capabilities}
+                mutate={mutate}
+                onDirtyChange={(value) => {
+                  dirty.current = value;
+                }}
+              />
+            )}
+          </>
+        )}
         {detail && (
           <div hidden={tab !== "terminal"} className="terminal-tab-panel">
             <Suspense fallback={<p className="detail-loading">Loading terminal…</p>}>
@@ -133,6 +140,29 @@ export function Inspector({
         )}
       </div>
     </aside>
+  );
+}
+
+function NodeIdentity({ node }: { node: Detail["node"] }) {
+  return (
+    <>
+      <h2 className="detail-title">{displayNodeTitle(node)}</h2>
+      <div className="detail-meta">
+        <span className={`badge ${node.ui_state}`}>
+          {node.ui_state === "preparing"
+            ? "preparing"
+            : node.generation_active
+              ? "generating"
+              : node.ui_state.replaceAll("_", " ")}
+        </span>
+        {node.process_state && (
+          <span className="badge neutral" title="Provider process state; this does not determine work outcome">
+            process {node.process_state.toLowerCase().replaceAll("_", " ")}
+            {node.process_exit_code !== null && ` (${node.process_exit_code})`}
+          </span>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -330,22 +360,6 @@ function Overview({
   ]);
   return (
     <>
-      <h2 className="detail-title">{displayNodeTitle(node)}</h2>
-      <div className="detail-meta">
-        <span className={`badge ${node.ui_state}`}>
-          {node.ui_state === "preparing"
-            ? "preparing"
-            : node.generation_active
-              ? "generating"
-              : node.ui_state.replaceAll("_", " ")}
-        </span>
-        {node.process_state && (
-          <span className="badge neutral" title="Provider process state; this does not determine work outcome">
-            process {node.process_state.toLowerCase().replaceAll("_", " ")}
-            {node.process_exit_code !== null && ` (${node.process_exit_code})`}
-          </span>
-        )}
-      </div>
       {node.runtime_guard && (
         <section className="section runtime-guard" role="alert" aria-label="Runtime guard">
           <div className="section-heading">

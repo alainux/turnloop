@@ -1904,6 +1904,14 @@ form.composer:has(.composer-config-panel) {
 }
 .detail.terminal-detail {
   overflow: hidden;
+  /* The persistent node identity sits above the terminal panel. */
+  display: flex;
+  flex-direction: column;
+}
+.detail.terminal-detail > .terminal-tab-panel {
+  flex: 1;
+  min-height: 0;
+  height: auto;
 }
 .terminal-tab-panel {
   height: 100%;

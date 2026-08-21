@@ -477,18 +477,19 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
     }
     manager_payload = {
         "outcome": "COMPLETE",
-        "summary": "manager returned",
+        "summary": "review returned",
         "artifacts": [
             {
                 "kind": ArtifactKind.JSON.value,
-                "name": "manager-result",
-                "schema_name": "turn.manager-result",
+                "name": "review-decision",
+                "schema_name": "turn.review-decision",
                 "schema_version": "v1",
                 "content": {
-                    "decision": "BLOCK",
+                    "decision": "ESCALATE",
                     "summary": "Need a human decision.",
+                    "required_changes": [],
                     "work_items": [],
-                    "missing_inputs": [],
+                    "missing_inputs": ["choose a game engine"],
                 },
             }
         ],
@@ -534,34 +535,30 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
     # The lead's harness session is retained on the lead record.
     retained_lead = await store.project_lead(root.project_id)
     assert retained_lead.session_id == "review-session"
-    manager_snapshot = await runner.organization_manager.snapshot(store, root.id)
-    manager_result = await runner._provider_manager_review(manager_snapshot)
-    assert manager_result.decision is ManagerDecision.BLOCK
-    # The manager review resumes the boundary itself: its pane is closed for
-    # the stale writer and reconciled against the retained session.
-    assert root.id in runner.terminal.close_requests
-    assert terminal.reconciled_sessions == [
-        (root.id, str(root.project_id), "retained-planner-session", "codex")
-    ]
-    assert planner.contexts[1][0].node.agent.session_id == "retained-planner-session"
-    assert planner.contexts[1][0].node.id == root.id
+    # Root completion acceptance belongs to the lead. Recording the durable
+    # request launches nothing; settling it runs one bounded lead turn.
+    await runner._request_authority_completion_review(root)
+    assert len(planner.contexts) == 1
+    pending = next(
+        request for request in await store.review_requests(root.project_id)
+        if request.kind.value == "COMPLETION_REVIEW"
+        and request.status.value == "PENDING"
+    )
+    assert pending.receiver_is_lead is True
+    assert pending.receiver_id == lead.terminal_owner_id
+
+    await runner.settle_review_request(root.project_id, pending.id)
+    # The lead's review turn ran on the lead's own identity and pane.
+    assert planner.contexts[1][0].node.id == lead.terminal_owner_id
+    assert lead.terminal_owner_id in terminal.close_requests
     runs = await store.get_runs(lead.terminal_owner_id)
     assert {run.worker for run in runs} == {"project-lead"}
-    lead_run = runs[-1]
-    assert lead_run.process_owner_id == lead.terminal_owner_id
-    assert lead_run.process_state.value == "EXITED"
-    manager_runs = await store.get_runs(root.id)
-    manager_run = next(
-        run for run in reversed(manager_runs) if run.worker == "organization-manager"
-    )
-    assert manager_run.process_owner_id == root.id
-    assert manager_run.process_state.value == "EXITED"
-    assert lead.terminal_owner_id in terminal.close_requests
-    assert root.id in terminal.close_requests
+    assert all(run.process_owner_id == lead.terminal_owner_id for run in runs)
+    assert all(run.process_state.value == "EXITED" for run in runs)
+    # ESCALATE at the top of the hierarchy blocks on explicit user input,
+    # visibly: the boundary is BLOCKED and the trail says so.
     refreshed = await store.get_node(root.id)
-    assert refreshed.agent.session_id == "review-session"
-    # The review request trail records the settled lead decision plus the
-    # boundary completion review.
+    assert refreshed.status.value == "BLOCKED"
     requests = await store.review_requests(root.project_id)
     assert {request.kind.value for request in requests} == {
         "PLAN_REVIEW",
@@ -573,6 +570,11 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
     assert plan_request.receiver_is_lead is True
     assert plan_request.decision.value == "APPROVE"
     assert plan_request.status.value == "SETTLED"
+    completion = next(
+        request for request in requests if request.kind.value == "COMPLETION_REVIEW"
+    )
+    assert completion.status.value == "SETTLED"
+    assert completion.summary.startswith("blocked on user input")
     await store.dispose()
 
 
