@@ -190,10 +190,6 @@ class DeleteProjectOptions(BaseModel):
     delete_conversations: bool = False
 
 
-class LeadChatMessage(BaseModel):
-    message: str = Field(min_length=1, max_length=20_000)
-
-
 class LeadWaitRequest(BaseModel):
     events: list[str] = Field(default_factory=list, max_length=32)
 
@@ -410,10 +406,6 @@ async def _serialize_graph(store: Store, project_id: uuid.UUID, runner: Runner |
             if (lead := await store.project_lead(project_id)) is not None
             else []
         ),
-        "lead_transcript": [
-            item.model_dump(mode="json")
-            for item in await store.lead_transcript(project_id)
-        ],
         "review_requests": [
             item.model_dump(mode="json")
             for item in await store.review_requests(project_id)
@@ -1154,65 +1146,6 @@ async def project_lead(project_id: str, request: Request):
         "project_id": project_id,
         "bootstrap_status": bootstrap,
         "lead": lead.model_dump(mode="json") if lead else None,
-        "transcript": [
-            item.model_dump(mode="json")
-            for item in await store.lead_transcript(pid)
-        ],
-    }
-
-
-@router.get("/api/projects/{project_id}/lead/chat")
-async def project_lead_chat(project_id: str, request: Request):
-    """Return the compact durable transcript used by Lead Chat."""
-    pid = uuid.UUID(project_id)
-    store: Store = request.app.state.store
-    if await store.get_node(pid) is None:
-        raise HTTPException(404, "project not found")
-    return {
-        "project_id": project_id,
-        "transcript": [
-            item.model_dump(mode="json")
-            for item in await store.lead_transcript(pid)
-        ],
-    }
-
-
-@router.post("/api/projects/{project_id}/lead/chat")
-async def send_project_lead_message(
-    project_id: str,
-    body: LeadChatMessage,
-    request: Request,
-):
-    """Send one user message through the retained Project Lead session."""
-    pid = uuid.UUID(project_id)
-    store: Store = request.app.state.store
-    runner: Runner = request.app.state.runner
-    if await store.get_node(pid) is None:
-        raise HTTPException(404, "project not found")
-    lead = await store.project_lead(pid)
-    if lead is None:
-        raise HTTPException(409, "project lead is not initialized")
-    try:
-        entry, _task = await runner.enqueue_lead_message(
-            lead.terminal_owner_id,
-            body.message,
-        )
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
-    except ControlOperationUnavailable as error:
-        raise HTTPException(409, str(error)) from error
-    return {
-        "project_id": project_id,
-        "message": entry.model_dump(mode="json"),
-        # The endpoint is intentionally asynchronous even for an idle Lead:
-        # the user must be able to queue another message while the provider
-        # turn is live. The transcript/SSE stream carries the later reply.
-        "queued": True,
-        "lead": (
-            refreshed.model_dump(mode="json")
-            if (refreshed := await store.project_lead(pid)) is not None
-            else None
-        ),
     }
 
 
@@ -1677,7 +1610,7 @@ async def _pty_socket(
             while True:
                 chunk = await queue.get()
                 if chunk is None:
-                    await websocket.send_json({"type": "status", "active": False})
+                    await websocket.send_json({"type": "status", "active": False, "ended": True})
                     return
                 # Incremental UTF-8 decoding may produce an empty text chunk
                 # while it waits for the rest of a code point. It is not EOF
@@ -1700,6 +1633,7 @@ async def _pty_socket(
                     await websocket.send_json({
                         "type": "status",
                         "active": bool(snapshot.get("active")),
+                        "ended": False,
                         "idle": bool(snapshot.get("idle")),
                         "stalled": bool(snapshot.get("stalled")),
                         "idle_reaped": bool(snapshot.get("idle_reaped")),
@@ -1755,33 +1689,12 @@ async def shell_socket(websocket: WebSocket, node_id: str):
     nid = uuid.UUID(node_id)
     if await _send_runtime_guard(websocket, runner, nid):
         return
-    # The id may be a graph node or a project lead's stable terminal owner.
-    is_lead = await runner.store.get_node(nid) is None and (
-        await runner.store.lead_by_terminal_owner(nid) is not None
-    )
-    opened = (
-        await runner.open_lead_shell(nid)
-        if is_lead
-        else await runner.open_shell(nid)
-    )
+    # Lead owners deliberately have no shell endpoint. The Lead is attached
+    # through /terminal so browser input reaches the active provider PTY.
+    opened = await runner.open_shell(nid)
     if not opened:
         await websocket.close(code=1011, reason="project directory unavailable")
         return
-    input_filter = None
-    if is_lead:
-        # The Lead pane is never a generic shell: typed lines are assembled
-        # locally and submitted as retained-session conversation turns. This
-        # remains true while a Lead turn runs; input is queued and never
-        # written into the active provider.
-        async def input_filter(data: bytes | str) -> bytes | None:
-            text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
-            result = await runner.lead_console_input(nid, text)
-            if result is None:
-                return None
-            return result.encode()
-
-        if not runner.lead_busy(nid):
-            runner._announce_lead_idle(nid)
     async def cleanup_shell() -> bool:
         # A websocket disappearing is a detach, not an explicit close. This
         # keeps the Herdr-backed shell available for reconnects and server
@@ -1793,7 +1706,7 @@ async def shell_socket(websocket: WebSocket, node_id: str):
             return False
         return await runner.detach_shell(nid)
 
-    await _pty_socket(websocket, node_id, runner.shell, cleanup_shell, input_filter=input_filter)
+    await _pty_socket(websocket, node_id, runner.shell, cleanup_shell)
 
 
 async def _send_runtime_guard(websocket: WebSocket, runner: Runner, node_id: uuid.UUID) -> bool:

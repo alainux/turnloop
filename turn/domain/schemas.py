@@ -422,32 +422,6 @@ class ProjectLead(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
-class LeadMessageRole(str, Enum):
-    USER = "user"
-    LEAD = "lead"
-    UPDATE = "update"
-
-
-class LeadMessageStatus(str, Enum):
-    QUEUED = "QUEUED"
-    CONSUMED = "CONSUMED"
-
-
-class LeadTranscriptEntry(BaseModel):
-    """One durable, project-local item in the human-facing lead chat."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4)
-    project_id: uuid.UUID
-    role: LeadMessageRole
-    content: str = Field(min_length=1)
-    event_name: Optional[str] = None
-    status: LeadMessageStatus = LeadMessageStatus.CONSUMED
-    run_id: Optional[uuid.UUID] = None
-    created_at: datetime = Field(default_factory=_utcnow)
-
-
 class InboundMessageStatus(str, Enum):
     QUEUED = "QUEUED"
     CONSUMED = "CONSUMED"
@@ -970,7 +944,6 @@ class GraphView(BaseModel):
     # Run history owned by the lead's stable terminal identity. The lead is
     # not a graph node, so its runs ride at the project level.
     lead_runs: list[Run] = Field(default_factory=list)
-    lead_transcript: list[LeadTranscriptEntry] = Field(default_factory=list)
     review_requests: list[ReviewRequest] = Field(default_factory=list)
     nodes: list[GraphNodeView] = Field(default_factory=list)
     edges: list[Edge] = Field(default_factory=list)

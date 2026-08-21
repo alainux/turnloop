@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import uuid
 from typing import Literal
 
-from turn.domain.lead import LeadTranscriptEntry, ProjectLead, ReviewRequest
+from turn.domain.lead import ProjectLead, ReviewRequest
 from turn.domain.organization import BudgetRequest, Handoff, WorkItem
 from turn.domain.schemas import Artifact, Edge, InboundMessage, Node, Run, Trigger
 
@@ -35,7 +35,6 @@ class ProjectState:
     # Exactly one project lead per project. ``None`` only for projects that
     # predate the lead model until their next normalization pass creates it.
     lead: ProjectLead | None = None
-    lead_transcript: list[LeadTranscriptEntry] = field(default_factory=list)
     inbound_messages: dict[uuid.UUID, InboundMessage] = field(default_factory=dict)
 
     @classmethod

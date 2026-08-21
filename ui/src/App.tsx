@@ -43,8 +43,7 @@ import { Graph as GraphCanvas } from "./components/Graph";
 import { DocumentView } from "./components/DocumentView";
 import { Icon } from "./components/Icon";
 import { Inspector } from "./components/Inspector";
-import { LeadInspector, LeadOversight } from "./components/LeadOversight";
-import { LeadChat } from "./components/LeadChat";
+import { LeadOversight, LeadTerminalView } from "./components/LeadOversight";
 import { LogsPanel } from "./components/LogsPanel";
 import { QualityPanel } from "./components/QualityPanel";
 import { WorkView } from "./components/WorkView";
@@ -212,7 +211,6 @@ export default function App() {
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<string | null>(null);
-  const [leadOpen, setLeadOpen] = useState(false);
   const [viewMode, setViewMode] = useState<"lead" | "graph" | "document" | "work">("lead");
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -483,7 +481,7 @@ export default function App() {
                       setViewMode("lead");
                     }}
                   >
-                    Lead Chat
+                    Lead
                   </button>
                   <button
                     role="tab"
@@ -562,14 +560,19 @@ export default function App() {
             </div>
             {graphReady && root ? (
               viewMode === "lead" ? (
-                <LeadChat
-                  projectId={projectId!}
-                  lead={graph!.lead ?? null}
-                  transcript={graph!.lead_transcript ?? []}
-                  bootstrapStatus={graph!.bootstrap_status ?? "READY"}
-                  onOpenTerminal={() => setLeadOpen(true)}
-                  onChanged={loadGraph}
-                />
+                graph!.lead ? (
+                  <LeadTerminalView
+                    projectId={projectId}
+                    lead={graph!.lead}
+                    bootstrapStatus={graph!.bootstrap_status ?? "READY"}
+                    reviews={graph!.review_requests ?? []}
+                    runs={graph!.lead_runs ?? []}
+                  />
+                ) : (
+                  <div className="project-loading" aria-live="polite">
+                    Waiting for the project Lead to initialize…
+                  </div>
+                )
               ) : viewMode === "document" ? (
                 <DocumentView
                   nodes={graph!.nodes}
@@ -611,7 +614,11 @@ export default function App() {
                     lead={graph!.lead ?? null}
                     bootstrapStatus={graph!.bootstrap_status ?? "READY"}
                     reviews={graph!.review_requests ?? []}
-                    onOpen={() => setLeadOpen(true)}
+                    onOpen={() => {
+                      setSelected(null);
+                      setSelectedTrigger(null);
+                      setViewMode("lead");
+                    }}
                   />
                 </div>
               )
@@ -680,24 +687,6 @@ export default function App() {
               />
             ) : null;
           })()}
-        </>
-      )}
-      {leadOpen && graph?.lead && projectId && (
-        <>
-          <ResizeHandle
-            target="inspector"
-            value={inspectorWidth}
-            onResize={beginResize}
-            onAdjust={adjustResize}
-          />
-          <LeadInspector
-            projectId={projectId}
-            lead={graph.lead}
-            bootstrapStatus={graph.bootstrap_status ?? "READY"}
-            reviews={graph.review_requests ?? []}
-            runs={graph.lead_runs ?? []}
-            onClose={() => setLeadOpen(false)}
-          />
         </>
       )}
       <footer className="statusbar">

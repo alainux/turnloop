@@ -112,7 +112,7 @@ def parser() -> argparse.ArgumentParser:
     lead = sub.add_parser("lead", help="inspect and control the project lead")
     lead_sub = lead.add_subparsers(dest="lead_command", required=True)
     lead_show = lead_sub.add_parser(
-        "show", aliases=["inspect"], help="show lead chat, project state, work, and reviews"
+        "show", aliases=["inspect"], help="show lead state, project state, work, and reviews"
     )
     lead_show.add_argument("project_id", type=uuid.UUID, nargs="?")
     lead_show.add_argument("--format", choices=["json", "text"], default="json")
@@ -1040,10 +1040,6 @@ async def lead_command(args) -> int:
             payload = {
                 "project_id": str(project_id),
                 "lead": lead.model_dump(mode="json"),
-                "transcript": [
-                    item.model_dump(mode="json")
-                    for item in await store.lead_transcript(project_id)
-                ],
                 "root": root.model_dump(mode="json"),
                 "work_items": [item.model_dump(mode="json") for item in work_items],
                 "reviews": [item.model_dump(mode="json") for item in reviews],
@@ -1059,7 +1055,6 @@ async def lead_command(args) -> int:
             if args.format == "text":
                 print(
                     f"lead {payload['lead']['id']} · {payload['lead']['status']} · "
-                    f"{len(payload['transcript'])} chat entries · "
                     f"{len(payload['reviews'])} reviews"
                 )
             else:

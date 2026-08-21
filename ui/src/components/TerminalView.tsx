@@ -10,13 +10,14 @@ interface Props {
   node: GraphNode;
   runs: Run[];
   control?: ControlActivity | null;
+  endpoint?: "shell" | "terminal";
 }
 
 const HERDR_OPERATOR_WARNING =
   "CAUTION: HERDR CANNOT BE LAUNCHED INSIDE SUBPROCESSES OR FROM HERDR ITSELF. " +
   "DO NOT TRY TO LAUNCH HERDR; REQUEST/USE THE ALREADY-RUNNING DAEMON.";
 
-export function TerminalView({ node, control }: Props) {
+export function TerminalView({ node, control, endpoint: nodeEndpoint = "shell" }: Props) {
   const host = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(false);
   const [idle, setIdle] = useState(false);
@@ -33,9 +34,9 @@ export function TerminalView({ node, control }: Props) {
   // A project owns one Herdr space. A node gets a durable pane only when an
   // agent runs or a user explicitly opens its terminal; the inspector only
   // attaches to that pane.
-  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "transcript">("connecting");
+  const [connection, setConnection] = useState<"connecting" | "connected" | "disconnected" | "waiting" | "transcript">("connecting");
   const showControl = Boolean(control) && surface === "control";
-  const endpoint = showControl ? "terminal" : "shell";
+  const endpoint = showControl ? "terminal" : nodeEndpoint;
   const streamNodeId = showControl ? control!.terminal_node_id : node.id;
 
   useEffect(() => {
@@ -233,8 +234,8 @@ export function TerminalView({ node, control }: Props) {
           setConnection("disconnected");
         } else if (message.type === "snapshot") {
           const snapshotActive = Boolean(message.active);
-          sessionEnded = !snapshotActive;
-          setConnection(snapshotActive ? "connected" : "transcript");
+          sessionEnded = endpoint !== "terminal" && !snapshotActive;
+          setConnection(snapshotActive ? "connected" : endpoint === "terminal" ? "waiting" : "transcript");
           activate(snapshotActive, Boolean(message.idle));
           terminal.reset();
           if (message.output) {
@@ -257,23 +258,23 @@ export function TerminalView({ node, control }: Props) {
           await queueTerminalWrite(String(message.data ?? ""));
         } else if (message.type === "status") {
           const statusActive = Boolean(message.active);
+          const statusEnded = Boolean(message.ended);
           if (!statusActive) {
-            sessionEnded = true;
-            setConnection("transcript");
+            sessionEnded = endpoint !== "terminal" || statusEnded;
+            setConnection(endpoint === "terminal" ? "waiting" : "transcript");
           }
           activate(statusActive, Boolean(message.idle));
-          if (!statusActive && socket?.readyState === WebSocket.OPEN) {
-            // The outer attach client ended (for example after a cancelled
-            // harness). Close this subscription so the durable Herdr pane is
-            // reattached by the normal retry path instead of leaving xterm
-            // displaying the old client's "[terminated]" final frame.
+          if (!statusActive && statusEnded && endpoint === "terminal" && socket?.readyState === WebSocket.OPEN) {
+            // A provider control stream ended, not the project pane. Close
+            // only this subscription so the next real Lead Run reattaches to
+            // the same durable Herdr owner.
             socket.close();
           }
         }
       };
       socket.onclose = () => {
         activate(false);
-        if (!disposed && sessionEnded) {
+        if (!disposed && endpoint !== "terminal" && sessionEnded) {
           setConnection("transcript");
         } else if (!disposed) {
           setConnection("disconnected");
@@ -368,15 +369,13 @@ export function TerminalView({ node, control }: Props) {
   }, [endpoint, node.id, reconnectKey, streamNodeId]);
 
   return (
-    <div
-      className={`terminal-shell ${!active ? "terminal-shell-collapsed" : ""}`}
-    >
+    <div className={`terminal-shell ${!active ? "terminal-shell-collapsed" : ""}`}>
       <div className="terminal-head">
         <Icon name="terminal" />
         <span className="terminal-title">
           {showControl
             ? node.control_activity?.kind === "manager_review" ? "control · manager" : "control · plan audit"
-            : "shell"} · {streamNodeId.slice(0, 8)}
+            : nodeEndpoint === "terminal" ? "provider" : "shell"} · {streamNodeId.slice(0, 8)}
         </span>
         {control && (
           <span className="terminal-view-switch" role="tablist" aria-label="Terminal surface">
@@ -395,6 +394,8 @@ export function TerminalView({ node, control }: Props) {
             ? (idle ? "LIVE · waiting" : "LIVE")
             : connection === "connecting"
             ? "CONNECTING"
+            : connection === "waiting"
+            ? "WAITING FOR RUN"
             : connection === "transcript"
             ? "TRANSCRIPT"
             : "RECONNECTING"}
@@ -407,6 +408,8 @@ export function TerminalView({ node, control }: Props) {
               ? `${runtimeGuard} ${HERDR_OPERATOR_WARNING}`
             : connection === "connecting"
               ? "Connecting to this node’s persistent Herdr shell…"
+              : connection === "waiting"
+              ? "Waiting for the Lead provider Run; no synthetic output is shown."
               : connection === "transcript"
               ? "Session finished; transcript retained."
               : "Connection interrupted; reconnecting to the persistent Herdr shell…"}
@@ -415,7 +418,7 @@ export function TerminalView({ node, control }: Props) {
       )}
       <div
         ref={host}
-        className={`terminal-shadow-host ${(!active && connection !== "transcript") || view !== "terminal" ? "is-collapsed" : ""}`}
+        className={`terminal-shadow-host ${(!active && connection === "connecting") || view !== "terminal" ? "is-collapsed" : ""}`}
         aria-label="Agent terminal"
       />
       {view === "activity" && <HarnessActivity node={node} />}

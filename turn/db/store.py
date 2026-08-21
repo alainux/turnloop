@@ -73,9 +73,6 @@ from turn.capabilities.catalog import CapabilityCatalog
 from turn.domain.capability_contracts import SETUP_CAPABILITY_ID, capability_ids_for_agent_type
 from turn.domain.lead import (
     BootstrapStatus,
-    LeadMessageRole,
-    LeadMessageStatus,
-    LeadTranscriptEntry,
     LeadStatus,
     ProjectLead,
     ReviewDecision,
@@ -363,9 +360,6 @@ class Store:
         for item in raw.get("review_requests", []):
             review = ReviewRequest.model_validate(item)
             state.review_requests[review.id] = review
-        for item in raw.get("lead_transcript", raw.get("lead_messages", [])):
-            transcript_item = LeadTranscriptEntry.model_validate(item)
-            state.lead_transcript.append(transcript_item)
         for item in raw.get("inbound_messages", []):
             inbox_item = InboundMessage.model_validate(item)
             state.inbound_messages[inbox_item.id] = inbox_item
@@ -505,10 +499,6 @@ class Store:
             ]
         if state.lead is not None:
             payload["lead"] = self._model_dump(state.lead)
-        if state.lead_transcript:
-            payload["lead_transcript"] = [
-                self._model_dump(value) for value in state.lead_transcript
-            ]
         if state.inbound_messages:
             payload["inbound_messages"] = [
                 self._model_dump(value) for value in state.inbound_messages.values()
@@ -1053,31 +1043,6 @@ class Store:
             elif agent is not None and state.lead.agent is None:
                 state.lead.agent = agent
                 changed = True
-            if not state.lead_transcript:
-                root = state.nodes.get(project_id)
-                objective = (
-                    root.generated_prompt
-                    if root is not None and root.generated_prompt
-                    else root.objective
-                    if root is not None
-                    else "Project objective received."
-                )
-                state.lead_transcript.extend([
-                    LeadTranscriptEntry(
-                        project_id=project_id,
-                        role=LeadMessageRole.USER,
-                        content=objective,
-                    ),
-                    LeadTranscriptEntry(
-                        project_id=project_id,
-                        role=LeadMessageRole.UPDATE,
-                        content=(
-                            "I’ve got it. I’m framing the work with the organization "
-                            "while the team starts behind the scenes."
-                        ),
-                    ),
-                ])
-                changed = True
             if changed:
                 await self._persist_project(project_id)
             return state.lead.model_copy(deep=True)
@@ -1107,81 +1072,6 @@ class Store:
                 state.lead.wait_events = list(dict.fromkeys(wait_events))
             await self._persist_project(project_id)
             return state.lead.model_copy(deep=True)
-
-    async def append_lead_message(
-        self,
-        project_id: uuid.UUID,
-        *,
-        role: LeadMessageRole | str,
-        content: str,
-        event_name: str | None = None,
-        status: LeadMessageStatus | str = LeadMessageStatus.CONSUMED,
-        run_id: uuid.UUID | None = None,
-    ) -> LeadTranscriptEntry:
-        """Append one validated item to the project's durable lead chat."""
-        entry = LeadTranscriptEntry(
-            project_id=project_id,
-            role=LeadMessageRole(role),
-            content=content.strip(),
-            event_name=event_name,
-            status=LeadMessageStatus(status),
-            run_id=run_id,
-        )
-        async with self._project_lock(project_id):
-            state = self._state(project_id)
-            state.lead_transcript.append(entry)
-            await self._persist_project(project_id)
-        await self._log(
-            project_id,
-            kind="lead.message",
-            action=f"lead.{entry.role.value}",
-            message=entry.content,
-            data={
-                "message_id": str(entry.id),
-                "role": entry.role.value,
-                "event_name": entry.event_name,
-            },
-        )
-        return entry.model_copy(deep=True)
-
-    async def lead_transcript(self, project_id: uuid.UUID) -> list[LeadTranscriptEntry]:
-        state = self._states.get(project_id)
-        if state is None:
-            return []
-        return [entry.model_copy(deep=True) for entry in state.lead_transcript]
-
-    async def pending_lead_messages(
-        self, project_id: uuid.UUID
-    ) -> list[LeadTranscriptEntry]:
-        state = self._states.get(project_id)
-        if state is None:
-            return []
-        return [
-            entry.model_copy(deep=True)
-            for entry in state.lead_transcript
-            if entry.role is LeadMessageRole.USER
-            and entry.status is LeadMessageStatus.QUEUED
-        ]
-
-    async def mark_lead_messages_consumed(
-        self,
-        project_id: uuid.UUID,
-        message_ids: list[uuid.UUID],
-        run_id: uuid.UUID,
-    ) -> None:
-        if not message_ids:
-            return
-        wanted = set(message_ids)
-        async with self._project_lock(project_id):
-            state = self._state(project_id)
-            changed = False
-            for entry in state.lead_transcript:
-                if entry.id in wanted and entry.status is LeadMessageStatus.QUEUED:
-                    entry.status = LeadMessageStatus.CONSUMED
-                    entry.run_id = run_id
-                    changed = True
-            if changed:
-                await self._persist_project(project_id)
 
     async def queue_inbound_message(
         self,

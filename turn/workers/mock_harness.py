@@ -217,7 +217,7 @@ class MockHarnessPlanner(Planner):
     ) -> tuple[dict[str, Any], Usage, str | None]:
         """Run a structured control-plane turn through the mock process.
 
-        Lead Chat and other test-mode control turns must use the same
+        Lead control-plane and other test-mode turns must use the same
         process-backed mock harness as ordinary mock nodes. Keeping this on
         the planner adapter preserves the normal terminal/session/run path;
         it does not create an in-process chat shortcut.

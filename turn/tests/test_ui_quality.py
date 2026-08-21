@@ -149,7 +149,7 @@ def test_terminal_is_a_raw_dom_pty_view():
     assert "Telemetry {telemetryStatus(telemetry)}" in terminal
     assert "telemetry-unavailable" in css
     assert "terminal_node_id" in terminal
-    assert 'endpoint = showControl ? "terminal" : "shell"' in terminal
+    assert 'const endpoint = showControl ? "terminal" : nodeEndpoint' in terminal
     assert "streamNodeId" in terminal
 
 
@@ -158,7 +158,7 @@ def test_terminal_finish_is_a_transcript_and_status_heartbeats_do_not_replay_bac
     api = (ROOT / "turn" / "server" / "api.py").read_text()
     assert '"TRANSCRIPT"' in terminal
     assert "sessionEnded" in terminal
-    assert 'connection !== "transcript"' in terminal
+    assert 'endpoint !== "terminal" && sessionEnded' in terminal
     assert "if chunk is None:" in api
     assert 'if chunk == "":' in api
     status_block = api[api.index("async def send_status"):api.index("status_sender =", api.index("async def send_status"))]

@@ -550,7 +550,9 @@ async def test_provider_review_adapters_require_typed_artifacts_and_session_boun
     await runner.settle_review_request(root.project_id, pending.id)
     # The lead's review turn ran on the lead's own identity and pane.
     assert planner.contexts[1][0].node.id == lead.terminal_owner_id
-    assert lead.terminal_owner_id in terminal.close_requests
+    # Provider control detaches after a bounded turn; the project-local Herdr
+    # pane remains retained for the next Lead turn or browser reconnect.
+    assert lead.terminal_owner_id not in terminal.close_requests
     runs = await store.get_runs(lead.terminal_owner_id)
     assert {run.worker for run in runs} == {"project-lead"}
     assert all(run.process_owner_id == lead.terminal_owner_id for run in runs)

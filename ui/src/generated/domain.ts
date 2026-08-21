@@ -214,7 +214,6 @@ export interface GraphView {
   bootstrap_status: string;
   lead: ProjectLead | null;
   lead_runs: Array<Run>;
-  lead_transcript: Array<LeadTranscriptEntry>;
   review_requests: Array<ReviewRequest>;
   nodes: Array<GraphNodeView>;
   edges: Array<Edge>;
@@ -286,22 +285,7 @@ export interface Integrator {
   session_id: string | null;
 }
 
-export type LeadMessageRole = "user" | "lead" | "update";
-
-export type LeadMessageStatus = "QUEUED" | "CONSUMED";
-
 export type LeadStatus = "IDLE" | "RUNNING" | "DORMANT";
-
-export interface LeadTranscriptEntry {
-  id: string;
-  project_id: string;
-  role: LeadMessageRole;
-  content: string;
-  event_name: string | null;
-  status: LeadMessageStatus;
-  run_id: string | null;
-  created_at: string;
-}
 
 export type ManagerDecision = "ACCEPT" | "CONTINUE" | "BLOCK";
 

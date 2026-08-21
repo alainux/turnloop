@@ -118,7 +118,7 @@ def test_three_complete_ui_runs_persist_coherent_graphs_logs_and_results(tmp_pat
                     page.get_by_role("button", name="Project and run configuration").click()
                     page.get_by_label("Auto-run", exact=True).check()
                     page.get_by_role("button", name="Create workgraph").click()
-                    page.get_by_role("heading", name="Lead Chat").wait_for()
+                    page.get_by_role("heading", name="Lead terminal").wait_for()
                     page.get_by_role("tab", name="Graph").click()
                     page.locator(".gnode").first.wait_for(timeout=15000)
                     project_id = page.evaluate(

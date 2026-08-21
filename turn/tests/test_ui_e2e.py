@@ -171,7 +171,7 @@ def test_react_authoring_manual_graph_inspector_terminal_and_visuals(tmp_path):
             page.get_by_role("button", name="Project and run configuration").click()
             page.get_by_label("Auto-run", exact=True).uncheck()
             page.get_by_role("button", name="Create workgraph").click()
-            page.get_by_role("heading", name="Lead Chat").wait_for()
+            page.get_by_role("heading", name="Lead terminal").wait_for()
             page.get_by_role("tab", name="Graph").click()
             page.locator(".gnode").first.wait_for()
             assert page.get_by_role("button", name="New project").count() == 1
