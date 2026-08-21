@@ -41,8 +41,9 @@ export function Inspector({
   notify,
 }: Props) {
   const [detail, setDetail] = useState<Detail | null>(null);
-  const [tab, setTab] = useState<Tab>("overview");
-  const [terminalVisited, setTerminalVisited] = useState(false);
+  // The live terminal is the primary surface: it shows as soon as a node is
+  // selected and stays mounted while the user browses the overview.
+  const [tab, setTab] = useState<Tab>("terminal");
   const [error, setError] = useState("");
   const dirty = useRef(false);
   const loadVersion = useRef(0);
@@ -98,10 +99,7 @@ export function Inspector({
             role="tab"
             aria-selected={tab === item}
             className={tab === item ? "active" : ""}
-            onClick={() => {
-              if (item === "terminal") setTerminalVisited(true);
-              setTab(item);
-            }}
+            onClick={() => setTab(item)}
           >
             {item[0].toUpperCase() + item.slice(1)}
           </button>
@@ -122,7 +120,7 @@ export function Inspector({
             }}
           />
         ) : null}
-        {detail && terminalVisited && (
+        {detail && (
           <div hidden={tab !== "terminal"} className="terminal-tab-panel">
             <Suspense fallback={<p className="detail-loading">Loading terminal…</p>}>
               <TerminalView
